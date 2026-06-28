@@ -20,6 +20,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::WindowId;
 
+/// The Ember app icon (embedded). Set on the window + the macOS dock at startup.
+const ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.png"));
+
 const PAD: f32 = 4.0;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
@@ -78,6 +81,7 @@ impl ApplicationHandler for App {
         let h = DEFAULT_ROWS as f32 * CELL_HEIGHT + 2.0 * PAD;
         let attrs = ember_platform::window_attributes("Ember", w, h);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        ember_platform::set_app_icon(&window, ICON_PNG);
 
         let size = window.inner_size();
         let dims = dims_for(size.width.max(1), size.height.max(1));
