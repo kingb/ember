@@ -645,6 +645,7 @@ dependencies = [
  "bytemuck",
  "ember-core",
  "glyphon",
+ "png",
  "pollster",
  "wgpu",
  "winit",

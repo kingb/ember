@@ -5,6 +5,7 @@
 //! quad, and the egui chrome overlay land in later epics.
 
 pub mod grid_model;
+pub mod headless;
 pub mod quads;
 pub mod renderer;
 

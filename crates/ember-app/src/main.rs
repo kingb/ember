@@ -9,6 +9,8 @@
 //! session's pixel lane into that pane's grid. This is the splits + tabs
 //! milestone — live tiled shells, on Linux and macOS.
 
+mod screenshot;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,7 +30,7 @@ use winit::window::WindowId;
 /// The Ember app icon (embedded). Set on the window + the macOS dock at startup.
 const ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.png"));
 
-const PAD: f32 = 4.0;
+pub(crate) const PAD: f32 = 4.0;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 /// How often the loop polls the pixel lanes when idle (~125 Hz). A proxy-waker on
@@ -36,8 +38,22 @@ const DEFAULT_ROWS: u16 = 24;
 const POLL: Duration = Duration::from_millis(8);
 
 fn main() {
-    if std::env::args().any(|a| a == "--version" || a == "-V") {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
         print_banner();
+        return;
+    }
+    // Headless self-review: render a deterministic scene to a PNG and exit. Needs
+    // a GPU but no display (Metal/Vulkan render offscreen), so it works in CI /
+    // an agent shell. See `screenshot::parse` for flags.
+    if args.iter().any(|a| a == "--screenshot") {
+        match screenshot::parse(&args).and_then(screenshot::run) {
+            Ok(path) => println!("wrote {path}"),
+            Err(e) => {
+                eprintln!("screenshot failed: {e}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
     let event_loop = EventLoop::new().expect("create event loop");
@@ -79,7 +95,7 @@ struct RunState {
 }
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
-fn inset(r: Rect, p: f64) -> Rect {
+pub(crate) fn inset(r: Rect, p: f64) -> Rect {
     Rect::new(
         r.x + p,
         r.y + p,
@@ -89,7 +105,7 @@ fn inset(r: Rect, p: f64) -> Rect {
 }
 
 /// Cell grid that fits an inner pixel rect.
-fn dims_for_rect(r: Rect, cw: f32, ch: f32) -> GridDims {
+pub(crate) fn dims_for_rect(r: Rect, cw: f32, ch: f32) -> GridDims {
     let cols = ((r.width as f32 / cw).floor() as i64).clamp(1, u16::MAX as i64);
     let rows = ((r.height as f32 / ch).floor() as i64).clamp(1, u16::MAX as i64);
     GridDims::new(cols as u16, rows as u16)

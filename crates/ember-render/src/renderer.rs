@@ -26,20 +26,20 @@ use winit::window::Window;
 
 use crate::grid_model::GridModel;
 
-const FONT_SIZE: f32 = 12.0;
-const LINE_HEIGHT: f32 = 15.0;
+pub(crate) const FONT_SIZE: f32 = 12.0;
+pub(crate) const LINE_HEIGHT: f32 = 15.0;
 /// Approximate monospace advance as a fraction of font size — used only to pick a
 /// sensible default window size; glyphon does the real per-glyph advance.
 pub const CELL_WIDTH: f32 = FONT_SIZE * 0.6;
 pub const CELL_HEIGHT: f32 = LINE_HEIGHT;
-const PAD: f32 = 4.0;
+pub(crate) const PAD: f32 = 4.0;
 
 /// Dark background fill (matches the surface clear).
-const BG: Rgb = Rgb::new(0x10, 0x10, 0x10);
+pub(crate) const BG: Rgb = Rgb::new(0x10, 0x10, 0x10);
 /// Default foreground for blanks / separators.
-const FG: Rgb = Rgb::new(0xcc, 0xcc, 0xcc);
+pub(crate) const FG: Rgb = Rgb::new(0xcc, 0xcc, 0xcc);
 /// Accent used for the focused-pane border and the active tab background.
-const ACCENT: Rgb = Rgb::new(0xe2, 0x5a, 0x1c);
+pub(crate) const ACCENT: Rgb = Rgb::new(0xe2, 0x5a, 0x1c);
 
 /// One visible pane: which session fills it and the inner pixel rect it occupies
 /// (already inset for padding by the app).
@@ -64,7 +64,7 @@ struct PaneRender {
 
 /// Measure the monospace advance for the current font/size, so background quads
 /// line up with the glyphs glyphon flows.
-fn measure_cell_width(font_system: &mut FontSystem) -> f32 {
+pub(crate) fn measure_cell_width(font_system: &mut FontSystem) -> f32 {
     let mut probe = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     probe.set_text(
         font_system,
@@ -85,13 +85,135 @@ fn measure_cell_width(font_system: &mut FontSystem) -> f32 {
 }
 
 /// sRGB `Rgb` + alpha → linear RGBA for the sRGB surface target.
-fn lin_rgba(c: Rgb, a: f32) -> [f32; 4] {
+pub(crate) fn lin_rgba(c: Rgb, a: f32) -> [f32; 4] {
     [
         srgb_to_linear(c.r),
         srgb_to_linear(c.g),
         srgb_to_linear(c.b),
         a,
     ]
+}
+
+// --- Shared draw logic (windowed Renderer + headless screenshot) -------------
+// These free fns are the single source of truth for how a grid becomes glyphs +
+// quads, so the headless PNG matches what ships on screen pixel-for-pixel.
+
+/// Shape one grid's rows into `buffer` as per-cell fg-colored runs (one logical
+/// line per grid row).
+pub(crate) fn shape_grid(font_system: &mut FontSystem, buffer: &mut Buffer, grid: &GridModel) {
+    let lines = grid.dims.screen_lines;
+    let mut spans: Vec<(String, Color)> = Vec::new();
+    for row in 0..lines {
+        for (text, fg) in grid.row_runs(row) {
+            spans.push((text, Color::rgb(fg.r, fg.g, fg.b)));
+        }
+        if row + 1 < lines {
+            spans.push(("\n".to_string(), Color::rgb(FG.r, FG.g, FG.b)));
+        }
+    }
+    let base = Attrs::new().family(Family::Monospace);
+    buffer.set_rich_text(
+        font_system,
+        spans
+            .iter()
+            .map(|(t, c)| (t.as_str(), Attrs::new().family(Family::Monospace).color(*c))),
+        &base,
+        Shaping::Advanced,
+        None,
+    );
+    buffer.shape_until_scroll(font_system, false);
+}
+
+/// Append a grid's bg fills + (when focused) cursor + (when focused && split)
+/// focus border, for a pane at logical `rect`, scaled to physical px by `sf`.
+pub(crate) fn grid_quads(
+    grid: &GridModel,
+    rect: Rect,
+    cw: f32,
+    sf: f32,
+    focused: bool,
+    split: bool,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) {
+    let ox = rect.x as f32;
+    let oy = rect.y as f32;
+    let ch = CELL_HEIGHT;
+    for row in 0..grid.dims.screen_lines {
+        for col in 0..grid.dims.columns {
+            if let Some(cell) = grid.cell(row, col) {
+                let bg = grid.style_of(cell.style).bg;
+                if bg != BG {
+                    out.push((
+                        scaled(ox + col as f32 * cw, oy + row as f32 * ch, cw, ch, sf),
+                        lin_rgba(bg, 1.0),
+                    ));
+                }
+            }
+        }
+    }
+    if focused {
+        let cur = grid.cursor;
+        if cur.visible {
+            out.push((
+                scaled(
+                    ox + cur.col as f32 * cw,
+                    oy + cur.row as f32 * ch,
+                    cw,
+                    ch,
+                    sf,
+                ),
+                lin_rgba(FG, 0.5),
+            ));
+        }
+        if split {
+            push_border(out, rect, ACCENT, sf);
+        }
+    }
+}
+
+/// Build the tab-strip quads (active-tab bg, scaled by `sf`) and shape the labels
+/// into `chrome`. No-op for a single tab.
+pub(crate) fn build_tabs(
+    font_system: &mut FontSystem,
+    chrome: &mut Buffer,
+    tabs: &[TabLabel],
+    cw: f32,
+    logical_w: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) {
+    if tabs.len() <= 1 {
+        return;
+    }
+    chrome.set_size(font_system, Some(logical_w), Some(LINE_HEIGHT));
+    let strip_h = CELL_HEIGHT + 2.0 * PAD;
+    let mut x = 0.0f32;
+    let mut spans: Vec<(String, Color)> = Vec::new();
+    for tab in tabs {
+        let label = format!(" {} ", tab.title);
+        let w = label.chars().count() as f32 * cw;
+        if tab.active {
+            out.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(ACCENT, 0.85)));
+        }
+        let fg = if tab.active {
+            Color::rgb(0xff, 0xff, 0xff)
+        } else {
+            Color::rgb(0x88, 0x88, 0x88)
+        };
+        spans.push((label, fg));
+        x += w;
+    }
+    let base = Attrs::new().family(Family::Monospace);
+    chrome.set_rich_text(
+        font_system,
+        spans
+            .iter()
+            .map(|(t, c)| (t.as_str(), Attrs::new().family(Family::Monospace).color(*c))),
+        &base,
+        Shaping::Advanced,
+        None,
+    );
+    chrome.shape_until_scroll(font_system, false);
 }
 
 pub struct Renderer {
@@ -296,27 +418,7 @@ impl Renderer {
         // Pass 1: shape each visible pane's text into its own buffer.
         for vp in &self.visible {
             if let Some(p) = self.panes.get_mut(&vp.session) {
-                let lines = p.grid.dims.screen_lines;
-                let mut spans: Vec<(String, Color)> = Vec::new();
-                for row in 0..lines {
-                    for (text, fg) in p.grid.row_runs(row) {
-                        spans.push((text, Color::rgb(fg.r, fg.g, fg.b)));
-                    }
-                    if row + 1 < lines {
-                        spans.push(("\n".to_string(), Color::rgb(FG.r, FG.g, FG.b)));
-                    }
-                }
-                let base = Attrs::new().family(Family::Monospace);
-                p.buffer.set_rich_text(
-                    &mut self.font_system,
-                    spans.iter().map(|(t, c)| {
-                        (t.as_str(), Attrs::new().family(Family::Monospace).color(*c))
-                    }),
-                    &base,
-                    Shaping::Advanced,
-                    None,
-                );
-                p.buffer.shape_until_scroll(&mut self.font_system, false);
+                shape_grid(&mut self.font_system, &mut p.buffer, &p.grid);
             }
         }
 
@@ -327,52 +429,24 @@ impl Renderer {
         // Pass 2: collect background fills, cursor, focus border, and tab strip
         // (geometry built in logical px, then scaled to physical by `sf`).
         let cw = self.cell_w;
-        let ch = CELL_HEIGHT;
         let split = self.visible.len() > 1;
         let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
         for vp in &self.visible {
-            let Some(p) = self.panes.get(&vp.session) else {
-                continue;
-            };
-            let ox = vp.rect.x as f32;
-            let oy = vp.rect.y as f32;
-            let cols = p.grid.dims.columns;
-            let lines = p.grid.dims.screen_lines;
-            for row in 0..lines {
-                for col in 0..cols {
-                    if let Some(cell) = p.grid.cell(row, col) {
-                        let bg = p.grid.style_of(cell.style).bg;
-                        if bg != BG {
-                            rects.push((
-                                scaled(ox + col as f32 * cw, oy + row as f32 * ch, cw, ch, sf),
-                                lin_rgba(bg, 1.0),
-                            ));
-                        }
-                    }
-                }
-            }
-            let focused = self.focused.as_ref() == Some(&vp.session);
-            if focused {
-                let cursor = p.grid.cursor;
-                if cursor.visible {
-                    rects.push((
-                        scaled(
-                            ox + cursor.col as f32 * cw,
-                            oy + cursor.row as f32 * ch,
-                            cw,
-                            ch,
-                            sf,
-                        ),
-                        lin_rgba(FG, 0.5),
-                    ));
-                }
-            }
-            // Border the focused pane only when the window is actually split.
-            if focused && split {
-                push_border(&mut rects, vp.rect, ACCENT, sf);
+            if let Some(p) = self.panes.get(&vp.session) {
+                let focused = self.focused.as_ref() == Some(&vp.session);
+                grid_quads(&p.grid, vp.rect, cw, sf, focused, split, &mut rects);
             }
         }
-        self.build_tab_strip(&mut rects, sf);
+        let logical_w = self.config.width as f32 / sf;
+        build_tabs(
+            &mut self.font_system,
+            &mut self.chrome,
+            &self.tabs,
+            cw,
+            logical_w,
+            sf,
+            &mut rects,
+        );
 
         self.quads.prepare(
             &self.device,
@@ -490,58 +564,17 @@ impl Renderer {
         self.atlas.trim();
         true
     }
-
-    /// Build the tab strip: a background quad behind the active tab plus the
-    /// concatenated labels shaped into the chrome buffer. No-op for a single tab.
-    fn build_tab_strip(&mut self, rects: &mut Vec<([f32; 4], [f32; 4])>, sf: f32) {
-        if self.tabs.len() <= 1 {
-            return;
-        }
-        // Re-size the chrome buffer to the logical window width each frame.
-        let logical_w = self.config.width as f32 / sf;
-        self.chrome
-            .set_size(&mut self.font_system, Some(logical_w), Some(LINE_HEIGHT));
-        let cw = self.cell_w;
-        let strip_h = CELL_HEIGHT + 2.0 * PAD;
-        let mut x = 0.0f32;
-        let mut spans: Vec<(String, Color)> = Vec::new();
-        for tab in &self.tabs {
-            let label = format!(" {} ", tab.title);
-            let w = label.chars().count() as f32 * cw;
-            if tab.active {
-                rects.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(ACCENT, 0.85)));
-            }
-            let fg = if tab.active {
-                Color::rgb(0xff, 0xff, 0xff)
-            } else {
-                Color::rgb(0x88, 0x88, 0x88)
-            };
-            spans.push((label, fg));
-            x += w;
-        }
-        let base = Attrs::new().family(Family::Monospace);
-        self.chrome.set_rich_text(
-            &mut self.font_system,
-            spans
-                .iter()
-                .map(|(t, c)| (t.as_str(), Attrs::new().family(Family::Monospace).color(*c))),
-            &base,
-            Shaping::Advanced,
-            None,
-        );
-        self.chrome.shape_until_scroll(&mut self.font_system, false);
-    }
 }
 
 /// A `(rect_px, …)`-ready physical-pixel quad from logical `x,y,w,h` and the
 /// HiDPI scale factor.
-fn scaled(x: f32, y: f32, w: f32, h: f32, sf: f32) -> [f32; 4] {
+pub(crate) fn scaled(x: f32, y: f32, w: f32, h: f32, sf: f32) -> [f32; 4] {
     [x * sf, y * sf, w * sf, h * sf]
 }
 
 /// Push four thin quads outlining `rect` (logical px) in `color` — a ~1.5px
 /// focus border, scaled to physical px by `sf`.
-fn push_border(rects: &mut Vec<([f32; 4], [f32; 4])>, rect: Rect, color: Rgb, sf: f32) {
+pub(crate) fn push_border(rects: &mut Vec<([f32; 4], [f32; 4])>, rect: Rect, color: Rgb, sf: f32) {
     let t = 1.5f32;
     let (x, y, w, h) = (
         rect.x as f32,
