@@ -1,8 +1,14 @@
-//! `ember-render` — wgpu + glyphon + egui consumer (design §6).
+//! `ember-render` — wgpu + glyphon consumer (design §6).
 //!
 //! Owns the neutral grid and applies owned frame deltas; never borrows engine
-//! memory. The GPU pipelines and glyph atlas land in later epics. Empty-but-real
-//! stub that proves the `ember-core` link.
+//! memory. v1 renders monospace text via glyphon; per-cell color, the cursor
+//! quad, and the egui chrome overlay land in later epics.
+
+pub mod grid_model;
+pub mod renderer;
+
+pub use grid_model::GridModel;
+pub use renderer::{CELL_HEIGHT, CELL_WIDTH, Renderer};
 
 /// Returns the `ember-core` version this render layer is built against.
 pub fn core_version() -> &'static str {

@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 ember-core.workspace = true
+wgpu.workspace = true
+glyphon.workspace = true
+winit.workspace = true
+pollster.workspace = true
 
 [lints]
 workspace = true
