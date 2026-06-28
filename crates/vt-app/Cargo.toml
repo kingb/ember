@@ -1,0 +1,18 @@
+[package]
+name = "vt-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ember-term"
+path = "src/main.rs"
+
+[dependencies]
+vt-core.workspace = true
+vt-session.workspace = true
+vt-render.workspace = true
+vt-platform.workspace = true
+
+[lints]
+workspace = true

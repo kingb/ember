@@ -1,0 +1,11 @@
+[package]
+name = "vt-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vt-core.workspace = true
+
+[lints]
+workspace = true
