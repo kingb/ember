@@ -3,8 +3,9 @@
 
 use crate::geom::Rect;
 use crate::ids::PaneId;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     Left,
     Right,
