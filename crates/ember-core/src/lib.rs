@@ -4,13 +4,15 @@
 //! and matchers land in later epics; the multiplexer model (layout tree,
 //! layout fn, focus, commands) lives here.
 
+pub mod focus;
 pub mod geom;
 pub mod ids;
 pub mod layout;
 
+pub use focus::{Direction, focus_dir};
 pub use geom::Rect;
 pub use ids::{PaneId, SessionId, TabId};
-pub use layout::{Axis, LayoutNode, Tab, WindowTree};
+pub use layout::{Axis, LayoutNode, Tab, WindowTree, layout};
 
 /// The crate version, surfaced for diagnostics and the `ember-term --version`
 /// banner. Acts as the workspace's first real, linkable symbol.
