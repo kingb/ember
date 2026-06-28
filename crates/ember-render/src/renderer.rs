@@ -23,8 +23,8 @@ use winit::window::Window;
 
 use crate::grid_model::GridModel;
 
-const FONT_SIZE: f32 = 16.0;
-const LINE_HEIGHT: f32 = 20.0;
+const FONT_SIZE: f32 = 12.0;
+const LINE_HEIGHT: f32 = 15.0;
 /// Approximate monospace advance as a fraction of font size — used only to pick a
 /// sensible default window size; glyphon does the real per-glyph advance.
 pub const CELL_WIDTH: f32 = FONT_SIZE * 0.6;

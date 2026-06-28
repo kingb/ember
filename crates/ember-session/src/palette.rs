@@ -78,24 +78,25 @@ impl Palette {
 
 /// Build the canonical xterm 256-color table: 16 base + 6×6×6 cube + 24 grays.
 fn build_xterm_256() -> [Rgb; 256] {
-    // The classic 16 ANSI colors (xterm defaults).
+    // A modern 16-color set tuned for a dark background — the classic VGA
+    // palette (blue = #000080) is unreadably dark, so the normals are brightened.
     const BASE: [(u8, u8, u8); 16] = [
-        (0x00, 0x00, 0x00),
-        (0x80, 0x00, 0x00),
-        (0x00, 0x80, 0x00),
-        (0x80, 0x80, 0x00),
-        (0x00, 0x00, 0x80),
-        (0x80, 0x00, 0x80),
-        (0x00, 0x80, 0x80),
-        (0xc0, 0xc0, 0xc0),
-        (0x80, 0x80, 0x80),
-        (0xff, 0x00, 0x00),
-        (0x00, 0xff, 0x00),
-        (0xff, 0xff, 0x00),
-        (0x00, 0x00, 0xff),
-        (0xff, 0x00, 0xff),
-        (0x00, 0xff, 0xff),
-        (0xff, 0xff, 0xff),
+        (0x1a, 0x1a, 0x1a), // black
+        (0xd9, 0x4a, 0x3d), // red
+        (0x4e, 0xb8, 0x3a), // green
+        (0xd9, 0xb0, 0x2c), // yellow
+        (0x3b, 0x8e, 0xea), // blue
+        (0xb0, 0x56, 0xd4), // magenta
+        (0x3a, 0xb8, 0xb8), // cyan
+        (0xcc, 0xcc, 0xcc), // white
+        (0x66, 0x66, 0x66), // bright black
+        (0xff, 0x6b, 0x5e), // bright red
+        (0x6b, 0xe5, 0x52), // bright green
+        (0xff, 0xd5, 0x4a), // bright yellow
+        (0x5c, 0xa8, 0xff), // bright blue
+        (0xc9, 0x7c, 0xf0), // bright magenta
+        (0x5a, 0xd8, 0xd8), // bright cyan
+        (0xff, 0xff, 0xff), // bright white
     ];
 
     let mut colors = [Rgb::new(0, 0, 0); 256];
@@ -128,7 +129,7 @@ mod tests {
     #[test]
     fn cube_and_grays_are_populated() {
         let p = Palette::dark();
-        assert_eq!(p.resolve(Color::Indexed(0)), Rgb::new(0, 0, 0));
+        assert_eq!(p.resolve(Color::Indexed(0)), Rgb::new(0x1a, 0x1a, 0x1a));
         assert_eq!(p.resolve(Color::Indexed(15)), Rgb::new(0xff, 0xff, 0xff));
         // 196 = pure red in the cube (r=5,g=0,b=0).
         assert_eq!(p.resolve(Color::Indexed(196)), Rgb::new(255, 0, 0));
@@ -151,7 +152,7 @@ mod tests {
         );
         assert_eq!(
             p.resolve(Color::Named(NamedColor::Red)),
-            Rgb::new(0x80, 0, 0)
+            Rgb::new(0xd9, 0x4a, 0x3d)
         );
     }
 }
