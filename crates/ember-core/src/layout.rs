@@ -183,7 +183,7 @@ pub struct Tab {
     pub focus: PaneId,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowTree {
     pub tabs: Vec<Tab>,
     pub active: usize,

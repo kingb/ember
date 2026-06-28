@@ -4,12 +4,14 @@
 //! and matchers land in later epics; the multiplexer model (layout tree,
 //! layout fn, focus, commands) lives here.
 
+pub mod app;
 pub mod command;
 pub mod focus;
 pub mod geom;
 pub mod ids;
 pub mod layout;
 
+pub use app::{AppState, ChromeRow, ChromeRowKind, ChromeState, Gate, GateId, GateRegistry};
 pub use command::{LayoutCommand, LayoutEffect, apply};
 pub use focus::{Direction, focus_dir};
 pub use geom::Rect;

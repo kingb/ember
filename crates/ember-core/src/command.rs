@@ -49,7 +49,7 @@ pub enum LayoutCommand {
     },
 }
 
-/// A described side effect of applying a [`LayoutCommand`]. The owner (vt-app)
+/// A described side effect of applying a [`LayoutCommand`]. The owner (ember-app)
 /// performs the actual IO; the core only emits the intent.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayoutEffect {
