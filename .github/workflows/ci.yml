@@ -28,3 +28,5 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all --all-features
+      - name: Bench (compile gate)
+        run: cargo bench --all --no-run

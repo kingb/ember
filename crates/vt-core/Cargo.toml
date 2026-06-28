@@ -6,3 +6,10 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "latency"
+harness = false
