@@ -623,6 +623,7 @@ dependencies = [
 name = "ember-render"
 version = "0.0.0"
 dependencies = [
+ "bytemuck",
  "ember-core",
  "glyphon",
  "pollster",

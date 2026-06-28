@@ -8,11 +8,13 @@
 
 use std::sync::Arc;
 
-use ember_core::{GridDelta, GridDims};
+use ember_core::{GridDelta, GridDims, Rgb};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
+
+use crate::quads::{QuadRenderer, srgb_to_linear};
 use wgpu::{
     CompositeAlphaMode, DeviceDescriptor, Instance, InstanceDescriptor, MultisampleState,
     PresentMode, RequestAdapterOptions, SurfaceConfiguration, TextureUsages,
@@ -29,6 +31,38 @@ pub const CELL_WIDTH: f32 = FONT_SIZE * 0.6;
 pub const CELL_HEIGHT: f32 = LINE_HEIGHT;
 const PAD: f32 = 4.0;
 
+/// Measure the monospace advance for the current font/size, so background quads
+/// line up with the glyphs glyphon flows.
+fn measure_cell_width(font_system: &mut FontSystem) -> f32 {
+    let mut probe = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    probe.set_text(
+        font_system,
+        "MMMMMMMMMM",
+        &Attrs::new().family(Family::Monospace),
+        Shaping::Advanced,
+        None,
+    );
+    probe.shape_until_scroll(font_system, false);
+    if let Some(run) = probe.layout_runs().next() {
+        let glyphs = run.glyphs;
+        if glyphs.len() >= 2 {
+            let span = glyphs[glyphs.len() - 1].x - glyphs[0].x;
+            return span / (glyphs.len() - 1) as f32;
+        }
+    }
+    FONT_SIZE * 0.6
+}
+
+/// sRGB `Rgb` + alpha → linear RGBA for the sRGB surface target.
+fn lin_rgba(c: Rgb, a: f32) -> [f32; 4] {
+    [
+        srgb_to_linear(c.r),
+        srgb_to_linear(c.g),
+        srgb_to_linear(c.b),
+        a,
+    ]
+}
+
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -40,7 +74,10 @@ pub struct Renderer {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     buffer: Buffer,
+    quads: QuadRenderer,
     grid: GridModel,
+    /// Measured monospace advance (px) — keeps bg quads aligned with glyphs.
+    cell_w: f32,
     // Keep the window LAST so it drops after the surface (winit/wgpu requirement).
     window: Arc<Window>,
 }
@@ -104,6 +141,9 @@ impl Renderer {
         let mut buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         buffer.set_size(&mut font_system, Some(width as f32), Some(height as f32));
 
+        let cell_w = measure_cell_width(&mut font_system);
+        let quads = QuadRenderer::new(&device, format);
+
         Self {
             device,
             queue,
@@ -115,7 +155,9 @@ impl Renderer {
             atlas,
             text_renderer,
             buffer,
+            quads,
             grid: GridModel::new(dims),
+            cell_w,
             window,
         }
     }
@@ -172,6 +214,37 @@ impl Renderer {
             None,
         );
         self.buffer.shape_until_scroll(&mut self.font_system, false);
+
+        // Build per-cell background fills + the block cursor (drawn under text).
+        let default_bg = Rgb::new(0x10, 0x10, 0x10);
+        let cw = self.cell_w;
+        let ch = CELL_HEIGHT;
+        let cols = self.grid.dims.columns;
+        let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
+        for row in 0..lines {
+            for col in 0..cols {
+                if let Some(cell) = self.grid.cell(row, col) {
+                    let bg = self.grid.style_of(cell.style).bg;
+                    if bg != default_bg {
+                        let x = PAD + col as f32 * cw;
+                        let y = PAD + row as f32 * ch;
+                        rects.push(([x, y, cw, ch], lin_rgba(bg, 1.0)));
+                    }
+                }
+            }
+        }
+        let cursor = self.grid.cursor;
+        if cursor.visible {
+            let x = PAD + cursor.col as f32 * cw;
+            let y = PAD + cursor.row as f32 * ch;
+            rects.push(([x, y, cw, ch], lin_rgba(Rgb::new(0xcc, 0xcc, 0xcc), 0.5)));
+        }
+        self.quads.prepare(
+            &self.device,
+            &self.queue,
+            (self.config.width as f32, self.config.height as f32),
+            &rects,
+        );
 
         self.viewport.update(
             &self.queue,
@@ -234,9 +307,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.04,
-                            g: 0.04,
-                            b: 0.05,
+                            r: srgb_to_linear(0x10) as f64,
+                            g: srgb_to_linear(0x10) as f64,
+                            b: srgb_to_linear(0x10) as f64,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -247,6 +320,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            self.quads.draw(&mut pass);
             let _ = self
                 .text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass);

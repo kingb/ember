@@ -51,6 +51,12 @@ impl GridModel {
         self.styles.get(&id).copied().unwrap_or_default()
     }
 
+    /// The cell at `(row, col)`, if in bounds.
+    pub fn cell(&self, row: u16, col: u16) -> Option<&NeutralCell> {
+        let idx = row as usize * self.dims.columns as usize + col as usize;
+        self.cells.get(idx)
+    }
+
     /// The plain text of one row (blanks rendered as spaces).
     pub fn row_text(&self, row: u16) -> String {
         let cols = self.dims.columns as usize;
