@@ -5,16 +5,26 @@
 //! layout fn, focus, commands) lives here.
 
 pub mod app;
+pub mod backend;
 pub mod command;
 pub mod focus;
 pub mod geom;
+pub mod grid;
 pub mod ids;
 pub mod layout;
 
 pub use app::{AppState, ChromeRow, ChromeRowKind, ChromeState, Gate, GateId, GateRegistry};
+pub use backend::{
+    BackendControl, BackendEvent, BackendHandle, ClipboardOp, ExitStatus, FrameRx, FrameTx,
+    OscEvent, PassthroughEvent, SessionBackend, VtProjection, frame_channel,
+};
 pub use command::{LayoutCommand, LayoutEffect, apply};
 pub use focus::{Direction, focus_dir};
 pub use geom::Rect;
+pub use grid::{
+    Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, NeutralCell, Rgb,
+    Style, StyleId,
+};
 pub use ids::{PaneId, SessionId, TabId};
 pub use layout::{Axis, LayoutNode, Tab, WindowTree, layout};
 

@@ -23,6 +23,7 @@ ember-platform = { path = "crates/ember-platform" }
 # Not consumed yet; wired into ember-session in Epic B.
 alacritty_terminal = "=0.26.0"
 serde = { version = "1", features = ["derive"] }
+bitflags = { version = "2", features = ["serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
