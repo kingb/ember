@@ -66,6 +66,36 @@ impl GridModel {
             .collect()
     }
 
+    /// One row as runs of `(text, fg)`, merging consecutive same-fg cells and
+    /// trimming the trailing blank run. Drives per-cell foreground color.
+    pub fn row_runs(&self, row: u16) -> Vec<(String, ember_core::Rgb)> {
+        let cols = self.dims.columns as usize;
+        let start = row as usize * cols;
+        let end = (start + cols).min(self.cells.len());
+        let mut runs: Vec<(String, ember_core::Rgb)> = Vec::new();
+        for cell in &self.cells[start..end] {
+            let ch = match &cell.content {
+                CellContent::Char(c) => *c,
+                CellContent::Cluster(s) => s.chars().next().unwrap_or(' '),
+                CellContent::Empty => ' ',
+            };
+            let fg = self.style_of(cell.style).fg;
+            match runs.last_mut() {
+                Some((text, run_fg)) if *run_fg == fg => text.push(ch),
+                _ => runs.push((ch.to_string(), fg)),
+            }
+        }
+        // Trailing blanks have no glyph; drop them to keep the buffer small.
+        while runs.last().is_some_and(|(t, _)| t.trim().is_empty()) {
+            runs.pop();
+        }
+        if let Some((text, _)) = runs.last_mut() {
+            let trimmed = text.trim_end().to_string();
+            *text = trimmed;
+        }
+        runs
+    }
+
     /// The whole screen as text, rows separated by `\n` (trailing blanks trimmed
     /// per row to keep the buffer small).
     pub fn screen_text(&self) -> String {
@@ -115,6 +145,47 @@ mod tests {
         assert_eq!(g.row_text(0).trim_end(), "hi");
         assert_eq!(g.row_text(1).trim_end(), "y");
         assert_eq!(g.screen_text(), "hi\ny\n");
+    }
+
+    #[test]
+    fn row_runs_merge_by_color_and_trim() {
+        use ember_core::{Rgb, Style};
+        let dims = GridDims::new(10, 1);
+        let mut g = GridModel::new(dims);
+        let red = Style {
+            fg: Rgb::new(255, 0, 0),
+            ..Default::default()
+        };
+        let mut d = GridDelta {
+            epoch: 1,
+            dims,
+            reset: true,
+            cells: vec![
+                CellPatch {
+                    row: 0,
+                    col: 0,
+                    cell: NeutralCell::new(CellContent::Char('a'), StyleId(1)),
+                },
+                CellPatch {
+                    row: 0,
+                    col: 1,
+                    cell: NeutralCell::new(CellContent::Char('b'), StyleId(1)),
+                },
+                CellPatch {
+                    row: 0,
+                    col: 2,
+                    cell: NeutralCell::new(CellContent::Char('c'), StyleId(0)),
+                },
+            ],
+            ..Default::default()
+        };
+        d.new_styles = vec![(StyleId(1), red), (StyleId(0), Style::default())];
+        g.apply(d);
+        let runs = g.row_runs(0);
+        // "ab" (red) merges into one run; "c" (default) is its own; blanks trimmed.
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0], ("ab".to_string(), Rgb::new(255, 0, 0)));
+        assert_eq!(runs[1].0, "c");
     }
 
     #[test]

@@ -148,11 +148,26 @@ impl Renderer {
     /// Draw the current grid. Returns `false` if the surface needs reconfiguring
     /// (the caller should request another redraw).
     pub fn render(&mut self) -> bool {
-        let text = self.grid.screen_text();
-        self.buffer.set_text(
+        // Build per-cell foreground-colored spans (runs of same-fg text per row,
+        // rows joined by newlines).
+        let lines = self.grid.dims.screen_lines;
+        let default_fg = Color::rgb(0xcc, 0xcc, 0xcc);
+        let mut spans: Vec<(String, Color)> = Vec::new();
+        for row in 0..lines {
+            for (text, fg) in self.grid.row_runs(row) {
+                spans.push((text, Color::rgb(fg.r, fg.g, fg.b)));
+            }
+            if row + 1 < lines {
+                spans.push(("\n".to_string(), default_fg));
+            }
+        }
+        let base = Attrs::new().family(Family::Monospace);
+        self.buffer.set_rich_text(
             &mut self.font_system,
-            &text,
-            &Attrs::new().family(Family::Monospace),
+            spans
+                .iter()
+                .map(|(t, c)| (t.as_str(), Attrs::new().family(Family::Monospace).color(*c))),
+            &base,
             Shaping::Advanced,
             None,
         );
