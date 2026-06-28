@@ -320,7 +320,12 @@ impl Renderer {
             }
         }
 
-        // Pass 2: collect background fills, cursor, focus border, and tab strip.
+        // The app works in logical px; the surface is physical. Scale every draw
+        // coordinate by the live HiDPI factor (handles Retina + display moves).
+        let sf = self.window.scale_factor() as f32;
+
+        // Pass 2: collect background fills, cursor, focus border, and tab strip
+        // (geometry built in logical px, then scaled to physical by `sf`).
         let cw = self.cell_w;
         let ch = CELL_HEIGHT;
         let split = self.visible.len() > 1;
@@ -339,7 +344,7 @@ impl Renderer {
                         let bg = p.grid.style_of(cell.style).bg;
                         if bg != BG {
                             rects.push((
-                                [ox + col as f32 * cw, oy + row as f32 * ch, cw, ch],
+                                scaled(ox + col as f32 * cw, oy + row as f32 * ch, cw, ch, sf),
                                 lin_rgba(bg, 1.0),
                             ));
                         }
@@ -351,22 +356,23 @@ impl Renderer {
                 let cursor = p.grid.cursor;
                 if cursor.visible {
                     rects.push((
-                        [
+                        scaled(
                             ox + cursor.col as f32 * cw,
                             oy + cursor.row as f32 * ch,
                             cw,
                             ch,
-                        ],
+                            sf,
+                        ),
                         lin_rgba(FG, 0.5),
                     ));
                 }
             }
             // Border the focused pane only when the window is actually split.
             if focused && split {
-                push_border(&mut rects, vp.rect, ACCENT);
+                push_border(&mut rects, vp.rect, ACCENT, sf);
             }
         }
-        self.build_tab_strip(&mut rects);
+        self.build_tab_strip(&mut rects, sf);
 
         self.quads.prepare(
             &self.device,
@@ -395,14 +401,14 @@ impl Renderer {
             if let Some(p) = self.panes.get(&vp.session) {
                 areas.push(TextArea {
                     buffer: &p.buffer,
-                    left: vp.rect.x as f32,
-                    top: vp.rect.y as f32,
-                    scale: 1.0,
+                    left: vp.rect.x as f32 * sf,
+                    top: vp.rect.y as f32 * sf,
+                    scale: sf,
                     bounds: TextBounds {
-                        left: vp.rect.x as i32,
-                        top: vp.rect.y as i32,
-                        right: (vp.rect.x + vp.rect.width) as i32,
-                        bottom: (vp.rect.y + vp.rect.height) as i32,
+                        left: (vp.rect.x as f32 * sf) as i32,
+                        top: (vp.rect.y as f32 * sf) as i32,
+                        right: ((vp.rect.x + vp.rect.width) as f32 * sf) as i32,
+                        bottom: ((vp.rect.y + vp.rect.height) as f32 * sf) as i32,
                     },
                     default_color: Color::rgb(FG.r, FG.g, FG.b),
                     custom_glyphs: &[],
@@ -413,8 +419,8 @@ impl Renderer {
             areas.push(TextArea {
                 buffer: &self.chrome,
                 left: 0.0,
-                top: PAD,
-                scale: 1.0,
+                top: PAD * sf,
+                scale: sf,
                 bounds: full_bounds,
                 default_color: Color::rgb(FG.r, FG.g, FG.b),
                 custom_glyphs: &[],
@@ -487,10 +493,14 @@ impl Renderer {
 
     /// Build the tab strip: a background quad behind the active tab plus the
     /// concatenated labels shaped into the chrome buffer. No-op for a single tab.
-    fn build_tab_strip(&mut self, rects: &mut Vec<([f32; 4], [f32; 4])>) {
+    fn build_tab_strip(&mut self, rects: &mut Vec<([f32; 4], [f32; 4])>, sf: f32) {
         if self.tabs.len() <= 1 {
             return;
         }
+        // Re-size the chrome buffer to the logical window width each frame.
+        let logical_w = self.config.width as f32 / sf;
+        self.chrome
+            .set_size(&mut self.font_system, Some(logical_w), Some(LINE_HEIGHT));
         let cw = self.cell_w;
         let strip_h = CELL_HEIGHT + 2.0 * PAD;
         let mut x = 0.0f32;
@@ -499,7 +509,7 @@ impl Renderer {
             let label = format!(" {} ", tab.title);
             let w = label.chars().count() as f32 * cw;
             if tab.active {
-                rects.push(([x, 0.0, w, strip_h], lin_rgba(ACCENT, 0.85)));
+                rects.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(ACCENT, 0.85)));
             }
             let fg = if tab.active {
                 Color::rgb(0xff, 0xff, 0xff)
@@ -523,9 +533,16 @@ impl Renderer {
     }
 }
 
-/// Push four thin quads outlining `rect` in `color` (a 1px focus border).
-fn push_border(rects: &mut Vec<([f32; 4], [f32; 4])>, rect: Rect, color: Rgb) {
-    let t = 1.0f32;
+/// A `(rect_px, …)`-ready physical-pixel quad from logical `x,y,w,h` and the
+/// HiDPI scale factor.
+fn scaled(x: f32, y: f32, w: f32, h: f32, sf: f32) -> [f32; 4] {
+    [x * sf, y * sf, w * sf, h * sf]
+}
+
+/// Push four thin quads outlining `rect` (logical px) in `color` — a ~1.5px
+/// focus border, scaled to physical px by `sf`.
+fn push_border(rects: &mut Vec<([f32; 4], [f32; 4])>, rect: Rect, color: Rgb, sf: f32) {
+    let t = 1.5f32;
     let (x, y, w, h) = (
         rect.x as f32,
         rect.y as f32,
@@ -533,8 +550,8 @@ fn push_border(rects: &mut Vec<([f32; 4], [f32; 4])>, rect: Rect, color: Rgb) {
         rect.height as f32,
     );
     let c = lin_rgba(color, 1.0);
-    rects.push(([x, y, w, t], c)); // top
-    rects.push(([x, y + h - t, w, t], c)); // bottom
-    rects.push(([x, y, t, h], c)); // left
-    rects.push(([x + w - t, y, t, h], c)); // right
+    rects.push((scaled(x, y, w, t, sf), c)); // top
+    rects.push((scaled(x, y + h - t, w, t, sf), c)); // bottom
+    rects.push((scaled(x, y, t, h, sf), c)); // left
+    rects.push((scaled(x + w - t, y, t, h, sf), c)); // right
 }

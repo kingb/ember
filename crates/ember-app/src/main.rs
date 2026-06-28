@@ -225,15 +225,16 @@ impl ApplicationHandler for App {
 }
 
 impl RunState {
-    /// The pixel rect available to the layout (full surface minus the tab strip).
+    /// The **logical**-pixel rect available to the layout (full surface minus the
+    /// tab strip). `px` is physical; the renderer draws in logical units and scales
+    /// to physical by the HiDPI factor, so layout/dims must be logical too — else a
+    /// Retina shell gets 2× the columns it can show.
     fn viewport(&self) -> Rect {
+        let sf = self.renderer.window().scale_factor();
         let chrome = Renderer::chrome_height(self.tree.tabs.len()) as f64;
-        Rect::new(
-            0.0,
-            chrome,
-            self.px.0 as f64,
-            (self.px.1 as f64 - chrome).max(1.0),
-        )
+        let w = self.px.0 as f64 / sf;
+        let h = self.px.1 as f64 / sf;
+        Rect::new(0.0, chrome, w.max(1.0), (h - chrome).max(1.0))
     }
 
     fn active_tab(&self) -> &Tab {
@@ -386,14 +387,23 @@ impl RunState {
                 self.new_tab();
                 true
             }
-            // Cmd+Alt+Arrows — move focus geometrically between panes.
-            Key::Named(NamedKey::ArrowLeft) if mods.alt_key() => self.focus_dir(Direction::Left),
-            Key::Named(NamedKey::ArrowRight) if mods.alt_key() => self.focus_dir(Direction::Right),
-            Key::Named(NamedKey::ArrowUp) if mods.alt_key() => self.focus_dir(Direction::Up),
-            Key::Named(NamedKey::ArrowDown) if mods.alt_key() => self.focus_dir(Direction::Down),
-            // Cmd+Shift+Arrows — cycle the active tab.
+            // Cmd+1..9 — jump straight to a tab (Option/Alt is awkward on macOS, so
+            // tab + pane navigation avoid it entirely).
+            Key::Character(s) if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() => {
+                if let Some(n) = s.chars().next().and_then(|c| c.to_digit(10)) {
+                    self.select_tab(n as usize);
+                }
+                true
+            }
+            // Cmd+Shift+Arrows — cycle the active tab. (Checked before the plain
+            // arrows so Shift wins.)
             Key::Named(NamedKey::ArrowRight) if mods.shift_key() => self.cycle_tab(1),
             Key::Named(NamedKey::ArrowLeft) if mods.shift_key() => self.cycle_tab(-1),
+            // Cmd+Arrows — move focus geometrically between panes.
+            Key::Named(NamedKey::ArrowLeft) => self.focus_dir(Direction::Left),
+            Key::Named(NamedKey::ArrowRight) => self.focus_dir(Direction::Right),
+            Key::Named(NamedKey::ArrowUp) => self.focus_dir(Direction::Up),
+            Key::Named(NamedKey::ArrowDown) => self.focus_dir(Direction::Down),
             _ => false,
         }
     }
@@ -468,6 +478,14 @@ impl RunState {
             self.sync_layout();
         }
         true
+    }
+
+    /// Jump to tab `n` (1-based); no-op if out of range.
+    fn select_tab(&mut self, n: usize) {
+        if n >= 1 && n <= self.tree.tabs.len() {
+            self.tree.active = n - 1;
+            self.sync_layout();
+        }
     }
 
     /// Close the pane backing `session` wherever it lives (a shell exited, or a
