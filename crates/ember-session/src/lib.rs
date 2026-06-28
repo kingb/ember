@@ -4,9 +4,11 @@
 //! the neutral grid. `TmuxControlMode` (phase 2) and `a future out-of-process backend` (future)
 //! land later.
 
+pub mod local_pty;
 pub mod palette;
 pub mod projection;
 
+pub use local_pty::{LocalPty, LocalPtyConfig};
 pub use palette::Palette;
 pub use projection::AlacrittyProjection;
 

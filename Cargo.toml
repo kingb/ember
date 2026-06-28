@@ -24,6 +24,7 @@ ember-platform = { path = "crates/ember-platform" }
 alacritty_terminal = "=0.26.0"
 serde = { version = "1", features = ["derive"] }
 bitflags = { version = "2", features = ["serde"] }
+portable-pty = "0.9"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
