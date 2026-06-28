@@ -14,6 +14,11 @@ of iTerm2's macOS/Objective-C source and not an extension of an existing termina
 **North star:** fidelity to the iTerm2 experience, sufficient to serve as a daily-driver
 replacement on Linux. The build is multi-phase and multi-subsystem.
 
+**Platforms:** Linux and **macOS are co-equal v1 run/dev targets** — the project is
+developed and dogfooded on macOS, so Ember must build, run, and be usable on both from the
+start (cross-platform stack + own-drawn chrome make this nearly free; see §7). The
+*fidelity* north star is Linux; macOS-native AppKit polish is a later enhancement, not v1.
+
 ### v1 feature scope (tiered)
 
 - **Table-stakes:** split panes; tab rename + drag-reorder; profiles; regex search.
@@ -285,9 +290,19 @@ Pure-domain code requests effects; the platform impl performs them:
 - **Global hotkey** — the Quake/hotkey-window summon (see Wayland note).
 - **Notifications, file dialogs** — thin wrappers.
 
-`LinuxBackend` is the v1 implementation. A future `MacBackend` (AppKit — native
-`NSWindow` tabs, native hotkey) is explicitly not v1; the seam guarantees it can land
-later without touching `ember-core` or `ember-render`.
+Both `LinuxBackend` and `MacBackend` are **v1 implementations — macOS is a co-equal
+run/dev target.** Developed and dogfooded on macOS, while the daily-driver north star
+remains Linux. The cross-platform stack (`winit`, `wgpu`/Metal, `glyphon`, `portable-pty`,
+`egui`) plus our own-drawn chrome means Ember launches, renders, runs a live shell, and
+does splits/tabs on both OSes with shared code; only the OS-specific effects above differ.
+`MacBackend` covers macOS clipboard, open-path/URL, and global hotkey (AppKit/Carbon, or a
+cross-platform hotkey crate). `ember-core`, `ember-render`, and the shared parts of
+`ember-platform` must use **no OS-exclusive APIs**.
+
+**Deep AppKit native-feel** — native `NSWindow` tabs, traffic-light integration, native
+menus — is explicitly **deferred**; v1 macOS uses the same own-drawn chrome as Linux. The
+`PlatformBackend` seam guarantees that polish can land later without touching
+`ember-core`/`ember-render`.
 
 ### IME / compose
 
@@ -305,6 +320,9 @@ Unlike X11, Wayland has no universal global-shortcut API by design. Strategy:
 
 The hotkey-window is a mid-tier feature, so best-effort reach via the portal is preferred
 over compositor-specific integrations and their ongoing maintenance cost.
+
+On **macOS**, `MacBackend` registers the global hotkey through AppKit/Carbon (or a
+cross-platform hotkey crate) — no portal dance needed.
 
 ## 8. Feature → subsystem mapping
 
@@ -341,11 +359,18 @@ This combination provides both broad ecosystem compatibility and the iTerm2 feel
 **Within v1:**
 
 1. **Foundation** — winit window + wgpu cell render + `LocalPty` + alacritty showing a
-   live shell. The Wayland IME/compose and global-hotkey spike runs here.
+   live shell, **on both Linux and macOS** (this is where Ember first runs on the macOS dev
+   box). The Wayland IME/compose + global-hotkey spike runs here.
 2. **Multiplexer** — tabs + binary splits + geometric focus navigation.
-3. **Native chrome** — pixel tab bar + split dividers + egui scaffolding.
+3. **Native chrome** — pixel tab bar + split dividers + egui scaffolding (own-drawn,
+   identical on both OSes).
 4. **Features** — profiles, regex search, shell integration, triggers, smart selection +
-   semantic history, hotkey window.
+   semantic history, hotkey window, and the `MacBackend` platform impl (clipboard / open /
+   hotkey) for macOS run/dev parity.
+
+**Platform parity** runs across all four v1 phases rather than as a separate phase: dual-OS
+CI green from commit #1, OS-specific code confined to `PlatformBackend`
+(`LinuxBackend`/`MacBackend`). Deep AppKit native-feel is post-v1.
 
 **Phase 2:** `tmux -CC` (`TmuxControlMode`); evaluate `libghostty-vt` as the VT engine.
 
