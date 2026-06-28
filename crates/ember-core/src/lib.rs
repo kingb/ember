@@ -1,8 +1,16 @@
 //! `ember-core` — pure domain layer for Ember (design §2, §5).
 //!
-//! Session/layout/matching logic with zero IO. Concrete domain types
-//! (the `SessionBackend` contract, layout tree, matchers) land in later
-//! epics; this is the empty-but-real foundation.
+//! Session/layout/matching logic with zero IO. The `SessionBackend` contract
+//! and matchers land in later epics; the multiplexer model (layout tree,
+//! layout fn, focus, commands) lives here.
+
+pub mod geom;
+pub mod ids;
+pub mod layout;
+
+pub use geom::Rect;
+pub use ids::{PaneId, SessionId, TabId};
+pub use layout::{Axis, LayoutNode, Tab, WindowTree};
 
 /// The crate version, surfaced for diagnostics and the `ember-term --version`
 /// banner. Acts as the workspace's first real, linkable symbol.

@@ -22,6 +22,7 @@ ember-platform = { path = "crates/ember-platform" }
 # VT engine — pinned centrally for API-churn stability (design §2/§3).
 # Not consumed yet; wired into ember-session in Epic B.
 alacritty_terminal = "=0.26.0"
+serde = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
