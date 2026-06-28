@@ -171,8 +171,34 @@ pub(crate) fn grid_quads(
     }
 }
 
-/// Build the tab-strip quads (active-tab bg, scaled by `sf`) and shape the labels
-/// into `chrome`. No-op for a single tab.
+/// Background of the tab strip (a touch lighter than the terminal, iTerm-style).
+const STRIP_BG: Rgb = Rgb::new(0x1b, 0x1b, 0x1b);
+/// Fill of the active tab button.
+const TAB_ACTIVE: Rgb = Rgb::new(0x2e, 0x2e, 0x2e);
+
+/// Center `s` in a field `width` columns wide (truncating with `…` if too long).
+fn center(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if width == 0 {
+        return String::new();
+    }
+    if n >= width {
+        if width == 1 {
+            return "…".to_string();
+        }
+        let keep: String = s.chars().take(width - 1).collect();
+        return format!("{keep}…");
+    }
+    let total = width - n;
+    let left = total / 2;
+    let right = total - left;
+    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+}
+
+/// Build the tab strip (iTerm-style): a full-width bar, equal-width tab buttons
+/// (active one lighter with an Ember-orange underline), `⌘N` hints, and a `+`
+/// button. Quads go to `out`; the single concatenated label line is shaped into
+/// `chrome`. No-op for a single tab. All geometry is logical px, scaled by `sf`.
 pub(crate) fn build_tabs(
     font_system: &mut FontSystem,
     chrome: &mut Buffer,
@@ -187,23 +213,44 @@ pub(crate) fn build_tabs(
     }
     chrome.set_size(font_system, Some(logical_w), Some(LINE_HEIGHT));
     let strip_h = CELL_HEIGHT + 2.0 * PAD;
-    let mut x = 0.0f32;
+    // Full-width strip background.
+    out.push((
+        scaled(0.0, 0.0, logical_w, strip_h, sf),
+        lin_rgba(STRIP_BG, 1.0),
+    ));
+
+    // Work in integer columns so quads and (monospace) text stay aligned.
+    let total_cols = (logical_w / cw).floor() as usize;
+    let plus_cols = 3usize.min(total_cols);
+    let tab_cols = total_cols.saturating_sub(plus_cols);
+    let n = tabs.len(); // >= 2 (single-tab strips return early above)
+    let seg = tab_cols / n;
+
+    let base = Attrs::new().family(Family::Monospace);
     let mut spans: Vec<(String, Color)> = Vec::new();
-    for tab in tabs {
-        let label = format!(" {} ", tab.title);
-        let w = label.chars().count() as f32 * cw;
+    let mut col = 0usize;
+    for (i, tab) in tabs.iter().enumerate() {
+        // Last tab absorbs any leftover columns so the row fills exactly.
+        let width = if i == n - 1 { tab_cols - col } else { seg };
+        let x = col as f32 * cw;
+        let w = width as f32 * cw;
         if tab.active {
-            out.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(ACCENT, 0.85)));
+            out.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(TAB_ACTIVE, 1.0)));
+            // Ember-orange underline accent on the active tab.
+            out.push((scaled(x, strip_h - 2.0, w, 2.0, sf), lin_rgba(ACCENT, 1.0)));
         }
+        let label = format!("{}  ⌘{}", tab.title, i + 1);
         let fg = if tab.active {
             Color::rgb(0xff, 0xff, 0xff)
         } else {
-            Color::rgb(0x88, 0x88, 0x88)
+            Color::rgb(0x8a, 0x8a, 0x8a)
         };
-        spans.push((label, fg));
-        x += w;
+        spans.push((center(&label, width), fg));
+        col += width;
     }
-    let base = Attrs::new().family(Family::Monospace);
+    // The "+" button.
+    spans.push((center("+", plus_cols), Color::rgb(0x8a, 0x8a, 0x8a)));
+
     chrome.set_rich_text(
         font_system,
         spans
