@@ -8,3 +8,12 @@
 *.swp
 .idea/
 .vscode/
+
+# local tooling
+.runtime/
+.claude/
+.logs/
+__pycache__/
+state.json
+CLAUDE.md
+CLAUDE.local.md
