@@ -1,4 +1,4 @@
-//! `vt-core` — pure domain layer for Ember (design §2, §5).
+//! `ember-core` — pure domain layer for Ember (design §2, §5).
 //!
 //! Session/layout/matching logic with zero IO. Concrete domain types
 //! (the `SessionBackend` contract, layout tree, matchers) land in later

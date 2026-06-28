@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/vt-core",
-    "crates/vt-session",
-    "crates/vt-render",
-    "crates/vt-platform",
-    "crates/vt-app",
+    "crates/ember-core",
+    "crates/ember-session",
+    "crates/ember-render",
+    "crates/ember-platform",
+    "crates/ember-app",
 ]
 
 [workspace.package]
@@ -15,12 +15,12 @@ license = "MIT OR Apache-2.0"
 authors = ["The Ember authors"]
 
 [workspace.dependencies]
-vt-core = { path = "crates/vt-core" }
-vt-session = { path = "crates/vt-session" }
-vt-render = { path = "crates/vt-render" }
-vt-platform = { path = "crates/vt-platform" }
+ember-core = { path = "crates/ember-core" }
+ember-session = { path = "crates/ember-session" }
+ember-render = { path = "crates/ember-render" }
+ember-platform = { path = "crates/ember-platform" }
 # VT engine — pinned centrally for API-churn stability (design §2/§3).
-# Not consumed yet; wired into vt-session in Epic B.
+# Not consumed yet; wired into ember-session in Epic B.
 alacritty_terminal = "=0.26.0"
 
 [workspace.lints.rust]

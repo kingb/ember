@@ -9,7 +9,7 @@ use std::hint::black_box;
 
 fn placeholder(c: &mut Criterion) {
     c.bench_function("placeholder_noop", |b| {
-        b.iter(|| black_box(vt_core::version()));
+        b.iter(|| black_box(ember_core::version()));
     });
 }
 

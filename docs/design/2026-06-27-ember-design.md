@@ -31,11 +31,11 @@ boundary is front-loaded so it can be introduced later without reshaping the cor
 
 | Crate | Responsibility | Depends on |
 |---|---|---|
-| `vt-core` | Pure domain: `SessionBackend` trait, `SessionCommand`, layout tree, focus/layout, profiles, OSC/trigger **matching**. No tokio/IO/winit/wgpu. | — |
-| `vt-session` | Backend impls: `LocalPty` (v1), `TmuxControlMode` (phase 2), `a future out-of-process backend` (future). | `vt-core` |
-| `vt-render` | wgpu + glyphon + custom GPU chrome + egui overlay. Consumes the neutral grid by owned delta. | `vt-core` |
-| `vt-platform` | winit + `PlatformBackend` (hotkey, open-path, clipboard IO). macOS seam. | `vt-core` |
-| `vt-app` | Binary: event loop, input routing, layout, config; trigger **dispatch**. | all |
+| `ember-core` | Pure domain: `SessionBackend` trait, `SessionCommand`, layout tree, focus/layout, profiles, OSC/trigger **matching**. No tokio/IO/winit/wgpu. | — |
+| `ember-session` | Backend impls: `LocalPty` (v1), `TmuxControlMode` (phase 2), `a future out-of-process backend` (future). | `ember-core` |
+| `ember-render` | wgpu + glyphon + custom GPU chrome + egui overlay. Consumes the neutral grid by owned delta. | `ember-core` |
+| `ember-platform` | winit + `PlatformBackend` (hotkey, open-path, clipboard IO). macOS seam. | `ember-core` |
+| `ember-app` | Binary: event loop, input routing, layout, config; trigger **dispatch**. | all |
 
 ### Two seams
 
@@ -46,22 +46,22 @@ boundary is front-loaded so it can be introduced later without reshaping the cor
 
 ```
             input events                     OS effects
-   winit ─────────────► vt-app ──────────────────────► vt-platform
+   winit ─────────────► ember-app ──────────────────────► ember-platform
                           │  │                         (clipboard, open,
             SessionCommand│  │ LayoutCommand            hotkey, notify)
                           ▼  │
-   vt-session ── owned ───┐  │
+   ember-session ── owned ───┐  │
    (emulation thread)     │  ▼
-     PTY bytes ─► engine  │  vt-core (layout tree, focus,
+     PTY bytes ─► engine  │  ember-core (layout tree, focus,
      ─► projection fn ────┤   profiles, matchers — pure)
         owned delta       │  │
                           ▼  ▼
-                       vt-render ──► GPU surface
+                       ember-render ──► GPU surface
                   (owns neutral grid; cell grid +
                    native chrome + egui overlay)
 ```
 
-The core invariant: pure domain logic in `vt-core` performs no IO, so whole classes of
+The core invariant: pure domain logic in `ember-core` performs no IO, so whole classes of
 failure cannot originate there, and the layout/matching logic is exhaustively testable
 without a running system.
 
@@ -173,10 +173,10 @@ could meet a surprise.
 Identity is a `SessionId` string newtype: `LocalPty` fills its own id; `a future out-of-process backend`
 fills the bus `AgentRef`.
 
-## 5. Multiplexer / UI model (`vt-core`)
+## 5. Multiplexer / UI model (`ember-core`)
 
-The structured "what is on screen" layer, kept pure (no winit/wgpu/IO). `vt-app` owns an
-instance and drives it; `vt-render` reads it; the platform and session layers receive the
+The structured "what is on screen" layer, kept pure (no winit/wgpu/IO). `ember-app` owns an
+instance and drives it; `ember-render` reads it; the platform and session layers receive the
 resulting side effects.
 
 ### Layout tree
@@ -220,9 +220,9 @@ For v1 we build the **typed place** (the `ChromeState`/`GateRegistry` fields), n
 plumbing that feeds it; the feed is a phase-3 concern. This ensures nothing has to be
 retrofitted later.
 
-## 6. Render (`vt-render`)
+## 6. Render (`ember-render`)
 
-Render is a pure **consumer**, driven by the event loop in `vt-app`. It never holds a
+Render is a pure **consumer**, driven by the event loop in `ember-app`. It never holds a
 `SessionBackend` and never borrows across the engine-thread boundary — `!Send` makes that
 illegal, so the "render reads engine state under a lock" failure mode is structurally
 impossible.
@@ -270,7 +270,7 @@ app, as every serious Linux terminal does.
   font/DPI is kept consistent across both; and input routing follows one rule —
   egui-overlay-first when a popup is open, otherwise the terminal.
 
-## 7. Platform seam (`vt-platform`)
+## 7. Platform seam (`ember-platform`)
 
 The OS-contact layer and the macOS seam. `winit` owns the window and event loop; all UI
 inside it is ours.
@@ -279,7 +279,7 @@ inside it is ours.
 
 Pure-domain code requests effects; the platform impl performs them:
 
-- **Clipboard get/set** — OSC 52 *policy* lives in `vt-core`; the read/write is here.
+- **Clipboard get/set** — OSC 52 *policy* lives in `ember-core`; the read/write is here.
 - **Open path / open URL** — the effect side of trigger dispatch and smart-selection /
   semantic-history actions.
 - **Global hotkey** — the Quake/hotkey-window summon (see Wayland note).
@@ -287,7 +287,7 @@ Pure-domain code requests effects; the platform impl performs them:
 
 `LinuxBackend` is the v1 implementation. A future `MacBackend` (AppKit — native
 `NSWindow` tabs, native hotkey) is explicitly not v1; the seam guarantees it can land
-later without touching `vt-core` or `vt-render`.
+later without touching `ember-core` or `ember-render`.
 
 ### IME / compose
 
@@ -310,15 +310,15 @@ over compositor-specific integrations and their ongoing maintenance cost.
 
 | Feature | Lands in | Notes |
 |---|---|---|
-| Split panes | `vt-core` layout tree | §5 |
-| Tab rename + drag-reorder | `vt-core` state + native tab bar | reorder = `LayoutCommand::MoveTab` |
-| Profiles | `vt-core` data + egui editor | profile is a config struct |
-| Regex search | `vt-core` matcher + egui search bar | matcher pure, UI transient |
-| Shell integration | `vt-core` (OSC parse → semantic model) + chrome marks | §8.1 |
-| Smart selection + semantic history | `vt-core` matcher + `PlatformBackend` open | match pure, open is effect |
-| Hotkey / Quake window | `vt-platform` | portal + fallback, §7 |
-| Triggers (regex → action) | `vt-core` matcher + `vt-app` dispatch | match in core, dispatch in app |
-| `tmux -CC` | `vt-session` (`TmuxControlMode`) | phase 2 |
+| Split panes | `ember-core` layout tree | §5 |
+| Tab rename + drag-reorder | `ember-core` state + native tab bar | reorder = `LayoutCommand::MoveTab` |
+| Profiles | `ember-core` data + egui editor | profile is a config struct |
+| Regex search | `ember-core` matcher + egui search bar | matcher pure, UI transient |
+| Shell integration | `ember-core` (OSC parse → semantic model) + chrome marks | §8.1 |
+| Smart selection + semantic history | `ember-core` matcher + `PlatformBackend` open | match pure, open is effect |
+| Hotkey / Quake window | `ember-platform` | portal + fallback, §7 |
+| Triggers (regex → action) | `ember-core` matcher + `ember-app` dispatch | match in core, dispatch in app |
+| `tmux -CC` | `ember-session` (`TmuxControlMode`) | phase 2 |
 
 Every feature maps onto an existing seam; no new crate or structural change is required.
 
@@ -365,7 +365,7 @@ Each phase is independently runnable.
 
 ## 11. Testing
 
-- `vt-core` is pure and is exhaustively unit-tested with zero IO: layout math, focus
+- `ember-core` is pure and is exhaustively unit-tested with zero IO: layout math, focus
   navigation, command application, OSC/trigger matching.
 - **Dual-OS CI from the first commit** (Linux + macOS), even though the macOS platform impl
   comes later, to keep the `PlatformBackend` seam honest.

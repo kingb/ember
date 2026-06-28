@@ -8,9 +8,9 @@ fn main() {
     println!(
         "ember-term {} (core {}, session {}, render {}, platform {})",
         env!("CARGO_PKG_VERSION"),
-        vt_core::version(),
-        vt_session::core_version(),
-        vt_render::core_version(),
-        vt_platform::core_version(),
+        ember_core::version(),
+        ember_session::core_version(),
+        ember_render::core_version(),
+        ember_platform::core_version(),
     );
 }

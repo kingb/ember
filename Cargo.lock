@@ -173,6 +173,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
+name = "ember-app"
+version = "0.0.0"
+dependencies = [
+ "ember-core",
+ "ember-platform",
+ "ember-render",
+ "ember-session",
+]
+
+[[package]]
+name = "ember-core"
+version = "0.0.0"
+dependencies = [
+ "criterion",
+]
+
+[[package]]
+name = "ember-platform"
+version = "0.0.0"
+dependencies = [
+ "ember-core",
+]
+
+[[package]]
+name = "ember-render"
+version = "0.0.0"
+dependencies = [
+ "ember-core",
+]
+
+[[package]]
+name = "ember-session"
+version = "0.0.0"
+dependencies = [
+ "ember-core",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -474,44 +512,6 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
-
-[[package]]
-name = "vt-app"
-version = "0.0.0"
-dependencies = [
- "vt-core",
- "vt-platform",
- "vt-render",
- "vt-session",
-]
-
-[[package]]
-name = "vt-core"
-version = "0.0.0"
-dependencies = [
- "criterion",
-]
-
-[[package]]
-name = "vt-platform"
-version = "0.0.0"
-dependencies = [
- "vt-core",
-]
-
-[[package]]
-name = "vt-render"
-version = "0.0.0"
-dependencies = [
- "vt-core",
-]
-
-[[package]]
-name = "vt-session"
-version = "0.0.0"
-dependencies = [
- "vt-core",
-]
 
 [[package]]
 name = "walkdir"

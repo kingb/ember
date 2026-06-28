@@ -15,11 +15,11 @@ its boundary is front-loaded.
 
 | Crate | Responsibility |
 |---|---|
-| `vt-core` | Pure domain: `SessionBackend` trait, layout tree, focus/layout, profiles, OSC/trigger matching. No IO. |
-| `vt-session` | Backend impls: `LocalPty` (v1), `TmuxControlMode` (phase 2), `a future out-of-process backend` (future). |
-| `vt-render` | wgpu + glyphon + custom GPU chrome + egui overlay. |
-| `vt-platform` | winit + `PlatformBackend` (clipboard, open, hotkey). macOS seam. |
-| `vt-app` | Binary: event loop, input routing, layout, config; trigger dispatch. |
+| `ember-core` | Pure domain: `SessionBackend` trait, layout tree, focus/layout, profiles, OSC/trigger matching. No IO. |
+| `ember-session` | Backend impls: `LocalPty` (v1), `TmuxControlMode` (phase 2), `a future out-of-process backend` (future). |
+| `ember-render` | wgpu + glyphon + custom GPU chrome + egui overlay. |
+| `ember-platform` | winit + `PlatformBackend` (clipboard, open, hotkey). macOS seam. |
+| `ember-app` | Binary: event loop, input routing, layout, config; trigger dispatch. |
 
 Two extension seams: **`SessionBackend`** (tmux / daemon / bus) and **`PlatformBackend`**
 (macOS). See the design doc for the full picture, including the projection-based render

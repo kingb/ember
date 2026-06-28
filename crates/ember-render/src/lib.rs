@@ -1,12 +1,12 @@
-//! `vt-render` — wgpu + glyphon + egui consumer (design §6).
+//! `ember-render` — wgpu + glyphon + egui consumer (design §6).
 //!
 //! Owns the neutral grid and applies owned frame deltas; never borrows engine
 //! memory. The GPU pipelines and glyph atlas land in later epics. Empty-but-real
-//! stub that proves the `vt-core` link.
+//! stub that proves the `ember-core` link.
 
-/// Returns the `vt-core` version this render layer is built against.
+/// Returns the `ember-core` version this render layer is built against.
 pub fn core_version() -> &'static str {
-    vt_core::version()
+    ember_core::version()
 }
 
 #[cfg(test)]
