@@ -13,6 +13,7 @@ ember-core.workspace = true
 ember-session.workspace = true
 ember-render.workspace = true
 ember-platform.workspace = true
+winit.workspace = true
 
 [lints]
 workspace = true

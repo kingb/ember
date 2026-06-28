@@ -22,6 +22,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # winit + wgpu need windowing/GL dev headers to build on Linux.
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libx11-dev libxrandr-dev \
+            libxi-dev libgl1-mesa-dev libegl1-mesa-dev
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
