@@ -175,8 +175,21 @@ impl GridDelta {
     /// Merge `newer` into `self` (coalescing under backpressure). Newer per-cell
     /// patches win; newer cursor/dims/epoch take precedence; first-seen styles
     /// accumulate (newer wins per id); a `reset` supersedes all pending state.
-    pub fn merge(&mut self, newer: GridDelta) {
+    pub fn merge(&mut self, mut newer: GridDelta) {
         if newer.reset {
+            // A reset rebuilds cells from scratch, but `StyleId`s are stable and
+            // cumulative: the engine's interner ships each style as `new_styles`
+            // exactly once, and `newer`'s cells may reference ids first seen in the
+            // delta being superseded. Carry the learned styles forward (newer wins
+            // per id) so a coalesced reset never strands a cell with no known style
+            // — otherwise the consumer falls back to the default style and renders
+            // black-on-black.
+            let mut styles: BTreeMap<StyleId, Style> =
+                std::mem::take(&mut self.new_styles).into_iter().collect();
+            for (id, style) in std::mem::take(&mut newer.new_styles) {
+                styles.insert(id, style);
+            }
+            newer.new_styles = styles.into_iter().collect();
             *self = newer;
             return;
         }
@@ -253,6 +266,34 @@ mod tests {
         assert!(a.reset);
         assert!(a.cells.is_empty());
         assert_eq!(a.epoch, 5);
+    }
+
+    #[test]
+    fn merge_reset_carries_styles_forward() {
+        // Regression: a styles-bearing delta coalescing with a later reset (e.g.
+        // init styles + a resize reset, both pending before the first drain) must
+        // not strand cells with no known style — else the consumer renders the
+        // default style (black-on-black). The interner only ships each style once,
+        // so the reset must keep the superseded delta's styles.
+        let dims = GridDims::new(80, 24);
+        let red = Style {
+            fg: Rgb::new(255, 0, 0),
+            ..Default::default()
+        };
+        let mut a = GridDelta::new(1, dims);
+        a.new_styles = vec![(StyleId(0), red)];
+
+        // A full reset whose cells reference StyleId(0) but ships no new styles.
+        let mut b = GridDelta::full(2, dims);
+        b.cells = vec![patch(0, 0, 'x', 0)];
+        a.merge(b);
+
+        assert!(a.reset);
+        assert_eq!(
+            a.new_styles,
+            vec![(StyleId(0), red)],
+            "reset must carry forward the style its cells reference"
+        );
     }
 
     #[test]
