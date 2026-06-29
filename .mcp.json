@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ember-term": {
+      "command": "cargo",
+      "args": ["run", "-q", "--bin", "ember-term", "--", "mcp"],
+      "description": "EmberTerm debug control: drive (type/key/chord) and introspect (state) a running ember-term launched with EMBER_CONTROL=1, plus headless screenshots."
+    }
+  }
+}

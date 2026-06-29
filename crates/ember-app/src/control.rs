@@ -1,19 +1,21 @@
-//! Debug control surface. When `EMBER_CONTROL=<unix socket path>` is set,
-//! `ember-term` listens for line-delimited JSON commands so an agent or CI can
-//! **drive and introspect the live app** without a human at the keyboard:
+//! Debug control surface. When `EMBER_CONTROL` is set, `ember-term`
+//! listens on a unix socket for line-delimited JSON commands, so an agent or CI
+//! can **drive and introspect the live app** without a human at the keyboard:
 //! inject typed text, press named keys, run multiplexer chords, and dump grid
 //! state as JSON (dims / cursor / styles / screen text).
+//!
+//! **One socket per instance.** `EMBER_CONTROL=1` (or `auto`) binds a per-PID
+//! socket under `$TMPDIR/ember-ctl/<pid>.sock` so multiple ember-terms never
+//! collide; `EMBER_CONTROL=/explicit/path` uses that path verbatim (single
+//! instance). The client (`ember-term ctl`) discovers instances by scanning that
+//! directory: with exactly one live instance it auto-targets it, otherwise it
+//! lists them and asks for `--pid`/`--sock`.
 //!
 //! Wire protocol (one JSON object per line, one request per connection):
 //!   {"cmd":"type","text":"ls\n"}      -> {"ok":true}
 //!   {"cmd":"key","name":"Enter"}      -> {"ok":true}
 //!   {"cmd":"chord","keys":"cmd+d"}    -> {"ok":true}
 //!   {"cmd":"state"}                   -> {"ok":true,"state":{...}}
-//!
-//! The listener runs on a background thread and forwards [`ControlMsg`]s to the
-//! winit event loop, which drains them each poll tick (see `about_to_wait`). A
-//! `state` request round-trips through a reply channel so the main thread can
-//! build the snapshot. The matching client lives in [`client`] (`ember-term ctl`).
 
 use std::sync::mpsc::Sender;
 
@@ -30,30 +32,57 @@ pub enum ControlMsg {
 }
 
 #[cfg(unix)]
-pub use unix::{client, spawn_listener};
+pub use unix::{client, list_instances, resolve_socket, send, server_bind_path, spawn_listener};
 
 #[cfg(unix)]
 mod unix {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread;
     use std::time::Duration;
 
+    use serde_json::Value;
+
     use super::ControlMsg;
 
+    /// Directory holding per-instance sockets: `$TMPDIR/ember-ctl/`.
+    pub fn socket_dir() -> PathBuf {
+        let base = std::env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        base.join("ember-ctl")
+    }
+
+    fn pid_socket(pid: u32) -> PathBuf {
+        socket_dir().join(format!("{pid}.sock"))
+    }
+
+    /// Resolve the path this process should bind from the `EMBER_CONTROL` value: an
+    /// explicit path (contains `/`) verbatim, else a per-PID socket in the dir.
+    pub fn server_bind_path(env_val: &str) -> PathBuf {
+        if env_val.contains('/') {
+            PathBuf::from(env_val)
+        } else {
+            pid_socket(std::process::id())
+        }
+    }
+
     /// Bind the control socket and spawn the accept loop. Returns the receiver the
-    /// event loop drains. Each connection carries one request line and gets one
-    /// response line.
-    pub fn spawn_listener(path: &str) -> std::io::Result<Receiver<ControlMsg>> {
-        let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path)?;
+    /// event loop drains. Each connection carries one request line + one response.
+    pub fn spawn_listener(bind_path: &Path) -> std::io::Result<Receiver<ControlMsg>> {
+        if let Some(dir) = bind_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Only our own (per-PID) path is removed here, so we never clobber another
+        // live instance's socket.
+        let _ = std::fs::remove_file(bind_path);
+        let listener = UnixListener::bind(bind_path)?;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                let tx = tx.clone();
-                // Handle each connection inline; requests are tiny and infrequent.
                 if let Err(e) = serve(stream, &tx) {
                     eprintln!("[ember-control] request error: {e}");
                 }
@@ -66,7 +95,7 @@ mod unix {
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            return Ok(());
+            return Ok(()); // liveness probe (no payload) — just close.
         }
         let resp = dispatch(&line, tx);
         writeln!(stream, "{resp}")
@@ -74,24 +103,23 @@ mod unix {
 
     /// Parse one request line and forward it; returns the JSON response line.
     fn dispatch(line: &str, tx: &Sender<ControlMsg>) -> String {
-        let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+        let v: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
             Err(e) => return format!("{{\"ok\":false,\"error\":\"bad json: {e}\"}}"),
         };
-        let cmd = v.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
-        match cmd {
+        match v.get("cmd").and_then(Value::as_str).unwrap_or("") {
             "type" => {
-                let text = v.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+                let text = v.get("text").and_then(Value::as_str).unwrap_or_default();
                 let _ = tx.send(ControlMsg::Type(text.to_string()));
                 ok()
             }
             "key" => {
-                let name = v.get("name").and_then(|t| t.as_str()).unwrap_or_default();
+                let name = v.get("name").and_then(Value::as_str).unwrap_or_default();
                 let _ = tx.send(ControlMsg::Key(name.to_string()));
                 ok()
             }
             "chord" => {
-                let keys = v.get("keys").and_then(|t| t.as_str()).unwrap_or_default();
+                let keys = v.get("keys").and_then(Value::as_str).unwrap_or_default();
                 let _ = tx.send(ControlMsg::Chord(keys.to_string()));
                 ok()
             }
@@ -116,45 +144,120 @@ mod unix {
         format!("{{\"ok\":false,\"error\":\"{msg}\"}}")
     }
 
-    /// `ember-term ctl <cmd> [arg]` — the client side. Connects to the socket
-    /// (`--sock`, else `$EMBER_CONTROL`, else `/tmp/ember.sock`), sends one request,
-    /// and prints the response. `type` unescapes `\n`/`\t`/`\\` in its argument.
-    pub fn client(args: &[String]) -> Result<(), String> {
-        // args = ["ctl", <cmd>, <arg?>...] plus optional `--sock <path>`.
-        let mut sock = std::env::var("EMBER_CONTROL").unwrap_or_else(|_| "/tmp/ember.sock".into());
-        let mut rest: Vec<&String> = Vec::new();
-        let mut it = args.iter().skip(1); // skip "ctl"
-        while let Some(a) = it.next() {
-            if a == "--sock" {
-                sock = it.next().ok_or("--sock needs a path")?.clone();
+    /// Live instances as `(pid, socket_path)`, by scanning the socket dir and
+    /// probing each. Stale socket files (no listener) are pruned best-effort.
+    pub fn list_instances() -> Vec<(u32, PathBuf)> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(socket_dir()) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let pid = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok());
+            let Some(pid) = pid else { continue };
+            if UnixStream::connect(&path).is_ok() {
+                out.push((pid, path));
             } else {
-                rest.push(a);
+                let _ = std::fs::remove_file(&path); // prune stale.
             }
         }
-        let cmd = rest.first().map(|s| s.as_str()).unwrap_or("state");
-        let arg = rest.get(1).map(|s| s.as_str()).unwrap_or("");
-        let request = match cmd {
-            "type" => serde_json::json!({"cmd":"type","text": unescape(arg)}),
-            "key" => serde_json::json!({"cmd":"key","name": arg}),
-            "chord" => serde_json::json!({"cmd":"chord","keys": arg}),
-            "state" => serde_json::json!({"cmd":"state"}),
-            other => return Err(format!("unknown ctl cmd: {other} (type|key|chord|state)")),
-        };
+        out.sort_by_key(|(pid, _)| *pid);
+        out
+    }
 
-        let mut stream = UnixStream::connect(&sock).map_err(|e| {
-            format!("connect {sock}: {e} (is ember-term running with EMBER_CONTROL={sock}?)")
-        })?;
+    /// Resolve which socket the client should talk to: explicit `--sock`, else
+    /// `--pid`, else the sole live instance (error + list if zero or many).
+    pub fn resolve_socket(sock: Option<String>, pid: Option<u32>) -> Result<PathBuf, String> {
+        if let Some(s) = sock {
+            return Ok(PathBuf::from(s));
+        }
+        if let Some(p) = pid {
+            return Ok(pid_socket(p));
+        }
+        let live = list_instances();
+        match live.len() {
+            1 => Ok(live[0].1.clone()),
+            0 => Err(
+                "no running ember-term with a control socket (launch with EMBER_CONTROL=1)".into(),
+            ),
+            _ => {
+                let pids: Vec<String> = live.iter().map(|(p, _)| p.to_string()).collect();
+                Err(format!(
+                    "multiple instances ({}); pass --pid <PID> or --sock <PATH>",
+                    pids.join(", ")
+                ))
+            }
+        }
+    }
+
+    /// Send one request to `socket` and return the response line.
+    pub fn send(socket: &Path, request: &Value) -> Result<String, String> {
+        let mut stream = UnixStream::connect(socket)
+            .map_err(|e| format!("connect {}: {e}", socket.display()))?;
         writeln!(stream, "{request}").map_err(|e| format!("write: {e}"))?;
         let mut reader = BufReader::new(stream);
         let mut resp = String::new();
         reader
             .read_line(&mut resp)
             .map_err(|e| format!("read: {e}"))?;
-        print!("{resp}");
+        Ok(resp.trim_end().to_string())
+    }
+
+    /// `ember-term ctl [--sock P | --pid N] <list|type|key|chord|state> [arg]`.
+    pub fn client(args: &[String]) -> Result<(), String> {
+        let mut sock: Option<String> = None;
+        let mut pid: Option<u32> = None;
+        let mut rest: Vec<&String> = Vec::new();
+        let mut it = args.iter().skip(1); // skip "ctl"
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--sock" => sock = Some(it.next().ok_or("--sock needs a path")?.clone()),
+                "--pid" => {
+                    pid = Some(
+                        it.next()
+                            .ok_or("--pid needs a number")?
+                            .parse()
+                            .map_err(|e| format!("--pid: {e}"))?,
+                    )
+                }
+                _ => rest.push(a),
+            }
+        }
+        let cmd = rest.first().map(|s| s.as_str()).unwrap_or("state");
+        let arg = rest.get(1).map(|s| s.as_str()).unwrap_or("");
+
+        if cmd == "list" {
+            let live = list_instances();
+            if live.is_empty() {
+                println!("(no running ember-term control sockets)");
+            }
+            for (pid, path) in live {
+                println!("pid {pid}\t{}", path.display());
+            }
+            return Ok(());
+        }
+
+        let request = match cmd {
+            "type" => serde_json::json!({"cmd":"type","text": unescape(arg)}),
+            "key" => serde_json::json!({"cmd":"key","name": arg}),
+            "chord" => serde_json::json!({"cmd":"chord","keys": arg}),
+            "state" => serde_json::json!({"cmd":"state"}),
+            other => {
+                return Err(format!(
+                    "unknown ctl cmd: {other} (list|type|key|chord|state)"
+                ));
+            }
+        };
+        let socket = resolve_socket(sock, pid)?;
+        let resp = send(&socket, &request)?;
+        println!("{resp}");
         Ok(())
     }
 
-    /// Turn `\n` / `\t` / `\\` escapes in a CLI argument into real characters, so
+    /// Turn `\n` / `\t` / `\r` / `\\` escapes in a CLI argument into real chars, so
     /// `ctl type "ls\n"` actually presses Enter.
     fn unescape(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -181,11 +284,18 @@ mod unix {
 }
 
 #[cfg(not(unix))]
-pub fn spawn_listener(_path: &str) -> std::io::Result<std::sync::mpsc::Receiver<ControlMsg>> {
+pub fn spawn_listener(
+    _p: &std::path::Path,
+) -> std::io::Result<std::sync::mpsc::Receiver<ControlMsg>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "control socket is unix-only",
     ))
+}
+
+#[cfg(not(unix))]
+pub fn server_bind_path(_env_val: &str) -> std::path::PathBuf {
+    std::path::PathBuf::new()
 }
 
 #[cfg(not(unix))]

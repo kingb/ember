@@ -10,6 +10,8 @@
 //! milestone — live tiled shells, on Linux and macOS.
 
 mod control;
+#[cfg(unix)]
+mod mcp;
 mod screenshot;
 
 use std::collections::HashMap;
@@ -47,14 +49,30 @@ fn main() {
         print_banner();
         return;
     }
-    // Debug control client: `ember-term ctl <type|key|chord|state> [arg]` talks to
-    // a running instance's EMBER_CONTROL socket. See `control`.
+    // Debug control client: `ember-term ctl [--pid N|--sock P] <list|type|key|chord|state>`
+    // talks to a running instance's EMBER_CONTROL socket. See `control`.
     if args.get(1).map(String::as_str) == Some("ctl") {
         if let Err(e) = control::client(&args[1..]) {
             eprintln!("ctl: {e}");
             std::process::exit(1);
         }
         return;
+    }
+    // MCP stdio server: `ember-term mcp` exposes the control surface as tools.
+    if args.get(1).map(String::as_str) == Some("mcp") {
+        #[cfg(unix)]
+        {
+            if let Err(e) = mcp::serve() {
+                eprintln!("mcp: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("mcp is unix-only");
+            std::process::exit(1);
+        }
     }
     // Headless self-review: render a deterministic scene to a PNG and exit. Needs
     // a GPU but no display (Metal/Vulkan render offscreen), so it works in CI /
@@ -69,19 +87,23 @@ fn main() {
         }
         return;
     }
-    // Optional debug control surface: `EMBER_CONTROL=/tmp/ember.sock ember-term`
-    // lets `ember-term ctl ...` drive + introspect this instance.
+    // Optional debug control surface. `EMBER_CONTROL=1` binds a per-PID socket
+    // under $TMPDIR/ember-ctl/ (so multiple instances coexist); an explicit path
+    // is used verbatim. `ember-term ctl`/`mcp` then drive + introspect this window.
     let control_rx = match std::env::var("EMBER_CONTROL") {
-        Ok(path) if !path.is_empty() => match control::spawn_listener(&path) {
-            Ok(rx) => {
-                eprintln!("[ember] control socket listening at {path}");
-                Some(rx)
+        Ok(val) if !val.is_empty() => {
+            let bind = control::server_bind_path(&val);
+            match control::spawn_listener(&bind) {
+                Ok(rx) => {
+                    eprintln!("[ember] control socket listening at {}", bind.display());
+                    Some(rx)
+                }
+                Err(e) => {
+                    eprintln!("[ember] control socket failed: {e}");
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!("[ember] control socket failed: {e}");
-                None
-            }
-        },
+        }
         _ => None,
     };
     let event_loop = EventLoop::new().expect("create event loop");
