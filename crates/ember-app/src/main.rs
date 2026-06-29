@@ -9,11 +9,15 @@
 //! session's pixel lane into that pane's grid. This is the splits + tabs
 //! milestone — live tiled shells, on Linux and macOS.
 
+mod control;
 mod screenshot;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
+
+use control::ControlMsg;
 
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, Direction, GridDims, LayoutCommand,
@@ -43,6 +47,15 @@ fn main() {
         print_banner();
         return;
     }
+    // Debug control client: `ember-term ctl <type|key|chord|state> [arg]` talks to
+    // a running instance's EMBER_CONTROL socket. See `control`.
+    if args.get(1).map(String::as_str) == Some("ctl") {
+        if let Err(e) = control::client(&args[1..]) {
+            eprintln!("ctl: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Headless self-review: render a deterministic scene to a PNG and exit. Needs
     // a GPU but no display (Metal/Vulkan render offscreen), so it works in CI /
     // an agent shell. See `screenshot::parse` for flags.
@@ -56,9 +69,27 @@ fn main() {
         }
         return;
     }
+    // Optional debug control surface: `EMBER_CONTROL=/tmp/ember.sock ember-term`
+    // lets `ember-term ctl ...` drive + introspect this instance.
+    let control_rx = match std::env::var("EMBER_CONTROL") {
+        Ok(path) if !path.is_empty() => match control::spawn_listener(&path) {
+            Ok(rx) => {
+                eprintln!("[ember] control socket listening at {path}");
+                Some(rx)
+            }
+            Err(e) => {
+                eprintln!("[ember] control socket failed: {e}");
+                None
+            }
+        },
+        _ => None,
+    };
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::default();
+    let mut app = App {
+        state: None,
+        control_rx,
+    };
     event_loop.run_app(&mut app).expect("run event loop");
 }
 
@@ -73,9 +104,10 @@ fn print_banner() {
     );
 }
 
-#[derive(Default)]
 struct App {
     state: Option<RunState>,
+    /// Receiver for debug-control commands (Some when `EMBER_CONTROL` is set).
+    control_rx: Option<Receiver<ControlMsg>>,
 }
 
 struct RunState {
@@ -92,6 +124,8 @@ struct RunState {
     next_pane: u64,
     next_session: u64,
     next_tab: u64,
+    /// Debug-control command receiver (drained each poll tick).
+    control_rx: Option<Receiver<ControlMsg>>,
 }
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
@@ -149,6 +183,7 @@ impl ApplicationHandler for App {
             next_pane: 2,
             next_session: 2,
             next_tab: 2,
+            control_rx: self.control_rx.take(),
         };
         state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
         state.sync_layout();
@@ -227,6 +262,15 @@ impl ApplicationHandler for App {
         for session in exited {
             state.close_session(&session);
         }
+        // Drain debug-control commands (EMBER_CONTROL) and act on them.
+        let cmds: Vec<ControlMsg> = state
+            .control_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for cmd in cmds {
+            state.handle_control(cmd, event_loop);
+        }
         if state.tree.tabs.is_empty() {
             state.shutdown_all();
             event_loop.exit();
@@ -291,6 +335,81 @@ impl RunState {
         for (_, h) in self.sessions.drain() {
             let _ = h.control.send(BackendControl::Shutdown);
         }
+    }
+
+    /// Send raw bytes to the focused session's PTY (used by control + key paths).
+    fn send_to_focused(&self, bytes: Vec<u8>) {
+        if let Some(h) = self.focused_session() {
+            let _ = h
+                .control
+                .send(BackendControl::Input(bytes.into_boxed_slice()));
+        }
+    }
+
+    /// Act on a debug-control command (see `control`): inject text/keys, run a
+    /// chord, or reply with a JSON state dump.
+    fn handle_control(&mut self, msg: ControlMsg, event_loop: &ActiveEventLoop) {
+        match msg {
+            ControlMsg::Type(text) => self.send_to_focused(text.into_bytes()),
+            ControlMsg::Key(name) => {
+                if let Some(key) = named_key(&name) {
+                    if let Some(bytes) = encode_key(&key, ModifiersState::empty()) {
+                        self.send_to_focused(bytes);
+                    }
+                }
+            }
+            ControlMsg::Chord(combo) => {
+                if let Some((key, mods)) = parse_chord(&combo) {
+                    if mods.super_key() {
+                        if self.handle_shortcut(&key, mods) && self.tree.tabs.is_empty() {
+                            self.shutdown_all();
+                            event_loop.exit();
+                        }
+                    } else if let Some(bytes) = encode_key(&key, mods) {
+                        self.send_to_focused(bytes);
+                    }
+                }
+            }
+            ControlMsg::State(reply) => {
+                let _ = reply.send(self.state_json());
+            }
+        }
+    }
+
+    /// A JSON snapshot of the live app for the debug control surface: scale,
+    /// surface size, tabs, and the active tab's panes (dims/cursor/styles/text).
+    fn state_json(&self) -> String {
+        let sf = self.renderer.window().scale_factor();
+        let tab = self.active_tab();
+        let focus = tab.focus;
+        let panes: Vec<serde_json::Value> = tab
+            .root
+            .leaves()
+            .iter()
+            .map(|(pane, sess)| {
+                let snap = self.renderer.pane_snapshot(sess);
+                serde_json::json!({
+                    "session": sess.0,
+                    "pane": pane.0,
+                    "focused": *pane == focus,
+                    "dims": snap.as_ref().map(|s| serde_json::json!([s.cols, s.rows])),
+                    "cursor": snap.as_ref().map(|s| serde_json::json!({
+                        "row": s.cursor_row, "col": s.cursor_col, "visible": s.cursor_visible,
+                    })),
+                    "styles_known": snap.as_ref().map(|s| s.styles_known),
+                    "text": snap.as_ref().map(|s| s.text.clone()),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "scale_factor": sf,
+            "surface": [self.px.0, self.px.1],
+            "tabs": self.tree.tabs.len(),
+            "active_tab": self.tree.active,
+            "focus_pane": focus.0,
+            "panes": panes,
+        })
+        .to_string()
     }
 
     /// Run the `KillSession` side effects of an applied command (the layout tree is
@@ -534,6 +653,46 @@ impl RunState {
         self.tree.active = self.tree.active.min(self.tree.tabs.len() - 1);
         self.sync_layout();
     }
+}
+
+/// Parse a key token (`enter`, `tab`, `arrowleft`/`left`, or a single char) into a
+/// winit [`Key`]. Used by the debug control surface.
+fn named_key(name: &str) -> Option<Key> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "enter" | "return" => Key::Named(NamedKey::Enter),
+        "tab" => Key::Named(NamedKey::Tab),
+        "esc" | "escape" => Key::Named(NamedKey::Escape),
+        "backspace" => Key::Named(NamedKey::Backspace),
+        "space" => Key::Named(NamedKey::Space),
+        "left" | "arrowleft" => Key::Named(NamedKey::ArrowLeft),
+        "right" | "arrowright" => Key::Named(NamedKey::ArrowRight),
+        "up" | "arrowup" => Key::Named(NamedKey::ArrowUp),
+        "down" | "arrowdown" => Key::Named(NamedKey::ArrowDown),
+        s if s.chars().count() == 1 => Key::Character(s.into()),
+        _ => return None,
+    })
+}
+
+/// Parse a chord like `cmd+shift+arrowright` or `cmd+d` into a key + modifiers, so
+/// the control surface can drive the same shortcut path as real keystrokes.
+fn parse_chord(combo: &str) -> Option<(Key, ModifiersState)> {
+    let parts: Vec<&str> = combo
+        .split('+')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let (key_tok, mod_toks) = parts.split_last()?;
+    let mut mods = ModifiersState::empty();
+    for m in mod_toks {
+        match m.to_ascii_lowercase().as_str() {
+            "cmd" | "super" | "win" | "meta" => mods |= ModifiersState::SUPER,
+            "shift" => mods |= ModifiersState::SHIFT,
+            "alt" | "option" => mods |= ModifiersState::ALT,
+            "ctrl" | "control" => mods |= ModifiersState::CONTROL,
+            _ => return None,
+        }
+    }
+    Some((named_key(key_tok)?, mods))
 }
 
 /// Map a key press to the bytes to send to the PTY. Covers the essentials for a

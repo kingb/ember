@@ -56,6 +56,18 @@ pub struct TabLabel {
     pub active: bool,
 }
 
+/// A read-only snapshot of a pane's grid for the debug control surface.
+#[derive(Clone, Debug)]
+pub struct PaneSnapshot {
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub cursor_visible: bool,
+    pub styles_known: usize,
+    pub text: String,
+}
+
 /// Per-session render state: the neutral grid plus the glyph buffer it flows into.
 struct PaneRender {
     grid: GridModel,
@@ -416,6 +428,20 @@ impl Renderer {
     /// Drop a session's grid (its shell exited or its pane was closed).
     pub fn remove_pane(&mut self, session: &SessionId) {
         self.panes.remove(session);
+    }
+
+    /// A read-only snapshot of a pane's grid — for the debug control surface. The
+    /// `text` is the whole screen as text (trailing blanks trimmed per row).
+    pub fn pane_snapshot(&self, session: &SessionId) -> Option<PaneSnapshot> {
+        self.panes.get(session).map(|p| PaneSnapshot {
+            cols: p.grid.dims.columns,
+            rows: p.grid.dims.screen_lines,
+            cursor_row: p.grid.cursor.row,
+            cursor_col: p.grid.cursor.col,
+            cursor_visible: p.grid.cursor.visible,
+            styles_known: p.grid.styles_len(),
+            text: p.grid.screen_text(),
+        })
     }
 
     /// Apply an owned delta to the pane backing `session`, off the pixel lane.

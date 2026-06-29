@@ -10,7 +10,7 @@ pub mod quads;
 pub mod renderer;
 
 pub use grid_model::GridModel;
-pub use renderer::{CELL_HEIGHT, CELL_WIDTH, Renderer, TabLabel, VisiblePane};
+pub use renderer::{CELL_HEIGHT, CELL_WIDTH, PaneSnapshot, Renderer, TabLabel, VisiblePane};
 
 /// Returns the `ember-core` version this render layer is built against.
 pub fn core_version() -> &'static str {
