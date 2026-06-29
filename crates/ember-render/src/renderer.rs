@@ -548,6 +548,46 @@ impl Renderer {
             });
         }
 
+        // Optional per-frame diagnostics: `EMBER_DEBUG=1 ember-term`. Prints scale,
+        // surface size, and each visible pane's rect/dims/cursor + its cursor-row
+        // text, so a display-less reviewer can tell whether the grid actually has
+        // content and whether geometry is sane.
+        if std::env::var_os("EMBER_DEBUG").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static FRAME: AtomicU64 = AtomicU64::new(0);
+            let f = FRAME.fetch_add(1, Ordering::Relaxed);
+            if f % 30 == 0 {
+                eprintln!(
+                    "[ember-debug] frame={f} sf={sf} surface={}x{} visible={} areas={}",
+                    self.config.width,
+                    self.config.height,
+                    self.visible.len(),
+                    areas.len()
+                );
+                for vp in &self.visible {
+                    if let Some(p) = self.panes.get(&vp.session) {
+                        let c = p.grid.cursor;
+                        eprintln!(
+                            "  {:?} rect=({:.0},{:.0},{:.0},{:.0}) dims={}x{} cur=({},{},vis={}) row[{}]={:?}",
+                            vp.session,
+                            vp.rect.x,
+                            vp.rect.y,
+                            vp.rect.width,
+                            vp.rect.height,
+                            p.grid.dims.columns,
+                            p.grid.dims.screen_lines,
+                            c.row,
+                            c.col,
+                            c.visible,
+                            c.row,
+                            p.grid
+                                .row_text(c.row.min(p.grid.dims.screen_lines.saturating_sub(1)))
+                        );
+                    }
+                }
+            }
+        }
+
         let prepared = self.text_renderer.prepare(
             &self.device,
             &self.queue,
@@ -557,7 +597,11 @@ impl Renderer {
             areas,
             &mut self.swash_cache,
         );
-        if prepared.is_err() {
+        if let Err(e) = prepared {
+            // Don't freeze on a transient atlas/prepare error: log it (always, since
+            // it means glyphs won't paint this frame) and ask for another redraw.
+            eprintln!("[ember] text prepare failed, skipping glyphs this frame: {e:?}");
+            self.window.request_redraw();
             return true;
         }
 
