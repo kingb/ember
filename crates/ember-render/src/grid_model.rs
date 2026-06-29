@@ -51,6 +51,12 @@ impl GridModel {
         self.styles.get(&id).copied().unwrap_or_default()
     }
 
+    /// How many styles have been learned — `0` means no delta has arrived yet, so
+    /// every cell falls back to the default style (a diagnostic signal).
+    pub fn styles_len(&self) -> usize {
+        self.styles.len()
+    }
+
     /// The cell at `(row, col)`, if in bounds.
     pub fn cell(&self, row: u16, col: u16) -> Option<&NeutralCell> {
         let idx = row as usize * self.dims.columns as usize + col as usize;

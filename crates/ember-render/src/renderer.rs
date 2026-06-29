@@ -548,27 +548,29 @@ impl Renderer {
             });
         }
 
-        // Optional per-frame diagnostics: `EMBER_DEBUG=1 ember-term`. Prints scale,
-        // surface size, and each visible pane's rect/dims/cursor + its cursor-row
-        // text, so a display-less reviewer can tell whether the grid actually has
-        // content and whether geometry is sane.
+        // Optional diagnostics: `EMBER_DEBUG=/tmp/e.log ember-term` (file sink) or
+        // `EMBER_DEBUG=1` (stderr). Logs scale, surface size, and each visible
+        // pane's rect/dims/cursor + cursor-row text, so a display-less reviewer can
+        // tell whether the grid has content and whether geometry is sane. Captures
+        // the first few frames (startup) plus a periodic heartbeat.
         if std::env::var_os("EMBER_DEBUG").is_some() {
             use std::sync::atomic::{AtomicU64, Ordering};
             static FRAME: AtomicU64 = AtomicU64::new(0);
             let f = FRAME.fetch_add(1, Ordering::Relaxed);
-            if f % 30 == 0 {
-                eprintln!(
+            if f < 8 || f % 60 == 0 {
+                debug_emit(&format!(
                     "[ember-debug] frame={f} sf={sf} surface={}x{} visible={} areas={}",
                     self.config.width,
                     self.config.height,
                     self.visible.len(),
                     areas.len()
-                );
+                ));
                 for vp in &self.visible {
                     if let Some(p) = self.panes.get(&vp.session) {
                         let c = p.grid.cursor;
-                        eprintln!(
-                            "  {:?} rect=({:.0},{:.0},{:.0},{:.0}) dims={}x{} cur=({},{},vis={}) row[{}]={:?}",
+                        let row = c.row.min(p.grid.dims.screen_lines.saturating_sub(1));
+                        debug_emit(&format!(
+                            "  {:?} rect=({:.0},{:.0},{:.0},{:.0}) dims={}x{} cur=({},{},vis={}) styles_known={} row[{}]={:?}",
                             vp.session,
                             vp.rect.x,
                             vp.rect.y,
@@ -579,10 +581,10 @@ impl Renderer {
                             c.row,
                             c.col,
                             c.visible,
-                            c.row,
-                            p.grid
-                                .row_text(c.row.min(p.grid.dims.screen_lines.saturating_sub(1)))
-                        );
+                            p.grid.styles_len(),
+                            row,
+                            p.grid.row_text(row).trim_end()
+                        ));
                     }
                 }
             }
@@ -600,6 +602,7 @@ impl Renderer {
         if let Err(e) = prepared {
             // Don't freeze on a transient atlas/prepare error: log it (always, since
             // it means glyphs won't paint this frame) and ask for another redraw.
+            debug_emit(&format!("[ember] text prepare failed this frame: {e:?}"));
             eprintln!("[ember] text prepare failed, skipping glyphs this frame: {e:?}");
             self.window.request_redraw();
             return true;
@@ -661,6 +664,26 @@ impl Renderer {
 /// HiDPI scale factor.
 pub(crate) fn scaled(x: f32, y: f32, w: f32, h: f32, sf: f32) -> [f32; 4] {
     [x * sf, y * sf, w * sf, h * sf]
+}
+
+/// Emit a debug line to the `EMBER_DEBUG` sink: a file path if the value contains
+/// `/` (so a reviewer can `cat` it on the same machine), else stderr. No-op when
+/// the var is unset.
+pub(crate) fn debug_emit(line: &str) {
+    match std::env::var("EMBER_DEBUG") {
+        Ok(v) if v.contains('/') => {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&v)
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        Ok(_) => eprintln!("{line}"),
+        Err(_) => {}
+    }
 }
 
 /// Push four thin quads outlining `rect` (logical px) in `color` — a ~1.5px
