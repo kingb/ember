@@ -240,6 +240,16 @@ impl ApplicationHandler for App {
                     return;
                 }
                 let mods = state.modifiers;
+                if std::env::var_os("EMBER_DEBUG").is_some() {
+                    eprintln!(
+                        "[ember-key] {:?} super={} shift={} alt={} ctrl={}",
+                        key.logical_key,
+                        mods.super_key(),
+                        mods.shift_key(),
+                        mods.alt_key(),
+                        mods.control_key()
+                    );
+                }
                 // Super (Cmd/Win) combos are multiplexer shortcuts — consumed, never
                 // forwarded to the shell.
                 if mods.super_key() {
@@ -547,8 +557,10 @@ impl RunState {
     /// a recognized shortcut (so the caller can check for an emptied tree → quit).
     fn handle_shortcut(&mut self, key: &Key, mods: ModifiersState) -> bool {
         match key {
-            // Cmd+? — show the keyboard cheat-sheet overlay (any key dismisses).
-            Key::Character(s) if s.as_str() == "?" => {
+            // Cmd+? — show the cheat-sheet overlay (any key dismisses). macOS often
+            // reports the base key "/" rather than the shifted "?" when Cmd is held,
+            // so accept either (Cmd+/ opens it too).
+            Key::Character(s) if s.as_str() == "?" || s.as_str() == "/" => {
                 self.show_help();
                 true
             }
