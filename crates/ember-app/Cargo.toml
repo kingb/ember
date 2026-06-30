@@ -16,5 +16,9 @@ ember-platform.workspace = true
 winit.workspace = true
 serde_json.workspace = true
 
+# Native menu bar — macOS only (avoids muda's GTK backend on Linux CI).
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.19.3"
+
 [lints]
 workspace = true

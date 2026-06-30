@@ -12,6 +12,7 @@
 mod control;
 #[cfg(unix)]
 mod mcp;
+mod menu;
 mod screenshot;
 
 use std::collections::HashMap;
@@ -150,6 +151,8 @@ struct RunState {
     control_rx: Option<Receiver<ControlMsg>>,
     /// Whether the keyboard cheat-sheet overlay is showing.
     help: bool,
+    /// Native menu bar (macOS); inert elsewhere. Kept alive for the app's life.
+    menu: menu::AppMenu,
 }
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
@@ -209,6 +212,7 @@ impl ApplicationHandler for App {
             next_tab: 2,
             control_rx: self.control_rx.take(),
             help: false,
+            menu: menu::build(),
         };
         state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
         state.sync_layout();
@@ -314,6 +318,10 @@ impl ApplicationHandler for App {
             .unwrap_or_default();
         for cmd in cmds {
             state.handle_control(cmd, event_loop);
+        }
+        // Native Help > Keyboard Shortcuts menu item (macOS) toggles the overlay.
+        if menu::take_shortcuts_event(&state.menu) {
+            state.toggle_help();
         }
         if state.tree.tabs.is_empty() {
             state.shutdown_all();
@@ -566,7 +574,7 @@ impl RunState {
             // delivers it, so Cmd+/ is the real binding; "?" is accepted too in
             // case a layout delivers it.
             Key::Character(s) if s.as_str() == "/" || s.as_str() == "?" => {
-                self.show_help();
+                self.toggle_help();
                 true
             }
             // Cmd+D / Cmd+Shift+D — split the focused pane side-by-side / stacked.
@@ -686,6 +694,15 @@ impl RunState {
     fn show_help(&mut self) {
         self.help = true;
         self.renderer.set_help(Some(help_lines()));
+    }
+
+    /// Toggle the cheat-sheet overlay (Cmd+/ and the Help menu item).
+    fn toggle_help(&mut self) {
+        if self.help {
+            self.hide_help();
+        } else {
+            self.show_help();
+        }
     }
 
     /// Hide the cheat-sheet overlay (no-op if not shown).
