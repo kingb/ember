@@ -745,6 +745,7 @@ impl RunState {
             match hit {
                 TabHit::Tab(i) => self.select_tab(i + 1),
                 TabHit::NewTab => self.new_tab(),
+                TabHit::Help => self.toggle_help(),
             }
         }
     }

@@ -80,6 +80,8 @@ pub enum TabHit {
     Tab(usize),
     /// The trailing "+" button (open a new tab).
     NewTab,
+    /// The trailing "?" button (toggle the shortcuts overlay).
+    Help,
 }
 
 /// A read-only snapshot of a pane's grid for the debug control surface.
@@ -220,6 +222,8 @@ pub(crate) fn grid_quads(
 const STRIP_BG: Rgb = Rgb::new(0x1b, 0x1b, 0x1b);
 /// Fill of the active tab button.
 const TAB_ACTIVE: Rgb = Rgb::new(0x2e, 0x2e, 0x2e);
+/// Width (in columns) of each trailing tab-strip utility button ("+", "?").
+const BTN_COLS: usize = 3;
 
 /// Center `s` in a field `width` columns wide (truncating with `…` if too long).
 fn center(s: &str, width: usize) -> String {
@@ -264,10 +268,12 @@ pub(crate) fn build_tabs(
         lin_rgba(STRIP_BG, 1.0),
     ));
 
-    // Work in integer columns so quads and (monospace) text stay aligned.
+    // Work in integer columns so quads and (monospace) text stay aligned. The two
+    // trailing utility buttons ("+" new-tab, "?" help) each reserve `BTN_COLS`.
     let total_cols = (logical_w / cw).floor() as usize;
-    let plus_cols = 3usize.min(total_cols);
-    let tab_cols = total_cols.saturating_sub(plus_cols);
+    let plus_cols = BTN_COLS.min(total_cols);
+    let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
+    let tab_cols = total_cols.saturating_sub(plus_cols + help_cols);
     let n = tabs.len(); // >= 2 (single-tab strips return early above)
     let seg = tab_cols / n;
 
@@ -293,8 +299,10 @@ pub(crate) fn build_tabs(
         spans.push((center(&label, width), fg));
         col += width;
     }
-    // The "+" button.
-    spans.push((center("+", plus_cols), Color::rgb(0x8a, 0x8a, 0x8a)));
+    // Trailing utility buttons: "+" (new tab) and "?" (keyboard shortcuts).
+    let btn_fg = Color::rgb(0x8a, 0x8a, 0x8a);
+    spans.push((center("+", plus_cols), btn_fg));
+    spans.push((center("?", help_cols), btn_fg));
 
     chrome.set_rich_text(
         font_system,
@@ -627,9 +635,9 @@ impl Renderer {
         self.tabs = tabs;
     }
 
-    /// Hit-test a click at logical `(x, y)` against the tab strip. Returns the tab
-    /// button or the "+" button hit, or `None` (no strip, or click below it). Must
-    /// mirror the column math in [`build_tabs`].
+    /// Hit-test a click at logical `(x, y)` against the tab strip: a tab button, the
+    /// trailing "+" (new tab) or "?" (help), or `None` (no strip / click below it).
+    /// Must mirror the column math in [`build_tabs`].
     pub fn tab_hit(&self, x: f32, y: f32) -> Option<TabHit> {
         let n = self.tabs.len();
         if n <= 1 {
@@ -643,12 +651,16 @@ impl Renderer {
         let logical_w = self.config.width as f32 / sf;
         let cw = self.cell_w;
         let total_cols = (logical_w / cw).floor() as usize;
-        let plus_cols = 3usize.min(total_cols);
-        let tab_cols = total_cols.saturating_sub(plus_cols);
+        let plus_cols = BTN_COLS.min(total_cols);
+        let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
+        let tab_cols = total_cols.saturating_sub(plus_cols + help_cols);
         let seg = tab_cols / n;
         let col = (x / cw).floor() as usize;
         if col >= total_cols {
             return None;
+        }
+        if col >= tab_cols + plus_cols {
+            return Some(TabHit::Help);
         }
         if col >= tab_cols {
             return Some(TabHit::NewTab);
