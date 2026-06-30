@@ -19,11 +19,13 @@ use wgpu::{
 };
 
 use crate::grid_model::GridModel;
+use crate::paint::{
+    AboutLayout, build_about, build_help, build_tabs, grid_quads, measure_cell_width, shape_grid,
+};
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
-    ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, AboutLayout, BG, CELL_HEIGHT, FG,
-    FONT_SIZE, HELP_PAD, LINE_HEIGHT, PAD, TabLabel, build_about, build_help, build_tabs,
-    grid_quads, measure_cell_width, shape_grid,
+    ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, BG, CELL_HEIGHT, FG, FONT_SIZE, HELP_PAD,
+    LINE_HEIGHT, PAD, TabLabel,
 };
 
 /// One pane in a screenshot scene: a grid and the **logical** inner rect it fills.

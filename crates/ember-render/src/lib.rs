@@ -6,6 +6,7 @@
 
 pub mod grid_model;
 pub mod headless;
+mod paint;
 pub mod quads;
 pub mod renderer;
 
