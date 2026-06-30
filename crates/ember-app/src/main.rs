@@ -1257,6 +1257,9 @@ fn help_lines() -> Vec<(String, String)> {
         ("Cmd+Arrows", "Focus pane"),
         ("Cmd+Shift+Arrows", "Switch tab"),
         ("Cmd+1..9", "Jump to tab"),
+        ("Drag / 2×/3× click", "Select text / word / line"),
+        ("Cmd+C / Cmd+V", "Copy selection / paste"),
+        ("Cmd+,", "Settings"),
         ("Cmd+/", "Show this help"),
     ]
     .iter()
