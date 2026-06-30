@@ -29,8 +29,9 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, build_about, build_help, build_settings, build_tabs, debug_emit, grid_quads,
-    measure_cell_width, push_backdrop, shape_grid, spark_quads,
+    measure_cell_width, push_backdrop, selection_quads, shape_grid, spark_quads,
 };
+use crate::selection::Selection;
 
 pub(crate) const FONT_SIZE: f32 = 12.0;
 pub(crate) const LINE_HEIGHT: f32 = 15.0;
@@ -219,6 +220,8 @@ pub struct Renderer {
     /// The decoded backdrop image kept in RAM so [`Self::capture_to_png`] can
     /// replay it through the headless path (the GPU texture isn't readable here).
     image_rgba: Option<(Vec<u8>, u32, u32)>,
+    /// The active text selection and the session whose pane it belongs to.
+    selection: Option<(SessionId, Selection)>,
     // Keep the window LAST so it drops after the surface (winit/wgpu requirement).
     window: Arc<Window>,
 }
@@ -325,6 +328,7 @@ impl Renderer {
             image,
             image_fit: ImageFit::default(),
             image_rgba: None,
+            selection: None,
             window,
         }
     }
@@ -391,6 +395,11 @@ impl Renderer {
                         grid: &p.grid,
                         rect: vp.rect,
                         focused: self.focused.as_ref() == Some(&vp.session),
+                        selection: self
+                            .selection
+                            .as_ref()
+                            .filter(|(sid, _)| *sid == vp.session)
+                            .map(|(_, sel)| *sel),
                     })
             })
             .collect();
@@ -554,6 +563,21 @@ impl Renderer {
     /// to decide whether to drive continuous redraws.
     pub fn backdrop_animating(&self) -> bool {
         self.backdrop.sparks
+    }
+
+    /// Set or clear the active text selection (and the session it belongs to).
+    /// Requests a redraw so the highlight updates.
+    pub fn set_selection(&mut self, selection: Option<(SessionId, Selection)>) {
+        self.selection = selection;
+        self.window.request_redraw();
+    }
+
+    /// The currently selected text, if any (read from the owning pane's grid).
+    pub fn selected_text(&self) -> Option<String> {
+        let (sid, sel) = self.selection.as_ref()?;
+        let p = self.panes.get(sid)?;
+        let text = sel.text(&p.grid);
+        (!text.is_empty()).then_some(text)
     }
 
     /// Set (or clear with `None`) the backdrop image and its fit mode.
@@ -740,6 +764,11 @@ impl Renderer {
                 if let Some(p) = self.panes.get(&vp.session) {
                     let focused = self.focused.as_ref() == Some(&vp.session);
                     grid_quads(&p.grid, vp.rect, cw, sf, focused, split, &mut rects);
+                    if let Some((sid, sel)) = &self.selection {
+                        if *sid == vp.session {
+                            selection_quads(&p.grid, sel, vp.rect, cw, sf, &mut rects);
+                        }
+                    }
                 }
             }
             let logical_w = self.config.width as f32 / sf;

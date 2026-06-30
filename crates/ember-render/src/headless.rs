@@ -22,19 +22,22 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     AboutLayout, build_about, build_help, build_settings, build_tabs, grid_quads,
-    measure_cell_width, push_backdrop, shape_grid, spark_quads,
+    measure_cell_width, push_backdrop, selection_quads, shape_grid, spark_quads,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
     ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, BG, BackdropParams, CELL_HEIGHT, FG,
     FONT_SIZE, HELP_PAD, ImageFit, LINE_HEIGHT, PAD, TabLabel,
 };
+use crate::selection::Selection;
 
 /// One pane in a screenshot scene: a grid and the **logical** inner rect it fills.
 pub struct PaneShot<'a> {
     pub grid: &'a GridModel,
     pub rect: Rect,
     pub focused: bool,
+    /// Text selection to highlight in this pane, if any.
+    pub selection: Option<Selection>,
 }
 
 /// A full scene to capture: logical window size, HiDPI scale, the panes, and the
@@ -230,6 +233,9 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
                 split,
                 &mut rects,
             );
+            if let Some(sel) = &pane.selection {
+                selection_quads(pane.grid, sel, pane.rect, cw, sf, &mut rects);
+            }
         }
         build_tabs(
             &mut font_system,

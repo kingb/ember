@@ -28,7 +28,8 @@ use ember_core::{
 };
 use ember_platform::MenuAction;
 use ember_render::{
-    BackdropParams, CELL_HEIGHT, CELL_WIDTH, ImageFit, Renderer, TabHit, TabLabel, VisiblePane,
+    BackdropParams, CELL_HEIGHT, CELL_WIDTH, ImageFit, Point, Renderer, Selection, SelectionMode,
+    TabHit, TabLabel, VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
@@ -48,6 +49,8 @@ const DEFAULT_ROWS: u16 = 24;
 const POLL: Duration = Duration::from_millis(8);
 /// Redraw cadence (~60fps) while an animation (e.g. the About glow) is active.
 const ANIM_FRAME: Duration = Duration::from_millis(16);
+/// Max gap between clicks at the same cell to count as a double/triple click.
+const MULTI_CLICK: Duration = Duration::from_millis(400);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -174,6 +177,18 @@ struct RunState {
     menu: ember_platform::AppMenu,
     /// Last cursor position in **logical** px.
     cursor: (f64, f64),
+    /// Visible panes' inner rects (logical px), for mouse→cell hit-testing.
+    pane_rects: Vec<(SessionId, Rect)>,
+    /// Active text selection + the session (pane) it belongs to.
+    sel: Option<(SessionId, Selection)>,
+    /// Whether a mouse drag is currently extending the selection.
+    selecting: bool,
+    /// Last mouse-down (time, pane, cell), for double/triple-click detection.
+    last_click: Option<(Instant, SessionId, u16, u16)>,
+    /// Consecutive-click count at the same cell (1 = simple, 2 = word, 3 = line).
+    click_count: u32,
+    /// OS clipboard handle (lazily; `None` if the platform clipboard is unavailable).
+    clipboard: Option<arboard::Clipboard>,
 }
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
@@ -250,6 +265,12 @@ impl ApplicationHandler for App {
             window_focused: true,
             menu: ember_platform::build_menu(),
             cursor: (0.0, 0.0),
+            pane_rects: Vec::new(),
+            sel: None,
+            selecting: false,
+            last_click: None,
+            click_count: 0,
+            clipboard: arboard::Clipboard::new().ok(),
         };
         state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
         state.sync_layout();
@@ -281,12 +302,21 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let sf = state.renderer.window().scale_factor();
                 state.cursor = (position.x / sf, position.y / sf);
+                if state.selecting {
+                    let (x, y) = state.cursor;
+                    state.extend_selection(x, y);
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
             } => state.left_click(),
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => state.selecting = false,
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
                     return;
@@ -549,6 +579,26 @@ impl RunState {
             }
             ControlMsg::About => self.toggle_about(),
             ControlMsg::Settings => self.toggle_settings(),
+            ControlMsg::Select(r1, c1, r2, c2, mode) => {
+                let Some(sid) = self.focused_session_id() else {
+                    return;
+                };
+                let mode = match mode.as_str() {
+                    "word" => SelectionMode::Word,
+                    "line" => SelectionMode::Line,
+                    _ => SelectionMode::Simple,
+                };
+                let mut s = Selection::new(Point::new(r1, c1), mode);
+                s.update(Point::new(r2, c2));
+                self.sel = Some((sid, s));
+                self.renderer.set_selection(self.sel.clone());
+            }
+            ControlMsg::Copy => self.copy_selection(),
+            ControlMsg::Paste(text) => {
+                if !text.is_empty() {
+                    self.send_to_focused(text.into_bytes());
+                }
+            }
         }
     }
 
@@ -657,6 +707,10 @@ impl RunState {
             .collect();
 
         let focused = focused_session.unwrap_or_else(|| visible[0].session.clone());
+        self.pane_rects = visible
+            .iter()
+            .map(|vp| (vp.session.clone(), vp.rect))
+            .collect();
         self.renderer.set_visible(visible, focused, tabs);
         self.renderer.window().request_redraw();
     }
@@ -689,6 +743,16 @@ impl RunState {
             // Cmd+, — Settings (the macOS Preferences convention; also a menu item).
             Key::Character(s) if s.as_str() == "," => {
                 self.toggle_settings();
+                true
+            }
+            // Cmd+C — copy the current selection (macOS clipboard convention;
+            // Ctrl+C remains SIGINT to the shell). Cmd+V — paste.
+            Key::Character(s) if s.eq_ignore_ascii_case("c") => {
+                self.copy_selection();
+                true
+            }
+            Key::Character(s) if s.eq_ignore_ascii_case("v") => {
+                self.paste_clipboard();
                 true
             }
             // Cmd+D / Cmd+Shift+D — split the focused pane side-by-side / stacked.
@@ -824,6 +888,103 @@ impl RunState {
                 TabHit::Tab(i) => self.select_tab(i + 1),
                 TabHit::NewTab => self.new_tab(),
                 TabHit::Help => self.toggle_help(),
+            }
+            return;
+        }
+        // A click in a pane body starts a selection (mode by click count).
+        self.begin_selection(x, y);
+    }
+
+    /// Map a logical-px point to `(session, row, col)` in whichever visible pane
+    /// contains it (clamped to that pane's grid), or `None` if outside all panes.
+    fn pixel_to_cell(&self, x: f64, y: f64) -> Option<(SessionId, u16, u16)> {
+        let (cw, ch) = self.renderer.cell_size();
+        let (cw, ch) = (cw as f64, ch as f64);
+        for (sid, rect) in &self.pane_rects {
+            if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
+                let dims = self
+                    .dims_cache
+                    .get(sid)
+                    .copied()
+                    .unwrap_or(GridDims::new(1, 1));
+                let col = (((x - rect.x) / cw).floor().max(0.0) as u16)
+                    .min(dims.columns.saturating_sub(1));
+                let row = (((y - rect.y) / ch).floor().max(0.0) as u16)
+                    .min(dims.screen_lines.saturating_sub(1));
+                return Some((sid.clone(), row, col));
+            }
+        }
+        None
+    }
+
+    /// Begin a selection at a pane-body point; click count picks the mode
+    /// (1 = cell, 2 = word, 3 = line).
+    fn begin_selection(&mut self, x: f64, y: f64) {
+        let Some((sid, row, col)) = self.pixel_to_cell(x, y) else {
+            self.clear_selection();
+            return;
+        };
+        let now = Instant::now();
+        let same = self.last_click.as_ref().is_some_and(|(t, s, r, c)| {
+            now.duration_since(*t) < MULTI_CLICK && *s == sid && *r == row && *c == col
+        });
+        self.click_count = if same {
+            (self.click_count + 1).min(3)
+        } else {
+            1
+        };
+        self.last_click = Some((now, sid.clone(), row, col));
+        let mode = match self.click_count {
+            2 => SelectionMode::Word,
+            3 => SelectionMode::Line,
+            _ => SelectionMode::Simple,
+        };
+        let selection = Selection::new(Point::new(row, col), mode);
+        self.sel = Some((sid, selection));
+        self.selecting = true;
+        self.renderer.set_selection(self.sel.clone());
+    }
+
+    /// Extend the in-progress selection to a logical-px point (drag).
+    fn extend_selection(&mut self, x: f64, y: f64) {
+        let Some((sid, row, col)) = self.pixel_to_cell(x, y) else {
+            return;
+        };
+        if let Some((ssid, selection)) = self.sel.as_mut() {
+            if *ssid == sid {
+                selection.update(Point::new(row, col));
+                self.renderer.set_selection(self.sel.clone());
+            }
+        }
+    }
+
+    /// Clear any selection.
+    fn clear_selection(&mut self) {
+        if self.sel.is_some() {
+            self.sel = None;
+            self.selecting = false;
+            self.renderer.set_selection(None);
+        }
+    }
+
+    /// Copy the current selection's text to the OS clipboard (Cmd+C).
+    fn copy_selection(&mut self) {
+        if let Some(text) = self.renderer.selected_text() {
+            if let Some(cb) = self.clipboard.as_mut() {
+                if let Err(e) = cb.set_text(text) {
+                    eprintln!("[ember] clipboard copy failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Paste the OS clipboard into the focused pane's PTY (Cmd+V). Non-bracketed
+    /// for v1 — bracketed-paste mode isn't surfaced across the seam yet (see bead).
+    fn paste_clipboard(&mut self) {
+        let text = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
+        if let Some(text) = text {
+            if !text.is_empty() {
+                self.send_to_focused(text.into_bytes());
             }
         }
     }
@@ -1096,6 +1257,9 @@ fn help_lines() -> Vec<(String, String)> {
         ("Cmd+Arrows", "Focus pane"),
         ("Cmd+Shift+Arrows", "Switch tab"),
         ("Cmd+1..9", "Jump to tab"),
+        ("Drag / 2×/3× click", "Select text / word / line"),
+        ("Cmd+C / Cmd+V", "Copy selection / paste"),
+        ("Cmd+,", "Settings"),
         ("Cmd+/", "Show this help"),
     ]
     .iter()

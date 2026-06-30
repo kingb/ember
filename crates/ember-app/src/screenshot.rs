@@ -46,6 +46,10 @@ pub struct Opts {
     pub bg_image: Option<String>,
     /// Backdrop image fit: `cover` | `contain` | `stretch` | `tile`.
     pub bg_fit: String,
+    /// A selection to highlight on the active pane: `(r1, c1, r2, c2)`.
+    pub select: Option<(u16, u16, u16, u16)>,
+    /// Selection mode: `simple` | `word` | `line`.
+    pub select_mode: String,
 }
 
 impl Default for Opts {
@@ -64,6 +68,8 @@ impl Default for Opts {
             ember_phase: 1.4,
             bg_image: None,
             bg_fit: "cover".to_string(),
+            select: None,
+            select_mode: "simple".to_string(),
         }
     }
 }
@@ -105,6 +111,19 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             }
             "--bg-image" => opts.bg_image = Some(next()?),
             "--bg-fit" => opts.bg_fit = next()?,
+            "--select" => {
+                let v = next()?;
+                let nums: Vec<u16> = v
+                    .split(',')
+                    .map(|s| s.trim().parse())
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| format!("--select expects r1,c1,r2,c2: {e}"))?;
+                if nums.len() != 4 {
+                    return Err("--select expects r1,c1,r2,c2".to_string());
+                }
+                opts.select = Some((nums[0], nums[1], nums[2], nums[3]));
+            }
+            "--select-mode" => opts.select_mode = next()?,
             _ => {}
         }
         i += 1;
@@ -210,12 +229,26 @@ pub fn run(opts: Opts) -> Result<String, String> {
 
     // Capture.
     let focus_session = tree.tabs[0].root.session_of(tree.tabs[0].focus).cloned();
+    let selection = opts.select.map(|(r1, c1, r2, c2)| {
+        let mode = match opts.select_mode.as_str() {
+            "word" => ember_render::SelectionMode::Word,
+            "line" => ember_render::SelectionMode::Line,
+            _ => ember_render::SelectionMode::Simple,
+        };
+        let mut s = ember_render::Selection::new(ember_render::Point::new(r1, c1), mode);
+        s.update(ember_render::Point::new(r2, c2));
+        s
+    });
     let shots: Vec<PaneShot> = panes
         .iter()
-        .map(|(sid, _, grid, rect)| PaneShot {
-            grid,
-            rect: *rect,
-            focused: Some(sid) == focus_session.as_ref(),
+        .map(|(sid, _, grid, rect)| {
+            let focused = Some(sid) == focus_session.as_ref();
+            PaneShot {
+                grid,
+                rect: *rect,
+                focused,
+                selection: if focused { selection } else { None },
+            }
         })
         .collect();
     let tabs: Vec<TabLabel> = tree

@@ -38,6 +38,13 @@ pub enum ControlMsg {
     About,
     /// Toggle the Settings overlay (the menu item isn't injectable in tests).
     Settings,
+    /// Set a selection on the focused pane: `(r1, c1, r2, c2, mode)` where mode is
+    /// `simple` | `word` | `line`.
+    Select(u16, u16, u16, u16, String),
+    /// Copy the current selection to the clipboard.
+    Copy,
+    /// Paste the given text into the focused pane (as if from the clipboard).
+    Paste(String),
 }
 
 #[cfg(unix)]
@@ -171,6 +178,25 @@ mod unix {
                 let _ = tx.send(ControlMsg::Settings);
                 ok()
             }
+            "select" => {
+                let g = |k| v.get(k).and_then(Value::as_u64).unwrap_or(0) as u16;
+                let mode = v
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("simple")
+                    .to_string();
+                let _ = tx.send(ControlMsg::Select(g("r1"), g("c1"), g("r2"), g("c2"), mode));
+                ok()
+            }
+            "copy" => {
+                let _ = tx.send(ControlMsg::Copy);
+                ok()
+            }
+            "paste" => {
+                let text = v.get("text").and_then(Value::as_str).unwrap_or("");
+                let _ = tx.send(ControlMsg::Paste(text.to_string()));
+                ok()
+            }
             other => err(&format!("unknown cmd: {other}")),
         }
     }
@@ -298,9 +324,16 @@ mod unix {
             }
             "about" => serde_json::json!({"cmd":"about"}),
             "settings" => serde_json::json!({"cmd":"settings"}),
+            "select" => {
+                let g = |i: usize| rest.get(i).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                let mode = rest.get(5).map(|s| s.as_str()).unwrap_or("simple");
+                serde_json::json!({"cmd":"select","r1":g(1),"c1":g(2),"r2":g(3),"c2":g(4),"mode":mode})
+            }
+            "copy" => serde_json::json!({"cmd":"copy"}),
+            "paste" => serde_json::json!({"cmd":"paste","text": unescape(arg)}),
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot|click|about|settings)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot|click|about|settings|select|copy|paste)"
                 ));
             }
         };
