@@ -29,6 +29,9 @@ pub enum ControlMsg {
     Chord(String),
     /// Request a JSON state dump; the main thread replies on the channel.
     State(Sender<String>),
+    /// Capture the live window to a PNG at the given path; reply is the full
+    /// JSON response line (`{"ok":true,"path":..}` / `{"ok":false,"error":..}`).
+    Screenshot(String, Sender<String>),
 }
 
 #[cfg(unix)]
@@ -131,6 +134,21 @@ mod unix {
                 match reply_rx.recv_timeout(Duration::from_secs(2)) {
                     Ok(state) => format!("{{\"ok\":true,\"state\":{state}}}"),
                     Err(_) => err("state timeout"),
+                }
+            }
+            "screenshot" => {
+                let path = v
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("/tmp/ember-live.png")
+                    .to_string();
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if tx.send(ControlMsg::Screenshot(path, reply_tx)).is_err() {
+                    return err("event loop gone");
+                }
+                match reply_rx.recv_timeout(Duration::from_secs(15)) {
+                    Ok(resp) => resp, // main builds the full JSON response.
+                    Err(_) => err("screenshot timeout"),
                 }
             }
             other => err(&format!("unknown cmd: {other}")),
@@ -245,9 +263,17 @@ mod unix {
             "key" => serde_json::json!({"cmd":"key","name": arg}),
             "chord" => serde_json::json!({"cmd":"chord","keys": arg}),
             "state" => serde_json::json!({"cmd":"state"}),
+            "screenshot" => {
+                let path = if arg.is_empty() {
+                    "/tmp/ember-live.png"
+                } else {
+                    arg
+                };
+                serde_json::json!({"cmd":"screenshot","path": path})
+            }
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot)"
                 ));
             }
         };

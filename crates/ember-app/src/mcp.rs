@@ -109,6 +109,11 @@ fn tools() -> Value {
                 "tabs": {"type": "integer"},
                 "run": {"type": "string"}
             }}
+        },
+        {
+            "name": "ember_live_screenshot",
+            "description": "Capture the CURRENT on-screen state of a running ember-term to a PNG (pixel-identical to the window) and return the path to read. Args: path (default /tmp/ember-live.png), plus pid/sock to target an instance.",
+            "inputSchema": {"type": "object", "properties": with(target_props(), "path", json!({"type": "string"}))}
         }
     ])
 }
@@ -189,6 +194,16 @@ fn tools_call(params: Option<&Value>) -> Result<Value, String> {
             Ok(text(format!(
                 "wrote {path} — read this file to view the render"
             )))
+        }
+        "ember_live_screenshot" => {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("/tmp/ember-live.png");
+            Ok(text(send(
+                &args,
+                json!({"cmd": "screenshot", "path": path}),
+            )?))
         }
         other => Err(format!("unknown tool: {other}")),
     }

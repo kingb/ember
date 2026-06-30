@@ -395,6 +395,13 @@ impl RunState {
             ControlMsg::State(reply) => {
                 let _ = reply.send(self.state_json());
             }
+            ControlMsg::Screenshot(path, reply) => {
+                let resp = match self.renderer.capture_to_png(std::path::Path::new(&path)) {
+                    Ok(()) => serde_json::json!({"ok": true, "path": path}).to_string(),
+                    Err(e) => serde_json::json!({"ok": false, "error": e}).to_string(),
+                };
+                let _ = reply.send(resp);
+            }
         }
     }
 

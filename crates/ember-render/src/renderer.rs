@@ -9,6 +9,7 @@
 //! draws what it is told and routes deltas to the right pane.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use ember_core::{GridDelta, GridDims, Rect, Rgb, SessionId};
@@ -428,6 +429,35 @@ impl Renderer {
     /// Drop a session's grid (its shell exited or its pane was closed).
     pub fn remove_pane(&mut self, session: &SessionId) {
         self.panes.remove(session);
+    }
+
+    /// Capture the **current on-screen scene** to a PNG (debug control surface).
+    /// Renders the live grids through the same headless path used by `--screenshot`,
+    /// so the PNG is pixel-identical to the window. Builds a throwaway offscreen GPU
+    /// context (no surface read-back needed).
+    pub fn capture_to_png(&self, path: &Path) -> Result<(), String> {
+        let sf = self.window.scale_factor() as f32;
+        let panes: Vec<crate::headless::PaneShot> = self
+            .visible
+            .iter()
+            .filter_map(|vp| {
+                self.panes
+                    .get(&vp.session)
+                    .map(|p| crate::headless::PaneShot {
+                        grid: &p.grid,
+                        rect: vp.rect,
+                        focused: self.focused.as_ref() == Some(&vp.session),
+                    })
+            })
+            .collect();
+        let shot = crate::headless::Shot {
+            logical_w: self.config.width as f32 / sf,
+            logical_h: self.config.height as f32 / sf,
+            scale: sf,
+            panes,
+            tabs: self.tabs.clone(),
+        };
+        crate::headless::capture(&shot, path)
     }
 
     /// A read-only snapshot of a pane's grid — for the debug control surface. The
