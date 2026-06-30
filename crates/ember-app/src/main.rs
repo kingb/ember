@@ -234,9 +234,13 @@ impl ApplicationHandler for App {
                 if key.state != ElementState::Pressed {
                     return;
                 }
-                // While the cheat-sheet overlay is up, any key dismisses it.
+                // While the cheat-sheet overlay is up, the next *fresh* key press
+                // dismisses it. Auto-repeat is ignored — otherwise holding Cmd+/ for
+                // even a moment repeats "/" and closes the overlay right after it opens.
                 if state.help {
-                    state.hide_help();
+                    if !key.repeat {
+                        state.hide_help();
+                    }
                     return;
                 }
                 let mods = state.modifiers;
