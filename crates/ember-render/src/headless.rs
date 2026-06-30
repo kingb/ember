@@ -21,7 +21,8 @@ use wgpu::{
 use crate::grid_model::GridModel;
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
-    BG, CELL_HEIGHT, FG, FONT_SIZE, HELP_PAD, LINE_HEIGHT, PAD, TabLabel, build_help, build_tabs,
+    ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, AboutLayout, BG, CELL_HEIGHT, FG,
+    FONT_SIZE, HELP_PAD, LINE_HEIGHT, PAD, TabLabel, build_about, build_help, build_tabs,
     grid_quads, measure_cell_width, shape_grid,
 };
 
@@ -42,6 +43,8 @@ pub struct Shot<'a> {
     pub tabs: Vec<TabLabel>,
     /// When set, the cheat-sheet overlay is drawn instead of the panes.
     pub help: Option<Vec<(String, String)>>,
+    /// When set, the About overlay is drawn (with the given glow intensity).
+    pub about: Option<(AboutInfo, f32)>,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
@@ -111,10 +114,30 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
     let mut buffers: Vec<Buffer> = Vec::new();
     let mut help_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut chrome = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut about_title = Buffer::new(
+        &mut font_system,
+        Metrics::new(ABOUT_TITLE_SIZE, ABOUT_TITLE_LINE),
+    );
+    let mut about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut help_panel: Option<Rect> = None;
+    let mut about_layout: Option<AboutLayout> = None;
 
-    if let Some(lines) = &shot.help {
+    if let Some((info, glow)) = &shot.about {
+        // About overlay replaces the panes (same helper as on-screen).
+        about_layout = Some(build_about(
+            &mut font_system,
+            &mut about_title,
+            &mut about_body,
+            info,
+            *glow,
+            cw,
+            shot.logical_w,
+            shot.logical_h,
+            sf,
+            &mut rects,
+        ));
+    } else if let Some(lines) = &shot.help {
         // Cheat-sheet overlay replaces the panes (same helper as on-screen).
         help_panel = Some(build_help(
             &mut font_system,
@@ -170,7 +193,26 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
     );
 
     let mut areas: Vec<TextArea> = Vec::new();
-    if let Some(panel) = help_panel {
+    if let Some(layout) = &about_layout {
+        areas.push(TextArea {
+            buffer: &about_title,
+            left: layout.title_left * sf,
+            top: layout.title_top * sf,
+            scale: sf,
+            bounds: full_bounds,
+            default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
+            custom_glyphs: &[],
+        });
+        areas.push(TextArea {
+            buffer: &about_body,
+            left: 0.0,
+            top: layout.body_top * sf,
+            scale: sf,
+            bounds: full_bounds,
+            default_color: Color::rgb(FG.r, FG.g, FG.b),
+            custom_glyphs: &[],
+        });
+    } else if let Some(panel) = help_panel {
         areas.push(TextArea {
             buffer: &help_buf,
             left: (panel.x as f32 + HELP_PAD) * sf,

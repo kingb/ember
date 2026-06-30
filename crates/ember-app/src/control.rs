@@ -34,6 +34,8 @@ pub enum ControlMsg {
     Screenshot(String, Sender<String>),
     /// Left-click at logical `(x, y)` — for driving tabs/UI in tests.
     Click(f64, f64),
+    /// Toggle the About overlay (the menu item isn't injectable in tests).
+    About,
 }
 
 #[cfg(unix)]
@@ -157,6 +159,10 @@ mod unix {
                 let x = v.get("x").and_then(Value::as_f64).unwrap_or(0.0);
                 let y = v.get("y").and_then(Value::as_f64).unwrap_or(0.0);
                 let _ = tx.send(ControlMsg::Click(x, y));
+                ok()
+            }
+            "about" => {
+                let _ = tx.send(ControlMsg::About);
                 ok()
             }
             other => err(&format!("unknown cmd: {other}")),
@@ -284,9 +290,10 @@ mod unix {
                 let y: f64 = rest.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
                 serde_json::json!({"cmd":"click","x": x, "y": y})
             }
+            "about" => serde_json::json!({"cmd":"about"}),
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot|click)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot|click|about)"
                 ));
             }
         };

@@ -11,7 +11,7 @@ pub mod renderer;
 
 pub use grid_model::GridModel;
 pub use renderer::{
-    CELL_HEIGHT, CELL_WIDTH, PaneSnapshot, Renderer, TabHit, TabLabel, VisiblePane,
+    AboutInfo, CELL_HEIGHT, CELL_WIDTH, PaneSnapshot, Renderer, TabHit, TabLabel, VisiblePane,
 };
 
 /// Returns the `ember-core` version this render layer is built against.

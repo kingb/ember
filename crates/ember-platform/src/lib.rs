@@ -5,6 +5,9 @@
 //! effect seam — clipboard, open-path/URL, hotkey — with `LinuxBackend` and
 //! `MacBackend` as co-equal v1 targets (the deep AppKit polish is deferred).
 
+pub mod menu;
+pub use menu::{AppMenu, MenuAction, build_menu, menu_action};
+
 use winit::dpi::LogicalSize;
 use winit::window::{Window, WindowAttributes};
 

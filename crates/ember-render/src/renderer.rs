@@ -43,6 +43,11 @@ pub(crate) const FG: Rgb = Rgb::new(0xcc, 0xcc, 0xcc);
 pub(crate) const ACCENT: Rgb = Rgb::new(0xe2, 0x5a, 0x1c);
 /// Inner padding of the help (cheat-sheet) overlay panel, in logical px.
 pub(crate) const HELP_PAD: f32 = 16.0;
+/// Amber the ember glow brightens toward at peak intensity.
+pub(crate) const AMBER: Rgb = Rgb::new(0xff, 0x9d, 0x3c);
+/// About-page wordmark font size (logical px).
+pub(crate) const ABOUT_TITLE_SIZE: f32 = 46.0;
+pub(crate) const ABOUT_TITLE_LINE: f32 = 54.0;
 
 /// One visible pane: which session fills it and the inner pixel rect it occupies
 /// (already inset for padding by the app).
@@ -57,6 +62,15 @@ pub struct VisiblePane {
 pub struct TabLabel {
     pub title: String,
     pub active: bool,
+}
+
+/// Static content for the About overlay (the animated glow is separate).
+#[derive(Clone, Debug)]
+pub struct AboutInfo {
+    /// Large wordmark (e.g. "ember").
+    pub title: String,
+    /// Centered lines below the wordmark (tagline, version, license, authors).
+    pub lines: Vec<String>,
 }
 
 /// What the tab strip was clicked on (from [`Renderer::tab_hit`]).
@@ -106,6 +120,13 @@ pub(crate) fn measure_cell_width(font_system: &mut FontSystem) -> f32 {
         }
     }
     FONT_SIZE * 0.6
+}
+
+/// Linear interpolation between two sRGB colors (`t` clamped to `[0,1]`).
+pub(crate) fn lerp_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Rgb::new(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b))
 }
 
 /// sRGB `Rgb` + alpha → linear RGBA for the sRGB surface target.
@@ -379,6 +400,13 @@ pub struct Renderer {
     help: Option<Vec<(String, String)>>,
     /// Glyph buffer for the help overlay.
     help_buffer: Buffer,
+    /// When `Some`, the About overlay is shown.
+    about: Option<AboutInfo>,
+    /// Animated ember-glow intensity for the About overlay, in `[0, 1]`.
+    about_glow: f32,
+    /// Large wordmark buffer + body-lines buffer for the About overlay.
+    about_title: Buffer,
+    about_body: Buffer,
     /// Measured monospace advance (px) — keeps bg quads aligned with glyphs.
     cell_w: f32,
     // Keep the window LAST so it drops after the surface (winit/wgpu requirement).
@@ -444,6 +472,11 @@ impl Renderer {
         let mut chrome = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         chrome.set_size(&mut font_system, Some(width as f32), Some(LINE_HEIGHT));
         let help_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let about_title = Buffer::new(
+            &mut font_system,
+            Metrics::new(ABOUT_TITLE_SIZE, ABOUT_TITLE_LINE),
+        );
+        let about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
 
         let cell_w = measure_cell_width(&mut font_system);
         let quads = QuadRenderer::new(&device, format);
@@ -466,6 +499,10 @@ impl Renderer {
             chrome,
             help: None,
             help_buffer,
+            about: None,
+            about_glow: 0.0,
+            about_title,
+            about_body,
             cell_w,
             window,
         }
@@ -542,6 +579,7 @@ impl Renderer {
             panes,
             tabs: self.tabs.clone(),
             help: self.help.clone(),
+            about: self.about.clone().map(|i| (i, self.about_glow)),
         };
         crate::headless::capture(&shot, path)
     }
@@ -638,6 +676,22 @@ impl Renderer {
         self.help.is_some()
     }
 
+    /// Show the About overlay with this content, or hide it with `None`.
+    pub fn set_about(&mut self, info: Option<AboutInfo>) {
+        self.about = info;
+        self.window.request_redraw();
+    }
+
+    /// Whether the About overlay is shown.
+    pub fn about_visible(&self) -> bool {
+        self.about.is_some()
+    }
+
+    /// Update the animated ember-glow intensity (`[0,1]`) for the About overlay.
+    pub fn set_about_glow(&mut self, glow: f32) {
+        self.about_glow = glow.clamp(0.0, 1.0);
+    }
+
     /// Build the help overlay using this renderer's buffer (wrapper over the shared
     /// [`build_help`] so the windowed + headless paths render it identically).
     fn build_help_quads(&mut self, sf: f32, rects: &mut Vec<([f32; 4], [f32; 4])>) -> Rect {
@@ -682,7 +736,41 @@ impl Renderer {
         let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
         let mut areas: Vec<TextArea> = Vec::new();
 
-        if self.help.is_some() {
+        if let Some(info) = self.about.clone() {
+            // Modal About page: scrim + animated ember glow + wordmark + info.
+            let logical_w = self.config.width as f32 / sf;
+            let logical_h = self.config.height as f32 / sf;
+            let layout = build_about(
+                &mut self.font_system,
+                &mut self.about_title,
+                &mut self.about_body,
+                &info,
+                self.about_glow,
+                self.cell_w,
+                logical_w,
+                logical_h,
+                sf,
+                &mut rects,
+            );
+            areas.push(TextArea {
+                buffer: &self.about_title,
+                left: layout.title_left * sf,
+                top: layout.title_top * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
+                custom_glyphs: &[],
+            });
+            areas.push(TextArea {
+                buffer: &self.about_body,
+                left: 0.0,
+                top: layout.body_top * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(FG.r, FG.g, FG.b),
+                custom_glyphs: &[],
+            });
+        } else if self.help.is_some() {
             // Modal cheat-sheet: a scrim + centered panel + the key list, drawn
             // instead of the panes (fully obscured so the text stays legible).
             let panel = self.build_help_quads(sf, &mut rects);
@@ -877,6 +965,127 @@ impl Renderer {
         frame.present();
         self.atlas.trim();
         true
+    }
+}
+
+/// Text-placement result from [`build_about`] (logical px; title is centered).
+pub(crate) struct AboutLayout {
+    pub title_left: f32,
+    pub title_top: f32,
+    pub body_top: f32,
+}
+
+/// Build the About overlay: a dark scrim, a pulsing ember-glow halo behind the
+/// wordmark, the centered wordmark (shaped into `title_buf`), and centered body
+/// lines (shaped into `body_buf`). `glow ∈ [0,1]` animates the halo + title heat.
+/// Pushes quads to `out`; returns where to place the two text areas. Shared by the
+/// windowed renderer and headless capture so they render identically.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_about(
+    font_system: &mut FontSystem,
+    title_buf: &mut Buffer,
+    body_buf: &mut Buffer,
+    info: &AboutInfo,
+    glow: f32,
+    cw: f32,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) -> AboutLayout {
+    // Scrim — fully obscure the terminal behind the modal.
+    out.push((
+        scaled(0.0, 0.0, logical_w, logical_h, sf),
+        lin_rgba(Rgb::new(0, 0, 0), 0.86),
+    ));
+
+    let title_h = ABOUT_TITLE_LINE;
+    let gap = 22.0;
+    let content_h = title_h + gap + info.lines.len() as f32 * LINE_HEIGHT;
+    let top = ((logical_h - content_h) * 0.5).max(0.0);
+    let title_top = top;
+    let body_top = top + title_h + gap;
+    let cx = logical_w * 0.5;
+    let glow_cy = title_top + title_h * 0.5;
+
+    // Ember-glow halo: many concentric centered quads from large+faint (outer) to
+    // small+bright (inner). Overlapping alpha accumulates toward the center, so the
+    // hard rectangle edges blur into a soft warm gradient. Pulses with `glow`.
+    const RINGS: usize = 14;
+    let base_w = logical_w.min(640.0) * 0.78;
+    let base_h = title_h * 3.1;
+    for k in 0..RINGS {
+        let f = k as f32 / (RINGS as f32 - 1.0); // 0 = outer, 1 = inner
+        let w = base_w * (1.0 - 0.74 * f);
+        let h = base_h * (1.0 - 0.66 * f);
+        let alpha = (0.035 + 0.075 * f) * glow; // cumulative across rings
+        let color = lerp_rgb(ACCENT, AMBER, f);
+        out.push((
+            scaled(cx - w * 0.5, glow_cy - h * 0.5, w, h, sf),
+            lin_rgba(color, alpha),
+        ));
+    }
+
+    // Wordmark — heat from amber toward near-white at peak glow; centered.
+    title_buf.set_size(font_system, Some(logical_w), Some(title_h));
+    let tc = lerp_rgb(AMBER, Rgb::new(0xff, 0xe6, 0xc2), glow);
+    let base = Attrs::new().family(Family::Monospace);
+    title_buf.set_rich_text(
+        font_system,
+        [(
+            info.title.as_str(),
+            Attrs::new()
+                .family(Family::Monospace)
+                .color(Color::rgb(tc.r, tc.g, tc.b)),
+        )],
+        &base,
+        Shaping::Advanced,
+        None,
+    );
+    title_buf.shape_until_scroll(font_system, false);
+    let title_w = title_buf
+        .layout_runs()
+        .next()
+        .map(|r| r.line_w)
+        .unwrap_or(0.0);
+    let title_left = ((logical_w - title_w) * 0.5).max(0.0);
+
+    // Body lines — centered per line via leading spaces (monospace). Line 0 (the
+    // tagline) in amber, the rest dimmed.
+    body_buf.set_size(font_system, Some(logical_w), Some(logical_h));
+    let total_cols = (logical_w / cw).floor() as usize;
+    let mut spans: Vec<(String, Color)> = Vec::new();
+    let last = info.lines.len().saturating_sub(1);
+    for (i, line) in info.lines.iter().enumerate() {
+        let pad = total_cols.saturating_sub(line.chars().count()) / 2;
+        let centered = format!("{}{}", " ".repeat(pad), line);
+        let text = if i < last {
+            format!("{centered}\n")
+        } else {
+            centered
+        };
+        let color = if i == 0 {
+            Color::rgb(AMBER.r, AMBER.g, AMBER.b)
+        } else {
+            Color::rgb(0xaa, 0xaa, 0xaa)
+        };
+        spans.push((text, color));
+    }
+    body_buf.set_rich_text(
+        font_system,
+        spans
+            .iter()
+            .map(|(t, c)| (t.as_str(), Attrs::new().family(Family::Monospace).color(*c))),
+        &base,
+        Shaping::Advanced,
+        None,
+    );
+    body_buf.shape_until_scroll(font_system, false);
+
+    AboutLayout {
+        title_left,
+        title_top,
+        body_top,
     }
 }
 

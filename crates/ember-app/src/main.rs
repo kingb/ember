@@ -12,7 +12,6 @@
 mod control;
 #[cfg(unix)]
 mod mcp;
-mod menu;
 mod screenshot;
 
 use std::collections::HashMap;
@@ -26,6 +25,7 @@ use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, Direction, GridDims, LayoutCommand,
     LayoutEffect, LayoutNode, PaneId, Rect, SessionBackend, SessionId, Tab, TabId, apply, layout,
 };
+use ember_platform::MenuAction;
 use ember_render::{CELL_HEIGHT, CELL_WIDTH, Renderer, TabHit, TabLabel, VisiblePane};
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
@@ -43,6 +43,8 @@ const DEFAULT_ROWS: u16 = 24;
 /// How often the loop polls the pixel lanes when idle (~125 Hz). A proxy-waker on
 /// frame push is the noted refinement; this keeps CPU sane without it.
 const POLL: Duration = Duration::from_millis(8);
+/// Redraw cadence (~60fps) while an animation (e.g. the About glow) is active.
+const ANIM_FRAME: Duration = Duration::from_millis(16);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -151,8 +153,11 @@ struct RunState {
     control_rx: Option<Receiver<ControlMsg>>,
     /// Whether the keyboard cheat-sheet overlay is showing.
     help: bool,
+    /// Whether the About overlay is showing, and when it opened (for the glow clock).
+    about: bool,
+    about_since: Instant,
     /// Native menu bar (macOS); inert elsewhere. Kept alive for the app's life.
-    menu: menu::AppMenu,
+    menu: ember_platform::AppMenu,
     /// Last cursor position in **logical** px.
     cursor: (f64, f64),
 }
@@ -214,7 +219,9 @@ impl ApplicationHandler for App {
             next_tab: 2,
             control_rx: self.control_rx.take(),
             help: false,
-            menu: menu::build(),
+            about: false,
+            about_since: Instant::now(),
+            menu: ember_platform::build_menu(),
             cursor: (0.0, 0.0),
         };
         state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
@@ -250,12 +257,12 @@ impl ApplicationHandler for App {
                 if key.state != ElementState::Pressed {
                     return;
                 }
-                // While the cheat-sheet overlay is up, the next *fresh* key press
-                // dismisses it. Auto-repeat is ignored — otherwise holding Cmd+/ for
-                // even a moment repeats "/" and closes the overlay right after it opens.
-                if state.help {
+                // While a modal overlay (help / About) is up, the next *fresh* key
+                // press dismisses it. Auto-repeat is ignored — otherwise holding
+                // Cmd+/ for a moment repeats "/" and closes it right after it opens.
+                if state.help || state.about {
                     if !key.repeat {
-                        state.hide_help();
+                        state.dismiss_overlay();
                     }
                     return;
                 }
@@ -331,20 +338,33 @@ impl ApplicationHandler for App {
         for cmd in cmds {
             state.handle_control(cmd, event_loop);
         }
-        // Native Help > Keyboard Shortcuts menu item (macOS) toggles the overlay.
-        if menu::take_shortcuts_event(&state.menu) {
-            state.toggle_help();
+        // Native menu items (macOS) → semantic actions.
+        if let Some(action) = ember_platform::menu_action(&state.menu) {
+            match action {
+                MenuAction::ShowShortcuts => state.toggle_help(),
+                MenuAction::About => state.toggle_about(),
+            }
         }
         if state.tree.tabs.is_empty() {
             state.shutdown_all();
             event_loop.exit();
             return;
         }
+        let now = Instant::now();
+        // Animate the About overlay's ember glow while it's open: push a fresh glow
+        // scalar and redraw every frame (the renderer stays a pure consumer).
+        if state.about {
+            let t = now.duration_since(state.about_since).as_secs_f32();
+            state.renderer.set_about_glow(ember_glow(t));
+            state.renderer.window().request_redraw();
+        }
         // Poll the pixel lanes; redraw only when something changed.
         if state.drain_frames() {
             state.renderer.window().request_redraw();
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
+        // ~60fps while animating, else the idle poll.
+        let wait = if state.about { ANIM_FRAME } else { POLL };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(now + wait));
     }
 }
 
@@ -413,11 +433,11 @@ impl RunState {
     /// Act on a debug-control command (see `control`): inject text/keys, run a
     /// chord, or reply with a JSON state dump.
     fn handle_control(&mut self, msg: ControlMsg, event_loop: &ActiveEventLoop) {
-        // Mirror the keyboard: while the cheat-sheet is up, any input dismisses it
+        // Mirror the keyboard: while a modal overlay is up, any input dismisses it
         // (but state/screenshot still work, so the overlay can be inspected).
-        if self.help {
+        if self.help || self.about {
             if let ControlMsg::Type(_) | ControlMsg::Key(_) | ControlMsg::Chord(_) = &msg {
-                self.hide_help();
+                self.dismiss_overlay();
                 return;
             }
         }
@@ -456,6 +476,7 @@ impl RunState {
                 self.cursor = (x, y);
                 self.left_click();
             }
+            ControlMsg::About => self.toggle_about(),
         }
     }
 
@@ -706,17 +727,17 @@ impl RunState {
         true
     }
 
-    /// Show the keyboard cheat-sheet overlay.
+    /// Show the keyboard cheat-sheet overlay (closing About — they're exclusive).
     fn show_help(&mut self) {
+        self.hide_about();
         self.help = true;
         self.renderer.set_help(Some(help_lines()));
     }
 
-    /// Handle a left click at the current cursor position: dismiss the overlay if
-    /// shown, else hit-test the tab strip (switch tab / open a new tab).
+    /// Handle a left click at the current cursor position: dismiss an open overlay,
+    /// else hit-test the tab strip (switch tab / open a new tab).
     fn left_click(&mut self) {
-        if self.help {
-            self.hide_help();
+        if self.dismiss_overlay() {
             return;
         }
         let (x, y) = self.cursor;
@@ -743,6 +764,39 @@ impl RunState {
             self.help = false;
             self.renderer.set_help(None);
         }
+    }
+
+    /// Show the About overlay (closing the cheat-sheet — they're exclusive).
+    fn show_about(&mut self) {
+        self.hide_help();
+        self.about = true;
+        self.about_since = Instant::now();
+        self.renderer.set_about(Some(about_info()));
+    }
+
+    /// Hide the About overlay (no-op if not shown).
+    fn hide_about(&mut self) {
+        if self.about {
+            self.about = false;
+            self.renderer.set_about(None);
+        }
+    }
+
+    /// Toggle the About overlay (the Ember → About Ember menu item).
+    fn toggle_about(&mut self) {
+        if self.about {
+            self.hide_about();
+        } else {
+            self.show_about();
+        }
+    }
+
+    /// Dismiss whichever modal overlay is open; returns whether one was showing.
+    fn dismiss_overlay(&mut self) -> bool {
+        let shown = self.help || self.about;
+        self.hide_help();
+        self.hide_about();
+        shown
     }
 
     /// Jump to tab `n` (1-based); no-op if out of range.
@@ -785,7 +839,30 @@ impl RunState {
     }
 }
 
-/// The keyboard cheat-sheet shown by the Cmd+? overlay. Keep in sync with
+/// Content for the About overlay.
+fn about_info() -> ember_render::AboutInfo {
+    ember_render::AboutInfo {
+        title: "ember".to_string(),
+        lines: vec![
+            "a native terminal".to_string(),
+            String::new(),
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+            "MIT OR Apache-2.0".to_string(),
+            "Brandon W. King · Claude Opus 4.8".to_string(),
+        ],
+    }
+}
+
+/// Continuous ember-glow intensity `[0,1]` for the About overlay: a slow breathe
+/// with faster flicker overtones so it reads like a live, crackling ember.
+fn ember_glow(t: f32) -> f32 {
+    use std::f32::consts::TAU;
+    let breathe = 0.55 + 0.30 * (TAU * 0.45 * t).sin();
+    let flicker = 0.10 * (TAU * 3.1 * t).sin() + 0.05 * (TAU * 6.7 * t).sin();
+    (breathe + flicker).clamp(0.12, 1.0)
+}
+
+/// The keyboard cheat-sheet shown by the Cmd+/ overlay. Keep in sync with
 /// [`RunState::handle_shortcut`].
 fn help_lines() -> Vec<(String, String)> {
     [
