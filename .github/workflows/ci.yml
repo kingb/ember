@@ -38,3 +38,15 @@ jobs:
         run: cargo test --all --all-features
       - name: Bench (compile gate)
         run: cargo bench --all --no-run
+
+  licenses:
+    name: license gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Fails the build if any dependency's license falls outside the permissive
+      # allow-list in deny.toml — i.e. if anything copyleft/infectious (GPL/AGPL/…)
+      # ever sneaks in via a dependency bump. Policy lives in deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

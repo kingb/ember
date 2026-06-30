@@ -1,0 +1,43 @@
+# cargo-deny — license policy for Ember.
+#
+# Ember ships under `MIT OR Apache-2.0`, and Rust links statically, so a GPL/AGPL
+# dependency would be *infectious* (it would pull the whole binary under its terms).
+# This gate is deny-by-default: a crate passes only if its SPDX license expression
+# can be satisfied from the permissive allow-list below. Copyleft licenses
+# (GPL / LGPL / AGPL / MPL) are intentionally absent.
+#
+# Dual-licensed crates still pass via their permissive arm — e.g.
+# `Apache-2.0 OR GPL-2.0-only` is accepted because `Apache-2.0` is allowed, and
+# `MIT OR Apache-2.0 OR LGPL-2.1-or-later` via `MIT`. An `AND` expression (e.g.
+# `(MIT OR Apache-2.0) AND Unicode-3.0`) requires every atom to be allowed.
+#
+# Run locally: `cargo deny check licenses`
+
+[licenses]
+# Anything not satisfiable from this list fails the check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "0BSD",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Allowed by default; this section is here for future use (duplicate-version or
+# specific-crate bans). Not gated in CI today.
+multiple-versions = "allow"
+
+[advisories]
+# Security-advisory scanning is valuable but needs a network fetch of the RustSec
+# DB and can fail CI when a *new* advisory lands upstream. Kept out of the license
+# gate; wire `cargo deny check advisories` into a separate (non-blocking) job later.
+yanked = "warn"

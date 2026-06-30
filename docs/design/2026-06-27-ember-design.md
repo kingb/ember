@@ -27,6 +27,32 @@ start (cross-platform stack + own-drawn chrome make this nearly free; see §7). 
   (regex → action).
 - **Deferred:** instant replay; status bar (stretch); scripting API.
 
+### Design tenets
+
+Durable principles that outrank any single feature decision.
+
+**1. Discoverability over documentation.**
+
+*Problem:* it's frustrating to not know how to use a piece of software because you
+have to read the manual to figure out how to use it.
+
+*Therefore,* make every feature learnable at the **highest feasible rung** of this
+ladder, and only drop to a lower rung when the ones above are genuinely impossible:
+
+1. **Obvious in the UI** — the feature teaches itself by being used; a user can do the
+   thing without being told (Google-grade UX). *Always aim here first.*
+2. **Discoverable in-app** — when it can't be self-evident, surface *how* inside the
+   app: visible affordances and easy-to-find shortcuts. (The Cmd+/ shortcuts overlay
+   and the `?` button on the tab strip are the model — the shortcuts are findable, not
+   memorized from a manual.)
+3. **In-app tutorials** — teach in context: first-run hints, inline coach marks.
+4. **Video tutorials** — for flows that are inherently complex, show it.
+5. **Docs** — the last resort, never the first.
+
+"Add it to the docs" is not a substitute for making a feature discoverable. If a
+feature needs explaining, that's a signal to push it up the ladder, not to write more
+prose.
+
 ## 2. Architecture
 
 Layered, single-process. A future daemon/multi-process split is deferred, but its
