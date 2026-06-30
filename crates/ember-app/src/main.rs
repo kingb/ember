@@ -27,7 +27,9 @@ use ember_core::{
     LayoutEffect, LayoutNode, PaneId, Rect, SessionBackend, SessionId, Tab, TabId, apply, layout,
 };
 use ember_platform::MenuAction;
-use ember_render::{CELL_HEIGHT, CELL_WIDTH, Renderer, TabHit, TabLabel, VisiblePane};
+use ember_render::{
+    BackdropParams, CELL_HEIGHT, CELL_WIDTH, Renderer, TabHit, TabLabel, VisiblePane,
+};
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -161,6 +163,10 @@ struct RunState {
     config: Config,
     settings_open: bool,
     settings_sel: usize,
+    /// Backdrop animation clock + whether the window is focused (sparks pause when
+    /// unfocused, per the perf stance).
+    backdrop_since: Instant,
+    window_focused: bool,
     /// Native menu bar (macOS); inert elsewhere. Kept alive for the app's life.
     menu: ember_platform::AppMenu,
     /// Last cursor position in **logical** px.
@@ -229,6 +235,8 @@ impl ApplicationHandler for App {
             config: config::load(),
             settings_open: false,
             settings_sel: 0,
+            backdrop_since: Instant::now(),
+            window_focused: true,
             menu: ember_platform::build_menu(),
             cursor: (0.0, 0.0),
         };
@@ -251,6 +259,12 @@ impl ApplicationHandler for App {
                 state.px = (size.width.max(1), size.height.max(1));
                 state.renderer.resize(state.px.0, state.px.1);
                 state.sync_layout();
+            }
+            WindowEvent::Focused(focused) => {
+                state.window_focused = focused;
+                if focused {
+                    state.renderer.window().request_redraw();
+                }
             }
             WindowEvent::ModifiersChanged(mods) => state.modifiers = mods.state(),
             WindowEvent::CursorMoved { position, .. } => {
@@ -374,12 +388,25 @@ impl ApplicationHandler for App {
             state.renderer.set_about_anim(ember_glow(t), t);
             state.renderer.window().request_redraw();
         }
+        // Animate the campfire ember sparks (opt-in; paused when unfocused or under
+        // an overlay): advance the spark clock and redraw each frame.
+        let backdrop_anim = state.backdrop_animating();
+        if backdrop_anim {
+            let params =
+                state.backdrop_params(now.duration_since(state.backdrop_since).as_secs_f32());
+            state.renderer.set_backdrop(params);
+            state.renderer.window().request_redraw();
+        }
         // Poll the pixel lanes; redraw only when something changed.
         if state.drain_frames() {
             state.renderer.window().request_redraw();
         }
         // ~60fps while animating, else the idle poll.
-        let wait = if state.about { ANIM_FRAME } else { POLL };
+        let wait = if state.about || backdrop_anim {
+            ANIM_FRAME
+        } else {
+            POLL
+        };
         event_loop.set_control_flow(ControlFlow::WaitUntil(now + wait));
     }
 }
@@ -919,10 +946,34 @@ impl RunState {
         self.apply_appearance();
     }
 
-    /// Apply the current config's appearance to the renderer. (The backdrop/ember
-    /// rendering is wired in once the background pass lands; this is the hook.)
+    /// The backdrop params for the current config at animation time `t` seconds.
+    fn backdrop_params(&self, t: f32) -> BackdropParams {
+        let bg = &self.config.background;
+        BackdropParams {
+            gradient: bg.gradient,
+            scrim: bg.scrim,
+            sparks: bg.ember_sparks,
+            density: bg.ember_density,
+            time: t,
+        }
+    }
+
+    /// Push the current config's appearance (campfire backdrop + ember sparks) to
+    /// the renderer. Called on startup and whenever a setting changes.
     fn apply_appearance(&mut self) {
-        // TODO: self.renderer.set_backdrop(...) once the background pass merges.
+        let t = self.backdrop_since.elapsed().as_secs_f32();
+        let params = self.backdrop_params(t);
+        self.renderer.set_backdrop(params);
+    }
+
+    /// Whether the ember sparks should be animating right now (opt-in, only while
+    /// focused and no modal overlay is covering the panes).
+    fn backdrop_animating(&self) -> bool {
+        self.config.background.ember_sparks
+            && self.window_focused
+            && !self.help
+            && !self.about
+            && !self.settings_open
     }
 
     /// Jump to tab `n` (1-based); no-op if out of range.

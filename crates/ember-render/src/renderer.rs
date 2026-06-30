@@ -25,10 +25,11 @@ use wgpu::{
 };
 use winit::window::Window;
 
+use crate::background::SparkRenderer;
 use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, build_about, build_help, build_settings, build_tabs, debug_emit, grid_quads,
-    measure_cell_width, shape_grid,
+    measure_cell_width, push_backdrop, shape_grid, spark_quads,
 };
 
 pub(crate) const FONT_SIZE: f32 = 12.0;
@@ -75,6 +76,35 @@ pub struct AboutInfo {
     pub title: String,
     /// Centered lines below the wordmark (tagline, version, license, authors).
     pub lines: Vec<String>,
+}
+
+/// Campfire backdrop + ember-spark parameters. All off by default, so
+/// the terminal looks unchanged until enabled. The app updates `time` each frame
+/// (and should only animate — drive redraws — while `sparks` is on).
+#[derive(Clone, Copy, Debug)]
+pub struct BackdropParams {
+    /// Draw the warm vertical gradient behind the cells.
+    pub gradient: bool,
+    /// Darkening scrim over the backdrop for text legibility (`0.0`–`1.0`).
+    pub scrim: f32,
+    /// Draw the drifting, glowing ember sparks (additive).
+    pub sparks: bool,
+    /// Spark density multiplier (`1.0` ≈ 50 sparks).
+    pub density: f32,
+    /// Elapsed seconds, driving the spark animation.
+    pub time: f32,
+}
+
+impl Default for BackdropParams {
+    fn default() -> Self {
+        Self {
+            gradient: false,
+            scrim: 0.0,
+            sparks: false,
+            density: 1.0,
+            time: 0.0,
+        }
+    }
 }
 
 /// What the tab strip was clicked on (from [`Renderer::tab_hit`]).
@@ -146,6 +176,10 @@ pub struct Renderer {
     settings_buffer: Buffer,
     /// Measured monospace advance (px) — keeps bg quads aligned with glyphs.
     cell_w: f32,
+    /// Campfire backdrop + ember-spark settings (off by default).
+    backdrop: BackdropParams,
+    /// Additive pipeline for the glowing ember sparks.
+    sparks: SparkRenderer,
     // Keep the window LAST so it drops after the surface (winit/wgpu requirement).
     window: Arc<Window>,
 }
@@ -218,6 +252,7 @@ impl Renderer {
 
         let cell_w = measure_cell_width(&mut font_system);
         let quads = QuadRenderer::new(&device, format);
+        let sparks = SparkRenderer::new(&device, format);
 
         Self {
             device,
@@ -245,6 +280,8 @@ impl Renderer {
             settings: None,
             settings_buffer,
             cell_w,
+            backdrop: BackdropParams::default(),
+            sparks,
             window,
         }
     }
@@ -325,6 +362,7 @@ impl Renderer {
                 .clone()
                 .map(|i| (i, self.about_glow, self.about_time)),
             settings: self.settings.clone(),
+            backdrop: self.backdrop,
         };
         crate::headless::capture(&shot, path)
     }
@@ -455,6 +493,20 @@ impl Renderer {
         self.settings.is_some()
     }
 
+    /// Set the campfire backdrop + ember-spark parameters. All off by
+    /// default; the app updates this each frame (and should only drive continuous
+    /// redraws while `sparks` is on). Requests a redraw.
+    pub fn set_backdrop(&mut self, params: BackdropParams) {
+        self.backdrop = params;
+        self.window.request_redraw();
+    }
+
+    /// Whether an animated backdrop effect (sparks) is active — the app uses this
+    /// to decide whether to drive continuous redraws.
+    pub fn backdrop_animating(&self) -> bool {
+        self.backdrop.sparks
+    }
+
     /// Build the help overlay using this renderer's buffer (wrapper over the shared
     /// [`build_help`] so the windowed + headless paths render it identically).
     fn build_help_quads(&mut self, sf: f32, rects: &mut Vec<([f32; 4], [f32; 4])>) -> Rect {
@@ -497,6 +549,7 @@ impl Renderer {
             bottom: self.config.height as i32,
         };
         let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
+        let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
         let mut areas: Vec<TextArea> = Vec::new();
 
         if let Some((rows, selected)) = self.settings.clone() {
@@ -572,6 +625,20 @@ impl Renderer {
                 custom_glyphs: &[],
             });
         } else {
+            // Campfire backdrop (gradient + scrim) behind the cells — drawn first so
+            // empty cells (no bg quad) let it show through.
+            let logical_w = self.config.width as f32 / sf;
+            let logical_h = self.config.height as f32 / sf;
+            push_backdrop(&mut rects, &self.backdrop, logical_w, logical_h, sf);
+            if self.backdrop.sparks {
+                spark_rects = spark_quads(
+                    self.backdrop.density,
+                    self.backdrop.time,
+                    logical_w,
+                    logical_h,
+                    sf,
+                );
+            }
             // Pass 1: shape each visible pane's text into its own buffer.
             for vp in &self.visible {
                 if let Some(p) = self.panes.get_mut(&vp.session) {
@@ -635,6 +702,12 @@ impl Renderer {
             &self.queue,
             (self.config.width as f32, self.config.height as f32),
             &rects,
+        );
+        self.sparks.prepare(
+            &self.device,
+            &self.queue,
+            (self.config.width as f32, self.config.height as f32),
+            &spark_rects,
         );
         self.viewport.update(
             &self.queue,
@@ -745,6 +818,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             self.quads.draw(&mut pass);
+            self.sparks.draw(&mut pass);
             let _ = self
                 .text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass);

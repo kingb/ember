@@ -4,6 +4,7 @@
 //! memory. v1 renders monospace text via glyphon; per-cell color, the cursor
 //! quad, and the egui chrome overlay land in later epics.
 
+mod background;
 pub mod grid_model;
 pub mod headless;
 mod paint;
@@ -12,7 +13,8 @@ pub mod renderer;
 
 pub use grid_model::GridModel;
 pub use renderer::{
-    AboutInfo, CELL_HEIGHT, CELL_WIDTH, PaneSnapshot, Renderer, TabHit, TabLabel, VisiblePane,
+    AboutInfo, BackdropParams, CELL_HEIGHT, CELL_WIDTH, PaneSnapshot, Renderer, TabHit, TabLabel,
+    VisiblePane,
 };
 
 /// Returns the `ember-core` version this render layer is built against.
