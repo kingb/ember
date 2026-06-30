@@ -32,7 +32,7 @@ use ember_render::{
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::WindowId;
@@ -380,34 +380,41 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
-        let now = Instant::now();
-        // Animate the About overlay's ember glow while it's open: push a fresh glow
-        // scalar and redraw every frame (the renderer stays a pure consumer).
-        if state.about {
-            let t = now.duration_since(state.about_since).as_secs_f32();
-            state.renderer.set_about_anim(ember_glow(t), t);
-            state.renderer.window().request_redraw();
-        }
-        // Animate the campfire ember sparks (opt-in; paused when unfocused or under
-        // an overlay): advance the spark clock and redraw each frame.
-        let backdrop_anim = state.backdrop_animating();
-        if backdrop_anim {
-            let params =
-                state.backdrop_params(now.duration_since(state.backdrop_since).as_secs_f32());
-            state.renderer.set_backdrop(params);
-            state.renderer.window().request_redraw();
-        }
         // Poll the pixel lanes; redraw only when something changed.
         if state.drain_frames() {
             state.renderer.window().request_redraw();
         }
-        // ~60fps while animating, else the idle poll.
-        let wait = if state.about || backdrop_anim {
-            ANIM_FRAME
-        } else {
-            POLL
+        // Pace the loop: ~60fps while an animation is active, else the idle poll.
+        // The per-frame animation redraw is driven from `new_events` on the timer
+        // tick (not here) — that's the difference between sleeping between frames
+        // and spinning at full speed. Requesting a redraw *every* `about_to_wait`
+        // makes winit service it immediately, defeating `WaitUntil` (the CPU spike).
+        let animating = state.about || state.backdrop_animating();
+        let wait = if animating { ANIM_FRAME } else { POLL };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
+    }
+
+    /// Drive animations on the timer tick set by `about_to_wait`. This is the only
+    /// place that advances + redraws animations, so the loop genuinely sleeps
+    /// `ANIM_FRAME` between frames instead of busy-looping. The `set_*` calls
+    /// request the redraw internally; we don't request one every wait cycle.
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if !matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            return;
+        }
+        let Some(state) = self.state.as_mut() else {
+            return;
         };
-        event_loop.set_control_flow(ControlFlow::WaitUntil(now + wait));
+        let now = Instant::now();
+        if state.about {
+            let t = now.duration_since(state.about_since).as_secs_f32();
+            state.renderer.set_about_anim(ember_glow(t), t);
+        }
+        if state.backdrop_animating() {
+            let params =
+                state.backdrop_params(now.duration_since(state.backdrop_since).as_secs_f32());
+            state.renderer.set_backdrop(params);
+        }
     }
 }
 
