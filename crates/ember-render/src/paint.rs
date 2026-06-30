@@ -75,10 +75,15 @@ pub(crate) fn spark_quads(
             s - s.floor()
         };
         let seed = hash(12.9898, 4.1);
-        let seed2 = hash(78.233, 1.7);
-        let life = 2.5 + seed * 2.5;
-        let phase = ((t / life) + seed).fract(); // 0 = born at bottom, 1 = gone at top
-        let base_x = seed2 * logical_w;
+        // Stratify the phase offset evenly across the cycle (`i/n` + a little
+        // jitter) and take the lifetime from an *independent* seed. If the offset
+        // and rate both came from one seed, similar-seeded sparks move in lockstep
+        // and bunch up — embers emitted in bursts with dead gaps. Evenly-spread
+        // offsets keep emission continuous.
+        let offset = (fi + 0.5 * seed) / n as f32;
+        let life = 2.5 + hash(78.233, 1.7) * 2.5;
+        let phase = ((t / life) + offset).fract(); // 0 = born at bottom, 1 = gone at top
+        let base_x = hash(37.719, 2.3) * logical_w;
         let x = base_x + (t * 0.6 + fi * 1.7).sin() * (10.0 + seed * 14.0);
         // Rise from just below the bottom edge to above the top.
         let y = logical_h + 12.0 - phase * (logical_h + 24.0);
