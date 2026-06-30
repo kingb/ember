@@ -14,7 +14,12 @@ use std::time::Instant;
 
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
 
-fn build_spans(rows: usize, runs_per_row: usize, run_len: usize, iter: usize) -> Vec<(String, Color)> {
+fn build_spans(
+    rows: usize,
+    runs_per_row: usize,
+    run_len: usize,
+    iter: usize,
+) -> Vec<(String, Color)> {
     let palette = [
         Color::rgb(0xcc, 0xcc, 0xcc),
         Color::rgb(0x4e, 0xc9, 0xb0),
@@ -26,7 +31,7 @@ fn build_spans(rows: usize, runs_per_row: usize, run_len: usize, iter: usize) ->
         for k in 0..runs_per_row {
             // Vary content by iter so each reshape is novel (defeats caching).
             let base = (b'a' + ((r + k + iter) % 26) as u8) as char;
-            let chunk: String = std::iter::repeat(base).take(run_len).collect();
+            let chunk: String = std::iter::repeat_n(base, run_len).collect();
             spans.push((chunk, palette[k % palette.len()]));
         }
         spans.push(("\n".to_string(), palette[0]));
@@ -72,7 +77,11 @@ fn main() {
     let el = t0.elapsed();
     let per_ms = el.as_secs_f64() * 1000.0 / iters as f64;
 
-    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
     println!(
         "[{profile}] {cols}x{rows} full reshape: {per_ms:.3} ms each  (~{:.0} reshapes/sec max; at 60fps that's {:.1}% of the frame budget)",
         1000.0 / per_ms,
