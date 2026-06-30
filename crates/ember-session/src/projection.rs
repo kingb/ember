@@ -241,6 +241,33 @@ mod tests {
     }
 
     #[test]
+    fn background_color_resolves_to_palette_not_black() {
+        //  guard: a cell with an ANSI background (SGR 44 = blue bg) must
+        // resolve to the palette color, never the default/pure-black that a
+        // missing style would produce. (The black-block symptom was actually the
+        // styles-dropped-on-reset coalescing bug, fixed in ember-core::merge.)
+        use ember_core::Rgb;
+        let mut p = proj();
+        p.advance(b"\x1b[44mX");
+        let mut d = GridDelta::default();
+        p.drain_damage_into(&mut d);
+        let cell = find(&d, 0, 0);
+        let style = d
+            .new_styles
+            .iter()
+            .find(|(id, _)| *id == cell.cell.style)
+            .map(|(_, s)| *s)
+            .expect("style shipped in new_styles");
+        assert_eq!(cell.cell.content, CellContent::Char('X'));
+        assert_eq!(
+            style.bg,
+            Rgb::new(0x3b, 0x8e, 0xea),
+            "blue bg from the palette"
+        );
+        assert_ne!(style.bg, Rgb::new(0, 0, 0), "never pure black");
+    }
+
+    #[test]
     fn styles_are_interned_and_shipped() {
         let mut p = proj();
         p.advance(b"x");
