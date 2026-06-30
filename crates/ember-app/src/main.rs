@@ -9,6 +9,7 @@
 //! session's pixel lane into that pane's grid. This is the splits + tabs
 //! milestone — live tiled shells, on Linux and macOS.
 
+mod config;
 mod control;
 #[cfg(unix)]
 mod mcp;
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 use control::ControlMsg;
 
 use ember_core::{
-    Axis, BackendControl, BackendEvent, BackendHandle, Direction, GridDims, LayoutCommand,
+    Axis, BackendControl, BackendEvent, BackendHandle, Config, Direction, GridDims, LayoutCommand,
     LayoutEffect, LayoutNode, PaneId, Rect, SessionBackend, SessionId, Tab, TabId, apply, layout,
 };
 use ember_platform::MenuAction;
@@ -156,6 +157,10 @@ struct RunState {
     /// Whether the About overlay is showing, and when it opened (for the glow clock).
     about: bool,
     about_since: Instant,
+    /// User config + the Settings overlay state (open + selected row).
+    config: Config,
+    settings_open: bool,
+    settings_sel: usize,
     /// Native menu bar (macOS); inert elsewhere. Kept alive for the app's life.
     menu: ember_platform::AppMenu,
     /// Last cursor position in **logical** px.
@@ -221,11 +226,15 @@ impl ApplicationHandler for App {
             help: false,
             about: false,
             about_since: Instant::now(),
+            config: config::load(),
+            settings_open: false,
+            settings_sel: 0,
             menu: ember_platform::build_menu(),
             cursor: (0.0, 0.0),
         };
         state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
         state.sync_layout();
+        state.apply_appearance();
         self.state = Some(state);
     }
 
@@ -255,6 +264,12 @@ impl ApplicationHandler for App {
             } => state.left_click(),
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
+                    return;
+                }
+                // The Settings overlay is interactive — it handles its own keys
+                // (arrows / space / esc) rather than dismissing on any key.
+                if state.settings_open {
+                    state.settings_key(&key.logical_key);
                     return;
                 }
                 // While a modal overlay (help / About) is up, the next *fresh* key
@@ -343,6 +358,7 @@ impl ApplicationHandler for App {
             match action {
                 MenuAction::ShowShortcuts => state.toggle_help(),
                 MenuAction::About => state.toggle_about(),
+                MenuAction::Settings => state.toggle_settings(),
             }
         }
         if state.tree.tabs.is_empty() {
@@ -433,6 +449,16 @@ impl RunState {
     /// Act on a debug-control command (see `control`): inject text/keys, run a
     /// chord, or reply with a JSON state dump.
     fn handle_control(&mut self, msg: ControlMsg, event_loop: &ActiveEventLoop) {
+        // Route injected keys into the interactive Settings overlay (for tests),
+        // mirroring the real keyboard path.
+        if self.settings_open {
+            if let ControlMsg::Key(name) = &msg {
+                if let Some(k) = named_key(name) {
+                    self.settings_key(&k);
+                }
+                return;
+            }
+        }
         // Mirror the keyboard: while a modal overlay is up, any input dismisses it
         // (but state/screenshot still work, so the overlay can be inspected).
         if self.help || self.about {
@@ -477,6 +503,7 @@ impl RunState {
                 self.left_click();
             }
             ControlMsg::About => self.toggle_about(),
+            ControlMsg::Settings => self.toggle_settings(),
         }
     }
 
@@ -614,6 +641,11 @@ impl RunState {
                 self.toggle_help();
                 true
             }
+            // Cmd+, — Settings (the macOS Preferences convention; also a menu item).
+            Key::Character(s) if s.as_str() == "," => {
+                self.toggle_settings();
+                true
+            }
             // Cmd+D / Cmd+Shift+D — split the focused pane side-by-side / stacked.
             Key::Character(s) if s.eq_ignore_ascii_case("d") => {
                 let axis = if mods.shift_key() {
@@ -727,9 +759,10 @@ impl RunState {
         true
     }
 
-    /// Show the keyboard cheat-sheet overlay (closing About — they're exclusive).
+    /// Show the keyboard cheat-sheet overlay (closing other overlays — exclusive).
     fn show_help(&mut self) {
         self.hide_about();
+        self.hide_settings();
         self.help = true;
         self.renderer.set_help(Some(help_lines()));
     }
@@ -767,9 +800,10 @@ impl RunState {
         }
     }
 
-    /// Show the About overlay (closing the cheat-sheet — they're exclusive).
+    /// Show the About overlay (closing other overlays — they're exclusive).
     fn show_about(&mut self) {
         self.hide_help();
+        self.hide_settings();
         self.about = true;
         self.about_since = Instant::now();
         self.renderer.set_about(Some(about_info()));
@@ -794,10 +828,101 @@ impl RunState {
 
     /// Dismiss whichever modal overlay is open; returns whether one was showing.
     fn dismiss_overlay(&mut self) -> bool {
-        let shown = self.help || self.about;
+        let shown = self.help || self.about || self.settings_open;
         self.hide_help();
         self.hide_about();
+        self.hide_settings();
         shown
+    }
+
+    /// The Settings overlay rows as `(label, value)`, derived from the config.
+    fn settings_rows(&self) -> Vec<(String, String)> {
+        let bg = &self.config.background;
+        let on = |b: bool| if b { "on" } else { "off" }.to_string();
+        vec![
+            ("Gradient backdrop".into(), on(bg.gradient)),
+            ("Ember sparks".into(), on(bg.ember_sparks)),
+            ("Ember density".into(), format!("{:.1}", bg.ember_density)),
+            ("Scrim".into(), format!("{:.2}", bg.scrim)),
+        ]
+    }
+
+    /// Show the Settings overlay (closing other overlays — they're exclusive).
+    fn show_settings(&mut self) {
+        self.hide_help();
+        self.hide_about();
+        self.settings_open = true;
+        let rows = self.settings_rows();
+        self.renderer.set_settings(Some((rows, self.settings_sel)));
+    }
+
+    /// Hide the Settings overlay (no-op if not shown).
+    fn hide_settings(&mut self) {
+        if self.settings_open {
+            self.settings_open = false;
+            self.renderer.set_settings(None);
+        }
+    }
+
+    /// Toggle the Settings overlay (Ember → Settings… / Cmd+,).
+    fn toggle_settings(&mut self) {
+        if self.settings_open {
+            self.hide_settings();
+        } else {
+            self.show_settings();
+        }
+    }
+
+    /// Re-push the Settings rows + selection to the renderer after a change.
+    fn refresh_settings(&mut self) {
+        let rows = self.settings_rows();
+        self.renderer.set_settings(Some((rows, self.settings_sel)));
+    }
+
+    /// Handle a key while the Settings overlay is open: navigate + change values.
+    fn settings_key(&mut self, key: &Key) {
+        let n = self.settings_rows().len();
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.hide_settings();
+                return;
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.settings_sel = self.settings_sel.saturating_sub(1);
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.settings_sel = (self.settings_sel + 1).min(n - 1);
+            }
+            Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Space) => {
+                self.adjust_setting(1.0)
+            }
+            Key::Named(NamedKey::ArrowLeft) => self.adjust_setting(-1.0),
+            _ => {}
+        }
+        self.refresh_settings();
+    }
+
+    /// Change the selected setting by `dir` (+1 / -1): toggle bools, step numbers.
+    /// Persists the config and applies the appearance.
+    fn adjust_setting(&mut self, dir: f32) {
+        let bg = &mut self.config.background;
+        match self.settings_sel {
+            0 => bg.gradient = !bg.gradient,
+            1 => bg.ember_sparks = !bg.ember_sparks,
+            2 => bg.ember_density = (bg.ember_density + 0.1 * dir).clamp(0.0, 2.0),
+            3 => bg.scrim = (bg.scrim + 0.05 * dir).clamp(0.0, 1.0),
+            _ => {}
+        }
+        if let Err(e) = config::save(&self.config) {
+            eprintln!("[ember] config save failed: {e}");
+        }
+        self.apply_appearance();
+    }
+
+    /// Apply the current config's appearance to the renderer. (The backdrop/ember
+    /// rendering is wired in once the background pass lands; this is the hook.)
+    fn apply_appearance(&mut self) {
+        // TODO: self.renderer.set_backdrop(...) once the background pass merges.
     }
 
     /// Jump to tab `n` (1-based); no-op if out of range.

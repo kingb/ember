@@ -7,6 +7,7 @@
 pub mod app;
 pub mod backend;
 pub mod command;
+pub mod config;
 pub mod focus;
 pub mod geom;
 pub mod grid;
@@ -19,6 +20,7 @@ pub use backend::{
     OscEvent, PassthroughEvent, SessionBackend, VtProjection, frame_channel,
 };
 pub use command::{LayoutCommand, LayoutEffect, apply};
+pub use config::{Background, Config};
 pub use focus::{Direction, focus_dir};
 pub use geom::Rect;
 pub use grid::{

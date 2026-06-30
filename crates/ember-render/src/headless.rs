@@ -20,7 +20,8 @@ use wgpu::{
 
 use crate::grid_model::GridModel;
 use crate::paint::{
-    AboutLayout, build_about, build_help, build_tabs, grid_quads, measure_cell_width, shape_grid,
+    AboutLayout, build_about, build_help, build_settings, build_tabs, grid_quads,
+    measure_cell_width, shape_grid,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
@@ -47,6 +48,8 @@ pub struct Shot<'a> {
     pub help: Option<Vec<(String, String)>>,
     /// When set, the About overlay is drawn, with `(info, glow, elapsed_seconds)`.
     pub about: Option<(AboutInfo, f32, f32)>,
+    /// When set, the Settings overlay is drawn: `(rows of (label, value), selected)`.
+    pub settings: Option<(Vec<(String, String)>, usize)>,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
@@ -121,11 +124,25 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
         Metrics::new(ABOUT_TITLE_SIZE, ABOUT_TITLE_LINE),
     );
     let mut about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut settings_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut help_panel: Option<Rect> = None;
     let mut about_layout: Option<AboutLayout> = None;
+    let mut settings_origin: Option<(f32, f32)> = None;
 
-    if let Some((info, glow, t)) = &shot.about {
+    if let Some((rows, sel)) = &shot.settings {
+        settings_origin = Some(build_settings(
+            &mut font_system,
+            &mut settings_buf,
+            rows,
+            *sel,
+            cw,
+            shot.logical_w,
+            shot.logical_h,
+            sf,
+            &mut rects,
+        ));
+    } else if let Some((info, glow, t)) = &shot.about {
         // About overlay replaces the panes (same helper as on-screen).
         about_layout = Some(build_about(
             &mut font_system,
@@ -196,7 +213,17 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
     );
 
     let mut areas: Vec<TextArea> = Vec::new();
-    if let Some(layout) = &about_layout {
+    if let Some((left, top)) = settings_origin {
+        areas.push(TextArea {
+            buffer: &settings_buf,
+            left: left * sf,
+            top: top * sf,
+            scale: sf,
+            bounds: full_bounds,
+            default_color: Color::rgb(FG.r, FG.g, FG.b),
+            custom_glyphs: &[],
+        });
+    } else if let Some(layout) = &about_layout {
         areas.push(TextArea {
             buffer: &about_title,
             left: layout.title_left * sf,

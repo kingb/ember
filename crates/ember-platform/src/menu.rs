@@ -14,6 +14,8 @@ pub enum MenuAction {
     ShowShortcuts,
     /// Ember → About Ember.
     About,
+    /// Ember → Settings… (also bound to Cmd+,).
+    Settings,
 }
 
 #[cfg(target_os = "macos")]
@@ -31,6 +33,7 @@ mod imp {
     pub struct AppMenu {
         _menu: Menu,
         about_id: MenuId,
+        settings_id: MenuId,
         shortcuts_id: MenuId,
     }
 
@@ -44,6 +47,14 @@ mod imp {
         let about = MenuItem::new("About Ember", true, None);
         let about_id = about.id().clone();
         let _ = app_menu.append(&about);
+        let _ = app_menu.append(&PredefinedMenuItem::separator());
+        let settings = MenuItem::new(
+            "Settings…",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::Comma)),
+        );
+        let settings_id = settings.id().clone();
+        let _ = app_menu.append(&settings);
         let _ = app_menu.append(&PredefinedMenuItem::separator());
         let _ = app_menu.append(&PredefinedMenuItem::quit(None));
         let _ = menu.append(&app_menu);
@@ -63,6 +74,7 @@ mod imp {
         AppMenu {
             _menu: menu,
             about_id,
+            settings_id,
             shortcuts_id,
         }
     }
@@ -73,6 +85,8 @@ mod imp {
         while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
             if event.id == menu.about_id {
                 action = Some(MenuAction::About);
+            } else if event.id == menu.settings_id {
+                action = Some(MenuAction::Settings);
             } else if event.id == menu.shortcuts_id {
                 action = Some(MenuAction::ShowShortcuts);
             }

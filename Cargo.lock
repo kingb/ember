@@ -681,6 +681,7 @@ dependencies = [
  "ember-render",
  "ember-session",
  "serde_json",
+ "toml",
  "winit",
 ]
 
@@ -692,6 +693,7 @@ dependencies = [
  "criterion",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

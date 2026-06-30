@@ -27,8 +27,8 @@ use winit::window::Window;
 
 use crate::grid_model::GridModel;
 use crate::paint::{
-    BTN_COLS, build_about, build_help, build_tabs, debug_emit, grid_quads, measure_cell_width,
-    shape_grid,
+    BTN_COLS, build_about, build_help, build_settings, build_tabs, debug_emit, grid_quads,
+    measure_cell_width, shape_grid,
 };
 
 pub(crate) const FONT_SIZE: f32 = 12.0;
@@ -140,6 +140,10 @@ pub struct Renderer {
     /// Large wordmark buffer + body-lines buffer for the About overlay.
     about_title: Buffer,
     about_body: Buffer,
+    /// When `Some`, the Settings overlay is shown: `(rows of (label, value), selected)`.
+    settings: Option<(Vec<(String, String)>, usize)>,
+    /// Glyph buffer for the Settings overlay.
+    settings_buffer: Buffer,
     /// Measured monospace advance (px) — keeps bg quads aligned with glyphs.
     cell_w: f32,
     // Keep the window LAST so it drops after the surface (winit/wgpu requirement).
@@ -210,6 +214,7 @@ impl Renderer {
             Metrics::new(ABOUT_TITLE_SIZE, ABOUT_TITLE_LINE),
         );
         let about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let settings_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
 
         let cell_w = measure_cell_width(&mut font_system);
         let quads = QuadRenderer::new(&device, format);
@@ -237,6 +242,8 @@ impl Renderer {
             about_time: 0.0,
             about_title,
             about_body,
+            settings: None,
+            settings_buffer,
             cell_w,
             window,
         }
@@ -317,6 +324,7 @@ impl Renderer {
                 .about
                 .clone()
                 .map(|i| (i, self.about_glow, self.about_time)),
+            settings: self.settings.clone(),
         };
         crate::headless::capture(&shot, path)
     }
@@ -435,6 +443,18 @@ impl Renderer {
         self.about_time = t;
     }
 
+    /// Show the Settings overlay with these `(label, value)` rows and the selected
+    /// row index, or hide it with `None`.
+    pub fn set_settings(&mut self, view: Option<(Vec<(String, String)>, usize)>) {
+        self.settings = view;
+        self.window.request_redraw();
+    }
+
+    /// Whether the Settings overlay is shown.
+    pub fn settings_visible(&self) -> bool {
+        self.settings.is_some()
+    }
+
     /// Build the help overlay using this renderer's buffer (wrapper over the shared
     /// [`build_help`] so the windowed + headless paths render it identically).
     fn build_help_quads(&mut self, sf: f32, rects: &mut Vec<([f32; 4], [f32; 4])>) -> Rect {
@@ -479,7 +499,31 @@ impl Renderer {
         let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
         let mut areas: Vec<TextArea> = Vec::new();
 
-        if let Some(info) = self.about.clone() {
+        if let Some((rows, selected)) = self.settings.clone() {
+            // Modal Settings overlay.
+            let logical_w = self.config.width as f32 / sf;
+            let logical_h = self.config.height as f32 / sf;
+            let (left, top) = build_settings(
+                &mut self.font_system,
+                &mut self.settings_buffer,
+                &rows,
+                selected,
+                self.cell_w,
+                logical_w,
+                logical_h,
+                sf,
+                &mut rects,
+            );
+            areas.push(TextArea {
+                buffer: &self.settings_buffer,
+                left: left * sf,
+                top: top * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(FG.r, FG.g, FG.b),
+                custom_glyphs: &[],
+            });
+        } else if let Some(info) = self.about.clone() {
             // Modal About page: scrim + animated ember glow + wordmark + info.
             let logical_w = self.config.width as f32 / sf;
             let logical_h = self.config.height as f32 / sf;

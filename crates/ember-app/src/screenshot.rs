@@ -214,6 +214,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
         tabs,
         help: None,
         about: None,
+        settings: None,
     };
     headless::capture(&shot, Path::new(&opts.path))?;
 

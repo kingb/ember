@@ -36,6 +36,8 @@ pub enum ControlMsg {
     Click(f64, f64),
     /// Toggle the About overlay (the menu item isn't injectable in tests).
     About,
+    /// Toggle the Settings overlay (the menu item isn't injectable in tests).
+    Settings,
 }
 
 #[cfg(unix)]
@@ -165,6 +167,10 @@ mod unix {
                 let _ = tx.send(ControlMsg::About);
                 ok()
             }
+            "settings" => {
+                let _ = tx.send(ControlMsg::Settings);
+                ok()
+            }
             other => err(&format!("unknown cmd: {other}")),
         }
     }
@@ -291,9 +297,10 @@ mod unix {
                 serde_json::json!({"cmd":"click","x": x, "y": y})
             }
             "about" => serde_json::json!({"cmd":"about"}),
+            "settings" => serde_json::json!({"cmd":"settings"}),
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot|click|about)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot|click|about|settings)"
                 ));
             }
         };

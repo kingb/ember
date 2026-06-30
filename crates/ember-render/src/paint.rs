@@ -441,6 +441,82 @@ pub(crate) fn build_about(
     }
 }
 
+/// Build the Settings overlay: a centered panel with a title, a `(label, value)`
+/// row per setting (the `selected` row highlighted in Ember-orange), and a footer
+/// hint. Quads → `out`; the row text is shaped into `buf`. Returns the logical
+/// `(left, top)` to place the text area. Shared by windowed + headless.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_settings(
+    font_system: &mut FontSystem,
+    buf: &mut Buffer,
+    rows: &[(String, String)],
+    selected: usize,
+    cw: f32,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) -> (f32, f32) {
+    // Scrim.
+    out.push((
+        scaled(0.0, 0.0, logical_w, logical_h, sf),
+        lin_rgba(Rgb::new(0, 0, 0), 0.78),
+    ));
+    let pad = HELP_PAD;
+    let line = LINE_HEIGHT;
+    // title + blank + rows + blank + hint.
+    let body_lines = rows.len() as f32 + 4.0;
+    let w = (logical_w * 0.7).clamp(300.0, 520.0);
+    let h = body_lines * line + 2.0 * pad;
+    let x = ((logical_w - w) * 0.5).max(0.0);
+    let y = ((logical_h - h) * 0.5).max(0.0);
+    let panel = Rect::new(x as f64, y as f64, w as f64, h as f64);
+    out.push((
+        scaled(x, y, w, h, sf),
+        lin_rgba(Rgb::new(0x20, 0x22, 0x28), 0.98),
+    ));
+    push_border(out, panel, ACCENT, sf);
+
+    // Highlight the selected row (row index in the body: title(0), blank(1), rows…).
+    let row_y = y + pad + (2.0 + selected as f32) * line;
+    out.push((
+        scaled(x + pad * 0.5, row_y, w - pad, line, sf),
+        lin_rgba(ACCENT, 0.28),
+    ));
+
+    // Shape the text: title, blank, each "label …… value", blank, hint.
+    buf.set_size(font_system, Some(w - 2.0 * pad), Some(h - 2.0 * pad));
+    let inner_cols = ((w - 2.0 * pad) / cw).floor() as usize;
+    let base = Attrs::new().family(Family::Monospace);
+    let mut spans: Vec<(String, Color)> = Vec::new();
+    spans.push(("Settings\n\n".to_string(), Color::rgb(0xff, 0xff, 0xff)));
+    for (i, (label, value)) in rows.iter().enumerate() {
+        let gap = inner_cols.saturating_sub(label.chars().count() + value.chars().count());
+        let text = format!("{label}{}{value}\n", " ".repeat(gap.max(1)));
+        let color = if i == selected {
+            Color::rgb(0xff, 0xff, 0xff)
+        } else {
+            Color::rgb(0xbb, 0xbb, 0xbb)
+        };
+        spans.push((text, color));
+    }
+    spans.push((
+        "\n↑/↓ select   ←/→ change   esc close".to_string(),
+        Color::rgb(0x80, 0x80, 0x80),
+    ));
+    buf.set_rich_text(
+        font_system,
+        spans
+            .iter()
+            .map(|(t, c)| (t.as_str(), Attrs::new().family(Family::Monospace).color(*c))),
+        &base,
+        Shaping::Advanced,
+        None,
+    );
+    buf.shape_until_scroll(font_system, false);
+    (x + pad, y + pad)
+}
+
 /// A `(rect_px, …)`-ready physical-pixel quad from logical `x,y,w,h` and the
 /// HiDPI scale factor.
 pub(crate) fn scaled(x: f32, y: f32, w: f32, h: f32, sf: f32) -> [f32; 4] {
