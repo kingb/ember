@@ -135,6 +135,8 @@ pub struct Renderer {
     about: Option<AboutInfo>,
     /// Animated ember-glow intensity for the About overlay, in `[0, 1]`.
     about_glow: f32,
+    /// Elapsed seconds the About overlay has been open (drives the ember sparks).
+    about_time: f32,
     /// Large wordmark buffer + body-lines buffer for the About overlay.
     about_title: Buffer,
     about_body: Buffer,
@@ -232,6 +234,7 @@ impl Renderer {
             help_buffer,
             about: None,
             about_glow: 0.0,
+            about_time: 0.0,
             about_title,
             about_body,
             cell_w,
@@ -310,7 +313,10 @@ impl Renderer {
             panes,
             tabs: self.tabs.clone(),
             help: self.help.clone(),
-            about: self.about.clone().map(|i| (i, self.about_glow)),
+            about: self
+                .about
+                .clone()
+                .map(|i| (i, self.about_glow, self.about_time)),
         };
         crate::headless::capture(&shot, path)
     }
@@ -422,9 +428,11 @@ impl Renderer {
         self.about.is_some()
     }
 
-    /// Update the animated ember-glow intensity (`[0,1]`) for the About overlay.
-    pub fn set_about_glow(&mut self, glow: f32) {
+    /// Update the About overlay's animation inputs each frame: glow intensity
+    /// (`[0,1]`) and elapsed seconds since it opened (drives the ember sparks).
+    pub fn set_about_anim(&mut self, glow: f32, t: f32) {
         self.about_glow = glow.clamp(0.0, 1.0);
+        self.about_time = t;
     }
 
     /// Build the help overlay using this renderer's buffer (wrapper over the shared
@@ -481,6 +489,7 @@ impl Renderer {
                 &mut self.about_body,
                 &info,
                 self.about_glow,
+                self.about_time,
                 self.cell_w,
                 logical_w,
                 logical_h,

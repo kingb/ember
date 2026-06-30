@@ -45,8 +45,8 @@ pub struct Shot<'a> {
     pub tabs: Vec<TabLabel>,
     /// When set, the cheat-sheet overlay is drawn instead of the panes.
     pub help: Option<Vec<(String, String)>>,
-    /// When set, the About overlay is drawn (with the given glow intensity).
-    pub about: Option<(AboutInfo, f32)>,
+    /// When set, the About overlay is drawn, with `(info, glow, elapsed_seconds)`.
+    pub about: Option<(AboutInfo, f32, f32)>,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
@@ -125,7 +125,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
     let mut help_panel: Option<Rect> = None;
     let mut about_layout: Option<AboutLayout> = None;
 
-    if let Some((info, glow)) = &shot.about {
+    if let Some((info, glow, t)) = &shot.about {
         // About overlay replaces the panes (same helper as on-screen).
         about_layout = Some(build_about(
             &mut font_system,
@@ -133,6 +133,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             &mut about_body,
             info,
             *glow,
+            *t,
             cw,
             shot.logical_w,
             shot.logical_h,

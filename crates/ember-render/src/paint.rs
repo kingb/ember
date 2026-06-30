@@ -313,6 +313,7 @@ pub(crate) fn build_about(
     body_buf: &mut Buffer,
     info: &AboutInfo,
     glow: f32,
+    t: f32,
     cw: f32,
     logical_w: f32,
     logical_h: f32,
@@ -324,6 +325,31 @@ pub(crate) fn build_about(
         scaled(0.0, 0.0, logical_w, logical_h, sf),
         lin_rgba(Rgb::new(0, 0, 0), 0.86),
     ));
+
+    // Drifting ember sparks rising across the modal. Procedural + stateless — driven
+    // by `t` alone, so it animates with no stored particle state and renders
+    // identically windowed + headless. Small amber→ember dots that sway, rise, and
+    // fade in/out over a looping lifetime; overall brightness tracks `glow`.
+    {
+        use std::f32::consts::PI;
+        const SPARKS: usize = 28;
+        for i in 0..SPARKS {
+            let fi = i as f32;
+            let seed = {
+                let s = (fi * 12.9898).sin() * 43758.547;
+                s - s.floor()
+            };
+            let period = 3.2 + seed * 2.6;
+            let phase = ((t / period) + seed).fract();
+            let base_x = ((fi * 7.0).sin() * 0.5 + 0.5) * logical_w;
+            let x = base_x + (t * 0.7 + fi).sin() * 18.0;
+            let y = logical_h * (1.0 - phase);
+            let alpha = (PI * phase).sin().max(0.0) * 0.7 * glow;
+            let size = 2.0 + seed * 2.5;
+            let color = lerp_rgb(AMBER, ACCENT, phase);
+            out.push((scaled(x, y, size, size, sf), lin_rgba(color, alpha)));
+        }
+    }
 
     let title_h = ABOUT_TITLE_LINE;
     let gap = 22.0;

@@ -355,7 +355,7 @@ impl ApplicationHandler for App {
         // scalar and redraw every frame (the renderer stays a pure consumer).
         if state.about {
             let t = now.duration_since(state.about_since).as_secs_f32();
-            state.renderer.set_about_glow(ember_glow(t));
+            state.renderer.set_about_anim(ember_glow(t), t);
             state.renderer.window().request_redraw();
         }
         // Poll the pixel lanes; redraw only when something changed.
