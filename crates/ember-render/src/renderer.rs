@@ -25,7 +25,7 @@ use wgpu::{
 };
 use winit::window::Window;
 
-use crate::background::SparkRenderer;
+use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, build_about, build_help, build_settings, build_tabs, debug_emit, grid_quads,
@@ -107,6 +107,33 @@ impl Default for BackdropParams {
     }
 }
 
+/// How a backdrop image fills the window. Cover/contain/stretch use a
+/// clamped sampler with computed UVs; tile repeats the image at its native size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ImageFit {
+    /// Scale to fill the window, cropping the overflowing axis (default).
+    #[default]
+    Cover,
+    /// Scale to fit entirely inside the window, letterboxing the short axis.
+    Contain,
+    /// Stretch to the window, ignoring aspect ratio.
+    Stretch,
+    /// Repeat the image at its native pixel size.
+    Tile,
+}
+
+impl ImageFit {
+    /// Parse a config string (`cover`|`contain`|`stretch`|`tile`); unknown → `Cover`.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "contain" => Self::Contain,
+            "stretch" | "fill" => Self::Stretch,
+            "tile" | "repeat" => Self::Tile,
+            _ => Self::Cover,
+        }
+    }
+}
+
 /// What the tab strip was clicked on (from [`Renderer::tab_hit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TabHit {
@@ -134,6 +161,11 @@ pub struct PaneSnapshot {
 struct PaneRender {
     grid: GridModel,
     buffer: Buffer,
+    /// The shaped `buffer` is stale and must be re-shaped before the next draw.
+    /// Set on any applied delta or buffer resize; cleared after reshaping. Lets the
+    /// per-frame render skip glyphon reshaping for panes that didn't change — the
+    /// big CPU win when sparks drive 60fps redraws over an idle grid.
+    dirty: bool,
 }
 
 pub struct Renderer {
@@ -180,6 +212,13 @@ pub struct Renderer {
     backdrop: BackdropParams,
     /// Additive pipeline for the glowing ember sparks.
     sparks: SparkRenderer,
+    /// Full-surface textured-quad pass for a user-supplied backdrop image.
+    image: ImageRenderer,
+    /// How the backdrop image fills the window.
+    image_fit: ImageFit,
+    /// The decoded backdrop image kept in RAM so [`Self::capture_to_png`] can
+    /// replay it through the headless path (the GPU texture isn't readable here).
+    image_rgba: Option<(Vec<u8>, u32, u32)>,
     // Keep the window LAST so it drops after the surface (winit/wgpu requirement).
     window: Arc<Window>,
 }
@@ -253,6 +292,7 @@ impl Renderer {
         let cell_w = measure_cell_width(&mut font_system);
         let quads = QuadRenderer::new(&device, format);
         let sparks = SparkRenderer::new(&device, format);
+        let image = ImageRenderer::new(&device, format);
 
         Self {
             device,
@@ -282,6 +322,9 @@ impl Renderer {
             cell_w,
             backdrop: BackdropParams::default(),
             sparks,
+            image,
+            image_fit: ImageFit::default(),
+            image_rgba: None,
             window,
         }
     }
@@ -322,6 +365,7 @@ impl Renderer {
             PaneRender {
                 grid: GridModel::new(dims),
                 buffer,
+                dirty: true,
             },
         );
     }
@@ -363,6 +407,8 @@ impl Renderer {
                 .map(|i| (i, self.about_glow, self.about_time)),
             settings: self.settings.clone(),
             backdrop: self.backdrop,
+            image: self.image_rgba.clone(),
+            image_fit: self.image_fit,
         };
         crate::headless::capture(&shot, path)
     }
@@ -385,6 +431,7 @@ impl Renderer {
     pub fn apply_delta(&mut self, session: &SessionId, delta: GridDelta) {
         if let Some(p) = self.panes.get_mut(session) {
             p.grid.apply(delta);
+            p.dirty = true;
         }
     }
 
@@ -403,6 +450,8 @@ impl Renderer {
                     Some(vp.rect.width as f32),
                     Some(vp.rect.height as f32),
                 );
+                // Resizing the buffer invalidates its shaped layout.
+                p.dirty = true;
             }
         }
         self.visible = visible;
@@ -507,6 +556,22 @@ impl Renderer {
         self.backdrop.sparks
     }
 
+    /// Set (or clear with `None`) the backdrop image and its fit mode.
+    /// When an image is set it draws behind the cells *in place of* the gradient;
+    /// the scrim still applies for legibility. The decoded RGBA is kept in RAM so
+    /// on-screen captures can reproduce it headlessly. Requests a redraw.
+    pub fn set_backdrop_image(&mut self, img: Option<(Vec<u8>, u32, u32)>, fit: ImageFit) {
+        match &img {
+            Some((rgba, w, h)) => self
+                .image
+                .set_image(&self.device, &self.queue, rgba, *w, *h),
+            None => self.image.clear(),
+        }
+        self.image_rgba = img;
+        self.image_fit = fit;
+        self.window.request_redraw();
+    }
+
     /// Build the help overlay using this renderer's buffer (wrapper over the shared
     /// [`build_help`] so the windowed + headless paths render it identically).
     fn build_help_quads(&mut self, sf: f32, rects: &mut Vec<([f32; 4], [f32; 4])>) -> Rect {
@@ -551,6 +616,9 @@ impl Renderer {
         let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
         let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
         let mut areas: Vec<TextArea> = Vec::new();
+        // Whether to draw the backdrop image this frame (pane view only — never
+        // over the Settings/About/help overlays).
+        let mut draw_image = false;
 
         if let Some((rows, selected)) = self.settings.clone() {
             // Modal Settings overlay.
@@ -625,11 +693,26 @@ impl Renderer {
                 custom_glyphs: &[],
             });
         } else {
-            // Campfire backdrop (gradient + scrim) behind the cells — drawn first so
-            // empty cells (no bg quad) let it show through.
+            // Campfire backdrop (image or gradient, + scrim) behind the cells —
+            // drawn first so empty cells (no bg quad) let it show through. A
+            // backdrop image is the base layer (drawn in the render pass below), so
+            // suppress the gradient bands when one is set; the scrim still applies.
             let logical_w = self.config.width as f32 / sf;
             let logical_h = self.config.height as f32 / sf;
-            push_backdrop(&mut rects, &self.backdrop, logical_w, logical_h, sf);
+            draw_image = self.image.has_image();
+            let mut bp = self.backdrop;
+            if draw_image {
+                bp.gradient = false;
+            }
+            push_backdrop(&mut rects, &bp, logical_w, logical_h, sf);
+            if draw_image {
+                self.image.prepare(
+                    &self.device,
+                    &self.queue,
+                    (self.config.width as f32, self.config.height as f32),
+                    self.image_fit,
+                );
+            }
             if self.backdrop.sparks {
                 spark_rects = spark_quads(
                     self.backdrop.density,
@@ -639,10 +722,15 @@ impl Renderer {
                     sf,
                 );
             }
-            // Pass 1: shape each visible pane's text into its own buffer.
+            // Pass 1: (re)shape only panes whose grid/size changed since last frame.
+            // Buffers persist in `PaneRender`, so unchanged panes reuse their shaping
+            // — the TextArea below just references the existing buffer.
             for vp in &self.visible {
                 if let Some(p) = self.panes.get_mut(&vp.session) {
-                    shape_grid(&mut self.font_system, &mut p.buffer, &p.grid);
+                    if p.dirty {
+                        shape_grid(&mut self.font_system, &mut p.buffer, &p.grid);
+                        p.dirty = false;
+                    }
                 }
             }
             // Pass 2: bg fills, cursor, focus border, tab strip (logical px * sf).
@@ -817,6 +905,11 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            // Backdrop image is the base layer: drawn before the gradient/scrim
+            // quads (which alpha-darken it) and the cells.
+            if draw_image {
+                self.image.draw(&mut pass);
+            }
             self.quads.draw(&mut pass);
             self.sparks.draw(&mut pass);
             let _ = self

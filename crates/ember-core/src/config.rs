@@ -24,6 +24,13 @@ pub struct Background {
     pub ember_sparks: bool,
     /// Spark count/rate multiplier (`0.0`–`2.0`).
     pub ember_density: f32,
+    /// Path to a backdrop image (e.g. a fire photo) drawn behind the cells. When
+    /// set, it replaces the gradient; the scrim still darkens it for legibility.
+    /// `None`/missing → no image (the gradient/sparks path is used instead).
+    pub image: Option<String>,
+    /// How the backdrop image fills the window: `cover` | `contain` | `stretch` |
+    /// `tile`. Set in `config.toml` (not the Settings overlay).
+    pub image_fit: String,
 }
 
 impl Default for Background {
@@ -33,6 +40,8 @@ impl Default for Background {
             scrim: 0.45,
             ember_sparks: false,
             ember_density: 1.0,
+            image: None,
+            image_fit: "cover".to_string(),
         }
     }
 }
@@ -56,6 +65,8 @@ mod tests {
         assert!(c.background.ember_sparks);
         assert!(!c.background.gradient);
         assert_eq!(c.background.scrim, 0.45);
+        assert_eq!(c.background.image, None);
+        assert_eq!(c.background.image_fit, "cover");
     }
 
     #[test]
