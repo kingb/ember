@@ -430,8 +430,16 @@ impl ApplicationHandler for App {
         // tick (not here) — that's the difference between sleeping between frames
         // and spinning at full speed. Requesting a redraw *every* `about_to_wait`
         // makes winit service it immediately, defeating `WaitUntil` (the CPU spike).
-        let animating = state.about || state.backdrop_animating();
-        let wait = if animating { ANIM_FRAME } else { POLL };
+        // The About glow runs at ~60fps (brief, transient modal); the ambient
+        // ember sparks honor the configurable `ember_fps` cap (default 30) — fewer
+        // redraws ≈ proportionally less CPU, and embers drift fine at 30.
+        let wait = if state.about {
+            ANIM_FRAME
+        } else if state.backdrop_animating() {
+            state.ember_frame()
+        } else {
+            POLL
+        };
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
     }
 
@@ -1061,6 +1069,7 @@ impl RunState {
             ("Gradient backdrop".into(), on(bg.gradient)),
             ("Ember sparks".into(), on(bg.ember_sparks)),
             ("Ember density".into(), format!("{:.1}", bg.ember_density)),
+            ("Ember FPS".into(), format!("{}", bg.ember_fps)),
             ("Scrim".into(), format!("{:.2}", bg.scrim)),
             ("Backdrop image".into(), image),
         ]
@@ -1129,7 +1138,8 @@ impl RunState {
             0 => bg.gradient = !bg.gradient,
             1 => bg.ember_sparks = !bg.ember_sparks,
             2 => bg.ember_density = (bg.ember_density + 0.1 * dir).clamp(0.0, 2.0),
-            3 => bg.scrim = (bg.scrim + 0.05 * dir).clamp(0.0, 1.0),
+            3 => bg.ember_fps = (bg.ember_fps as i32 + (5.0 * dir) as i32).clamp(10, 120) as u32,
+            4 => bg.scrim = (bg.scrim + 0.05 * dir).clamp(0.0, 1.0),
             _ => {}
         }
         if let Err(e) = config::save(&self.config) {
@@ -1171,6 +1181,13 @@ impl RunState {
             self.renderer.set_backdrop_image(img, fit);
             self.image_loaded = want;
         }
+    }
+
+    /// The ambient ember animation's frame interval, from the configured `ember_fps`
+    /// cap (clamped 10–120). Lower fps ≈ proportionally less CPU.
+    fn ember_frame(&self) -> Duration {
+        let fps = self.config.background.ember_fps.clamp(10, 120);
+        Duration::from_millis((1000 / fps).max(1) as u64)
     }
 
     /// Whether the ember sparks should be animating right now (opt-in, only while
