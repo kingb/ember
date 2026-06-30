@@ -212,6 +212,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
         scale: opts.scale,
         panes: shots,
         tabs,
+        help: None,
     };
     headless::capture(&shot, Path::new(&opts.path))?;
 

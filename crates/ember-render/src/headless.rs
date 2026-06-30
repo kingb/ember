@@ -21,8 +21,8 @@ use wgpu::{
 use crate::grid_model::GridModel;
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
-    BG, CELL_HEIGHT, FG, FONT_SIZE, LINE_HEIGHT, PAD, TabLabel, build_tabs, grid_quads,
-    measure_cell_width, shape_grid,
+    BG, CELL_HEIGHT, FG, FONT_SIZE, HELP_PAD, LINE_HEIGHT, PAD, TabLabel, build_help, build_tabs,
+    grid_quads, measure_cell_width, shape_grid,
 };
 
 /// One pane in a screenshot scene: a grid and the **logical** inner rect it fills.
@@ -40,6 +40,8 @@ pub struct Shot<'a> {
     pub scale: f32,
     pub panes: Vec<PaneShot<'a>>,
     pub tabs: Vec<TabLabel>,
+    /// When set, the cheat-sheet overlay is drawn instead of the panes.
+    pub help: Option<Vec<(String, String)>>,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
@@ -100,43 +102,63 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
     let mut quads = QuadRenderer::new(&device, format);
     let cw = measure_cell_width(&mut font_system);
 
-    // Shape each pane into its own logical-sized buffer.
-    let mut buffers: Vec<Buffer> = Vec::with_capacity(shot.panes.len());
-    for pane in &shot.panes {
-        let mut buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-        buffer.set_size(
-            &mut font_system,
-            Some(pane.rect.width as f32),
-            Some(pane.rect.height as f32),
-        );
-        shape_grid(&mut font_system, &mut buffer, pane.grid);
-        buffers.push(buffer);
-    }
+    let full_bounds = TextBounds {
+        left: 0,
+        top: 0,
+        right: phys_w as i32,
+        bottom: phys_h as i32,
+    };
+    let mut buffers: Vec<Buffer> = Vec::new();
+    let mut help_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut chrome = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-
-    // Quads (bg fills, cursor, focus border, tab strip) — same helpers as on-screen.
-    let split = shot.panes.len() > 1;
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
-    for pane in &shot.panes {
-        grid_quads(
-            pane.grid,
-            pane.rect,
-            cw,
+    let mut help_panel: Option<Rect> = None;
+
+    if let Some(lines) = &shot.help {
+        // Cheat-sheet overlay replaces the panes (same helper as on-screen).
+        help_panel = Some(build_help(
+            &mut font_system,
+            &mut help_buf,
+            lines,
+            shot.logical_w,
+            shot.logical_h,
             sf,
-            pane.focused,
-            split,
+            &mut rects,
+        ));
+    } else {
+        // Shape each pane into its own logical-sized buffer, then build quads.
+        for pane in &shot.panes {
+            let mut buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+            buffer.set_size(
+                &mut font_system,
+                Some(pane.rect.width as f32),
+                Some(pane.rect.height as f32),
+            );
+            shape_grid(&mut font_system, &mut buffer, pane.grid);
+            buffers.push(buffer);
+        }
+        let split = shot.panes.len() > 1;
+        for pane in &shot.panes {
+            grid_quads(
+                pane.grid,
+                pane.rect,
+                cw,
+                sf,
+                pane.focused,
+                split,
+                &mut rects,
+            );
+        }
+        build_tabs(
+            &mut font_system,
+            &mut chrome,
+            &shot.tabs,
+            cw,
+            shot.logical_w,
+            sf,
             &mut rects,
         );
     }
-    build_tabs(
-        &mut font_system,
-        &mut chrome,
-        &shot.tabs,
-        cw,
-        shot.logical_w,
-        sf,
-        &mut rects,
-    );
     quads.prepare(&device, &queue, (phys_w as f32, phys_h as f32), &rects);
 
     viewport.update(
@@ -147,39 +169,45 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
         },
     );
 
-    let full_bounds = TextBounds {
-        left: 0,
-        top: 0,
-        right: phys_w as i32,
-        bottom: phys_h as i32,
-    };
     let mut areas: Vec<TextArea> = Vec::new();
-    for (pane, buffer) in shot.panes.iter().zip(buffers.iter()) {
+    if let Some(panel) = help_panel {
         areas.push(TextArea {
-            buffer,
-            left: pane.rect.x as f32 * sf,
-            top: pane.rect.y as f32 * sf,
-            scale: sf,
-            bounds: TextBounds {
-                left: (pane.rect.x as f32 * sf) as i32,
-                top: (pane.rect.y as f32 * sf) as i32,
-                right: ((pane.rect.x + pane.rect.width) as f32 * sf) as i32,
-                bottom: ((pane.rect.y + pane.rect.height) as f32 * sf) as i32,
-            },
-            default_color: Color::rgb(FG.r, FG.g, FG.b),
-            custom_glyphs: &[],
-        });
-    }
-    if shot.tabs.len() > 1 {
-        areas.push(TextArea {
-            buffer: &chrome,
-            left: 0.0,
-            top: PAD * sf,
+            buffer: &help_buf,
+            left: (panel.x as f32 + HELP_PAD) * sf,
+            top: (panel.y as f32 + HELP_PAD) * sf,
             scale: sf,
             bounds: full_bounds,
             default_color: Color::rgb(FG.r, FG.g, FG.b),
             custom_glyphs: &[],
         });
+    } else {
+        for (pane, buffer) in shot.panes.iter().zip(buffers.iter()) {
+            areas.push(TextArea {
+                buffer,
+                left: pane.rect.x as f32 * sf,
+                top: pane.rect.y as f32 * sf,
+                scale: sf,
+                bounds: TextBounds {
+                    left: (pane.rect.x as f32 * sf) as i32,
+                    top: (pane.rect.y as f32 * sf) as i32,
+                    right: ((pane.rect.x + pane.rect.width) as f32 * sf) as i32,
+                    bottom: ((pane.rect.y + pane.rect.height) as f32 * sf) as i32,
+                },
+                default_color: Color::rgb(FG.r, FG.g, FG.b),
+                custom_glyphs: &[],
+            });
+        }
+        if shot.tabs.len() > 1 {
+            areas.push(TextArea {
+                buffer: &chrome,
+                left: 0.0,
+                top: PAD * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(FG.r, FG.g, FG.b),
+                custom_glyphs: &[],
+            });
+        }
     }
     text_renderer
         .prepare(

@@ -148,6 +148,8 @@ struct RunState {
     next_tab: u64,
     /// Debug-control command receiver (drained each poll tick).
     control_rx: Option<Receiver<ControlMsg>>,
+    /// Whether the keyboard cheat-sheet overlay is showing.
+    help: bool,
 }
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
@@ -206,6 +208,7 @@ impl ApplicationHandler for App {
             next_session: 2,
             next_tab: 2,
             control_rx: self.control_rx.take(),
+            help: false,
         };
         state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
         state.sync_layout();
@@ -229,6 +232,11 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(mods) => state.modifiers = mods.state(),
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
+                    return;
+                }
+                // While the cheat-sheet overlay is up, any key dismisses it.
+                if state.help {
+                    state.hide_help();
                     return;
                 }
                 let mods = state.modifiers;
@@ -371,6 +379,14 @@ impl RunState {
     /// Act on a debug-control command (see `control`): inject text/keys, run a
     /// chord, or reply with a JSON state dump.
     fn handle_control(&mut self, msg: ControlMsg, event_loop: &ActiveEventLoop) {
+        // Mirror the keyboard: while the cheat-sheet is up, any input dismisses it
+        // (but state/screenshot still work, so the overlay can be inspected).
+        if self.help {
+            if let ControlMsg::Type(_) | ControlMsg::Key(_) | ControlMsg::Chord(_) = &msg {
+                self.hide_help();
+                return;
+            }
+        }
         match msg {
             ControlMsg::Type(text) => self.send_to_focused(text.into_bytes()),
             ControlMsg::Key(name) => {
@@ -531,6 +547,11 @@ impl RunState {
     /// a recognized shortcut (so the caller can check for an emptied tree → quit).
     fn handle_shortcut(&mut self, key: &Key, mods: ModifiersState) -> bool {
         match key {
+            // Cmd+? — show the keyboard cheat-sheet overlay (any key dismisses).
+            Key::Character(s) if s.as_str() == "?" => {
+                self.show_help();
+                true
+            }
             // Cmd+D / Cmd+Shift+D — split the focused pane side-by-side / stacked.
             Key::Character(s) if s.eq_ignore_ascii_case("d") => {
                 let axis = if mods.shift_key() {
@@ -644,6 +665,20 @@ impl RunState {
         true
     }
 
+    /// Show the keyboard cheat-sheet overlay.
+    fn show_help(&mut self) {
+        self.help = true;
+        self.renderer.set_help(Some(help_lines()));
+    }
+
+    /// Hide the cheat-sheet overlay (no-op if not shown).
+    fn hide_help(&mut self) {
+        if self.help {
+            self.help = false;
+            self.renderer.set_help(None);
+        }
+    }
+
     /// Jump to tab `n` (1-based); no-op if out of range.
     fn select_tab(&mut self, n: usize) {
         if n >= 1 && n <= self.tree.tabs.len() {
@@ -682,6 +717,24 @@ impl RunState {
         self.tree.active = self.tree.active.min(self.tree.tabs.len() - 1);
         self.sync_layout();
     }
+}
+
+/// The keyboard cheat-sheet shown by the Cmd+? overlay. Keep in sync with
+/// [`RunState::handle_shortcut`].
+fn help_lines() -> Vec<(String, String)> {
+    [
+        ("Cmd+D", "Split right (side by side)"),
+        ("Cmd+Shift+D", "Split down (stacked)"),
+        ("Cmd+W", "Close pane"),
+        ("Cmd+T", "New tab"),
+        ("Cmd+Arrows", "Focus pane"),
+        ("Cmd+Shift+Arrows", "Switch tab"),
+        ("Cmd+1..9", "Jump to tab"),
+        ("Cmd+?", "Show this help"),
+    ]
+    .iter()
+    .map(|(k, d)| (k.to_string(), d.to_string()))
+    .collect()
 }
 
 /// Parse a key token (`enter`, `tab`, `arrowleft`/`left`, or a single char) into a

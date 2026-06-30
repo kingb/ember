@@ -41,6 +41,8 @@ pub(crate) const BG: Rgb = Rgb::new(0x10, 0x10, 0x10);
 pub(crate) const FG: Rgb = Rgb::new(0xcc, 0xcc, 0xcc);
 /// Accent used for the focused-pane border and the active tab background.
 pub(crate) const ACCENT: Rgb = Rgb::new(0xe2, 0x5a, 0x1c);
+/// Inner padding of the help (cheat-sheet) overlay panel, in logical px.
+pub(crate) const HELP_PAD: f32 = 16.0;
 
 /// One visible pane: which session fills it and the inner pixel rect it occupies
 /// (already inset for padding by the app).
@@ -276,6 +278,73 @@ pub(crate) fn build_tabs(
     chrome.shape_until_scroll(font_system, false);
 }
 
+/// Build the cheat-sheet overlay: a full scrim + a centered panel (accent border)
+/// sized to `lines`, with the `(key, desc)` rows shaped into `buffer`. Pushes quads
+/// to `out` and returns the panel rect (logical px) for text placement. Shared by
+/// the windowed renderer and the headless capture so they render identically.
+pub(crate) fn build_help(
+    font_system: &mut FontSystem,
+    buffer: &mut Buffer,
+    lines: &[(String, String)],
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) -> Rect {
+    // Panel sized to content: title + dismiss hint + blank + one row per line.
+    let w = (logical_w * 0.7).clamp(280.0, 460.0);
+    let h = (lines.len() as f32 + 3.0) * LINE_HEIGHT + 2.0 * HELP_PAD;
+    let x = ((logical_w - w) * 0.5).max(0.0);
+    let y = ((logical_h - h) * 0.5).max(0.0);
+    let panel = Rect::new(x as f64, y as f64, w as f64, h as f64);
+
+    // Scrim over everything, then the panel fill + Ember-orange border.
+    out.push((
+        scaled(0.0, 0.0, logical_w, logical_h, sf),
+        lin_rgba(Rgb::new(0, 0, 0), 0.66),
+    ));
+    out.push((
+        scaled(x, y, w, h, sf),
+        lin_rgba(Rgb::new(0x20, 0x22, 0x28), 0.98),
+    ));
+    push_border(out, panel, ACCENT, sf);
+
+    // Shape the cheat-sheet text (keys in accent, descriptions in fg).
+    buffer.set_size(
+        font_system,
+        Some(w - 2.0 * HELP_PAD),
+        Some(h - 2.0 * HELP_PAD),
+    );
+    let mut spans: Vec<(String, Color)> = Vec::new();
+    spans.push((
+        "Keyboard Shortcuts\n".to_string(),
+        Color::rgb(0xff, 0xff, 0xff),
+    ));
+    spans.push((
+        "press any key to dismiss\n\n".to_string(),
+        Color::rgb(0x88, 0x88, 0x88),
+    ));
+    for (key, desc) in lines {
+        spans.push((
+            format!("{key:<18}"),
+            Color::rgb(ACCENT.r, ACCENT.g, ACCENT.b),
+        ));
+        spans.push((format!("{desc}\n"), Color::rgb(FG.r, FG.g, FG.b)));
+    }
+    let base = Attrs::new().family(Family::Monospace);
+    buffer.set_rich_text(
+        font_system,
+        spans
+            .iter()
+            .map(|(t, c)| (t.as_str(), Attrs::new().family(Family::Monospace).color(*c))),
+        &base,
+        Shaping::Advanced,
+        None,
+    );
+    buffer.shape_until_scroll(font_system, false);
+    panel
+}
+
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -297,6 +366,10 @@ pub struct Renderer {
     tabs: Vec<TabLabel>,
     /// Glyph buffer for the tab strip.
     chrome: Buffer,
+    /// When `Some`, the cheat-sheet overlay is shown with these `(key, desc)` rows.
+    help: Option<Vec<(String, String)>>,
+    /// Glyph buffer for the help overlay.
+    help_buffer: Buffer,
     /// Measured monospace advance (px) — keeps bg quads aligned with glyphs.
     cell_w: f32,
     // Keep the window LAST so it drops after the surface (winit/wgpu requirement).
@@ -361,6 +434,7 @@ impl Renderer {
 
         let mut chrome = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         chrome.set_size(&mut font_system, Some(width as f32), Some(LINE_HEIGHT));
+        let help_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
 
         let cell_w = measure_cell_width(&mut font_system);
         let quads = QuadRenderer::new(&device, format);
@@ -381,6 +455,8 @@ impl Renderer {
             focused: None,
             tabs: Vec::new(),
             chrome,
+            help: None,
+            help_buffer,
             cell_w,
             window,
         }
@@ -456,6 +532,7 @@ impl Renderer {
             scale: sf,
             panes,
             tabs: self.tabs.clone(),
+            help: self.help.clone(),
         };
         crate::headless::capture(&shot, path)
     }
@@ -503,6 +580,35 @@ impl Renderer {
         self.tabs = tabs;
     }
 
+    /// Show the cheat-sheet overlay with these `(key, description)` rows, or hide
+    /// it with `None`. The next `render` draws (or stops drawing) the modal.
+    pub fn set_help(&mut self, lines: Option<Vec<(String, String)>>) {
+        self.help = lines;
+        self.window.request_redraw();
+    }
+
+    /// Whether the help overlay is currently shown.
+    pub fn help_visible(&self) -> bool {
+        self.help.is_some()
+    }
+
+    /// Build the help overlay using this renderer's buffer (wrapper over the shared
+    /// [`build_help`] so the windowed + headless paths render it identically).
+    fn build_help_quads(&mut self, sf: f32, rects: &mut Vec<([f32; 4], [f32; 4])>) -> Rect {
+        let logical_w = self.config.width as f32 / sf;
+        let logical_h = self.config.height as f32 / sf;
+        let rows = self.help.clone().unwrap_or_default();
+        build_help(
+            &mut self.font_system,
+            &mut self.help_buffer,
+            &rows,
+            logical_w,
+            logical_h,
+            sf,
+            rects,
+        )
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
@@ -518,38 +624,89 @@ impl Renderer {
     /// Draw all visible panes (each in its rect) plus the tab strip. Returns
     /// `false` if the surface needs reconfiguring (request another redraw).
     pub fn render(&mut self) -> bool {
-        // Pass 1: shape each visible pane's text into its own buffer.
-        for vp in &self.visible {
-            if let Some(p) = self.panes.get_mut(&vp.session) {
-                shape_grid(&mut self.font_system, &mut p.buffer, &p.grid);
-            }
-        }
-
         // The app works in logical px; the surface is physical. Scale every draw
         // coordinate by the live HiDPI factor (handles Retina + display moves).
         let sf = self.window.scale_factor() as f32;
-
-        // Pass 2: collect background fills, cursor, focus border, and tab strip
-        // (geometry built in logical px, then scaled to physical by `sf`).
-        let cw = self.cell_w;
-        let split = self.visible.len() > 1;
+        let full_bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: self.config.width as i32,
+            bottom: self.config.height as i32,
+        };
         let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
-        for vp in &self.visible {
-            if let Some(p) = self.panes.get(&vp.session) {
-                let focused = self.focused.as_ref() == Some(&vp.session);
-                grid_quads(&p.grid, vp.rect, cw, sf, focused, split, &mut rects);
+        let mut areas: Vec<TextArea> = Vec::new();
+
+        if self.help.is_some() {
+            // Modal cheat-sheet: a scrim + centered panel + the key list, drawn
+            // instead of the panes (fully obscured so the text stays legible).
+            let panel = self.build_help_quads(sf, &mut rects);
+            areas.push(TextArea {
+                buffer: &self.help_buffer,
+                left: (panel.x as f32 + HELP_PAD) * sf,
+                top: (panel.y as f32 + HELP_PAD) * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(FG.r, FG.g, FG.b),
+                custom_glyphs: &[],
+            });
+        } else {
+            // Pass 1: shape each visible pane's text into its own buffer.
+            for vp in &self.visible {
+                if let Some(p) = self.panes.get_mut(&vp.session) {
+                    shape_grid(&mut self.font_system, &mut p.buffer, &p.grid);
+                }
+            }
+            // Pass 2: bg fills, cursor, focus border, tab strip (logical px * sf).
+            let cw = self.cell_w;
+            let split = self.visible.len() > 1;
+            for vp in &self.visible {
+                if let Some(p) = self.panes.get(&vp.session) {
+                    let focused = self.focused.as_ref() == Some(&vp.session);
+                    grid_quads(&p.grid, vp.rect, cw, sf, focused, split, &mut rects);
+                }
+            }
+            let logical_w = self.config.width as f32 / sf;
+            build_tabs(
+                &mut self.font_system,
+                &mut self.chrome,
+                &self.tabs,
+                cw,
+                logical_w,
+                sf,
+                &mut rects,
+            );
+
+            // Pass 3: one TextArea per visible pane (clipped to its rect) + the strip.
+            for vp in &self.visible {
+                if let Some(p) = self.panes.get(&vp.session) {
+                    areas.push(TextArea {
+                        buffer: &p.buffer,
+                        left: vp.rect.x as f32 * sf,
+                        top: vp.rect.y as f32 * sf,
+                        scale: sf,
+                        bounds: TextBounds {
+                            left: (vp.rect.x as f32 * sf) as i32,
+                            top: (vp.rect.y as f32 * sf) as i32,
+                            right: ((vp.rect.x + vp.rect.width) as f32 * sf) as i32,
+                            bottom: ((vp.rect.y + vp.rect.height) as f32 * sf) as i32,
+                        },
+                        default_color: Color::rgb(FG.r, FG.g, FG.b),
+                        custom_glyphs: &[],
+                    });
+                }
+            }
+            if self.tabs.len() > 1 {
+                areas.push(TextArea {
+                    buffer: &self.chrome,
+                    left: 0.0,
+                    top: PAD * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(FG.r, FG.g, FG.b),
+                    custom_glyphs: &[],
+                });
             }
         }
-        let logical_w = self.config.width as f32 / sf;
-        build_tabs(
-            &mut self.font_system,
-            &mut self.chrome,
-            &self.tabs,
-            cw,
-            logical_w,
-            sf,
-            &mut rects,
-        );
 
         self.quads.prepare(
             &self.device,
@@ -557,7 +714,6 @@ impl Renderer {
             (self.config.width as f32, self.config.height as f32),
             &rects,
         );
-
         self.viewport.update(
             &self.queue,
             Resolution {
@@ -565,44 +721,6 @@ impl Renderer {
                 height: self.config.height,
             },
         );
-
-        // Pass 3: one TextArea per visible pane (clipped to its rect) + the strip.
-        let full_bounds = TextBounds {
-            left: 0,
-            top: 0,
-            right: self.config.width as i32,
-            bottom: self.config.height as i32,
-        };
-        let mut areas: Vec<TextArea> = Vec::new();
-        for vp in &self.visible {
-            if let Some(p) = self.panes.get(&vp.session) {
-                areas.push(TextArea {
-                    buffer: &p.buffer,
-                    left: vp.rect.x as f32 * sf,
-                    top: vp.rect.y as f32 * sf,
-                    scale: sf,
-                    bounds: TextBounds {
-                        left: (vp.rect.x as f32 * sf) as i32,
-                        top: (vp.rect.y as f32 * sf) as i32,
-                        right: ((vp.rect.x + vp.rect.width) as f32 * sf) as i32,
-                        bottom: ((vp.rect.y + vp.rect.height) as f32 * sf) as i32,
-                    },
-                    default_color: Color::rgb(FG.r, FG.g, FG.b),
-                    custom_glyphs: &[],
-                });
-            }
-        }
-        if self.tabs.len() > 1 {
-            areas.push(TextArea {
-                buffer: &self.chrome,
-                left: 0.0,
-                top: PAD * sf,
-                scale: sf,
-                bounds: full_bounds,
-                default_color: Color::rgb(FG.r, FG.g, FG.b),
-                custom_glyphs: &[],
-            });
-        }
 
         // Optional diagnostics: `EMBER_DEBUG=/tmp/e.log ember-term` (file sink) or
         // `EMBER_DEBUG=1` (stderr). Logs scale, surface size, and each visible
