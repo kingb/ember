@@ -13,6 +13,7 @@ use crate::renderer::{
     ABOUT_TITLE_LINE, ACCENT, AMBER, AboutInfo, BG, BackdropParams, CELL_HEIGHT, FG, FONT_SIZE,
     HELP_PAD, LINE_HEIGHT, PAD, TabLabel,
 };
+use crate::selection::Selection;
 
 /// Deep, cooling ember the sparks fade toward as they rise.
 const EMBER_DARK: Rgb = Rgb::new(0x7a, 0x1a, 0x05);
@@ -215,6 +216,33 @@ pub(crate) fn grid_quads(
         }
         if split {
             push_border(out, rect, ACCENT, sf);
+        }
+    }
+}
+
+/// Translucent selection-highlight color (a calm blue, drawn over the cell bg and
+/// under the glyphs so selected text stays readable).
+const SELECT_BG: Rgb = Rgb::new(0x3a, 0x66, 0xb0);
+
+/// Append the selection-highlight quads for `selection` over the pane at `rect`
+/// (one quad per selected row span). Drawn after the bg fills, before text.
+pub(crate) fn selection_quads(
+    grid: &GridModel,
+    selection: &Selection,
+    rect: Rect,
+    cw: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) {
+    let ox = rect.x as f32;
+    let oy = rect.y as f32;
+    let ch = CELL_HEIGHT;
+    for row in 0..grid.dims.screen_lines {
+        if let Some((c0, c1)) = selection.row_span(grid, row) {
+            let x = ox + c0 as f32 * cw;
+            let w = (c1 - c0 + 1) as f32 * cw;
+            let y = oy + row as f32 * ch;
+            out.push((scaled(x, y, w, ch, sf), lin_rgba(SELECT_BG, 0.45)));
         }
     }
 }

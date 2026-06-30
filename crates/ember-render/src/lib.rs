@@ -10,12 +10,14 @@ pub mod headless;
 mod paint;
 pub mod quads;
 pub mod renderer;
+pub mod selection;
 
 pub use grid_model::GridModel;
 pub use renderer::{
     AboutInfo, BackdropParams, CELL_HEIGHT, CELL_WIDTH, ImageFit, PaneSnapshot, Renderer, TabHit,
     TabLabel, VisiblePane,
 };
+pub use selection::{Point, Selection, SelectionMode};
 
 /// Returns the `ember-core` version this render layer is built against.
 pub fn core_version() -> &'static str {
