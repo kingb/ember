@@ -557,10 +557,11 @@ impl RunState {
     /// a recognized shortcut (so the caller can check for an emptied tree → quit).
     fn handle_shortcut(&mut self, key: &Key, mods: ModifiersState) -> bool {
         match key {
-            // Cmd+? — show the cheat-sheet overlay (any key dismisses). macOS often
-            // reports the base key "/" rather than the shifted "?" when Cmd is held,
-            // so accept either (Cmd+/ opens it too).
-            Key::Character(s) if s.as_str() == "?" || s.as_str() == "/" => {
+            // Cmd+/ — show the cheat-sheet overlay (any key dismisses). macOS
+            // reserves Cmd+? (Cmd+Shift+/) for the system Help menu and never
+            // delivers it, so Cmd+/ is the real binding; "?" is accepted too in
+            // case a layout delivers it.
+            Key::Character(s) if s.as_str() == "/" || s.as_str() == "?" => {
                 self.show_help();
                 true
             }
@@ -742,7 +743,7 @@ fn help_lines() -> Vec<(String, String)> {
         ("Cmd+Arrows", "Focus pane"),
         ("Cmd+Shift+Arrows", "Switch tab"),
         ("Cmd+1..9", "Jump to tab"),
-        ("Cmd+?", "Show this help"),
+        ("Cmd+/", "Show this help"),
     ]
     .iter()
     .map(|(k, d)| (k.to_string(), d.to_string()))
