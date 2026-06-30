@@ -21,7 +21,7 @@ use wgpu::{
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    AboutLayout, build_about, build_help, build_settings, build_tabs, grid_quads,
+    AboutLayout, build_about, build_fps, build_help, build_settings, build_tabs, grid_quads,
     measure_cell_width, push_backdrop, selection_quads, shape_grid, spark_quads,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
@@ -61,6 +61,8 @@ pub struct Shot<'a> {
     pub image: Option<(Vec<u8>, u32, u32)>,
     /// How the backdrop image fills the window.
     pub image_fit: ImageFit,
+    /// FPS/frame-time debug readout text (bottom-right), or `None`.
+    pub fps_overlay: Option<String>,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
@@ -139,11 +141,13 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
     );
     let mut about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut settings_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut fps_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut help_panel: Option<Rect> = None;
     let mut about_layout: Option<AboutLayout> = None;
     let mut settings_origin: Option<(f32, f32)> = None;
+    let mut fps_origin: Option<(f32, f32)> = None;
 
     if let Some((rows, sel)) = &shot.settings {
         settings_origin = Some(build_settings(
@@ -246,6 +250,18 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             sf,
             &mut rects,
         );
+        if let Some(text) = &shot.fps_overlay {
+            fps_origin = Some(build_fps(
+                &mut font_system,
+                &mut fps_buf,
+                text,
+                cw,
+                shot.logical_w,
+                shot.logical_h,
+                sf,
+                &mut rects,
+            ));
+        }
     }
     quads.prepare(&device, &queue, (phys_w as f32, phys_h as f32), &rects);
     sparks.prepare(
@@ -328,6 +344,17 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
                 scale: sf,
                 bounds: full_bounds,
                 default_color: Color::rgb(FG.r, FG.g, FG.b),
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((left, top)) = fps_origin {
+            areas.push(TextArea {
+                buffer: &fps_buf,
+                left: left * sf,
+                top: top * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
                 custom_glyphs: &[],
             });
         }

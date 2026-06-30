@@ -45,6 +45,8 @@ pub enum ControlMsg {
     Copy,
     /// Paste the given text into the focused pane (as if from the clipboard).
     Paste(String),
+    /// Toggle the FPS/frame-time debug overlay.
+    Fps,
 }
 
 #[cfg(unix)]
@@ -197,6 +199,10 @@ mod unix {
                 let _ = tx.send(ControlMsg::Paste(text.to_string()));
                 ok()
             }
+            "fps" => {
+                let _ = tx.send(ControlMsg::Fps);
+                ok()
+            }
             other => err(&format!("unknown cmd: {other}")),
         }
     }
@@ -331,6 +337,7 @@ mod unix {
             }
             "copy" => serde_json::json!({"cmd":"copy"}),
             "paste" => serde_json::json!({"cmd":"paste","text": unescape(arg)}),
+            "fps" => serde_json::json!({"cmd":"fps"}),
             other => {
                 return Err(format!(
                     "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot|click|about|settings|select|copy|paste)"

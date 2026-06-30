@@ -50,6 +50,8 @@ pub struct Opts {
     pub select: Option<(u16, u16, u16, u16)>,
     /// Selection mode: `simple` | `word` | `line`.
     pub select_mode: String,
+    /// FPS/frame-time debug overlay text (bottom-right), for verifying its layout.
+    pub fps: Option<String>,
 }
 
 impl Default for Opts {
@@ -70,6 +72,7 @@ impl Default for Opts {
             bg_fit: "cover".to_string(),
             select: None,
             select_mode: "simple".to_string(),
+            fps: None,
         }
     }
 }
@@ -124,6 +127,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
                 opts.select = Some((nums[0], nums[1], nums[2], nums[3]));
             }
             "--select-mode" => opts.select_mode = next()?,
+            "--fps" => opts.fps = Some(next()?),
             _ => {}
         }
         i += 1;
@@ -291,6 +295,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
             .as_deref()
             .and_then(crate::load_backdrop_image),
         image_fit: ember_render::ImageFit::parse(&opts.bg_fit),
+        fps_overlay: opts.fps.clone(),
     };
     if opts.bg_image.is_some() && shot.image.is_none() {
         return Err(format!(

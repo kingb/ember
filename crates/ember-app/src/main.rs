@@ -173,6 +173,12 @@ struct RunState {
     /// unfocused, per the perf stance).
     backdrop_since: Instant,
     window_focused: bool,
+    /// FPS/frame-time debug overlay (toggle: Cmd+Shift+P / `ctl fps`). EMAs of the
+    /// redraw interval (cadence) and the render() call duration (per-frame cost).
+    fps_overlay: bool,
+    last_frame: Option<Instant>,
+    fps_ema_ms: f32,
+    render_ema_ms: f32,
     /// Native menu bar (macOS); inert elsewhere. Kept alive for the app's life.
     menu: ember_platform::AppMenu,
     /// Last cursor position in **logical** px.
@@ -263,6 +269,10 @@ impl ApplicationHandler for App {
             image_loaded: None,
             backdrop_since: Instant::now(),
             window_focused: true,
+            fps_overlay: false,
+            last_frame: None,
+            fps_ema_ms: 0.0,
+            render_ema_ms: 0.0,
             menu: ember_platform::build_menu(),
             cursor: (0.0, 0.0),
             pane_rects: Vec::new(),
@@ -366,7 +376,37 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 state.drain_frames();
+                // Frame-timing for the FPS overlay: cadence (interval between
+                // redraws) + the render() call's own duration (the per-frame cost).
+                let now = Instant::now();
+                if let Some(last) = state.last_frame {
+                    let dt = now.duration_since(last).as_secs_f32() * 1000.0;
+                    state.fps_ema_ms = if state.fps_ema_ms == 0.0 {
+                        dt
+                    } else {
+                        state.fps_ema_ms * 0.9 + dt * 0.1
+                    };
+                }
+                state.last_frame = Some(now);
+                if state.fps_overlay {
+                    let fps = if state.fps_ema_ms > 0.0 {
+                        1000.0 / state.fps_ema_ms
+                    } else {
+                        0.0
+                    };
+                    state.renderer.set_fps_overlay(Some(format!(
+                        "{fps:.0} fps · {:.1} ms",
+                        state.render_ema_ms
+                    )));
+                }
+                let t = Instant::now();
                 state.renderer.render();
+                let render_ms = t.elapsed().as_secs_f32() * 1000.0;
+                state.render_ema_ms = if state.render_ema_ms == 0.0 {
+                    render_ms
+                } else {
+                    state.render_ema_ms * 0.9 + render_ms * 0.1
+                };
             }
             _ => {}
         }
@@ -433,7 +473,7 @@ impl ApplicationHandler for App {
         // The About glow runs at ~60fps (brief, transient modal); the ambient
         // ember sparks honor the configurable `ember_fps` cap (default 30) — fewer
         // redraws ≈ proportionally less CPU, and embers drift fine at 30.
-        let wait = if state.about {
+        let wait = if state.about || state.fps_overlay {
             ANIM_FRAME
         } else if state.backdrop_animating() {
             state.ember_frame()
@@ -463,6 +503,10 @@ impl ApplicationHandler for App {
             let params =
                 state.backdrop_params(now.duration_since(state.backdrop_since).as_secs_f32());
             state.renderer.set_backdrop(params);
+        }
+        // Keep frames flowing while the FPS overlay is on, so its readout stays live.
+        if state.fps_overlay {
+            state.renderer.window().request_redraw();
         }
     }
 }
@@ -607,6 +651,7 @@ impl RunState {
                     self.send_to_focused(text.into_bytes());
                 }
             }
+            ControlMsg::Fps => self.toggle_fps(),
         }
     }
 
@@ -751,6 +796,11 @@ impl RunState {
             // Cmd+, — Settings (the macOS Preferences convention; also a menu item).
             Key::Character(s) if s.as_str() == "," => {
                 self.toggle_settings();
+                true
+            }
+            // Cmd+Shift+P — toggle the FPS / frame-time debug overlay.
+            Key::Character(s) if s.eq_ignore_ascii_case("p") && mods.shift_key() => {
+                self.toggle_fps();
                 true
             }
             // Cmd+C — copy the current selection (macOS clipboard convention;
@@ -1090,6 +1140,15 @@ impl RunState {
             self.settings_open = false;
             self.renderer.set_settings(None);
         }
+    }
+
+    /// Toggle the FPS/frame-time debug overlay (Cmd+Shift+P / `ctl fps`).
+    fn toggle_fps(&mut self) {
+        self.fps_overlay = !self.fps_overlay;
+        if !self.fps_overlay {
+            self.renderer.set_fps_overlay(None);
+        }
+        self.renderer.window().request_redraw();
     }
 
     /// Toggle the Settings overlay (Ember → Settings… / Cmd+,).

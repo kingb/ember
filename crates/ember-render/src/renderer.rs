@@ -28,8 +28,8 @@ use winit::window::Window;
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    BTN_COLS, build_about, build_help, build_settings, build_tabs, debug_emit, grid_quads,
-    measure_cell_width, push_backdrop, selection_quads, shape_grid, spark_quads,
+    BTN_COLS, build_about, build_fps, build_help, build_settings, build_tabs, debug_emit,
+    grid_quads, measure_cell_width, push_backdrop, selection_quads, shape_grid, spark_quads,
 };
 use crate::selection::Selection;
 
@@ -222,6 +222,10 @@ pub struct Renderer {
     image_rgba: Option<(Vec<u8>, u32, u32)>,
     /// The active text selection and the session whose pane it belongs to.
     selection: Option<(SessionId, Selection)>,
+    /// FPS/frame-time debug readout text (bottom-right), or `None` when hidden.
+    fps_overlay: Option<String>,
+    /// Glyph buffer for the FPS overlay.
+    fps_buffer: Buffer,
     // Keep the window LAST so it drops after the surface (winit/wgpu requirement).
     window: Arc<Window>,
 }
@@ -291,6 +295,7 @@ impl Renderer {
         );
         let about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let settings_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let fps_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
 
         let cell_w = measure_cell_width(&mut font_system);
         let quads = QuadRenderer::new(&device, format);
@@ -329,6 +334,8 @@ impl Renderer {
             image_fit: ImageFit::default(),
             image_rgba: None,
             selection: None,
+            fps_overlay: None,
+            fps_buffer,
             window,
         }
     }
@@ -418,6 +425,7 @@ impl Renderer {
             backdrop: self.backdrop,
             image: self.image_rgba.clone(),
             image_fit: self.image_fit,
+            fps_overlay: self.fps_overlay.clone(),
         };
         crate::headless::capture(&shot, path)
     }
@@ -570,6 +578,11 @@ impl Renderer {
     pub fn set_selection(&mut self, selection: Option<(SessionId, Selection)>) {
         self.selection = selection;
         self.window.request_redraw();
+    }
+
+    /// Set or clear the FPS/frame-time debug readout text (bottom-right).
+    pub fn set_fps_overlay(&mut self, text: Option<String>) {
+        self.fps_overlay = text;
     }
 
     /// The currently selected text, if any (read from the owning pane's grid).
@@ -809,6 +822,28 @@ impl Renderer {
                     scale: sf,
                     bounds: full_bounds,
                     default_color: Color::rgb(FG.r, FG.g, FG.b),
+                    custom_glyphs: &[],
+                });
+            }
+            // FPS/frame-time debug readout, on top of the panes (bottom-right).
+            if let Some(text) = self.fps_overlay.clone() {
+                let (left, top) = build_fps(
+                    &mut self.font_system,
+                    &mut self.fps_buffer,
+                    &text,
+                    cw,
+                    logical_w,
+                    logical_h,
+                    sf,
+                    &mut rects,
+                );
+                areas.push(TextArea {
+                    buffer: &self.fps_buffer,
+                    left: left * sf,
+                    top: top * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
                     custom_glyphs: &[],
                 });
             }

@@ -635,6 +635,41 @@ pub(crate) fn build_settings(
     (x + pad, y + pad)
 }
 
+/// Build the FPS/frame-time debug readout: a small dark box pinned to the
+/// bottom-right with `text` (e.g. "58 fps · 17.2 ms"). Quad → `out`, text shaped
+/// into `buf`; returns the logical `(left, top)` for the text area. Drawn on top
+/// of the panes (not a modal), so it never steals input.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_fps(
+    font_system: &mut FontSystem,
+    buf: &mut Buffer,
+    text: &str,
+    cw: f32,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) -> (f32, f32) {
+    let ipad = 5.0;
+    let w = text.chars().count() as f32 * cw + 2.0 * ipad;
+    let h = LINE_HEIGHT + 2.0 * ipad;
+    let x = (logical_w - w - 8.0).max(0.0);
+    let y = (logical_h - h - 8.0).max(0.0);
+    out.push((scaled(x, y, w, h, sf), lin_rgba(Rgb::new(0, 0, 0), 0.62)));
+    buf.set_size(font_system, Some(w), Some(h));
+    buf.set_text(
+        font_system,
+        text,
+        &Attrs::new()
+            .family(Family::Monospace)
+            .color(Color::rgb(AMBER.r, AMBER.g, AMBER.b)),
+        Shaping::Advanced,
+        None,
+    );
+    buf.shape_until_scroll(font_system, false);
+    (x + ipad, y + ipad)
+}
+
 /// A `(rect_px, …)`-ready physical-pixel quad from logical `x,y,w,h` and the
 /// HiDPI scale factor.
 pub(crate) fn scaled(x: f32, y: f32, w: f32, h: f32, sf: f32) -> [f32; 4] {
