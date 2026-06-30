@@ -18,7 +18,7 @@ use wgpu::{
     TextureFormat,
 };
 
-use crate::background::SparkRenderer;
+use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     AboutLayout, build_about, build_help, build_settings, build_tabs, grid_quads,
@@ -27,7 +27,7 @@ use crate::paint::{
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
     ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, BG, BackdropParams, CELL_HEIGHT, FG,
-    FONT_SIZE, HELP_PAD, LINE_HEIGHT, PAD, TabLabel,
+    FONT_SIZE, HELP_PAD, ImageFit, LINE_HEIGHT, PAD, TabLabel,
 };
 
 /// One pane in a screenshot scene: a grid and the **logical** inner rect it fills.
@@ -53,6 +53,11 @@ pub struct Shot<'a> {
     pub settings: Option<(Vec<(String, String)>, usize)>,
     /// Campfire backdrop + ember sparks (drawn behind the panes when active).
     pub backdrop: BackdropParams,
+    /// A backdrop image as `(rgba8, width, height)`; drawn behind the cells in
+    /// place of the gradient when set.
+    pub image: Option<(Vec<u8>, u32, u32)>,
+    /// How the backdrop image fills the window.
+    pub image_fit: ImageFit,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
@@ -112,6 +117,8 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
         TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
     let mut quads = QuadRenderer::new(&device, format);
     let mut sparks = SparkRenderer::new(&device, format);
+    let mut image = ImageRenderer::new(&device, format);
+    let mut draw_image = false;
     let cw = measure_cell_width(&mut font_system);
 
     let full_bounds = TextBounds {
@@ -174,14 +181,24 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             &mut rects,
         ));
     } else {
-        // Campfire backdrop (gradient + scrim) behind the cells, then sparks.
-        push_backdrop(
-            &mut rects,
-            &shot.backdrop,
-            shot.logical_w,
-            shot.logical_h,
-            sf,
-        );
+        // Campfire backdrop (image or gradient, + scrim) behind the cells, then
+        // sparks. A backdrop image is the base layer drawn in the render pass; it
+        // replaces the gradient (scrim still applies).
+        if let Some((rgba, w, h)) = &shot.image {
+            image.set_image(&device, &queue, rgba, *w, *h);
+            image.prepare(
+                &device,
+                &queue,
+                (phys_w as f32, phys_h as f32),
+                shot.image_fit,
+            );
+            draw_image = true;
+        }
+        let mut bp = shot.backdrop;
+        if draw_image {
+            bp.gradient = false;
+        }
+        push_backdrop(&mut rects, &bp, shot.logical_w, shot.logical_h, sf);
         if shot.backdrop.sparks {
             spark_rects = spark_quads(
                 shot.backdrop.density,
@@ -357,6 +374,9 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if draw_image {
+            image.draw(&mut pass);
+        }
         quads.draw(&mut pass);
         sparks.draw(&mut pass);
         let _ = text_renderer.render(&atlas, &viewport, &mut pass);

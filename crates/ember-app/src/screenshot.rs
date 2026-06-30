@@ -42,6 +42,10 @@ pub struct Opts {
     pub ember: bool,
     /// Animation time (seconds) to pin the sparks at, for a deterministic frame.
     pub ember_phase: f32,
+    /// Path to a backdrop image (PNG) to draw behind the cells.
+    pub bg_image: Option<String>,
+    /// Backdrop image fit: `cover` | `contain` | `stretch` | `tile`.
+    pub bg_fit: String,
 }
 
 impl Default for Opts {
@@ -58,6 +62,8 @@ impl Default for Opts {
             backdrop: false,
             ember: false,
             ember_phase: 1.4,
+            bg_image: None,
+            bg_fit: "cover".to_string(),
         }
     }
 }
@@ -97,6 +103,8 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--ember-phase" => {
                 opts.ember_phase = next()?.parse().map_err(|e| format!("--ember-phase: {e}"))?
             }
+            "--bg-image" => opts.bg_image = Some(next()?),
+            "--bg-fit" => opts.bg_fit = next()?,
             _ => {}
         }
         i += 1;
@@ -234,12 +242,29 @@ pub fn run(opts: Opts) -> Result<String, String> {
         settings: None,
         backdrop: ember_render::BackdropParams {
             gradient: opts.backdrop,
-            scrim: if opts.backdrop { 0.4 } else { 0.0 },
+            // An image backdrop supplies its own base; keep the scrim on so text
+            // stays legible over either a gradient or an image.
+            scrim: if opts.backdrop || opts.bg_image.is_some() {
+                0.4
+            } else {
+                0.0
+            },
             sparks: opts.ember,
             density: 1.0,
             time: opts.ember_phase,
         },
+        image: opts
+            .bg_image
+            .as_deref()
+            .and_then(crate::load_backdrop_image),
+        image_fit: ember_render::ImageFit::parse(&opts.bg_fit),
     };
+    if opts.bg_image.is_some() && shot.image.is_none() {
+        return Err(format!(
+            "--bg-image: could not load {:?} as a PNG",
+            opts.bg_image.as_deref().unwrap_or("")
+        ));
+    }
     headless::capture(&shot, Path::new(&opts.path))?;
 
     for (_, handle, _, _) in &panes {

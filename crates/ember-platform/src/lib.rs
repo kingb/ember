@@ -59,8 +59,9 @@ pub fn window_attributes(title: &str, width: f32, height: f32) -> WindowAttribut
         .with_inner_size(LogicalSize::new(width.max(1.0), height.max(1.0)))
 }
 
-/// Decode a PNG (RGBA or RGB) into a winit window icon.
-pub fn decode_icon(png_bytes: &[u8]) -> Option<winit::window::Icon> {
+/// Decode a PNG (RGBA or RGB) into raw RGBA8 bytes + `(width, height)`. The single
+/// PNG decode used for both the window icon and the backdrop image.
+pub fn decode_png_rgba(png_bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let decoder = png::Decoder::new(png_bytes);
     let mut reader = decoder.read_info().ok()?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
@@ -73,7 +74,13 @@ pub fn decode_icon(png_bytes: &[u8]) -> Option<winit::window::Icon> {
             .collect(),
         _ => return None,
     };
-    winit::window::Icon::from_rgba(rgba, info.width, info.height).ok()
+    Some((rgba, info.width, info.height))
+}
+
+/// Decode a PNG (RGBA or RGB) into a winit window icon.
+pub fn decode_icon(png_bytes: &[u8]) -> Option<winit::window::Icon> {
+    let (rgba, w, h) = decode_png_rgba(png_bytes)?;
+    winit::window::Icon::from_rgba(rgba, w, h).ok()
 }
 
 /// Set the application icon: the winit window icon (Linux/Windows) and, on

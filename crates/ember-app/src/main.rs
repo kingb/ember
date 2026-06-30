@@ -28,7 +28,7 @@ use ember_core::{
 };
 use ember_platform::MenuAction;
 use ember_render::{
-    BackdropParams, CELL_HEIGHT, CELL_WIDTH, Renderer, TabHit, TabLabel, VisiblePane,
+    BackdropParams, CELL_HEIGHT, CELL_WIDTH, ImageFit, Renderer, TabHit, TabLabel, VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
@@ -163,6 +163,9 @@ struct RunState {
     config: Config,
     settings_open: bool,
     settings_sel: usize,
+    /// The backdrop-image path currently uploaded to the renderer, so
+    /// `apply_appearance` re-decodes only when the configured path changes.
+    image_loaded: Option<String>,
     /// Backdrop animation clock + whether the window is focused (sparks pause when
     /// unfocused, per the perf stance).
     backdrop_since: Instant,
@@ -181,6 +184,13 @@ pub(crate) fn inset(r: Rect, p: f64) -> Rect {
         (r.width - 2.0 * p).max(1.0),
         (r.height - 2.0 * p).max(1.0),
     )
+}
+
+/// Load + decode a backdrop image (PNG) from `path` into `(rgba8, w, h)`.
+/// Forgiving: a missing/unreadable/non-PNG path yields `None` (no image).
+pub(crate) fn load_backdrop_image(path: &str) -> Option<(Vec<u8>, u32, u32)> {
+    let bytes = std::fs::read(path).ok()?;
+    ember_platform::decode_png_rgba(&bytes)
 }
 
 /// Cell grid that fits an inner pixel rect.
@@ -235,6 +245,7 @@ impl ApplicationHandler for App {
             config: config::load(),
             settings_open: false,
             settings_sel: 0,
+            image_loaded: None,
             backdrop_since: Instant::now(),
             window_focused: true,
             menu: ember_platform::build_menu(),
@@ -866,11 +877,24 @@ impl RunState {
     fn settings_rows(&self) -> Vec<(String, String)> {
         let bg = &self.config.background;
         let on = |b: bool| if b { "on" } else { "off" }.to_string();
+        // Backdrop image is config-only (path + fit live in config.toml); shown
+        // here read-only as "<filename> (<fit>)" or "none".
+        let image = match bg.image.as_deref() {
+            Some(p) => {
+                let name = std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(p);
+                format!("{name} ({})", bg.image_fit)
+            }
+            None => "none".to_string(),
+        };
         vec![
             ("Gradient backdrop".into(), on(bg.gradient)),
             ("Ember sparks".into(), on(bg.ember_sparks)),
             ("Ember density".into(), format!("{:.1}", bg.ember_density)),
             ("Scrim".into(), format!("{:.2}", bg.scrim)),
+            ("Backdrop image".into(), image),
         ]
     }
 
@@ -959,11 +983,26 @@ impl RunState {
     }
 
     /// Push the current config's appearance (campfire backdrop + ember sparks) to
-    /// the renderer. Called on startup and whenever a setting changes.
+    /// the renderer. Called on startup and whenever a setting changes. Decodes the
+    /// backdrop image only when the configured path changes (cheap on idle changes).
     fn apply_appearance(&mut self) {
         let t = self.backdrop_since.elapsed().as_secs_f32();
         let params = self.backdrop_params(t);
         self.renderer.set_backdrop(params);
+
+        let want = self.config.background.image.clone();
+        if want != self.image_loaded {
+            let fit = ImageFit::parse(&self.config.background.image_fit);
+            let img = want.as_deref().and_then(load_backdrop_image);
+            if want.is_some() && img.is_none() {
+                eprintln!(
+                    "[ember] backdrop image could not be loaded: {:?} (need a readable PNG)",
+                    want.as_deref().unwrap_or("")
+                );
+            }
+            self.renderer.set_backdrop_image(img, fit);
+            self.image_loaded = want;
+        }
     }
 
     /// Whether the ember sparks should be animating right now (opt-in, only while
