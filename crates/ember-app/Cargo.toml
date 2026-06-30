@@ -17,6 +17,7 @@ ember-platform.workspace = true
 winit.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+arboard.workspace = true
 
 [lints]
 workspace = true
