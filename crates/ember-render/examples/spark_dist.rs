@@ -51,7 +51,7 @@ fn main() {
     let line: String = emit_counts
         .iter()
         .take(120)
-        .map(|&c| bars[(c.min(7)) as usize])
+        .map(|&c| bars[c.min(7)])
         .collect();
     println!("  first 6s: {line}");
 }
