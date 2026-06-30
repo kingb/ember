@@ -18,14 +18,16 @@ use wgpu::{
     TextureFormat,
 };
 
+use crate::background::SparkRenderer;
 use crate::grid_model::GridModel;
 use crate::paint::{
-    AboutLayout, build_about, build_help, build_tabs, grid_quads, measure_cell_width, shape_grid,
+    AboutLayout, build_about, build_help, build_tabs, grid_quads, measure_cell_width,
+    push_backdrop, shape_grid, spark_quads,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
-    ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, BG, CELL_HEIGHT, FG, FONT_SIZE, HELP_PAD,
-    LINE_HEIGHT, PAD, TabLabel,
+    ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, BG, BackdropParams, CELL_HEIGHT, FG,
+    FONT_SIZE, HELP_PAD, LINE_HEIGHT, PAD, TabLabel,
 };
 
 /// One pane in a screenshot scene: a grid and the **logical** inner rect it fills.
@@ -47,6 +49,8 @@ pub struct Shot<'a> {
     pub help: Option<Vec<(String, String)>>,
     /// When set, the About overlay is drawn, with `(info, glow, elapsed_seconds)`.
     pub about: Option<(AboutInfo, f32, f32)>,
+    /// Campfire backdrop + ember sparks (drawn behind the panes when active).
+    pub backdrop: BackdropParams,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
@@ -105,6 +109,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
     let mut text_renderer =
         TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
     let mut quads = QuadRenderer::new(&device, format);
+    let mut sparks = SparkRenderer::new(&device, format);
     let cw = measure_cell_width(&mut font_system);
 
     let full_bounds = TextBounds {
@@ -122,6 +127,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
     );
     let mut about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
+    let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut help_panel: Option<Rect> = None;
     let mut about_layout: Option<AboutLayout> = None;
 
@@ -152,6 +158,23 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             &mut rects,
         ));
     } else {
+        // Campfire backdrop (gradient + scrim) behind the cells, then sparks.
+        push_backdrop(
+            &mut rects,
+            &shot.backdrop,
+            shot.logical_w,
+            shot.logical_h,
+            sf,
+        );
+        if shot.backdrop.sparks {
+            spark_rects = spark_quads(
+                shot.backdrop.density,
+                shot.backdrop.time,
+                shot.logical_w,
+                shot.logical_h,
+                sf,
+            );
+        }
         // Shape each pane into its own logical-sized buffer, then build quads.
         for pane in &shot.panes {
             let mut buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
@@ -186,6 +209,12 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
         );
     }
     quads.prepare(&device, &queue, (phys_w as f32, phys_h as f32), &rects);
+    sparks.prepare(
+        &device,
+        &queue,
+        (phys_w as f32, phys_h as f32),
+        &spark_rects,
+    );
 
     viewport.update(
         &queue,
@@ -303,6 +332,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             multiview_mask: None,
         });
         quads.draw(&mut pass);
+        sparks.draw(&mut pass);
         let _ = text_renderer.render(&atlas, &viewport, &mut pass);
     }
     encoder.copy_texture_to_buffer(

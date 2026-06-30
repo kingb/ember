@@ -36,6 +36,12 @@ pub struct Opts {
     pub tabs: usize,
     /// How long to let the shells produce output before capturing.
     pub settle_ms: u64,
+    /// Draw the campfire backdrop (warm gradient + legibility scrim).
+    pub backdrop: bool,
+    /// Draw the drifting ember sparks (additive glow).
+    pub ember: bool,
+    /// Animation time (seconds) to pin the sparks at, for a deterministic frame.
+    pub ember_phase: f32,
 }
 
 impl Default for Opts {
@@ -49,6 +55,9 @@ impl Default for Opts {
             runs: Vec::new(),
             tabs: 1,
             settle_ms: 700,
+            backdrop: false,
+            ember: false,
+            ember_phase: 1.4,
         }
     }
 }
@@ -80,6 +89,14 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
                 })
             }
             "--run" => opts.runs.push(next()?),
+            "--backdrop" => opts.backdrop = true,
+            "--ember" => {
+                opts.backdrop = true;
+                opts.ember = true;
+            }
+            "--ember-phase" => {
+                opts.ember_phase = next()?.parse().map_err(|e| format!("--ember-phase: {e}"))?
+            }
             _ => {}
         }
         i += 1;
@@ -214,6 +231,13 @@ pub fn run(opts: Opts) -> Result<String, String> {
         tabs,
         help: None,
         about: None,
+        backdrop: ember_render::BackdropParams {
+            gradient: opts.backdrop,
+            scrim: if opts.backdrop { 0.4 } else { 0.0 },
+            sparks: opts.ember,
+            density: 1.0,
+            time: opts.ember_phase,
+        },
     };
     headless::capture(&shot, Path::new(&opts.path))?;
 

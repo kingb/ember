@@ -10,9 +10,94 @@ use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
 use crate::grid_model::GridModel;
 use crate::quads::srgb_to_linear;
 use crate::renderer::{
-    ABOUT_TITLE_LINE, ACCENT, AMBER, AboutInfo, BG, CELL_HEIGHT, FG, FONT_SIZE, HELP_PAD,
-    LINE_HEIGHT, PAD, TabLabel,
+    ABOUT_TITLE_LINE, ACCENT, AMBER, AboutInfo, BG, BackdropParams, CELL_HEIGHT, FG, FONT_SIZE,
+    HELP_PAD, LINE_HEIGHT, PAD, TabLabel,
 };
+
+/// Deep, cooling ember the sparks fade toward as they rise.
+const EMBER_DARK: Rgb = Rgb::new(0x7a, 0x1a, 0x05);
+
+/// Push the campfire backdrop (a warm vertical gradient + a darkening legibility
+/// scrim) into the alpha-blended quad list, drawn behind the cells. Both are
+/// opt-in via [`BackdropParams`]; the sparks are a separate additive pass.
+pub(crate) fn push_backdrop(
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+    params: &BackdropParams,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+) {
+    if params.gradient {
+        // Dark warm vertical gradient: near-black at the top → ember-warm at the
+        // bottom (where the "fire" is), as opaque horizontal bands.
+        const TOP: Rgb = Rgb::new(0x0d, 0x08, 0x06);
+        const BOT: Rgb = Rgb::new(0x40, 0x19, 0x07);
+        const BANDS: usize = 48;
+        let band_h = logical_h / BANDS as f32;
+        for b in 0..BANDS {
+            let f = b as f32 / (BANDS as f32 - 1.0); // 0 = top, 1 = bottom
+            let y = f * logical_h;
+            let color = lerp_rgb(TOP, BOT, f);
+            // Overlap by 1px to avoid seams between bands.
+            out.push((
+                scaled(0.0, y, logical_w, band_h + 1.0, sf),
+                lin_rgba(color, 1.0),
+            ));
+        }
+    }
+    if params.scrim > 0.0 {
+        out.push((
+            scaled(0.0, 0.0, logical_w, logical_h, sf),
+            lin_rgba(Rgb::new(0, 0, 0), params.scrim.clamp(0.0, 1.0)),
+        ));
+    }
+}
+
+/// Compute the drifting ember-spark instances for the **additive** pass:
+/// `(rect_px, linear_rgba)` round glows rising from the bottom with lateral sway,
+/// flicker, and a fade-in/out over each spark's looping lifetime. Procedural +
+/// stateless — driven by `t` (seconds) alone, so it animates with no stored state
+/// and renders identically windowed + headless.
+pub(crate) fn spark_quads(
+    density: f32,
+    t: f32,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+) -> Vec<([f32; 4], [f32; 4])> {
+    use std::f32::consts::PI;
+    let n = ((50.0 * density).round() as i32).clamp(0, 240) as usize;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let fi = i as f32;
+        let hash = |a: f32, b: f32| {
+            let s = ((fi * a + b).sin() * 43758.547).abs();
+            s - s.floor()
+        };
+        let seed = hash(12.9898, 4.1);
+        let seed2 = hash(78.233, 1.7);
+        let life = 2.5 + seed * 2.5;
+        let phase = ((t / life) + seed).fract(); // 0 = born at bottom, 1 = gone at top
+        let base_x = seed2 * logical_w;
+        let x = base_x + (t * 0.6 + fi * 1.7).sin() * (10.0 + seed * 14.0);
+        // Rise from just below the bottom edge to above the top.
+        let y = logical_h + 12.0 - phase * (logical_h + 24.0);
+        // Hot amber near the fire, cooling to deep ember as it rises.
+        let color = if phase < 0.5 {
+            lerp_rgb(AMBER, ACCENT, phase * 2.0)
+        } else {
+            lerp_rgb(ACCENT, EMBER_DARK, (phase - 0.5) * 2.0)
+        };
+        let flicker = 0.8 + 0.2 * (t * (8.0 + seed * 6.0) + fi).sin();
+        let alpha = (PI * phase).sin().max(0.0) * 0.85 * flicker;
+        let size = 2.0 + seed * 4.0;
+        out.push((
+            scaled(x - size * 0.5, y - size * 0.5, size, size, sf),
+            lin_rgba(color, alpha),
+        ));
+    }
+    out
+}
 /// Measure the monospace advance for the current font/size, so background quads
 /// line up with the glyphs glyphon flows.
 pub(crate) fn measure_cell_width(font_system: &mut FontSystem) -> f32 {
