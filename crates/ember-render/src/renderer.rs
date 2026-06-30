@@ -59,6 +59,15 @@ pub struct TabLabel {
     pub active: bool,
 }
 
+/// What the tab strip was clicked on (from [`Renderer::tab_hit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabHit {
+    /// The tab button at this index.
+    Tab(usize),
+    /// The trailing "+" button (open a new tab).
+    NewTab,
+}
+
 /// A read-only snapshot of a pane's grid for the debug control surface.
 #[derive(Clone, Debug)]
 pub struct PaneSnapshot {
@@ -578,6 +587,43 @@ impl Renderer {
         self.visible = visible;
         self.focused = Some(focused);
         self.tabs = tabs;
+    }
+
+    /// Hit-test a click at logical `(x, y)` against the tab strip. Returns the tab
+    /// button or the "+" button hit, or `None` (no strip, or click below it). Must
+    /// mirror the column math in [`build_tabs`].
+    pub fn tab_hit(&self, x: f32, y: f32) -> Option<TabHit> {
+        let n = self.tabs.len();
+        if n <= 1 {
+            return None;
+        }
+        let strip_h = CELL_HEIGHT + 2.0 * PAD;
+        if !(0.0..=strip_h).contains(&y) || x < 0.0 {
+            return None;
+        }
+        let sf = self.window.scale_factor() as f32;
+        let logical_w = self.config.width as f32 / sf;
+        let cw = self.cell_w;
+        let total_cols = (logical_w / cw).floor() as usize;
+        let plus_cols = 3usize.min(total_cols);
+        let tab_cols = total_cols.saturating_sub(plus_cols);
+        let seg = tab_cols / n;
+        let col = (x / cw).floor() as usize;
+        if col >= total_cols {
+            return None;
+        }
+        if col >= tab_cols {
+            return Some(TabHit::NewTab);
+        }
+        let mut acc = 0;
+        for i in 0..n {
+            let width = if i == n - 1 { tab_cols - acc } else { seg };
+            if col >= acc && col < acc + width {
+                return Some(TabHit::Tab(i));
+            }
+            acc += width;
+        }
+        None
     }
 
     /// Show the cheat-sheet overlay with these `(key, description)` rows, or hide

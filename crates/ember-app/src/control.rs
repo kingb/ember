@@ -32,6 +32,8 @@ pub enum ControlMsg {
     /// Capture the live window to a PNG at the given path; reply is the full
     /// JSON response line (`{"ok":true,"path":..}` / `{"ok":false,"error":..}`).
     Screenshot(String, Sender<String>),
+    /// Left-click at logical `(x, y)` — for driving tabs/UI in tests.
+    Click(f64, f64),
 }
 
 #[cfg(unix)]
@@ -150,6 +152,12 @@ mod unix {
                     Ok(resp) => resp, // main builds the full JSON response.
                     Err(_) => err("screenshot timeout"),
                 }
+            }
+            "click" => {
+                let x = v.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+                let y = v.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+                let _ = tx.send(ControlMsg::Click(x, y));
+                ok()
             }
             other => err(&format!("unknown cmd: {other}")),
         }
@@ -271,9 +279,14 @@ mod unix {
                 };
                 serde_json::json!({"cmd":"screenshot","path": path})
             }
+            "click" => {
+                let x: f64 = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let y: f64 = rest.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                serde_json::json!({"cmd":"click","x": x, "y": y})
+            }
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot|click)"
                 ));
             }
         };

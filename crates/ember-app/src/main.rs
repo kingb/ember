@@ -26,10 +26,10 @@ use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, Direction, GridDims, LayoutCommand,
     LayoutEffect, LayoutNode, PaneId, Rect, SessionBackend, SessionId, Tab, TabId, apply, layout,
 };
-use ember_render::{CELL_HEIGHT, CELL_WIDTH, Renderer, TabLabel, VisiblePane};
+use ember_render::{CELL_HEIGHT, CELL_WIDTH, Renderer, TabHit, TabLabel, VisiblePane};
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::WindowId;
@@ -153,6 +153,8 @@ struct RunState {
     help: bool,
     /// Native menu bar (macOS); inert elsewhere. Kept alive for the app's life.
     menu: menu::AppMenu,
+    /// Last cursor position in **logical** px.
+    cursor: (f64, f64),
 }
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
@@ -213,6 +215,7 @@ impl ApplicationHandler for App {
             control_rx: self.control_rx.take(),
             help: false,
             menu: menu::build(),
+            cursor: (0.0, 0.0),
         };
         state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
         state.sync_layout();
@@ -234,6 +237,15 @@ impl ApplicationHandler for App {
                 state.sync_layout();
             }
             WindowEvent::ModifiersChanged(mods) => state.modifiers = mods.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                let sf = state.renderer.window().scale_factor();
+                state.cursor = (position.x / sf, position.y / sf);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => state.left_click(),
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
                     return;
@@ -439,6 +451,10 @@ impl RunState {
                     Err(e) => serde_json::json!({"ok": false, "error": e}).to_string(),
                 };
                 let _ = reply.send(resp);
+            }
+            ControlMsg::Click(x, y) => {
+                self.cursor = (x, y);
+                self.left_click();
             }
         }
     }
@@ -694,6 +710,22 @@ impl RunState {
     fn show_help(&mut self) {
         self.help = true;
         self.renderer.set_help(Some(help_lines()));
+    }
+
+    /// Handle a left click at the current cursor position: dismiss the overlay if
+    /// shown, else hit-test the tab strip (switch tab / open a new tab).
+    fn left_click(&mut self) {
+        if self.help {
+            self.hide_help();
+            return;
+        }
+        let (x, y) = self.cursor;
+        if let Some(hit) = self.renderer.tab_hit(x as f32, y as f32) {
+            match hit {
+                TabHit::Tab(i) => self.select_tab(i + 1),
+                TabHit::NewTab => self.new_tab(),
+            }
+        }
     }
 
     /// Toggle the cheat-sheet overlay (Cmd+/ and the Help menu item).
