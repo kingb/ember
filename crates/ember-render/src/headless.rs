@@ -336,17 +336,16 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
                 custom_glyphs: &[],
             });
         }
-        if shot.tabs.len() > 1 {
-            areas.push(TextArea {
-                buffer: &chrome,
-                left: 0.0,
-                top: PAD * sf,
-                scale: sf,
-                bounds: full_bounds,
-                default_color: Color::rgb(FG.r, FG.g, FG.b),
-                custom_glyphs: &[],
-            });
-        }
+        // The strip (with +/?/⚙ controls) is always drawn, so always show its text.
+        areas.push(TextArea {
+            buffer: &chrome,
+            left: 0.0,
+            top: PAD * sf,
+            scale: sf,
+            bounds: full_bounds,
+            default_color: Color::rgb(FG.r, FG.g, FG.b),
+            custom_glyphs: &[],
+        });
         if let Some((left, top)) = fps_origin {
             areas.push(TextArea {
                 buffer: &fps_buf,

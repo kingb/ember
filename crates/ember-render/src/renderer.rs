@@ -144,6 +144,8 @@ pub enum TabHit {
     NewTab,
     /// The trailing "?" button (toggle the shortcuts overlay).
     Help,
+    /// The trailing "⚙" button (toggle the Settings overlay).
+    Settings,
 }
 
 /// A read-only snapshot of a pane's grid for the debug control surface.
@@ -354,14 +356,11 @@ impl Renderer {
         (self.cell_w, CELL_HEIGHT)
     }
 
-    /// Height in px reserved for the tab strip given a tab count (0 for a single
-    /// tab — no strip is drawn). The app subtracts this from the layout viewport.
-    pub fn chrome_height(tab_count: usize) -> f32 {
-        if tab_count > 1 {
-            CELL_HEIGHT + 2.0 * PAD
-        } else {
-            0.0
-        }
+    /// Height in px reserved for the tab strip. The strip is **always** drawn (it
+    /// carries the +/?/⚙ controls even with one tab — design §1 discoverability),
+    /// so this is constant. The app subtracts it from the layout viewport.
+    pub fn chrome_height(_tab_count: usize) -> f32 {
+        CELL_HEIGHT + 2.0 * PAD
     }
 
     /// Register a session's grid so deltas can be routed to it. Idempotent.
@@ -480,10 +479,6 @@ impl Renderer {
     /// trailing "+" (new tab) or "?" (help), or `None` (no strip / click below it).
     /// Must mirror the column math in [`build_tabs`].
     pub fn tab_hit(&self, x: f32, y: f32) -> Option<TabHit> {
-        let n = self.tabs.len();
-        if n <= 1 {
-            return None;
-        }
         let strip_h = CELL_HEIGHT + 2.0 * PAD;
         if !(0.0..=strip_h).contains(&y) || x < 0.0 {
             return None;
@@ -494,11 +489,15 @@ impl Renderer {
         let total_cols = (logical_w / cw).floor() as usize;
         let plus_cols = BTN_COLS.min(total_cols);
         let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
-        let tab_cols = total_cols.saturating_sub(plus_cols + help_cols);
-        let seg = tab_cols / n;
+        let gear_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols + help_cols));
+        let tab_cols = total_cols.saturating_sub(plus_cols + help_cols + gear_cols);
         let col = (x / cw).floor() as usize;
         if col >= total_cols {
             return None;
+        }
+        // Trailing controls (always present): … "+" "?" "⚙".
+        if col >= tab_cols + plus_cols + help_cols {
+            return Some(TabHit::Settings);
         }
         if col >= tab_cols + plus_cols {
             return Some(TabHit::Help);
@@ -506,13 +505,18 @@ impl Renderer {
         if col >= tab_cols {
             return Some(TabHit::NewTab);
         }
-        let mut acc = 0;
-        for i in 0..n {
-            let width = if i == n - 1 { tab_cols - acc } else { seg };
-            if col >= acc && col < acc + width {
-                return Some(TabHit::Tab(i));
+        // Tab buttons only exist when there's more than one tab.
+        let n = self.tabs.len();
+        if n > 1 {
+            let seg = tab_cols / n;
+            let mut acc = 0;
+            for i in 0..n {
+                let width = if i == n - 1 { tab_cols - acc } else { seg };
+                if col >= acc && col < acc + width {
+                    return Some(TabHit::Tab(i));
+                }
+                acc += width;
             }
-            acc += width;
         }
         None
     }
@@ -814,17 +818,16 @@ impl Renderer {
                     });
                 }
             }
-            if self.tabs.len() > 1 {
-                areas.push(TextArea {
-                    buffer: &self.chrome,
-                    left: 0.0,
-                    top: PAD * sf,
-                    scale: sf,
-                    bounds: full_bounds,
-                    default_color: Color::rgb(FG.r, FG.g, FG.b),
-                    custom_glyphs: &[],
-                });
-            }
+            // The strip (with +/?/⚙ controls) is always drawn, so always show its text.
+            areas.push(TextArea {
+                buffer: &self.chrome,
+                left: 0.0,
+                top: PAD * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(FG.r, FG.g, FG.b),
+                custom_glyphs: &[],
+            });
             // FPS/frame-time debug readout, on top of the panes (bottom-right).
             if let Some(text) = self.fps_overlay.clone() {
                 let (left, top) = build_fps(

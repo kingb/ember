@@ -251,7 +251,7 @@ pub(crate) fn selection_quads(
 const STRIP_BG: Rgb = Rgb::new(0x1b, 0x1b, 0x1b);
 /// Fill of the active tab button.
 const TAB_ACTIVE: Rgb = Rgb::new(0x2e, 0x2e, 0x2e);
-/// Width (in columns) of each trailing tab-strip utility button ("+", "?").
+/// Width (in columns) of each trailing tab-strip utility button ("+", "?", "⚙").
 pub(crate) const BTN_COLS: usize = 3;
 
 /// Center `s` in a field `width` columns wide (truncating with `…` if too long).
@@ -273,10 +273,13 @@ fn center(s: &str, width: usize) -> String {
     format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
 }
 
-/// Build the tab strip (iTerm-style): a full-width bar, equal-width tab buttons
-/// (active one lighter with an Ember-orange underline), `⌘N` hints, and a `+`
-/// button. Quads go to `out`; the single concatenated label line is shaped into
-/// `chrome`. No-op for a single tab. All geometry is logical px, scaled by `sf`.
+/// Build the tab strip (iTerm-style): a full-width bar with the trailing utility
+/// buttons "+" (new tab), "?" (shortcuts), "⚙" (settings) — *always shown* so those
+/// controls are discoverable even with a single tab (design §1 discoverability
+/// tenet). With multiple tabs it also draws equal-width tab buttons (active one
+/// lighter with an Ember-orange underline + `⌘N` hint); with one tab the tab area
+/// is just an empty toolbar. Quads → `out`; the concatenated label line shapes into
+/// `chrome`. All geometry is logical px, scaled by `sf`.
 pub(crate) fn build_tabs(
     font_system: &mut FontSystem,
     chrome: &mut Buffer,
@@ -286,9 +289,6 @@ pub(crate) fn build_tabs(
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
 ) {
-    if tabs.len() <= 1 {
-        return;
-    }
     chrome.set_size(font_system, Some(logical_w), Some(LINE_HEIGHT));
     let strip_h = CELL_HEIGHT + 2.0 * PAD;
     // Full-width strip background.
@@ -297,41 +297,49 @@ pub(crate) fn build_tabs(
         lin_rgba(STRIP_BG, 1.0),
     ));
 
-    // Work in integer columns so quads and (monospace) text stay aligned. The two
-    // trailing utility buttons ("+" new-tab, "?" help) each reserve `BTN_COLS`.
+    // Work in integer columns so quads and (monospace) text stay aligned. The three
+    // trailing utility buttons each reserve `BTN_COLS`.
     let total_cols = (logical_w / cw).floor() as usize;
     let plus_cols = BTN_COLS.min(total_cols);
     let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
-    let tab_cols = total_cols.saturating_sub(plus_cols + help_cols);
-    let n = tabs.len(); // >= 2 (single-tab strips return early above)
-    let seg = tab_cols / n;
+    let gear_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols + help_cols));
+    let tab_cols = total_cols.saturating_sub(plus_cols + help_cols + gear_cols);
 
     let base = Attrs::new().family(Family::Monospace);
     let mut spans: Vec<(String, Color)> = Vec::new();
-    let mut col = 0usize;
-    for (i, tab) in tabs.iter().enumerate() {
-        // Last tab absorbs any leftover columns so the row fills exactly.
-        let width = if i == n - 1 { tab_cols - col } else { seg };
-        let x = col as f32 * cw;
-        let w = width as f32 * cw;
-        if tab.active {
-            out.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(TAB_ACTIVE, 1.0)));
-            // Ember-orange underline accent on the active tab.
-            out.push((scaled(x, strip_h - 2.0, w, 2.0, sf), lin_rgba(ACCENT, 1.0)));
+    let n = tabs.len();
+    if n > 1 {
+        let seg = tab_cols / n;
+        let mut col = 0usize;
+        for (i, tab) in tabs.iter().enumerate() {
+            // Last tab absorbs any leftover columns so the row fills exactly.
+            let width = if i == n - 1 { tab_cols - col } else { seg };
+            let x = col as f32 * cw;
+            let w = width as f32 * cw;
+            if tab.active {
+                out.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(TAB_ACTIVE, 1.0)));
+                // Ember-orange underline accent on the active tab.
+                out.push((scaled(x, strip_h - 2.0, w, 2.0, sf), lin_rgba(ACCENT, 1.0)));
+            }
+            let label = format!("{}  ⌘{}", tab.title, i + 1);
+            let fg = if tab.active {
+                Color::rgb(0xff, 0xff, 0xff)
+            } else {
+                Color::rgb(0x8a, 0x8a, 0x8a)
+            };
+            spans.push((center(&label, width), fg));
+            col += width;
         }
-        let label = format!("{}  ⌘{}", tab.title, i + 1);
-        let fg = if tab.active {
-            Color::rgb(0xff, 0xff, 0xff)
-        } else {
-            Color::rgb(0x8a, 0x8a, 0x8a)
-        };
-        spans.push((center(&label, width), fg));
-        col += width;
+    } else {
+        // Single tab: no tab buttons, just the control toolbar. Pad the tab area so
+        // the trailing buttons land in the right columns.
+        spans.push((" ".repeat(tab_cols), Color::rgb(FG.r, FG.g, FG.b)));
     }
-    // Trailing utility buttons: "+" (new tab) and "?" (keyboard shortcuts).
+    // Trailing utility buttons: "+" (new tab), "?" (shortcuts), "⚙" (settings).
     let btn_fg = Color::rgb(0x8a, 0x8a, 0x8a);
     spans.push((center("+", plus_cols), btn_fg));
     spans.push((center("?", help_cols), btn_fg));
+    spans.push((center("⚙", gear_cols), btn_fg));
 
     chrome.set_rich_text(
         font_system,
