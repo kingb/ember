@@ -19,6 +19,8 @@
 
 use std::sync::mpsc::Sender;
 
+use ember_core::ScrollAmount;
+
 /// A command forwarded from the control socket to the event loop.
 pub enum ControlMsg {
     /// Type raw text into the focused session (newlines included).
@@ -55,6 +57,8 @@ pub enum ControlMsg {
     RenameTab(usize, String),
     /// Begin inline rename of tab `i` (to screenshot the edit caret).
     EditTab(usize),
+    /// Scroll the focused pane's scrollback (for tests / accessibility).
+    Scroll(ScrollAmount),
 }
 
 #[cfg(unix)]
@@ -69,6 +73,7 @@ mod unix {
     use std::thread;
     use std::time::Duration;
 
+    use ember_core::ScrollAmount;
     use serde_json::Value;
 
     use super::ControlMsg;
@@ -209,6 +214,21 @@ mod unix {
             }
             "fps" => {
                 let _ = tx.send(ControlMsg::Fps);
+                ok()
+            }
+            "scroll" => {
+                let dir = v.get("dir").and_then(Value::as_str).unwrap_or("");
+                let amt = match dir {
+                    "top" => ScrollAmount::Top,
+                    "bottom" => ScrollAmount::Bottom,
+                    "page-up" | "pageup" => ScrollAmount::PageUp,
+                    "page-down" | "pagedown" => ScrollAmount::PageDown,
+                    n => match n.parse::<i32>() {
+                        Ok(n) => ScrollAmount::Lines(n),
+                        Err(_) => return err("scroll: dir = top|bottom|page-up|page-down|<lines>"),
+                    },
+                };
+                let _ = tx.send(ControlMsg::Scroll(amt));
                 ok()
             }
             "bell" => {
@@ -367,6 +387,7 @@ mod unix {
             "copy" => serde_json::json!({"cmd":"copy"}),
             "paste" => serde_json::json!({"cmd":"paste","text": unescape(arg)}),
             "fps" => serde_json::json!({"cmd":"fps"}),
+            "scroll" => serde_json::json!({"cmd":"scroll","dir": arg}),
             "bell" => match rest.get(1).and_then(|s| s.parse::<u64>().ok()) {
                 Some(t) => serde_json::json!({"cmd":"bell","tab":t}),
                 None => serde_json::json!({"cmd":"bell"}),

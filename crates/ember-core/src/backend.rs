@@ -50,6 +50,9 @@ pub enum BackendControl {
 pub enum ScrollAmount {
     /// Scroll by `n` lines: positive = up (into history), negative = down.
     Lines(i32),
+    /// Jump to an absolute display offset (lines up from the bottom) — for the
+    /// scrollbar thumb drag.
+    To(u16),
     /// Up one screenful.
     PageUp,
     /// Down one screenful.

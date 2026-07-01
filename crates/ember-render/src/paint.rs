@@ -723,39 +723,71 @@ pub(crate) fn build_fps(
     (x + ipad, y + ipad)
 }
 
-/// A subtle "scrolled up in history" pill (top-right of the pane), shown while the
-/// view isn't at the live bottom — the discoverable signal that you're in
-/// scrollback. `offset` is how many lines back you are. Quad → `out`, text into
-/// `buf`; returns the text origin. (No full scrollbar by design — Alacritty ships
-/// none either.)
-pub(crate) fn scroll_indicator(
-    font_system: &mut FontSystem,
-    buf: &mut Buffer,
-    offset: u16,
+/// Scrollbar width (logical px) and minimum thumb height.
+pub(crate) const SCROLLBAR_W: f32 = 8.0;
+const SCROLLBAR_MIN_THUMB: f32 = 20.0;
+
+/// Logical-px geometry of a pane's scrollbar as `(track, thumb)` each `[x,y,w,h]`,
+/// or `None` when there's no history to show. `screen_lines` = the pane's visible
+/// rows, `history_len` = lines of scrollback above. **Shared** by the draw and the
+/// app's hit-test so they can never drift. `display_offset` 0 = live bottom (thumb
+/// at the bottom); `history_len` = scrolled to the top.
+pub(crate) fn scrollbar_geometry(
+    display_offset: u16,
+    history_len: u16,
+    screen_lines: u16,
     pane: Rect,
-    cw: f32,
+) -> Option<([f32; 4], [f32; 4])> {
+    if history_len == 0 || screen_lines == 0 {
+        return None;
+    }
+    let total = history_len as f32 + screen_lines as f32;
+    let px = (pane.x + pane.width) as f32 - SCROLLBAR_W;
+    let py = pane.y as f32;
+    let ph = pane.height as f32;
+    let thumb_h = (screen_lines as f32 / total * ph).clamp(SCROLLBAR_MIN_THUMB.min(ph), ph);
+    let top_frac = history_len.saturating_sub(display_offset) as f32 / total;
+    let mut thumb_y = py + top_frac * ph;
+    if thumb_y + thumb_h > py + ph {
+        thumb_y = py + ph - thumb_h;
+    }
+    if thumb_y < py {
+        thumb_y = py;
+    }
+    Some((
+        [px, py, SCROLLBAR_W, ph],
+        [px + 1.0, thumb_y, SCROLLBAR_W - 2.0, thumb_h],
+    ))
+}
+
+/// Draw a pane's scrollbar (dark track + warm thumb) when it has history — Ember's
+/// discoverable "there's more, and here's where you are" affordance. A scrolled-up
+/// view (`display_offset > 0`) brightens the thumb to `ACCENT`.
+pub(crate) fn scrollbar(
+    display_offset: u16,
+    history_len: u16,
+    screen_lines: u16,
+    pane: Rect,
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
-) -> (f32, f32) {
-    let text = format!("\u{2191} {offset} lines");
-    let ipad = 4.0;
-    let w = text.chars().count() as f32 * cw + 2.0 * ipad;
-    let h = LINE_HEIGHT + 2.0 * ipad;
-    let x = ((pane.x + pane.width) as f32 - w - 6.0).max(pane.x as f32);
-    let y = pane.y as f32 + 6.0;
-    out.push((scaled(x, y, w, h, sf), lin_rgba(Rgb::new(0, 0, 0), 0.66)));
-    buf.set_size(font_system, Some(w), Some(h));
-    buf.set_text(
-        font_system,
-        &text,
-        &Attrs::new()
-            .family(Family::Monospace)
-            .color(Color::rgb(AMBER.r, AMBER.g, AMBER.b)),
-        Shaping::Advanced,
-        None,
-    );
-    buf.shape_until_scroll(font_system, false);
-    (x + ipad, y + ipad)
+) {
+    let Some((track, thumb)) = scrollbar_geometry(display_offset, history_len, screen_lines, pane)
+    else {
+        return;
+    };
+    out.push((
+        scaled(track[0], track[1], track[2], track[3], sf),
+        lin_rgba(Rgb::new(0, 0, 0), 0.22),
+    ));
+    let (c, a) = if display_offset > 0 {
+        (ACCENT, 0.9)
+    } else {
+        (Rgb::new(0x9a, 0x9a, 0x9a), 0.55)
+    };
+    out.push((
+        scaled(thumb[0], thumb[1], thumb[2], thumb[3], sf),
+        lin_rgba(c, a),
+    ));
 }
 
 /// A `(rect_px, …)`-ready physical-pixel quad from logical `x,y,w,h` and the

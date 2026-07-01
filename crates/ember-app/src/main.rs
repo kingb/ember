@@ -24,7 +24,8 @@ use control::ControlMsg;
 
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, Config, Direction, GridDims, LayoutCommand,
-    LayoutEffect, LayoutNode, PaneId, Rect, SessionBackend, SessionId, Tab, TabId, apply, layout,
+    LayoutEffect, LayoutNode, PaneId, Rect, ScrollAmount, SessionBackend, SessionId, Tab, TabId,
+    apply, layout,
 };
 use ember_platform::MenuAction;
 use ember_render::{
@@ -33,7 +34,7 @@ use ember_render::{
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, StartCause, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::WindowId;
@@ -51,6 +52,8 @@ const POLL: Duration = Duration::from_millis(8);
 const ANIM_FRAME: Duration = Duration::from_millis(16);
 /// Max gap between clicks at the same cell to count as a double/triple click.
 const MULTI_CLICK: Duration = Duration::from_millis(400);
+/// Scrollback lines per mouse-wheel notch (Alacritty/Ghostty default).
+const WHEEL_LINES: i32 = 3;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -205,6 +208,8 @@ struct RunState {
     /// In-progress tab drag-reorder: the tab being dragged, the press x (logical),
     /// and whether the drag threshold has been crossed (below it, it's a click).
     tab_drag: Option<TabDrag>,
+    /// In-progress scrollbar-thumb drag: the session whose scrollbar is grabbed.
+    scrollbar_drag: Option<SessionId>,
     /// Last tab-button mouse-down (time, tab index), for double-click-to-rename.
     last_tab_click: Option<(Instant, usize)>,
     /// Inline tab rename in progress: the tab index + the live edit buffer.
@@ -314,6 +319,7 @@ impl ApplicationHandler for App {
             clipboard: arboard::Clipboard::new().ok(),
             bracketed: HashMap::new(),
             tab_drag: None,
+            scrollbar_drag: None,
             last_tab_click: None,
             editing_tab: None,
             edit_buffer: String::new(),
@@ -350,10 +356,21 @@ impl ApplicationHandler for App {
                 state.cursor = (position.x / sf, position.y / sf);
                 if state.tab_drag.is_some() {
                     state.drag_tab_to(state.cursor.0);
+                } else if let Some(sid) = state.scrollbar_drag.clone() {
+                    state.scroll_to_at(&sid, state.cursor.1 as f32);
                 } else if state.selecting {
                     let (x, y) = state.cursor;
                     state.extend_selection(x, y);
                 }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (y * WHEEL_LINES as f32).round() as i32,
+                    MouseScrollDelta::PixelDelta(p) => {
+                        (p.y as f32 / CELL_HEIGHT * WHEEL_LINES as f32).round() as i32
+                    }
+                };
+                state.wheel_scroll(lines);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -367,6 +384,7 @@ impl ApplicationHandler for App {
             } => {
                 state.tab_drag = None;
                 state.selecting = false;
+                state.scrollbar_drag = None;
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
@@ -411,6 +429,21 @@ impl ApplicationHandler for App {
                         event_loop.exit();
                     }
                     return;
+                }
+                // Scrollback navigation: Shift+PageUp/Down (page), Shift+Home/End
+                // (top/bottom). No-op on the alt screen (the projection gates it).
+                if mods.shift_key() {
+                    let amt = match &key.logical_key {
+                        Key::Named(NamedKey::PageUp) => Some(ScrollAmount::PageUp),
+                        Key::Named(NamedKey::PageDown) => Some(ScrollAmount::PageDown),
+                        Key::Named(NamedKey::Home) => Some(ScrollAmount::Top),
+                        Key::Named(NamedKey::End) => Some(ScrollAmount::Bottom),
+                        _ => None,
+                    };
+                    if let Some(a) = amt {
+                        state.scroll_focused(a);
+                        return;
+                    }
                 }
                 if let Some(bytes) = encode_key(&key.logical_key, mods) {
                     if let Some(h) = state.focused_session() {
@@ -600,6 +633,54 @@ impl RunState {
             .and_then(|id| self.sessions.get(&id))
     }
 
+    /// Scroll the focused pane's scrollback by `amount`. No-op on the alternate
+    /// screen (the projection gates it).
+    fn scroll_focused(&self, amount: ScrollAmount) {
+        if let Some(h) = self.focused_session() {
+            let _ = h.control.send(BackendControl::Scroll(amount));
+        }
+    }
+
+    /// Handle a mouse-wheel notch worth `lines` (positive = up, into history). On
+    /// the primary screen this scrolls history; in a full-screen app (alt screen)
+    /// with no mouse reporting it translates to arrow keys so `less`/`man`/`vim`
+    /// still page; with mouse reporting on we leave it alone (that path is a future
+    /// mouse-forwarding feature).
+    fn wheel_scroll(&self, lines: i32) {
+        if lines == 0 {
+            return;
+        }
+        let Some(id) = self.focused_session_id() else {
+            return;
+        };
+        let (alt, mouse) = self.renderer.pane_modes(&id);
+        let Some(h) = self.sessions.get(&id) else {
+            return;
+        };
+        if alt {
+            if mouse {
+                return;
+            }
+            // Alternate-scroll: wheel → Up/Down arrows (CSI form).
+            let (seq, count): (&[u8], i32) = if lines > 0 {
+                (b"\x1b[A", lines)
+            } else {
+                (b"\x1b[B", -lines)
+            };
+            let mut bytes = Vec::with_capacity(seq.len() * count as usize);
+            for _ in 0..count {
+                bytes.extend_from_slice(seq);
+            }
+            let _ = h
+                .control
+                .send(BackendControl::Input(bytes.into_boxed_slice()));
+        } else {
+            let _ = h
+                .control
+                .send(BackendControl::Scroll(ScrollAmount::Lines(lines)));
+        }
+    }
+
     /// Spawn a shell-backed session and register its grid with the renderer.
     fn spawn_session(&mut self, id: SessionId, dims: GridDims) {
         let handle = LocalPty::spawn(LocalPtyConfig::new(id.clone(), dims)).expect("spawn shell");
@@ -707,6 +788,7 @@ impl RunState {
             ControlMsg::Copy => self.copy_selection(),
             ControlMsg::Paste(text) => self.paste_into_focused(&text),
             ControlMsg::Fps => self.toggle_fps(),
+            ControlMsg::Scroll(amount) => self.scroll_focused(amount),
             ControlMsg::Bell(tab) => {
                 // `Some(i)` = a specific tab's first session; `None` = focused pane.
                 let session = match tab {
@@ -1095,8 +1177,27 @@ impl RunState {
             }
             return;
         }
+        // A click on a pane scrollbar grabs the thumb (priority over selection),
+        // and jumps to the clicked position.
+        if let Some(sid) = self.renderer.scrollbar_hit(x as f32, y as f32) {
+            self.scrollbar_drag = Some(sid.clone());
+            self.scroll_to_at(&sid, y as f32);
+            return;
+        }
         // A click in a pane body starts a selection (mode by click count).
         self.begin_selection(x, y);
+    }
+
+    /// Send an absolute scroll for `session` mapping the mouse `y` to a display
+    /// offset via the scrollbar geometry (thumb drag / track click).
+    fn scroll_to_at(&self, session: &SessionId, y: f32) {
+        if let Some(off) = self.renderer.scroll_offset_at(session, y) {
+            if let Some(h) = self.sessions.get(session) {
+                let _ = h
+                    .control
+                    .send(BackendControl::Scroll(ScrollAmount::To(off)));
+            }
+        }
     }
 
     /// Live tab drag-reorder: once past the threshold, move the dragged tab to the
@@ -1633,6 +1734,8 @@ fn help_lines() -> Vec<(String, String)> {
         ("Drag / 2×/3× click", "Select text / word / line"),
         ("Cmd+C / Cmd+V", "Copy selection / paste"),
         ("Cmd+,", "Settings"),
+        ("Wheel / Shift+PgUp/Dn", "Scroll history"),
+        ("Shift+Home/End", "Scroll to top / bottom"),
         ("Cmd+/", "Show this help"),
     ]
     .iter()

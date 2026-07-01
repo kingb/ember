@@ -96,6 +96,11 @@ impl<L: EventListener> AlacrittyProjection<L> {
         }
         let scroll = match amount {
             ScrollAmount::Lines(n) => Scroll::Delta(n),
+            ScrollAmount::To(n) => {
+                // Absolute offset → delta from the current position.
+                let cur = self.term.grid().display_offset() as i32;
+                Scroll::Delta(n as i32 - cur)
+            }
             ScrollAmount::PageUp => Scroll::PageUp,
             ScrollAmount::PageDown => Scroll::PageDown,
             ScrollAmount::Top => Scroll::Top,
@@ -173,11 +178,7 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
         let mode = self.term.mode();
         out.bracketed_paste = mode.contains(TermMode::BRACKETED_PASTE);
         out.display_offset = self.display_offset.min(u16::MAX as usize) as u16;
-        out.history_len = self
-            .term
-            .grid()
-            .history_size()
-            .min(u16::MAX as usize) as u16;
+        out.history_len = self.term.grid().history_size().min(u16::MAX as usize) as u16;
         out.alt_screen = mode.contains(TermMode::ALT_SCREEN);
         // Any mouse-report mode means the app wants the wheel as mouse events.
         out.mouse_reporting = mode.intersects(

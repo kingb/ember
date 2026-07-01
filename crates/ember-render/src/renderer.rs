@@ -29,8 +29,8 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, bell_wash, build_about, build_fps, build_help, build_settings, build_tabs,
-    debug_emit, grid_quads, measure_cell_width, push_backdrop, scroll_indicator, selection_quads,
-    shape_grid, spark_quads,
+    debug_emit, grid_quads, measure_cell_width, push_backdrop, scrollbar, scrollbar_geometry,
+    selection_quads, shape_grid, spark_quads,
 };
 use crate::selection::Selection;
 
@@ -235,8 +235,6 @@ pub struct Renderer {
     fps_overlay: Option<String>,
     /// Glyph buffer for the FPS overlay.
     fps_buffer: Buffer,
-    /// Glyph buffer for the scrollback "↑ N lines" indicator.
-    scroll_buf: Buffer,
     /// Visual-bell flash intensity (`0..1`); a warm amber wash over the panes that
     /// the app decays to 0 after a BEL. `0.0` = no flash.
     bell_flash: f32,
@@ -310,7 +308,6 @@ impl Renderer {
         let about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let settings_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let fps_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-        let scroll_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
 
         let cell_w = measure_cell_width(&mut font_system);
         let quads = QuadRenderer::new(&device, format);
@@ -351,7 +348,6 @@ impl Renderer {
             selection: None,
             fps_overlay: None,
             fps_buffer,
-            scroll_buf,
             bell_flash: 0.0,
             window,
         }
@@ -443,6 +439,63 @@ impl Renderer {
             bell_flash: self.bell_flash,
         };
         crate::headless::capture(&shot, path)
+    }
+
+    /// `(alt_screen, mouse_reporting)` for a session's pane (from the latest delta),
+    /// defaulting to `(false, false)`. Drives how the app treats the mouse wheel:
+    /// history-scroll on the primary screen, wheel→arrows in a full-screen app.
+    pub fn pane_modes(&self, session: &SessionId) -> (bool, bool) {
+        self.panes
+            .get(session)
+            .map(|p| (p.grid.alt_screen, p.grid.mouse_reporting))
+            .unwrap_or((false, false))
+    }
+
+    /// Which visible pane's scrollbar track contains logical `(x, y)`, if any — so
+    /// the app can grab it (with priority over text selection).
+    pub fn scrollbar_hit(&self, x: f32, y: f32) -> Option<SessionId> {
+        for vp in &self.visible {
+            let Some(p) = self.panes.get(&vp.session) else {
+                continue;
+            };
+            if p.grid.alt_screen {
+                continue;
+            }
+            if let Some((track, _)) = scrollbar_geometry(
+                p.grid.display_offset,
+                p.grid.history_len,
+                p.grid.dims.screen_lines,
+                vp.rect,
+            ) {
+                if x >= track[0]
+                    && x <= track[0] + track[2]
+                    && y >= track[1]
+                    && y <= track[1] + track[3]
+                {
+                    return Some(vp.session.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Map a mouse `y` (logical px) to a target display offset for `session`'s
+    /// scrollbar — used for the thumb drag + track click. Clamped to the history.
+    pub fn scroll_offset_at(&self, session: &SessionId, y: f32) -> Option<u16> {
+        let vp = self.visible.iter().find(|v| &v.session == session)?;
+        let p = self.panes.get(session)?;
+        let (_, thumb) = scrollbar_geometry(
+            p.grid.display_offset,
+            p.grid.history_len,
+            p.grid.dims.screen_lines,
+            vp.rect,
+        )?;
+        let py = vp.rect.y as f32;
+        let ph = vp.rect.height as f32;
+        let thumb_h = thumb[3];
+        let travel = (ph - thumb_h).max(1.0);
+        let top_frac = ((y - py - thumb_h / 2.0) / travel).clamp(0.0, 1.0);
+        Some(((1.0 - top_frac) * p.grid.history_len as f32).round() as u16)
     }
 
     /// A read-only snapshot of a pane's grid — for the debug control surface. The
@@ -833,6 +886,18 @@ impl Renderer {
                             selection_quads(&p.grid, sel, vp.rect, cw, sf, &mut rects);
                         }
                     }
+                    // Scrollbar (right edge): shown whenever the pane has history and
+                    // isn't on the alt screen (no scrollback there).
+                    if !p.grid.alt_screen {
+                        scrollbar(
+                            p.grid.display_offset,
+                            p.grid.history_len,
+                            p.grid.dims.screen_lines,
+                            vp.rect,
+                            sf,
+                            &mut rects,
+                        );
+                    }
                 }
             }
             let logical_w = self.config.width as f32 / sf;
@@ -864,32 +929,6 @@ impl Renderer {
                         custom_glyphs: &[],
                     });
                 }
-            }
-            // Scroll indicator on the focused pane while it's up in history.
-            let scrolled = self.focused.as_ref().and_then(|fsid| {
-                let vp = self.visible.iter().find(|v| &v.session == fsid)?;
-                let p = self.panes.get(fsid)?;
-                (p.grid.display_offset > 0).then_some((p.grid.display_offset, vp.rect))
-            });
-            if let Some((off, rect)) = scrolled {
-                let (left, top) = scroll_indicator(
-                    &mut self.font_system,
-                    &mut self.scroll_buf,
-                    off,
-                    rect,
-                    cw,
-                    sf,
-                    &mut rects,
-                );
-                areas.push(TextArea {
-                    buffer: &self.scroll_buf,
-                    left: left * sf,
-                    top: top * sf,
-                    scale: sf,
-                    bounds: full_bounds,
-                    default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
-                    custom_glyphs: &[],
-                });
             }
             // The strip (with +/?/⚙ controls) is always drawn, so always show its text.
             areas.push(TextArea {
