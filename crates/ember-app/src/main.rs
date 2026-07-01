@@ -34,7 +34,7 @@ use ember_render::{
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::WindowId;
@@ -182,6 +182,11 @@ struct RunState {
     last_frame: Option<Instant>,
     fps_ema_ms: f32,
     render_ema_ms: f32,
+    /// When the last animation frame was advanced+redrawn. Animation is paced by
+    /// wall-clock elapsed since this (checked on every wake), NOT by the timer's
+    /// `ResumeTimeReached` — a flood of mouse-move events would otherwise keep
+    /// resetting the `WaitUntil` deadline and starve the animation (visible stutter).
+    last_anim: Instant,
     /// Visual bell: when the current ember flash started (None = no flash), and the
     /// set of tabs with an unseen bell (a background tab belled).
     bell_flash_since: Option<Instant>,
@@ -307,6 +312,7 @@ impl ApplicationHandler for App {
             last_frame: None,
             fps_ema_ms: 0.0,
             render_ema_ms: 0.0,
+            last_anim: Instant::now(),
             bell_flash_since: None,
             belled_tabs: std::collections::HashSet::new(),
             menu: ember_platform::build_menu(),
@@ -549,56 +555,33 @@ impl ApplicationHandler for App {
         if state.drain_frames() {
             state.renderer.window().request_redraw();
         }
-        // Pace the loop: ~60fps while an animation is active, else the idle poll.
-        // The per-frame animation redraw is driven from `new_events` on the timer
-        // tick (not here) — that's the difference between sleeping between frames
-        // and spinning at full speed. Requesting a redraw *every* `about_to_wait`
-        // makes winit service it immediately, defeating `WaitUntil` (the CPU spike).
-        // The About glow runs at ~60fps (brief, transient modal); the ambient
-        // ember sparks honor the configurable `ember_fps` cap (default 30) — fewer
-        // redraws ≈ proportionally less CPU, and embers drift fine at 30.
-        let wait = if state.about || state.fps_overlay || state.bell_flashing() {
+        // Pace animations by WALL-CLOCK elapsed since the last frame, checked here on
+        // *every* wake (timer tick OR any event). Advancing off the timer's
+        // `ResumeTimeReached` alone is fragile: a stream of mouse-move/resize events
+        // keeps resetting the `WaitUntil` deadline so the tick never fires and the
+        // sparks freeze until the mouse stops (the stutter). We only request a redraw
+        // once a frame-interval has actually elapsed, so this doesn't spin either.
+        let now = Instant::now();
+        let frame = if state.about || state.fps_overlay || state.bell_flashing() {
             ANIM_FRAME
         } else if state.backdrop_animating() {
             state.ember_frame()
         } else {
             POLL
         };
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
-    }
-
-    /// Drive animations on the timer tick set by `about_to_wait`. This is the only
-    /// place that advances + redraws animations, so the loop genuinely sleeps
-    /// `ANIM_FRAME` between frames instead of busy-looping. The `set_*` calls
-    /// request the redraw internally; we don't request one every wait cycle.
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
-        if !matches!(cause, StartCause::ResumeTimeReached { .. }) {
-            return;
-        }
-        let Some(state) = self.state.as_mut() else {
-            return;
-        };
-        let now = Instant::now();
-        if state.about {
-            let t = now.duration_since(state.about_since).as_secs_f32();
-            state.renderer.set_about_anim(ember_glow(t), t);
-        }
-        if state.backdrop_animating() {
-            let params =
-                state.backdrop_params(now.duration_since(state.backdrop_since).as_secs_f32());
-            state.renderer.set_backdrop(params);
-        }
-        // Decay the visual-bell ember flash; clear it once it reaches 0.
-        if let Some(since) = state.bell_flash_since {
-            let i = bell_flash_intensity(now.duration_since(since).as_secs_f32());
-            state.renderer.set_bell_flash(i);
-            if i <= 0.0 {
-                state.bell_flash_since = None;
+        let animating =
+            state.about || state.fps_overlay || state.bell_flashing() || state.backdrop_animating();
+        if animating {
+            if now.duration_since(state.last_anim) >= frame {
+                state.last_anim = now;
+                state.advance_animations(now);
+                state.renderer.window().request_redraw();
             }
-        }
-        // Keep frames flowing while the FPS overlay is on, so its readout stays live.
-        if state.fps_overlay {
-            state.renderer.window().request_redraw();
+            // Fixed deadline relative to the last frame (not `now`), so incoming
+            // events can't push it back indefinitely.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(state.last_anim + frame));
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now + POLL));
         }
     }
 }
@@ -1587,6 +1570,29 @@ impl RunState {
     fn ember_frame(&self) -> Duration {
         let fps = self.config.background.ember_fps.clamp(10, 120);
         Duration::from_millis((1000 / fps).max(1) as u64)
+    }
+
+    /// Advance every active animation to wall-clock time `now`: the About glow, the
+    /// ember sparks, and the visual-bell flash decay. Each `set_*` is a function of
+    /// elapsed time (not a delta), so an occasional long gap between frames just
+    /// samples the curve later — no jump. Called from the loop once per frame-interval.
+    fn advance_animations(&mut self, now: Instant) {
+        if self.about {
+            let t = now.duration_since(self.about_since).as_secs_f32();
+            self.renderer.set_about_anim(ember_glow(t), t);
+        }
+        if self.backdrop_animating() {
+            let params =
+                self.backdrop_params(now.duration_since(self.backdrop_since).as_secs_f32());
+            self.renderer.set_backdrop(params);
+        }
+        if let Some(since) = self.bell_flash_since {
+            let i = bell_flash_intensity(now.duration_since(since).as_secs_f32());
+            self.renderer.set_bell_flash(i);
+            if i <= 0.0 {
+                self.bell_flash_since = None;
+            }
+        }
     }
 
     /// Whether the ember sparks should be animating right now (opt-in, only while
