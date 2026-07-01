@@ -126,14 +126,16 @@ impl Selection {
         Some((c0, c1.min(last_col)))
     }
 
-    /// The selected text. Each row's segment is trailing-trimmed; rows are joined
-    /// with `\n`. (Wrapped-line joining without a newline is a known gap — see the
-    /// module/bead notes; we don't carry a per-row wrapped flag yet.)
+    /// The selected text. A soft-wrapped row is joined to the next **without** a
+    /// newline (so a wrapped logical line copies as one line); a hard line-break is
+    /// a `\n`. Hard lines are trailing-trimmed; a wrapped row keeps its full width
+    /// (its content continues into the next row).
     pub fn text(&self, grid: &GridModel) -> String {
         let (s, e) = self.effective_range(grid);
         let last_col = grid.dims.columns.saturating_sub(1);
-        let mut lines: Vec<String> = Vec::new();
-        for row in s.row..=e.row.min(grid.dims.screen_lines.saturating_sub(1)) {
+        let end_row = e.row.min(grid.dims.screen_lines.saturating_sub(1));
+        let mut out = String::new();
+        for row in s.row..=end_row {
             let c0 = if row == s.row { s.col } else { 0 };
             let c1 = if row == e.row { e.col } else { last_col };
             let mut line = String::new();
@@ -146,9 +148,17 @@ impl Selection {
                 }
                 col += 1;
             }
-            lines.push(line.trim_end().to_string());
+            // Does this row continue into the next selected row (soft wrap)?
+            if row < end_row && grid.row_wrapped(row) {
+                out.push_str(&line); // continues — no trim, no newline
+            } else {
+                out.push_str(line.trim_end());
+                if row < end_row {
+                    out.push('\n');
+                }
+            }
         }
-        lines.join("\n")
+        out
     }
 }
 
@@ -257,6 +267,50 @@ mod tests {
         let s = sel((0, 2), (0, 6), SelectionMode::Simple);
         assert_eq!(s.row_span(&g, 0), Some((2, 6)));
         assert_eq!(s.row_span(&g, 1), None);
+    }
+
+    #[test]
+    fn wrapped_row_joins_without_newline() {
+        // row0 soft-wraps into row1 (its last cell carries WRAPLINE) → one logical
+        // line, copied with no newline between.
+        let dims = GridDims::new(4, 2);
+        let mut g = GridModel::new(dims);
+        let mut cells = Vec::new();
+        for (c, ch) in "abcd".chars().enumerate() {
+            let mut cell = NeutralCell::new(CellContent::Char(ch), StyleId(0));
+            if c == 3 {
+                cell.wrapped = true; // last cell of the wrapped row
+            }
+            cells.push(CellPatch {
+                row: 0,
+                col: c as u16,
+                cell,
+            });
+        }
+        for (c, ch) in "ef".chars().enumerate() {
+            cells.push(CellPatch {
+                row: 1,
+                col: c as u16,
+                cell: NeutralCell::new(CellContent::Char(ch), StyleId(0)),
+            });
+        }
+        g.apply(GridDelta {
+            epoch: 1,
+            dims,
+            reset: true,
+            cells,
+            ..Default::default()
+        });
+        let s = sel((0, 0), (1, 3), SelectionMode::Simple);
+        assert_eq!(s.text(&g), "abcdef");
+    }
+
+    #[test]
+    fn hard_line_keeps_newline() {
+        // Same shape but NOT wrapped → newline preserved between the two lines.
+        let g = grid_from(&["abcd", "ef  "]);
+        let s = sel((0, 0), (1, 3), SelectionMode::Simple);
+        assert_eq!(s.text(&g), "abcd\nef");
     }
 
     #[test]

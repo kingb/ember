@@ -79,11 +79,19 @@ pub enum CellContent {
 pub struct NeutralCell {
     pub content: CellContent,
     pub style: StyleId,
+    /// Set on the **last cell of a row** when that row soft-wraps into the next
+    /// (alacritty's `WRAPLINE`). Lets copy join a wrapped logical line without a
+    /// spurious newline. Meaningless on non-last cells.
+    pub wrapped: bool,
 }
 
 impl NeutralCell {
     pub fn new(content: CellContent, style: StyleId) -> Self {
-        Self { content, style }
+        Self {
+            content,
+            style,
+            wrapped: false,
+        }
     }
 }
 
@@ -150,6 +158,10 @@ pub struct GridDelta {
     /// Styles first referenced by this delta.
     pub new_styles: Vec<(StyleId, Style)>,
     pub cursor: CursorState,
+    /// Snapshot of the engine's bracketed-paste mode (DEC 2004) as of this drain —
+    /// terminal state, like `cursor`, not damage. Lets the app wrap pastes in
+    /// `ESC[200~`…`ESC[201~` only when the app asked for it. Latest-wins on merge.
+    pub bracketed_paste: bool,
 }
 
 impl GridDelta {
@@ -218,6 +230,7 @@ impl GridDelta {
         self.epoch = newer.epoch;
         self.dims = newer.dims;
         self.cursor = newer.cursor;
+        self.bracketed_paste = newer.bracketed_paste;
     }
 }
 

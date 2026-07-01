@@ -195,6 +195,9 @@ struct RunState {
     click_count: u32,
     /// OS clipboard handle (lazily; `None` if the platform clipboard is unavailable).
     clipboard: Option<arboard::Clipboard>,
+    /// Per-session bracketed-paste (DEC 2004) mode, updated from each frame delta —
+    /// so paste can wrap in `ESC[200~`…`ESC[201~` only when the app asked for it.
+    bracketed: HashMap<SessionId, bool>,
 }
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
@@ -281,6 +284,7 @@ impl ApplicationHandler for App {
             last_click: None,
             click_count: 0,
             clipboard: arboard::Clipboard::new().ok(),
+            bracketed: HashMap::new(),
         };
         state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
         state.sync_layout();
@@ -646,11 +650,7 @@ impl RunState {
                 self.renderer.set_selection(self.sel.clone());
             }
             ControlMsg::Copy => self.copy_selection(),
-            ControlMsg::Paste(text) => {
-                if !text.is_empty() {
-                    self.send_to_focused(text.into_bytes());
-                }
-            }
+            ControlMsg::Paste(text) => self.paste_into_focused(&text),
             ControlMsg::Fps => self.toggle_fps(),
         }
     }
@@ -680,12 +680,17 @@ impl RunState {
                 })
             })
             .collect();
+        let bracketed = self
+            .focused_session_id()
+            .and_then(|id| self.bracketed.get(&id).copied())
+            .unwrap_or(false);
         serde_json::json!({
             "scale_factor": sf,
             "surface": [self.px.0, self.px.1],
             "tabs": self.tree.tabs.len(),
             "active_tab": self.tree.active,
             "focus_pane": focus.0,
+            "bracketed_paste": bracketed,
             "panes": panes,
         })
         .to_string()
@@ -774,11 +779,26 @@ impl RunState {
         let mut dirty = false;
         for (id, handle) in &self.sessions {
             while let Some(delta) = handle.frames.take() {
+                self.bracketed.insert(id.clone(), delta.bracketed_paste);
                 self.renderer.apply_delta(id, delta);
                 dirty = true;
             }
         }
         dirty
+    }
+
+    /// Send `text` to the focused pane as a paste: when that session enabled
+    /// bracketed paste, wrap it in `ESC[200~`…`ESC[201~` (stripping any embedded
+    /// markers first — see [`bracket_paste`]); otherwise send it raw.
+    fn paste_into_focused(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = self
+            .focused_session_id()
+            .and_then(|id| self.bracketed.get(&id).copied())
+            .unwrap_or(false);
+        self.send_to_focused(bracket_paste(text, bracketed));
     }
 
     /// Handle a Super-modified key as a multiplexer command. Returns whether it was
@@ -1037,14 +1057,12 @@ impl RunState {
         }
     }
 
-    /// Paste the OS clipboard into the focused pane's PTY (Cmd+V). Non-bracketed
-    /// for v1 — bracketed-paste mode isn't surfaced across the seam yet (see bead).
+    /// Paste the OS clipboard into the focused pane's PTY (Cmd+V), bracketed when
+    /// the focused app enabled bracketed-paste mode.
     fn paste_clipboard(&mut self) {
         let text = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
         if let Some(text) = text {
-            if !text.is_empty() {
-                self.send_to_focused(text.into_bytes());
-            }
+            self.paste_into_focused(&text);
         }
     }
 
@@ -1325,6 +1343,22 @@ fn ember_glow(t: f32) -> f32 {
 
 /// The keyboard cheat-sheet shown by the Cmd+/ overlay. Keep in sync with
 /// [`RunState::handle_shortcut`].
+/// Prepare paste bytes. When `bracketed`, wrap the text in the bracketed-paste
+/// guards `ESC[200~` … `ESC[201~`, stripping any embedded guard sequences first so
+/// a hostile clipboard can't close the bracket early and inject a command the shell
+/// would then execute. When not bracketed, send the text unchanged.
+fn bracket_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return text.as_bytes().to_vec();
+    }
+    let cleaned = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+    let mut out = Vec::with_capacity(cleaned.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(cleaned.as_bytes());
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
 fn help_lines() -> Vec<(String, String)> {
     [
         ("Cmd+D", "Split right (side by side)"),
@@ -1408,5 +1442,28 @@ fn encode_key(key: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
             Some(s.as_bytes().to_vec())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bracket_paste;
+
+    #[test]
+    fn paste_unbracketed_is_raw() {
+        assert_eq!(bracket_paste("ls -la\n", false), b"ls -la\n".to_vec());
+    }
+
+    #[test]
+    fn paste_bracketed_wraps() {
+        assert_eq!(bracket_paste("hi", true), b"\x1b[200~hi\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn paste_bracketed_strips_embedded_end_marker() {
+        // A hostile clipboard trying to break out of the bracket: the embedded
+        // ESC[201~ is removed so the payload can't escape into command position.
+        let got = bracket_paste("a\x1b[201~rm -rf /\n", true);
+        assert_eq!(got, b"\x1b[200~arm -rf /\n\x1b[201~".to_vec());
     }
 }
