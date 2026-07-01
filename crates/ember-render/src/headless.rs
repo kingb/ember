@@ -22,6 +22,7 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     AboutLayout, bell_wash, build_about, build_fps, build_help, build_settings, build_tabs,
+    scroll_indicator,
     grid_quads, measure_cell_width, push_backdrop, selection_quads, shape_grid, spark_quads,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
@@ -144,6 +145,8 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
     let mut about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut settings_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut fps_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut scroll_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut scroll_origin: Option<(f32, f32)> = None;
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut help_panel: Option<Rect> = None;
@@ -264,6 +267,19 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
                 &mut rects,
             ));
         }
+        for pane in &shot.panes {
+            if pane.focused && pane.grid.display_offset > 0 {
+                scroll_origin = Some(scroll_indicator(
+                    &mut font_system,
+                    &mut scroll_buf,
+                    pane.grid.display_offset,
+                    pane.rect,
+                    cw,
+                    sf,
+                    &mut rects,
+                ));
+            }
+        }
         bell_wash(
             &mut rects,
             shot.bell_flash,
@@ -358,6 +374,17 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
         if let Some((left, top)) = fps_origin {
             areas.push(TextArea {
                 buffer: &fps_buf,
+                left: left * sf,
+                top: top * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((left, top)) = scroll_origin {
+            areas.push(TextArea {
+                buffer: &scroll_buf,
                 left: left * sf,
                 top: top * sf,
                 scale: sf,

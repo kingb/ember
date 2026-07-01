@@ -723,6 +723,41 @@ pub(crate) fn build_fps(
     (x + ipad, y + ipad)
 }
 
+/// A subtle "scrolled up in history" pill (top-right of the pane), shown while the
+/// view isn't at the live bottom — the discoverable signal that you're in
+/// scrollback. `offset` is how many lines back you are. Quad → `out`, text into
+/// `buf`; returns the text origin. (No full scrollbar by design — Alacritty ships
+/// none either.)
+pub(crate) fn scroll_indicator(
+    font_system: &mut FontSystem,
+    buf: &mut Buffer,
+    offset: u16,
+    pane: Rect,
+    cw: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) -> (f32, f32) {
+    let text = format!("\u{2191} {offset} lines");
+    let ipad = 4.0;
+    let w = text.chars().count() as f32 * cw + 2.0 * ipad;
+    let h = LINE_HEIGHT + 2.0 * ipad;
+    let x = ((pane.x + pane.width) as f32 - w - 6.0).max(pane.x as f32);
+    let y = pane.y as f32 + 6.0;
+    out.push((scaled(x, y, w, h, sf), lin_rgba(Rgb::new(0, 0, 0), 0.66)));
+    buf.set_size(font_system, Some(w), Some(h));
+    buf.set_text(
+        font_system,
+        &text,
+        &Attrs::new()
+            .family(Family::Monospace)
+            .color(Color::rgb(AMBER.r, AMBER.g, AMBER.b)),
+        Shaping::Advanced,
+        None,
+    );
+    buf.shape_until_scroll(font_system, false);
+    (x + ipad, y + ipad)
+}
+
 /// A `(rect_px, …)`-ready physical-pixel quad from logical `x,y,w,h` and the
 /// HiDPI scale factor.
 pub(crate) fn scaled(x: f32, y: f32, w: f32, h: f32, sf: f32) -> [f32; 4] {

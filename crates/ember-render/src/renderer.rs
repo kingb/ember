@@ -29,8 +29,8 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, bell_wash, build_about, build_fps, build_help, build_settings, build_tabs,
-    debug_emit, grid_quads, measure_cell_width, push_backdrop, selection_quads, shape_grid,
-    spark_quads,
+    debug_emit, grid_quads, measure_cell_width, push_backdrop, scroll_indicator, selection_quads,
+    shape_grid, spark_quads,
 };
 use crate::selection::Selection;
 
@@ -235,6 +235,8 @@ pub struct Renderer {
     fps_overlay: Option<String>,
     /// Glyph buffer for the FPS overlay.
     fps_buffer: Buffer,
+    /// Glyph buffer for the scrollback "↑ N lines" indicator.
+    scroll_buf: Buffer,
     /// Visual-bell flash intensity (`0..1`); a warm amber wash over the panes that
     /// the app decays to 0 after a BEL. `0.0` = no flash.
     bell_flash: f32,
@@ -308,6 +310,7 @@ impl Renderer {
         let about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let settings_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let fps_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let scroll_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
 
         let cell_w = measure_cell_width(&mut font_system);
         let quads = QuadRenderer::new(&device, format);
@@ -348,6 +351,7 @@ impl Renderer {
             selection: None,
             fps_overlay: None,
             fps_buffer,
+            scroll_buf,
             bell_flash: 0.0,
             window,
         }
@@ -860,6 +864,32 @@ impl Renderer {
                         custom_glyphs: &[],
                     });
                 }
+            }
+            // Scroll indicator on the focused pane while it's up in history.
+            let scrolled = self.focused.as_ref().and_then(|fsid| {
+                let vp = self.visible.iter().find(|v| &v.session == fsid)?;
+                let p = self.panes.get(fsid)?;
+                (p.grid.display_offset > 0).then_some((p.grid.display_offset, vp.rect))
+            });
+            if let Some((off, rect)) = scrolled {
+                let (left, top) = scroll_indicator(
+                    &mut self.font_system,
+                    &mut self.scroll_buf,
+                    off,
+                    rect,
+                    cw,
+                    sf,
+                    &mut rects,
+                );
+                areas.push(TextArea {
+                    buffer: &self.scroll_buf,
+                    left: left * sf,
+                    top: top * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
+                    custom_glyphs: &[],
+                });
             }
             // The strip (with +/?/⚙ controls) is always drawn, so always show its text.
             areas.push(TextArea {
