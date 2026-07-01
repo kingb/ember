@@ -24,10 +24,16 @@ pub enum Osc133 {
 
 const PREFIX: &[u8] = b"\x1b]133;";
 
-/// Scan `bytes` for complete OSC 133 sequences, in order. An incomplete sequence
-/// at the very end (split across reads) is skipped — rare, since a shell writes
-/// its prompt + marks in a single write.
+/// Scan `bytes` for complete OSC 133 sequences, in order.
 pub fn scan(bytes: &[u8]) -> Vec<Osc133> {
+    scan_indexed(bytes).into_iter().map(|(_, m)| m).collect()
+}
+
+/// Like [`scan`], but each mark is paired with the byte index **just past** its
+/// terminator, so the caller can feed the engine incrementally and read the cursor
+/// at the exact point a mark was emitted (needed to anchor a prompt to its line).
+/// An incomplete sequence at the end (split across reads) is skipped.
+pub fn scan_indexed(bytes: &[u8]) -> Vec<(usize, Osc133)> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i + PREFIX.len() <= bytes.len() {
@@ -55,10 +61,11 @@ pub fn scan(bytes: &[u8]) -> Vec<Osc133> {
         }
         match term {
             Some(t) => {
+                let past = if bytes[t] == 0x07 { t + 1 } else { t + 2 };
                 if let Some(ev) = parse_params(&bytes[start..t]) {
-                    out.push(ev);
+                    out.push((past, ev));
                 }
-                i = if bytes[t] == 0x07 { t + 1 } else { t + 2 };
+                i = past;
             }
             None => break, // incomplete sequence at end of buffer
         }

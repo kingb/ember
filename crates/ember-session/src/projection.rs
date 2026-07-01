@@ -99,21 +99,21 @@ impl<L: EventListener> AlacrittyProjection<L> {
     /// still flow through unchanged). Returns the semantic marks found, in order,
     /// and records prompt/exit state for the gutter.
     pub fn advance(&mut self, bytes: &[u8]) -> Vec<OscEvent> {
-        self.parser.advance(&mut self.term, bytes);
         let mut events = Vec::new();
-        for m in crate::osc133::scan(bytes) {
+        let mut cut = 0usize;
+        for (past, m) in crate::osc133::scan_indexed(bytes) {
+            // Feed the engine up to and including this (invisible) mark, so the
+            // cursor sits exactly where the mark was emitted.
+            self.parser.advance(&mut self.term, &bytes[cut..past]);
+            cut = past;
             match m {
                 Osc133::PromptStart => {
-                    // Anchor the prompt to its absolute history line (post-advance
-                    // cursor row; the prompt is rendered by the time A is scanned).
                     let abs = self.term.grid().history_size() as i64
                         + self.term.grid().cursor.point.line.0.max(0) as i64;
                     self.marks.push(Mark {
                         abs_line: abs,
                         exit: None,
                     });
-                    // Bound memory: keep the last N marks (older ones scroll out of
-                    // history anyway).
                     if self.marks.len() > 512 {
                         self.marks.remove(0);
                     }
@@ -130,6 +130,8 @@ impl<L: EventListener> AlacrittyProjection<L> {
                 }
             }
         }
+        // Feed the remainder.
+        self.parser.advance(&mut self.term, &bytes[cut..]);
         events
     }
 
