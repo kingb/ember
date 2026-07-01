@@ -8,6 +8,7 @@ pub mod local_pty;
 pub mod osc133;
 pub mod palette;
 pub mod projection;
+pub mod shell_integration;
 
 pub use local_pty::{LocalPty, LocalPtyConfig};
 pub use palette::Palette;

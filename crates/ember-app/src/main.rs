@@ -673,7 +673,9 @@ impl RunState {
 
     /// Spawn a shell-backed session and register its grid with the renderer.
     fn spawn_session(&mut self, id: SessionId, dims: GridDims) {
-        let handle = LocalPty::spawn(LocalPtyConfig::new(id.clone(), dims)).expect("spawn shell");
+        let mut cfg = LocalPtyConfig::new(id.clone(), dims);
+        cfg.shell_integration = self.config.shell_integration;
+        let handle = LocalPty::spawn(cfg).expect("spawn shell");
         self.renderer.ensure_pane(&id, dims);
         self.dims_cache.insert(id.clone(), dims);
         self.sessions.insert(id, handle);
