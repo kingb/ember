@@ -624,6 +624,13 @@ impl RunState {
         }
     }
 
+    /// Jump the focused pane to the previous (`-1`) / next (`+1`) OSC 133 prompt.
+    fn jump_prompt(&self, dir: i8) {
+        if let Some(h) = self.focused_session() {
+            let _ = h.control.send(BackendControl::JumpMark(dir));
+        }
+    }
+
     /// Handle a mouse-wheel notch worth `lines` (positive = up, into history). On
     /// the primary screen this scrolls history; in a full-screen app (alt screen)
     /// with no mouse reporting it translates to arrow keys so `less`/`man`/`vim`
@@ -984,6 +991,15 @@ impl RunState {
             // Cmd+, — Settings (the macOS Preferences convention; also a menu item).
             Key::Character(s) if s.as_str() == "," => {
                 self.toggle_settings();
+                true
+            }
+            // Cmd+[ / Cmd+] — jump to previous / next command prompt (OSC 133).
+            Key::Character(s) if s.as_str() == "[" => {
+                self.jump_prompt(-1);
+                true
+            }
+            Key::Character(s) if s.as_str() == "]" => {
+                self.jump_prompt(1);
                 true
             }
             // Cmd+Shift+P — toggle the FPS / frame-time debug overlay.
@@ -1742,6 +1758,7 @@ fn help_lines() -> Vec<(String, String)> {
         ("Cmd+,", "Settings"),
         ("Wheel / Shift+PgUp/Dn", "Scroll history"),
         ("Shift+Home/End", "Scroll to top / bottom"),
+        ("Cmd+[ / Cmd+]", "Jump to prev / next command"),
         ("Cmd+/", "Show this help"),
     ]
     .iter()
