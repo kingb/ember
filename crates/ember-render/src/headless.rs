@@ -21,8 +21,8 @@ use wgpu::{
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    AboutLayout, build_about, build_fps, build_help, build_settings, build_tabs, grid_quads,
-    measure_cell_width, push_backdrop, selection_quads, shape_grid, spark_quads,
+    AboutLayout, bell_wash, build_about, build_fps, build_help, build_settings, build_tabs,
+    grid_quads, measure_cell_width, push_backdrop, selection_quads, shape_grid, spark_quads,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
@@ -63,6 +63,8 @@ pub struct Shot<'a> {
     pub image_fit: ImageFit,
     /// FPS/frame-time debug readout text (bottom-right), or `None`.
     pub fps_overlay: Option<String>,
+    /// Visual-bell flash intensity (`0..1`) — a warm amber wash over the panes.
+    pub bell_flash: f32,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
@@ -262,6 +264,13 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
                 &mut rects,
             ));
         }
+        bell_wash(
+            &mut rects,
+            shot.bell_flash,
+            shot.logical_w,
+            shot.logical_h,
+            sf,
+        );
     }
     quads.prepare(&device, &queue, (phys_w as f32, phys_h as f32), &rects);
     sparks.prepare(

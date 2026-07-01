@@ -6,10 +6,22 @@
 use serde::{Deserialize, Serialize};
 
 /// The full user configuration.
-#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub background: Background,
+    /// Visual bell: a terminal BEL flashes an ember pulse + lights the tab that
+    /// belled, instead of an audible beep. On by default.
+    pub visual_bell: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            background: Background::default(),
+            visual_bell: true,
+        }
+    }
 }
 
 /// Ambient backdrop + ember-glow appearance (the campfire aesthetic).
@@ -61,6 +73,7 @@ mod tests {
         assert!(!c.background.ember_sparks);
         assert_eq!(c.background.ember_density, 1.0);
         assert_eq!(c.background.ember_fps, 30);
+        assert!(c.visual_bell); // visual bell on by default
     }
 
     #[test]

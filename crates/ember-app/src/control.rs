@@ -47,6 +47,8 @@ pub enum ControlMsg {
     Paste(String),
     /// Toggle the FPS/frame-time debug overlay.
     Fps,
+    /// Inject a BEL for a tab's session (visual bell); `None` = the focused pane.
+    Bell(Option<usize>),
     /// Move the tab at index `from` to index `to` (drag-reorder, for tests).
     ReorderTab(usize, usize),
     /// Set tab `i`'s title to the given name (rename, for tests).
@@ -209,6 +211,11 @@ mod unix {
                 let _ = tx.send(ControlMsg::Fps);
                 ok()
             }
+            "bell" => {
+                let tab = v.get("tab").and_then(Value::as_u64).map(|n| n as usize);
+                let _ = tx.send(ControlMsg::Bell(tab));
+                ok()
+            }
             "reorder-tab" => {
                 let g = |k| v.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
                 let _ = tx.send(ControlMsg::ReorderTab(g("from"), g("to")));
@@ -360,6 +367,10 @@ mod unix {
             "copy" => serde_json::json!({"cmd":"copy"}),
             "paste" => serde_json::json!({"cmd":"paste","text": unescape(arg)}),
             "fps" => serde_json::json!({"cmd":"fps"}),
+            "bell" => match rest.get(1).and_then(|s| s.parse::<u64>().ok()) {
+                Some(t) => serde_json::json!({"cmd":"bell","tab":t}),
+                None => serde_json::json!({"cmd":"bell"}),
+            },
             "reorder-tab" => {
                 let g = |i: usize| rest.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
                 serde_json::json!({"cmd":"reorder-tab","from":g(1),"to":g(2)})

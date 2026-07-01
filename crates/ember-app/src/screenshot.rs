@@ -52,6 +52,10 @@ pub struct Opts {
     pub select_mode: String,
     /// FPS/frame-time debug overlay text (bottom-right), for verifying its layout.
     pub fps: Option<String>,
+    /// Visual-bell flash intensity (`0..1`) over the panes.
+    pub bell: f32,
+    /// Mark this tab index as having an unseen bell (draws the amber dot).
+    pub bell_tab: Option<usize>,
 }
 
 impl Default for Opts {
@@ -73,6 +77,8 @@ impl Default for Opts {
             select: None,
             select_mode: "simple".to_string(),
             fps: None,
+            bell: 0.0,
+            bell_tab: None,
         }
     }
 }
@@ -128,6 +134,10 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             }
             "--select-mode" => opts.select_mode = next()?,
             "--fps" => opts.fps = Some(next()?),
+            "--bell" => opts.bell = next()?.parse().map_err(|e| format!("--bell: {e}"))?,
+            "--bell-tab" => {
+                opts.bell_tab = Some(next()?.parse().map_err(|e| format!("--bell-tab: {e}"))?)
+            }
             _ => {}
         }
         i += 1;
@@ -267,6 +277,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
             },
             active: i == tree.active,
             editing: false,
+            bell: opts.bell_tab == Some(i),
         })
         .collect();
     let shot = Shot {
@@ -297,6 +308,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
             .and_then(crate::load_backdrop_image),
         image_fit: ember_render::ImageFit::parse(&opts.bg_fit),
         fps_overlay: opts.fps.clone(),
+        bell_flash: opts.bell,
     };
     if opts.bg_image.is_some() && shot.image.is_none() {
         return Err(format!(

@@ -54,6 +54,29 @@ pub(crate) fn push_backdrop(
     }
 }
 
+/// Peak alpha of the visual-bell wash — subtle by design (a fire flaring up, not a
+/// blinding strobe).
+const BELL_WASH_MAX: f32 = 0.16;
+
+/// Push the visual-bell flash: a warm amber full-surface tint at `intensity`
+/// (`0..1`) over the panes. No-op at 0.
+pub(crate) fn bell_wash(
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+    intensity: f32,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+) {
+    let a = intensity.clamp(0.0, 1.0) * BELL_WASH_MAX;
+    if a <= 0.0 {
+        return;
+    }
+    out.push((
+        scaled(0.0, 0.0, logical_w, logical_h, sf),
+        lin_rgba(AMBER, a),
+    ));
+}
+
 /// Compute the drifting ember-spark instances for the **additive** pass:
 /// `(rect_px, linear_rgba)` round glows rising from the bottom with lateral sway,
 /// flicker, and a fade-in/out over each spark's looping lifetime. Procedural +
@@ -329,6 +352,14 @@ pub(crate) fn build_tabs(
                 out.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(TAB_ACTIVE, 1.0)));
                 // Ember-orange underline accent on the active tab.
                 out.push((scaled(x, strip_h - 2.0, w, 2.0, sf), lin_rgba(ACCENT, 1.0)));
+            }
+            // Unseen-bell indicator: a small amber dot in the tab's top-right.
+            if tab.bell {
+                let d = 5.0;
+                out.push((
+                    scaled(x + w - d - 4.0, 4.0, d, d, sf),
+                    lin_rgba(AMBER, 0.95),
+                ));
             }
             // While editing show the buffer + a caret (no ⌘N hint); else title + hint.
             let label = if tab.editing {
