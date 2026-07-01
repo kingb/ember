@@ -212,7 +212,9 @@ fn emulation_loop(
     for ev in irx {
         match ev {
             Ev::Pty(bytes) => {
-                proj.advance(&bytes);
+                for osc in proj.advance(&bytes) {
+                    let _ = event_tx.send(BackendEvent::Osc(osc));
+                }
                 flush_outbox(&outbox, &mut writer);
                 push_frame(&mut proj, &frame_tx);
             }
@@ -226,6 +228,10 @@ fn emulation_loop(
             }
             Ev::Control(BackendControl::Scroll(amount)) => {
                 proj.scroll(amount);
+                push_frame(&mut proj, &frame_tx);
+            }
+            Ev::Control(BackendControl::JumpMark(dir)) => {
+                proj.scroll_to_prompt(dir);
                 push_frame(&mut proj, &frame_tx);
             }
             Ev::Control(BackendControl::Resize(new_dims)) => {

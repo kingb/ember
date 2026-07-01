@@ -140,6 +140,17 @@ pub struct CellPatch {
     pub cell: NeutralCell,
 }
 
+/// Shell-integration (OSC 133) command status, shown as a colored mark in the
+/// pane's left gutter at the command's prompt line. `Running` = command in flight
+/// (no exit yet); `Ok`/`Fail` from the command's exit code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkStatus {
+    #[default]
+    Running,
+    Ok,
+    Fail,
+}
+
 /// Owned, `Send`, **mergeable** render-bound delta (the B1 contract signature 1).
 ///
 /// Under backpressure the producer merges successive drains into one delta (the
@@ -173,6 +184,11 @@ pub struct GridDelta {
     /// The app has enabled mouse reporting — the wheel should go to it as mouse
     /// events, not be translated to arrow keys.
     pub mouse_reporting: bool,
+    /// OSC 133 command marks currently **visible** in the viewport, as
+    /// `(visible_row, status)` — recomputed each drain from the marks' absolute
+    /// history lines + `display_offset`, so they scroll with the content. Latest-
+    /// wins on merge (terminal state, not damage).
+    pub marks: Vec<(u16, MarkStatus)>,
 }
 
 impl GridDelta {
@@ -246,6 +262,7 @@ impl GridDelta {
         self.history_len = newer.history_len;
         self.alt_screen = newer.alt_screen;
         self.mouse_reporting = newer.mouse_reporting;
+        self.marks = newer.marks;
     }
 }
 

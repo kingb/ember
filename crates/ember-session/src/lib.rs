@@ -5,6 +5,7 @@
 //! land later.
 
 pub mod local_pty;
+pub mod osc133;
 pub mod palette;
 pub mod projection;
 
