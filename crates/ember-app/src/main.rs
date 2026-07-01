@@ -198,7 +198,29 @@ struct RunState {
     /// Per-session bracketed-paste (DEC 2004) mode, updated from each frame delta —
     /// so paste can wrap in `ESC[200~`…`ESC[201~` only when the app asked for it.
     bracketed: HashMap<SessionId, bool>,
+    /// In-progress tab drag-reorder: the tab being dragged, the press x (logical),
+    /// and whether the drag threshold has been crossed (below it, it's a click).
+    tab_drag: Option<TabDrag>,
+    /// Last tab-button mouse-down (time, tab index), for double-click-to-rename.
+    last_tab_click: Option<(Instant, usize)>,
+    /// Inline tab rename in progress: the tab index + the live edit buffer.
+    editing_tab: Option<usize>,
+    edit_buffer: String,
 }
+
+/// State for an in-progress tab drag-reorder.
+struct TabDrag {
+    /// Index of the tab currently being dragged (updated as it live-reorders).
+    tab: usize,
+    /// Logical-x of the initial press (to measure the drag threshold).
+    press_x: f64,
+    /// Whether the pointer has moved far enough to count as a drag (vs. a click).
+    active: bool,
+}
+
+/// How far (logical px) the pointer must move horizontally before a tab press
+/// becomes a drag-reorder rather than a click.
+const TAB_DRAG_THRESHOLD: f64 = 6.0;
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
 pub(crate) fn inset(r: Rect, p: f64) -> Rect {
@@ -285,6 +307,10 @@ impl ApplicationHandler for App {
             click_count: 0,
             clipboard: arboard::Clipboard::new().ok(),
             bracketed: HashMap::new(),
+            tab_drag: None,
+            last_tab_click: None,
+            editing_tab: None,
+            edit_buffer: String::new(),
         };
         state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
         state.sync_layout();
@@ -316,7 +342,9 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let sf = state.renderer.window().scale_factor();
                 state.cursor = (position.x / sf, position.y / sf);
-                if state.selecting {
+                if state.tab_drag.is_some() {
+                    state.drag_tab_to(state.cursor.0);
+                } else if state.selecting {
                     let (x, y) = state.cursor;
                     state.extend_selection(x, y);
                 }
@@ -330,7 +358,10 @@ impl ApplicationHandler for App {
                 state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
-            } => state.selecting = false,
+            } => {
+                state.tab_drag = None;
+                state.selecting = false;
+            }
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
                     return;
@@ -339,6 +370,11 @@ impl ApplicationHandler for App {
                 // (arrows / space / esc) rather than dismissing on any key.
                 if state.settings_open {
                     state.settings_key(&key.logical_key);
+                    return;
+                }
+                // Inline tab rename captures keys (title editor), not the PTY.
+                if state.editing_tab.is_some() {
+                    state.rename_key(&key.logical_key);
                     return;
                 }
                 // While a modal overlay (help / About) is up, the next *fresh* key
@@ -652,6 +688,27 @@ impl RunState {
             ControlMsg::Copy => self.copy_selection(),
             ControlMsg::Paste(text) => self.paste_into_focused(&text),
             ControlMsg::Fps => self.toggle_fps(),
+            ControlMsg::ReorderTab(from, to) => {
+                let vp = self.viewport();
+                apply(&mut self.tree, LayoutCommand::MoveTab { from, to }, vp);
+                self.sync_layout();
+            }
+            ControlMsg::RenameTab(i, name) => {
+                if let Some(t) = self.tree.tabs.get(i) {
+                    let id = t.id;
+                    let vp = self.viewport();
+                    apply(
+                        &mut self.tree,
+                        LayoutCommand::RenameTab {
+                            tab: id,
+                            title: name,
+                        },
+                        vp,
+                    );
+                    self.sync_layout();
+                }
+            }
+            ControlMsg::EditTab(i) => self.start_rename(i),
         }
     }
 
@@ -749,18 +806,25 @@ impl RunState {
         }
 
         let active = self.tree.active;
+        let editing_tab = self.editing_tab;
         let tabs: Vec<TabLabel> = self
             .tree
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, t)| TabLabel {
-                title: if t.title.is_empty() {
-                    format!("{}", i + 1)
-                } else {
-                    t.title.clone()
-                },
-                active: i == active,
+            .map(|(i, t)| {
+                let editing = editing_tab == Some(i);
+                TabLabel {
+                    title: if editing {
+                        self.edit_buffer.clone()
+                    } else if t.title.is_empty() {
+                        format!("{}", i + 1)
+                    } else {
+                        t.title.clone()
+                    },
+                    active: i == active,
+                    editing,
+                }
             })
             .collect();
 
@@ -960,10 +1024,32 @@ impl RunState {
         if self.dismiss_overlay() {
             return;
         }
+        // Any click commits an in-progress tab rename first.
+        let was_editing = self.editing_tab.is_some();
+        self.commit_rename();
         let (x, y) = self.cursor;
         if let Some(hit) = self.renderer.tab_hit(x as f32, y as f32) {
             match hit {
-                TabHit::Tab(i) => self.select_tab(i + 1),
+                TabHit::Tab(i) => {
+                    // Second click on the same tab (and we weren't just committing a
+                    // rename) → inline rename; otherwise select it + arm a drag.
+                    let now = Instant::now();
+                    let dbl = !was_editing
+                        && self
+                            .last_tab_click
+                            .is_some_and(|(t, ti)| ti == i && now.duration_since(t) < MULTI_CLICK);
+                    self.last_tab_click = Some((now, i));
+                    if dbl {
+                        self.start_rename(i);
+                    } else {
+                        self.select_tab(i + 1);
+                        self.tab_drag = Some(TabDrag {
+                            tab: i,
+                            press_x: x,
+                            active: false,
+                        });
+                    }
+                }
                 TabHit::NewTab => self.new_tab(),
                 TabHit::Help => self.toggle_help(),
                 TabHit::Settings => self.toggle_settings(),
@@ -972,6 +1058,99 @@ impl RunState {
         }
         // A click in a pane body starts a selection (mode by click count).
         self.begin_selection(x, y);
+    }
+
+    /// Live tab drag-reorder: once past the threshold, move the dragged tab to the
+    /// slot under the cursor as it crosses boundaries (Chrome-style).
+    fn drag_tab_to(&mut self, x: f64) {
+        let (from, active, press_x) = match &self.tab_drag {
+            Some(d) => (d.tab, d.active, d.press_x),
+            None => return,
+        };
+        if !active {
+            if (x - press_x).abs() < TAB_DRAG_THRESHOLD {
+                return;
+            }
+            if let Some(d) = self.tab_drag.as_mut() {
+                d.active = true;
+            }
+        }
+        let Some(slot) = self.renderer.tab_slot_at(x as f32) else {
+            return;
+        };
+        if slot != from {
+            if let Some(d) = self.tab_drag.as_mut() {
+                d.tab = slot;
+            }
+            let vp = self.viewport();
+            apply(
+                &mut self.tree,
+                LayoutCommand::MoveTab { from, to: slot },
+                vp,
+            );
+            self.sync_layout();
+        }
+    }
+
+    /// Begin inline rename of tab `i` (double-click); seeds the buffer with its title.
+    fn start_rename(&mut self, i: usize) {
+        if i >= self.tree.tabs.len() {
+            return;
+        }
+        self.tab_drag = None;
+        self.editing_tab = Some(i);
+        self.edit_buffer = self.tree.tabs[i].title.clone();
+        self.sync_layout();
+    }
+
+    /// Commit the in-progress rename (Enter / click away) → sets the tab title.
+    fn commit_rename(&mut self) {
+        let Some(i) = self.editing_tab.take() else {
+            return;
+        };
+        if let Some(t) = self.tree.tabs.get(i) {
+            let id = t.id;
+            let title = self.edit_buffer.clone();
+            let vp = self.viewport();
+            apply(
+                &mut self.tree,
+                LayoutCommand::RenameTab { tab: id, title },
+                vp,
+            );
+        }
+        self.edit_buffer.clear();
+        self.sync_layout();
+    }
+
+    /// Discard the in-progress rename (Esc).
+    fn cancel_rename(&mut self) {
+        if self.editing_tab.take().is_some() {
+            self.edit_buffer.clear();
+            self.sync_layout();
+        }
+    }
+
+    /// Route a key into the inline tab-rename editor.
+    fn rename_key(&mut self, key: &Key) {
+        match key {
+            Key::Named(NamedKey::Enter) => self.commit_rename(),
+            Key::Named(NamedKey::Escape) => self.cancel_rename(),
+            Key::Named(NamedKey::Backspace) => {
+                self.edit_buffer.pop();
+                self.sync_layout();
+            }
+            Key::Named(NamedKey::Space) => {
+                self.edit_buffer.push(' ');
+                self.sync_layout();
+            }
+            Key::Character(s) => {
+                for c in s.chars().filter(|c| !c.is_control()) {
+                    self.edit_buffer.push(c);
+                }
+                self.sync_layout();
+            }
+            _ => {}
+        }
     }
 
     /// Map a logical-px point to `(session, row, col)` in whichever visible pane

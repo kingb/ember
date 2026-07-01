@@ -47,6 +47,12 @@ pub enum ControlMsg {
     Paste(String),
     /// Toggle the FPS/frame-time debug overlay.
     Fps,
+    /// Move the tab at index `from` to index `to` (drag-reorder, for tests).
+    ReorderTab(usize, usize),
+    /// Set tab `i`'s title to the given name (rename, for tests).
+    RenameTab(usize, String),
+    /// Begin inline rename of tab `i` (to screenshot the edit caret).
+    EditTab(usize),
 }
 
 #[cfg(unix)]
@@ -203,6 +209,22 @@ mod unix {
                 let _ = tx.send(ControlMsg::Fps);
                 ok()
             }
+            "reorder-tab" => {
+                let g = |k| v.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
+                let _ = tx.send(ControlMsg::ReorderTab(g("from"), g("to")));
+                ok()
+            }
+            "rename-tab" => {
+                let i = v.get("i").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+                let _ = tx.send(ControlMsg::RenameTab(i, name.to_string()));
+                ok()
+            }
+            "edit-tab" => {
+                let i = v.get("i").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let _ = tx.send(ControlMsg::EditTab(i));
+                ok()
+            }
             other => err(&format!("unknown cmd: {other}")),
         }
     }
@@ -338,9 +360,25 @@ mod unix {
             "copy" => serde_json::json!({"cmd":"copy"}),
             "paste" => serde_json::json!({"cmd":"paste","text": unescape(arg)}),
             "fps" => serde_json::json!({"cmd":"fps"}),
+            "reorder-tab" => {
+                let g = |i: usize| rest.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                serde_json::json!({"cmd":"reorder-tab","from":g(1),"to":g(2)})
+            }
+            "rename-tab" => {
+                let i = rest.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let name = rest
+                    .get(2..)
+                    .map(|r| r.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                serde_json::json!({"cmd":"rename-tab","i":i,"name":name})
+            }
+            "edit-tab" => {
+                let i = rest.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                serde_json::json!({"cmd":"edit-tab","i":i})
+            }
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot|click|about|settings|select|copy|paste)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab)"
                 ));
             }
         };

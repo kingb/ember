@@ -316,13 +316,27 @@ pub(crate) fn build_tabs(
             let width = if i == n - 1 { tab_cols - col } else { seg };
             let x = col as f32 * cw;
             let w = width as f32 * cw;
-            if tab.active {
+            if tab.editing {
+                // Inline rename: accent fill + full border so it reads as an input.
+                out.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(TAB_ACTIVE, 1.0)));
+                push_border(
+                    out,
+                    Rect::new(x as f64, 0.0, w as f64, strip_h as f64),
+                    ACCENT,
+                    sf,
+                );
+            } else if tab.active {
                 out.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(TAB_ACTIVE, 1.0)));
                 // Ember-orange underline accent on the active tab.
                 out.push((scaled(x, strip_h - 2.0, w, 2.0, sf), lin_rgba(ACCENT, 1.0)));
             }
-            let label = format!("{}  ⌘{}", tab.title, i + 1);
-            let fg = if tab.active {
+            // While editing show the buffer + a caret (no ⌘N hint); else title + hint.
+            let label = if tab.editing {
+                format!("{}\u{2503}", tab.title) // ▏-ish caret
+            } else {
+                format!("{}  ⌘{}", tab.title, i + 1)
+            };
+            let fg = if tab.active || tab.editing {
                 Color::rgb(0xff, 0xff, 0xff)
             } else {
                 Color::rgb(0x8a, 0x8a, 0x8a)

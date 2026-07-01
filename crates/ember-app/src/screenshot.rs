@@ -266,6 +266,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
                 t.title.clone()
             },
             active: i == tree.active,
+            editing: false,
         })
         .collect();
     let shot = Shot {

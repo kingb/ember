@@ -68,6 +68,9 @@ pub struct VisiblePane {
 pub struct TabLabel {
     pub title: String,
     pub active: bool,
+    /// True while this tab's title is being edited inline (draw a caret + accent,
+    /// omit the `⌘N` hint). The `title` then carries the live edit buffer.
+    pub editing: bool,
 }
 
 /// Static content for the About overlay (the animated glow is separate).
@@ -519,6 +522,30 @@ impl Renderer {
             }
         }
         None
+    }
+
+    /// Which tab slot logical-x falls over, clamped to a valid tab index — used
+    /// during a drag to pick the drop position. `None` when there are no tab
+    /// buttons (≤1 tab). Mirrors the tab-area column math in [`build_tabs`].
+    pub fn tab_slot_at(&self, x: f32) -> Option<usize> {
+        let n = self.tabs.len();
+        if n <= 1 {
+            return None;
+        }
+        let sf = self.window.scale_factor() as f32;
+        let logical_w = self.config.width as f32 / sf;
+        let cw = self.cell_w;
+        let total_cols = (logical_w / cw).floor() as usize;
+        let plus_cols = BTN_COLS.min(total_cols);
+        let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
+        let gear_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols + help_cols));
+        let tab_cols = total_cols.saturating_sub(plus_cols + help_cols + gear_cols);
+        if tab_cols == 0 {
+            return Some(0);
+        }
+        let col = ((x / cw).floor().max(0.0) as usize).min(tab_cols - 1);
+        let seg = (tab_cols / n).max(1);
+        Some((col / seg).min(n - 1))
     }
 
     /// Show the cheat-sheet overlay with these `(key, description)` rows, or hide
