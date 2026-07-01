@@ -71,7 +71,10 @@ pub(crate) fn bell_wash(
     if a <= 0.0 {
         return;
     }
-    out.push((scaled(0.0, 0.0, logical_w, logical_h, sf), lin_rgba(AMBER, a)));
+    out.push((
+        scaled(0.0, 0.0, logical_w, logical_h, sf),
+        lin_rgba(AMBER, a),
+    ));
 }
 
 /// Compute the drifting ember-spark instances for the **additive** pass:
@@ -353,7 +356,10 @@ pub(crate) fn build_tabs(
             // Unseen-bell indicator: a small amber dot in the tab's top-right.
             if tab.bell {
                 let d = 5.0;
-                out.push((scaled(x + w - d - 4.0, 4.0, d, d, sf), lin_rgba(AMBER, 0.95)));
+                out.push((
+                    scaled(x + w - d - 4.0, 4.0, d, d, sf),
+                    lin_rgba(AMBER, 0.95),
+                ));
             }
             // While editing show the buffer + a caret (no ⌘N hint); else title + hint.
             let label = if tab.editing {

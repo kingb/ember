@@ -1587,7 +1587,7 @@ const BELL_FLASH_SECS: f32 = 0.6;
 /// Visual-bell flash intensity `[0,1]` given seconds since the BEL: full at 0,
 /// quadratic ease-out to 0 at [`BELL_FLASH_SECS`] (bright flare, soft fade).
 fn bell_flash_intensity(elapsed: f32) -> f32 {
-    if elapsed >= BELL_FLASH_SECS || elapsed < 0.0 {
+    if !(0.0..BELL_FLASH_SECS).contains(&elapsed) {
         return 0.0;
     }
     let x = 1.0 - elapsed / BELL_FLASH_SECS;
