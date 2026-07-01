@@ -170,7 +170,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
 pub fn run(opts: Opts) -> Result<String, String> {
     let (cw, ch) = headless::cell_metrics();
     let pad = PAD as f64;
-    let chrome = Renderer::chrome_height(opts.tabs) as f64;
+    let chrome = Renderer::chrome_height() as f64;
     let vp = Rect::new(
         0.0,
         chrome,

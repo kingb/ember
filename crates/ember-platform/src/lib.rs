@@ -16,9 +16,9 @@ use winit::window::{Window, WindowAttributes};
 /// wiring lands in Epic E (and `MacBackend`, ).
 pub trait PlatformBackend {
     /// Read the system clipboard (OSC 52 read policy lives in `ember-core`).
-    fn clipboard_get(&self) -> Option<String>;
+    fn clipboard(&self) -> Option<String>;
     /// Write the system clipboard.
-    fn clipboard_set(&self, text: &str);
+    fn set_clipboard(&self, text: &str);
     /// Open a path or URL (smart-selection / semantic-history / trigger effect).
     fn open_path(&self, target: &str);
 }
@@ -35,10 +35,10 @@ pub struct MacBackend;
 macro_rules! todo_backend {
     ($ty:ty) => {
         impl PlatformBackend for $ty {
-            fn clipboard_get(&self) -> Option<String> {
+            fn clipboard(&self) -> Option<String> {
                 None
             }
-            fn clipboard_set(&self, _text: &str) {}
+            fn set_clipboard(&self, _text: &str) {}
             fn open_path(&self, _target: &str) {}
         }
     };
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn backends_are_constructible() {
         // The seam stays honest on both OSes from day one (Kaylee's rule).
-        assert!(LinuxBackend.clipboard_get().is_none());
-        assert!(MacBackend.clipboard_get().is_none());
+        assert!(LinuxBackend.clipboard().is_none());
+        assert!(MacBackend.clipboard().is_none());
     }
 }

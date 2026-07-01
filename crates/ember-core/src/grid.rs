@@ -30,6 +30,12 @@ impl Rgb {
     }
 }
 
+impl From<(u8, u8, u8)> for Rgb {
+    fn from((r, g, b): (u8, u8, u8)) -> Self {
+        Self { r, g, b }
+    }
+}
+
 bitflags! {
     /// Per-cell rendering attributes — a superset both engines map onto
     /// (libghostty's `Style` POD carries exactly these as bools; alacritty's

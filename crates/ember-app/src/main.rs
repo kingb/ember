@@ -621,7 +621,7 @@ impl RunState {
     /// Retina shell gets 2× the columns it can show.
     fn viewport(&self) -> Rect {
         let sf = self.renderer.window().scale_factor();
-        let chrome = Renderer::chrome_height(self.tree.tabs.len()) as f64;
+        let chrome = Renderer::chrome_height() as f64;
         let w = self.px.0 as f64 / sf;
         let h = self.px.1 as f64 / sf;
         Rect::new(0.0, chrome, w.max(1.0), (h - chrome).max(1.0))
@@ -671,7 +671,8 @@ impl RunState {
         let Some(id) = self.focused_session_id() else {
             return;
         };
-        let (alt, mouse) = self.renderer.pane_modes(&id);
+        let m = self.renderer.pane_modes(&id);
+        let (alt, mouse) = (m.alt_screen, m.mouse_reporting);
         let Some(h) = self.sessions.get(&id) else {
             return;
         };
