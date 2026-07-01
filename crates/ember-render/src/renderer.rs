@@ -30,7 +30,7 @@ use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, bell_wash, build_about, build_fps, build_help, build_settings, build_tabs,
     debug_emit, grid_quads, measure_cell_width, push_backdrop, scrollbar, scrollbar_geometry,
-    selection_quads, shape_grid, spark_quads,
+    selection_quads, shape_grid, spark_quads, split_preview,
 };
 use crate::selection::Selection;
 
@@ -200,6 +200,9 @@ pub struct Renderer {
     focused: Option<SessionId>,
     /// Tab strip entries (drawn only when more than one tab exists).
     tabs: Vec<TabLabel>,
+    /// In-progress tab drag: `(dragged slot, cursor x in logical px)` for the lifted,
+    /// cursor-following tab; `None` when not dragging.
+    tab_drag: Option<(usize, f32)>,
     /// Glyph buffer for the tab strip.
     chrome: Buffer,
     /// When `Some`, the cheat-sheet overlay is shown with these `(key, desc)` rows.
@@ -237,6 +240,8 @@ pub struct Renderer {
     image_rgba: Option<(Vec<u8>, u32, u32)>,
     /// The active text selection and the session whose pane it belongs to.
     selection: Option<(SessionId, Selection)>,
+    /// Ctrl+Opt split drop-zone preview: `(hovered session, horizontal, ratio)`.
+    split_preview: Option<(SessionId, bool, f32)>,
     /// FPS/frame-time debug readout text (bottom-right), or `None` when hidden.
     fps_overlay: Option<String>,
     /// Glyph buffer for the FPS overlay.
@@ -335,6 +340,7 @@ impl Renderer {
             visible: Vec::new(),
             focused: None,
             tabs: Vec::new(),
+            tab_drag: None,
             chrome,
             help: None,
             help_buffer,
@@ -353,6 +359,7 @@ impl Renderer {
             image_fit: ImageFit::default(),
             image_rgba: None,
             selection: None,
+            split_preview: None,
             fps_overlay: None,
             fps_buffer,
             bell_flash: 0.0,
@@ -424,6 +431,11 @@ impl Renderer {
                             .as_ref()
                             .filter(|(sid, _)| *sid == vp.session)
                             .map(|(_, sel)| *sel),
+                        split_preview: self
+                            .split_preview
+                            .as_ref()
+                            .filter(|(sid, _, _)| *sid == vp.session)
+                            .map(|(_, h, r)| (*h, *r)),
                     })
             })
             .collect();
@@ -433,6 +445,7 @@ impl Renderer {
             scale: sf,
             panes,
             tabs: self.tabs.clone(),
+            tab_drag: self.tab_drag,
             help: self.help.clone(),
             about: self
                 .about
@@ -549,6 +562,20 @@ impl Renderer {
         self.visible = visible;
         self.focused = Some(focused);
         self.tabs = tabs;
+    }
+
+    /// Set/clear the in-progress tab drag: `(dragged slot, cursor x in logical px)`.
+    /// Drives the lifted, cursor-following tab in the strip.
+    pub fn set_tab_drag(&mut self, drag: Option<(usize, f32)>) {
+        self.tab_drag = drag;
+        self.window.request_redraw();
+    }
+
+    /// Set/clear the Ctrl+Opt split drop-zone preview: `(hovered session,
+    /// horizontal = side-by-side, ratio = existing pane fraction)`.
+    pub fn set_split_preview(&mut self, preview: Option<(SessionId, bool, f32)>) {
+        self.split_preview = preview;
+        self.window.request_redraw();
     }
 
     /// Hit-test a click at logical `(x, y)` against the tab strip: a tab button, the
@@ -912,6 +939,12 @@ impl Renderer {
                             selection_quads(&p.grid, sel, vp.rect, cw, sf, &mut rects);
                         }
                     }
+                    // Ctrl+Opt split drop-zone preview over the hovered pane.
+                    if let Some((psid, horizontal, ratio)) = &self.split_preview {
+                        if *psid == vp.session {
+                            split_preview(vp.rect, *horizontal, *ratio, sf, &mut rects);
+                        }
+                    }
                     // Scrollbar (right edge): shown whenever the pane has history and
                     // isn't on the alt screen (no scrollback there).
                     if !p.grid.alt_screen {
@@ -931,6 +964,7 @@ impl Renderer {
                 &mut self.font_system,
                 &mut self.chrome,
                 &self.tabs,
+                self.tab_drag,
                 cw,
                 logical_w,
                 sf,

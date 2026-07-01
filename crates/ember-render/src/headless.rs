@@ -23,7 +23,7 @@ use crate::grid_model::GridModel;
 use crate::paint::{
     AboutLayout, bell_wash, build_about, build_fps, build_help, build_settings, build_tabs,
     grid_quads, measure_cell_width, push_backdrop, scrollbar, selection_quads, shape_grid,
-    spark_quads,
+    spark_quads, split_preview,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
@@ -39,6 +39,8 @@ pub struct PaneShot<'a> {
     pub focused: bool,
     /// Text selection to highlight in this pane, if any.
     pub selection: Option<Selection>,
+    /// Ctrl+Opt split preview `(horizontal, ratio)` for this pane, if any.
+    pub split_preview: Option<(bool, f32)>,
 }
 
 /// A full scene to capture: logical window size, HiDPI scale, the panes, and the
@@ -49,6 +51,8 @@ pub struct Shot<'a> {
     pub scale: f32,
     pub panes: Vec<PaneShot<'a>>,
     pub tabs: Vec<TabLabel>,
+    /// In-progress tab drag `(dragged slot, cursor x logical)`, for the lifted tab.
+    pub tab_drag: Option<(usize, f32)>,
     /// When set, the cheat-sheet overlay is drawn instead of the panes.
     pub help: Option<Vec<(String, String)>>,
     /// When set, the About overlay is drawn, with `(info, glow, elapsed_seconds)`.
@@ -243,6 +247,9 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             if let Some(sel) = &pane.selection {
                 selection_quads(pane.grid, sel, pane.rect, cw, sf, &mut rects);
             }
+            if let Some((horizontal, ratio)) = pane.split_preview {
+                split_preview(pane.rect, horizontal, ratio, sf, &mut rects);
+            }
             if !pane.grid.alt_screen {
                 scrollbar(
                     pane.grid.display_offset,
@@ -258,6 +265,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             &mut font_system,
             &mut chrome,
             &shot.tabs,
+            shot.tab_drag,
             cw,
             shot.logical_w,
             sf,

@@ -291,6 +291,35 @@ pub(crate) fn selection_quads(
     }
 }
 
+/// Draw the visual-split drop-zone preview over a pane `rect`: a translucent
+/// ember-tinted overlay on the region the NEW pane would occupy (right half if
+/// `horizontal` = side-by-side, else bottom half), with a bright divider line at
+/// `ratio` (the existing pane's fraction). Held Ctrl+Opt + hover; click commits.
+pub(crate) fn split_preview(
+    rect: Rect,
+    horizontal: bool,
+    ratio: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) {
+    let (x, y, w, h) = (
+        rect.x as f32,
+        rect.y as f32,
+        rect.width as f32,
+        rect.height as f32,
+    );
+    let r = ratio.clamp(0.05, 0.95);
+    if horizontal {
+        let dx = x + w * r;
+        out.push((scaled(dx, y, w * (1.0 - r), h, sf), lin_rgba(ACCENT, 0.20)));
+        out.push((scaled(dx - 1.0, y, 2.0, h, sf), lin_rgba(ACCENT, 0.9)));
+    } else {
+        let dy = y + h * r;
+        out.push((scaled(x, dy, w, h * (1.0 - r), sf), lin_rgba(ACCENT, 0.20)));
+        out.push((scaled(x, dy - 1.0, w, 2.0, sf), lin_rgba(ACCENT, 0.9)));
+    }
+}
+
 /// Background of the tab strip (a touch lighter than the terminal, iTerm-style).
 const STRIP_BG: Rgb = Rgb::new(0x1b, 0x1b, 0x1b);
 /// Fill of the active tab button.
@@ -324,10 +353,12 @@ fn center(s: &str, width: usize) -> String {
 /// lighter with an Ember-orange underline + `⌘N` hint); with one tab the tab area
 /// is just an empty toolbar. Quads → `out`; the concatenated label line shapes into
 /// `chrome`. All geometry is logical px, scaled by `sf`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_tabs(
     font_system: &mut FontSystem,
     chrome: &mut Buffer,
     tabs: &[TabLabel],
+    drag: Option<(usize, f32)>,
     cw: f32,
     logical_w: f32,
     sf: f32,
@@ -352,6 +383,7 @@ pub(crate) fn build_tabs(
     let base = Attrs::new().family(Family::Monospace);
     let mut spans: Vec<(String, Color)> = Vec::new();
     let n = tabs.len();
+    let drag_slot = drag.map(|(s, _)| s);
     if n > 1 {
         let seg = tab_cols / n;
         let mut col = 0usize;
@@ -360,7 +392,15 @@ pub(crate) fn build_tabs(
             let width = if i == n - 1 { tab_cols - col } else { seg };
             let x = col as f32 * cw;
             let w = width as f32 * cw;
-            if tab.editing {
+            let dragging_this = drag_slot == Some(i);
+            if dragging_this {
+                // The grabbed tab's slot is a recessed "gap" (darker) — the lifted
+                // copy floats over it at the cursor (drawn after the loop).
+                out.push((
+                    scaled(x, 0.0, w, strip_h, sf),
+                    lin_rgba(Rgb::new(0x0c, 0x0c, 0x0c), 1.0),
+                ));
+            } else if tab.editing {
                 // Inline rename: accent fill + full border so it reads as an input.
                 out.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(TAB_ACTIVE, 1.0)));
                 push_border(
@@ -382,13 +422,16 @@ pub(crate) fn build_tabs(
                     lin_rgba(AMBER, 0.95),
                 ));
             }
-            // While editing show the buffer + a caret (no ⌘N hint); else title + hint.
+            // Editing → buffer + caret; dragging → title only (no ⌘N, grabbed); else
+            // title + ⌘N hint.
             let label = if tab.editing {
                 format!("{}\u{2503}", tab.title) // ▏-ish caret
+            } else if dragging_this {
+                tab.title.clone()
             } else {
                 format!("{}  ⌘{}", tab.title, i + 1)
             };
-            let fg = if tab.active || tab.editing {
+            let fg = if tab.active || tab.editing || dragging_this {
                 Color::rgb(0xff, 0xff, 0xff)
             } else {
                 Color::rgb(0x8a, 0x8a, 0x8a)
@@ -400,6 +443,33 @@ pub(crate) fn build_tabs(
         // Single tab: no tab buttons, just the control toolbar. Pad the tab area so
         // the trailing buttons land in the right columns.
         spans.push((" ".repeat(tab_cols), Color::rgb(FG.r, FG.g, FG.b)));
+    }
+    // A grabbed tab "lifts" and follows the cursor: a raised, accent-bordered copy
+    // with a drop shadow drawn over its (recessed) slot. Pixel-smooth follow on top
+    // of the slot-snapped reorder, so the drag reads clearly. (Label stays in the
+    // chrome buffer at the slot, which tracks the cursor via the live reorder.)
+    if let (Some((_, cursor_x)), true) = (drag, n > 1) {
+        let seg = (tab_cols / n).max(1);
+        let seg_w = seg as f32 * cw;
+        let lift_x = (cursor_x - seg_w * 0.5).clamp(0.0, (tab_cols as f32 * cw - seg_w).max(0.0));
+        out.push((
+            scaled(lift_x + 3.0, 3.0, seg_w, strip_h, sf),
+            lin_rgba(Rgb::new(0, 0, 0), 0.38),
+        )); // drop shadow
+        out.push((
+            scaled(lift_x, 0.0, seg_w, strip_h, sf),
+            lin_rgba(Rgb::new(0x3a, 0x3a, 0x3a), 1.0),
+        )); // raised fill
+        out.push((
+            scaled(lift_x, 0.0, seg_w, strip_h, sf),
+            lin_rgba(ACCENT, 0.18),
+        )); // warm tint
+        push_border(
+            out,
+            Rect::new(lift_x as f64, 0.0, seg_w as f64, strip_h as f64),
+            ACCENT,
+            sf,
+        );
     }
     // Trailing utility buttons: "+" (new tab), "?" (shortcuts), "⚙" (settings).
     let btn_fg = Color::rgb(0x8a, 0x8a, 0x8a);
