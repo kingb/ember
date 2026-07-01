@@ -140,6 +140,7 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
         }
         out.new_styles = first_seen;
         out.cursor = self.cursor_state();
+        out.bracketed_paste = self.term.mode().contains(TermMode::BRACKETED_PASTE);
     }
 }
 
@@ -150,7 +151,7 @@ impl<L: EventListener> AlacrittyProjection<L> {
         col: usize,
         first_seen: &mut Vec<(StyleId, Style)>,
     ) -> CellPatch {
-        let (content, style) = {
+        let (content, style, wrapped) = {
             let cell = &self.term.grid()[Point::new(Line(line as i32), Column(col))];
             neutral_of(cell, &self.palette)
         };
@@ -158,13 +159,17 @@ impl<L: EventListener> AlacrittyProjection<L> {
         CellPatch {
             row: line as u16,
             col: col as u16,
-            cell: NeutralCell::new(content, id),
+            cell: NeutralCell {
+                content,
+                style: id,
+                wrapped,
+            },
         }
     }
 }
 
-/// Resolve one alacritty cell into neutral content + style.
-fn neutral_of(cell: &Cell, palette: &Palette) -> (CellContent, Style) {
+/// Resolve one alacritty cell into neutral content + style + soft-wrap flag.
+fn neutral_of(cell: &Cell, palette: &Palette) -> (CellContent, Style, bool) {
     let flags = cell.flags;
     let mut fg = palette.resolve(cell.fg);
     let mut bg = palette.resolve(cell.bg);
@@ -198,7 +203,9 @@ fn neutral_of(cell: &Cell, palette: &Palette) -> (CellContent, Style) {
         ' ' | '\0' => CellContent::Empty,
         c => CellContent::Char(c),
     };
-    (content, style)
+    // Last cell of a soft-wrapped row carries WRAPLINE — the logical line continues.
+    let wrapped = flags.contains(Flags::WRAPLINE);
+    (content, style, wrapped)
 }
 
 #[cfg(test)]

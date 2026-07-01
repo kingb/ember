@@ -63,6 +63,13 @@ impl GridModel {
         self.cells.get(idx)
     }
 
+    /// Whether `row` soft-wraps into the next row (its last cell carries WRAPLINE).
+    /// Lets copy join a wrapped logical line without a spurious newline.
+    pub fn row_wrapped(&self, row: u16) -> bool {
+        let cols = self.dims.columns;
+        cols > 0 && self.cell(row, cols - 1).is_some_and(|c| c.wrapped)
+    }
+
     /// The plain text of one row (blanks rendered as spaces).
     pub fn row_text(&self, row: u16) -> String {
         let cols = self.dims.columns as usize;
