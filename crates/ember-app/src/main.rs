@@ -118,6 +118,10 @@ fn main() {
         }
         _ => None,
     };
+    // Set the macOS app name BEFORE winit creates NSApplication + the app menu —
+    // AppKit reads the process name when it builds that menu, so doing it in
+    // `resumed()` (after) is too late. Non-macOS: no-op.
+    ember_platform::set_app_name("Ember");
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
@@ -275,10 +279,6 @@ impl ApplicationHandler for App {
         if self.state.is_some() {
             return;
         }
-        // Set the macOS menu-bar app name before the menu is built (matches the
-        // "Ember" window title + brand; a non-bundled binary otherwise shows the
-        // executable name "ember-term").
-        ember_platform::set_app_name("Ember");
         let w = DEFAULT_COLS as f32 * CELL_WIDTH + 2.0 * PAD;
         let h = DEFAULT_ROWS as f32 * CELL_HEIGHT + 2.0 * PAD;
         let attrs = ember_platform::window_attributes("Ember", w, h);
