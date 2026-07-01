@@ -7,9 +7,10 @@
 //! in-app Cmd+/ overlay remains the portable path. Either way the app code is
 //! identical: `build_menu()` then poll `menu_action()` each tick.
 
-/// A menu item the user chose, in platform-agnostic terms.
+/// A menu item the user chose, in platform-agnostic terms. Exhaustive on purpose:
+/// it's matched only in the app, so the compiler flags an unhandled item when a
+/// variant is added (more useful than downstream compat here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum MenuAction {
     /// Help → Keyboard Shortcuts (also bound to Cmd+/).
     ShowShortcuts,

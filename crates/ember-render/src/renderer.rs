@@ -152,9 +152,10 @@ impl From<&str> for ImageFit {
     }
 }
 
-/// What the tab strip was clicked on (from [`Renderer::tab_hit`]).
+/// What the tab strip was clicked on (from [`Renderer::tab_hit`]). Exhaustive on
+/// purpose: it's matched only in the app, so the compiler flags an unhandled
+/// button when a variant is added (more useful than downstream compat here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum TabHit {
     /// The tab button at this index.
     Tab(usize),

@@ -571,7 +571,6 @@ impl ApplicationHandler for App {
                 MenuAction::ShowShortcuts => state.toggle_help(),
                 MenuAction::About => state.toggle_about(),
                 MenuAction::Settings => state.toggle_settings(),
-                _ => {}
             }
         }
         if state.tree.tabs.is_empty() {
@@ -1279,7 +1278,6 @@ impl RunState {
                 TabHit::NewTab => self.new_tab(),
                 TabHit::Help => self.toggle_help(),
                 TabHit::Settings => self.toggle_settings(),
-                _ => {}
             }
             return;
         }
