@@ -193,6 +193,22 @@ impl WindowTree {
     pub fn active_tab(&self) -> &Tab {
         &self.tabs[self.active]
     }
+
+    /// Move the tab at index `from` to index `to`, shifting the tabs in between.
+    /// `active` follows the tab that was active before the move (by id), so the
+    /// user stays on the same tab. No-op if either index is out of range or equal.
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        let n = self.tabs.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        let active_id = self.tabs[self.active].id;
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        if let Some(pos) = self.tabs.iter().position(|t| t.id == active_id) {
+            self.active = pos;
+        }
+    }
 }
 
 /// Pure layout: tile `area` into one rect per pane (design §5). Output order
@@ -262,6 +278,52 @@ mod tests {
     fn single_pane_fills_area() {
         let area = Rect::new(0.0, 0.0, 100.0, 50.0);
         assert_eq!(layout(&p(1), area), vec![(PaneId(1), area)]);
+    }
+
+    fn tree_with_tabs(n: u64) -> WindowTree {
+        WindowTree {
+            tabs: (1..=n)
+                .map(|i| Tab {
+                    id: TabId(i),
+                    title: format!("t{i}"),
+                    root: p(i),
+                    focus: PaneId(i),
+                })
+                .collect(),
+            active: 0,
+        }
+    }
+
+    fn ids(w: &WindowTree) -> Vec<u64> {
+        w.tabs.iter().map(|t| t.id.0).collect()
+    }
+
+    #[test]
+    fn move_tab_last_to_front_active_follows() {
+        let mut w = tree_with_tabs(3);
+        w.active = 2; // on tab id 3
+        w.move_tab(2, 0);
+        assert_eq!(ids(&w), vec![3, 1, 2]);
+        assert_eq!(w.active, 0); // still on id 3, now at front
+    }
+
+    #[test]
+    fn move_tab_front_to_back_active_follows() {
+        let mut w = tree_with_tabs(3);
+        w.active = 1; // on tab id 2
+        w.move_tab(0, 2);
+        assert_eq!(ids(&w), vec![2, 3, 1]);
+        assert_eq!(w.active, 0); // id 2 now at front
+    }
+
+    #[test]
+    fn move_tab_noop_when_equal_or_out_of_range() {
+        let mut w = tree_with_tabs(3);
+        let before = w.clone();
+        w.move_tab(1, 1);
+        w.move_tab(5, 0);
+        w.move_tab(0, 9);
+        assert_eq!(w, before);
     }
 
     #[test]
