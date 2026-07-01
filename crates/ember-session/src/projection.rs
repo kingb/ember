@@ -347,4 +347,39 @@ mod tests {
         assert!(!second.reset, "incremental drain is not a full reset");
         assert_eq!(find(&second, 0, 1).cell.content, CellContent::Char('b'));
     }
+
+    fn feed_lines(p: &mut AlacrittyProjection<VoidListener>, n: usize) {
+        let mut s = String::new();
+        for i in 1..=n {
+            s.push_str(&format!("L{i}\r\n"));
+        }
+        p.advance(s.as_bytes());
+    }
+
+    #[test]
+    fn scrolls_primary_history() {
+        let mut p = proj();
+        feed_lines(&mut p, 60); // 60 lines → history above the 24-row screen
+        p.scroll(ScrollAmount::Lines(5));
+        let mut d = GridDelta::default();
+        p.drain_damage_into(&mut d);
+        assert!(!d.alt_screen);
+        assert!(d.history_len > 0, "history should exist");
+        assert!(d.display_offset > 0, "should be scrolled up into history");
+    }
+
+    #[test]
+    fn scroll_is_noop_on_alt_screen() {
+        let mut p = proj();
+        feed_lines(&mut p, 60);
+        p.advance(b"\x1b[?1049h"); // enter the alternate screen (vim/less/htop)
+        p.scroll(ScrollAmount::PageUp); // must NOT touch primary history
+        let mut d = GridDelta::default();
+        p.drain_damage_into(&mut d);
+        assert!(d.alt_screen);
+        assert_eq!(
+            d.display_offset, 0,
+            "the alt screen has no scrollback — scrolling must be a no-op"
+        );
+    }
 }
