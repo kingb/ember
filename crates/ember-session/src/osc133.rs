@@ -11,6 +11,7 @@
 
 /// A parsed OSC 133 mark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Osc133 {
     /// `A` — a fresh prompt begins here (the gutter marks this line).
     PromptStart,

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use ember_core::{CellContent, CursorState, GridDelta, GridDims, NeutralCell, Style, StyleId};
 
 /// The current screen state, reconstructed from coalesced deltas.
+#[derive(Debug)]
 pub struct GridModel {
     pub dims: GridDims,
     cells: Vec<NeutralCell>,
@@ -103,6 +104,7 @@ impl GridModel {
                 CellContent::Char(ch) => *ch,
                 CellContent::Cluster(s) => s.chars().next().unwrap_or(' '),
                 CellContent::Empty => ' ',
+                _ => ' ',
             })
             .collect()
     }
@@ -119,6 +121,7 @@ impl GridModel {
                 CellContent::Char(c) => *c,
                 CellContent::Cluster(s) => s.chars().next().unwrap_or(' '),
                 CellContent::Empty => ' ',
+                _ => ' ',
             };
             let fg = self.style_of(cell.style).fg;
             match runs.last_mut() {

@@ -52,6 +52,7 @@ pub enum LayoutCommand {
 /// A described side effect of applying a [`LayoutCommand`]. The owner (ember-app)
 /// performs the actual IO; the core only emits the intent.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum LayoutEffect {
     /// The pane's session must be terminated.
     KillSession(SessionId),

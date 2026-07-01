@@ -181,6 +181,7 @@ impl<L: EventListener> AlacrittyProjection<L> {
             ScrollAmount::PageDown => Scroll::PageDown,
             ScrollAmount::Top => Scroll::Top,
             ScrollAmount::Bottom => Scroll::Bottom,
+            _ => return,
         };
         self.term.scroll_display(scroll);
     }

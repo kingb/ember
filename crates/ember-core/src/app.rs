@@ -13,6 +13,7 @@ use crate::layout::WindowTree;
 
 /// Kind of a structured, PTY-less chrome row (rail / timeline / inspector).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ChromeRowKind {
     Rail,
     Timeline,

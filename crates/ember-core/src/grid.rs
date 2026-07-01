@@ -30,6 +30,12 @@ impl Rgb {
     }
 }
 
+impl From<(u8, u8, u8)> for Rgb {
+    fn from((r, g, b): (u8, u8, u8)) -> Self {
+        Self { r, g, b }
+    }
+}
+
 bitflags! {
     /// Per-cell rendering attributes — a superset both engines map onto
     /// (libghostty's `Style` POD carries exactly these as bools; alacritty's
@@ -67,6 +73,7 @@ pub struct Style {
 /// A cell's printable content: a single char (the common case), a multi-codepoint
 /// grapheme cluster, or empty (blank — render fills the cell's bg, no glyph).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CellContent {
     #[default]
     Empty,
@@ -116,6 +123,7 @@ impl GridDims {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CursorShape {
     #[default]
     Block,
@@ -144,6 +152,7 @@ pub struct CellPatch {
 /// pane's left gutter at the command's prompt line. `Running` = command in flight
 /// (no exit yet); `Ok`/`Fail` from the command's exit code.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum MarkStatus {
     #[default]
     Running,

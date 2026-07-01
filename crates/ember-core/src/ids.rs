@@ -18,3 +18,27 @@ impl SessionId {
         Self(s.into())
     }
 }
+
+impl From<String> for SessionId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for SessionId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl From<u64> for PaneId {
+    fn from(n: u64) -> Self {
+        Self(n)
+    }
+}
+
+impl From<u64> for TabId {
+    fn from(n: u64) -> Self {
+        Self(n)
+    }
+}

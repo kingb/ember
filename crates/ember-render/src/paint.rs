@@ -250,6 +250,7 @@ pub(crate) fn grid_quads(
                 MarkStatus::Ok => GUTTER_OK,
                 MarkStatus::Fail => GUTTER_FAIL,
                 MarkStatus::Running => GUTTER_RUN,
+                _ => GUTTER_RUN,
             };
             out.push((
                 scaled(ox - 3.5, oy + row as f32 * ch + 1.0, 2.5, ch - 2.0, sf),

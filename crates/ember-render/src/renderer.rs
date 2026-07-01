@@ -121,6 +121,7 @@ impl Default for BackdropParams {
 /// How a backdrop image fills the window. Cover/contain/stretch use a
 /// clamped sampler with computed UVs; tile repeats the image at its native size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ImageFit {
     /// Scale to fill the window, cropping the overflowing axis (default).
     #[default]
@@ -145,8 +146,15 @@ impl ImageFit {
     }
 }
 
+impl From<&str> for ImageFit {
+    fn from(s: &str) -> Self {
+        Self::parse(s)
+    }
+}
+
 /// What the tab strip was clicked on (from [`Renderer::tab_hit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TabHit {
     /// The tab button at this index.
     Tab(usize),
@@ -156,6 +164,15 @@ pub enum TabHit {
     Help,
     /// The trailing "⚙" button (toggle the Settings overlay).
     Settings,
+}
+
+/// A pane's terminal modes (from the latest delta), driving mouse-wheel handling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaneModes {
+    /// The alternate screen is active (vim/less/htop) — no scrollback there.
+    pub alt_screen: bool,
+    /// The app enabled mouse reporting — forward the wheel as mouse events.
+    pub mouse_reporting: bool,
 }
 
 /// A read-only snapshot of a pane's grid for the debug control surface.
@@ -384,7 +401,7 @@ impl Renderer {
     /// Height in px reserved for the tab strip. The strip is **always** drawn (it
     /// carries the +/?/⚙ controls even with one tab — design §1 discoverability),
     /// so this is constant. The app subtracts it from the layout viewport.
-    pub fn chrome_height(_tab_count: usize) -> f32 {
+    pub fn chrome_height() -> f32 {
         CELL_HEIGHT + 2.0 * PAD
     }
 
@@ -414,7 +431,7 @@ impl Renderer {
     /// Renders the live grids through the same headless path used by `--screenshot`,
     /// so the PNG is pixel-identical to the window. Builds a throwaway offscreen GPU
     /// context (no surface read-back needed).
-    pub fn capture_to_png(&self, path: &Path) -> Result<(), String> {
+    pub fn capture_to_png(&self, path: &Path) -> Result<(), crate::headless::CaptureError> {
         let sf = self.window.scale_factor() as f32;
         let panes: Vec<crate::headless::PaneShot> = self
             .visible
@@ -464,11 +481,14 @@ impl Renderer {
     /// `(alt_screen, mouse_reporting)` for a session's pane (from the latest delta),
     /// defaulting to `(false, false)`. Drives how the app treats the mouse wheel:
     /// history-scroll on the primary screen, wheel→arrows in a full-screen app.
-    pub fn pane_modes(&self, session: &SessionId) -> (bool, bool) {
+    pub fn pane_modes(&self, session: &SessionId) -> PaneModes {
         self.panes
             .get(session)
-            .map(|p| (p.grid.alt_screen, p.grid.mouse_reporting))
-            .unwrap_or((false, false))
+            .map(|p| PaneModes {
+                alt_screen: p.grid.alt_screen,
+                mouse_reporting: p.grid.mouse_reporting,
+            })
+            .unwrap_or_default()
     }
 
     /// Which visible pane's scrollbar track contains logical `(x, y)`, if any — so
