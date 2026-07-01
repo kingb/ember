@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use alacritty_terminal::event::EventListener;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::test::TermSize;
@@ -14,7 +15,7 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use ember_core::{
     Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, NeutralCell,
-    Style, StyleId, VtProjection,
+    ScrollAmount, Style, StyleId, VtProjection,
 };
 
 use crate::palette::Palette;
@@ -58,6 +59,10 @@ pub struct AlacrittyProjection<L: EventListener> {
     palette: Palette,
     dims: GridDims,
     epoch: u64,
+    /// Lines the display is scrolled up from the live bottom (`0` = bottom).
+    /// Mirrors the engine's `display_offset`; read fresh each drain so it stays in
+    /// sync whether it changed via a scroll command or output pushing history.
+    display_offset: usize,
 }
 
 impl<L: EventListener> AlacrittyProjection<L> {
@@ -71,12 +76,37 @@ impl<L: EventListener> AlacrittyProjection<L> {
             palette: Palette::dark(),
             dims,
             epoch: 0,
+            display_offset: 0,
         }
     }
 
     /// Feed raw PTY bytes through the VT parser into the engine.
     pub fn advance(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// Scroll the display through scrollback history. **No-op on the alternate
+    /// screen** (vim/less/htop have no scrollback) — the classic scrollback bug is
+    /// scrolling primary history while a full-screen app is up, so we gate it at the
+    /// source. `scroll_display` marks the viewport fully damaged on any change, so
+    /// the next drain repaints the scrolled view.
+    pub fn scroll(&mut self, amount: ScrollAmount) {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        let scroll = match amount {
+            ScrollAmount::Lines(n) => Scroll::Delta(n),
+            ScrollAmount::To(n) => {
+                // Absolute offset → delta from the current position.
+                let cur = self.term.grid().display_offset() as i32;
+                Scroll::Delta(n as i32 - cur)
+            }
+            ScrollAmount::PageUp => Scroll::PageUp,
+            ScrollAmount::PageDown => Scroll::PageDown,
+            ScrollAmount::Top => Scroll::Top,
+            ScrollAmount::Bottom => Scroll::Bottom,
+        };
+        self.term.scroll_display(scroll);
     }
 
     /// Resize the engine grid.
@@ -110,6 +140,11 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
         out.epoch = self.epoch;
         out.dims = self.dims;
 
+        // Re-sync the display offset every drain: it changes both via scroll commands
+        // and as output rotates history while scrolled up (the engine bumps it to
+        // keep the viewport on the same content — the streaming-scroll fix).
+        self.display_offset = self.term.grid().display_offset();
+
         let cols = self.dims.columns as usize;
         let lines = self.dims.screen_lines as usize;
 
@@ -140,7 +175,15 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
         }
         out.new_styles = first_seen;
         out.cursor = self.cursor_state();
-        out.bracketed_paste = self.term.mode().contains(TermMode::BRACKETED_PASTE);
+        let mode = self.term.mode();
+        out.bracketed_paste = mode.contains(TermMode::BRACKETED_PASTE);
+        out.display_offset = self.display_offset.min(u16::MAX as usize) as u16;
+        out.history_len = self.term.grid().history_size().min(u16::MAX as usize) as u16;
+        out.alt_screen = mode.contains(TermMode::ALT_SCREEN);
+        // Any mouse-report mode means the app wants the wheel as mouse events.
+        out.mouse_reporting = mode.intersects(
+            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+        );
     }
 }
 
@@ -151,8 +194,13 @@ impl<L: EventListener> AlacrittyProjection<L> {
         col: usize,
         first_seen: &mut Vec<(StyleId, Style)>,
     ) -> CellPatch {
+        // Map a visible row to the engine's line index accounting for scroll: when
+        // scrolled up by `display_offset`, visible row `v` shows engine line
+        // `v - display_offset` (history lines are negative). At the bottom
+        // (`display_offset == 0`) this is just `Line(v)`.
+        let engine_line = line as i32 - self.display_offset as i32;
         let (content, style, wrapped) = {
-            let cell = &self.term.grid()[Point::new(Line(line as i32), Column(col))];
+            let cell = &self.term.grid()[Point::new(Line(engine_line), Column(col))];
             neutral_of(cell, &self.palette)
         };
         let id = self.interner.intern(style, first_seen);
@@ -298,5 +346,40 @@ mod tests {
         p.drain_damage_into(&mut second);
         assert!(!second.reset, "incremental drain is not a full reset");
         assert_eq!(find(&second, 0, 1).cell.content, CellContent::Char('b'));
+    }
+
+    fn feed_lines(p: &mut AlacrittyProjection<VoidListener>, n: usize) {
+        let mut s = String::new();
+        for i in 1..=n {
+            s.push_str(&format!("L{i}\r\n"));
+        }
+        p.advance(s.as_bytes());
+    }
+
+    #[test]
+    fn scrolls_primary_history() {
+        let mut p = proj();
+        feed_lines(&mut p, 60); // 60 lines → history above the 24-row screen
+        p.scroll(ScrollAmount::Lines(5));
+        let mut d = GridDelta::default();
+        p.drain_damage_into(&mut d);
+        assert!(!d.alt_screen);
+        assert!(d.history_len > 0, "history should exist");
+        assert!(d.display_offset > 0, "should be scrolled up into history");
+    }
+
+    #[test]
+    fn scroll_is_noop_on_alt_screen() {
+        let mut p = proj();
+        feed_lines(&mut p, 60);
+        p.advance(b"\x1b[?1049h"); // enter the alternate screen (vim/less/htop)
+        p.scroll(ScrollAmount::PageUp); // must NOT touch primary history
+        let mut d = GridDelta::default();
+        p.drain_damage_into(&mut d);
+        assert!(d.alt_screen);
+        assert_eq!(
+            d.display_offset, 0,
+            "the alt screen has no scrollback — scrolling must be a no-op"
+        );
     }
 }

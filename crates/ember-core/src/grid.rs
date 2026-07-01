@@ -162,6 +162,17 @@ pub struct GridDelta {
     /// terminal state, like `cursor`, not damage. Lets the app wrap pastes in
     /// `ESC[200~`…`ESC[201~` only when the app asked for it. Latest-wins on merge.
     pub bracketed_paste: bool,
+    /// Scrollback viewport state (terminal state, latest-wins on merge): how many
+    /// lines the display is scrolled **up** from the live bottom (`0` = at bottom),
+    /// and how many lines of history exist above.
+    pub display_offset: u16,
+    pub history_len: u16,
+    /// Alternate screen active (vim/less/htop/…): there is NO scrollback here, so
+    /// the app must suppress history scrolling and translate the wheel to arrows.
+    pub alt_screen: bool,
+    /// The app has enabled mouse reporting — the wheel should go to it as mouse
+    /// events, not be translated to arrow keys.
+    pub mouse_reporting: bool,
 }
 
 impl GridDelta {
@@ -231,6 +242,10 @@ impl GridDelta {
         self.dims = newer.dims;
         self.cursor = newer.cursor;
         self.bracketed_paste = newer.bracketed_paste;
+        self.display_offset = newer.display_offset;
+        self.history_len = newer.history_len;
+        self.alt_screen = newer.alt_screen;
+        self.mouse_reporting = newer.mouse_reporting;
     }
 }
 

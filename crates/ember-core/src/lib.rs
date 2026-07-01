@@ -17,7 +17,7 @@ pub mod layout;
 pub use app::{AppState, ChromeRow, ChromeRowKind, ChromeState, Gate, GateId, GateRegistry};
 pub use backend::{
     BackendControl, BackendEvent, BackendHandle, ClipboardOp, ExitStatus, FrameRx, FrameTx,
-    OscEvent, PassthroughEvent, SessionBackend, VtProjection, frame_channel,
+    OscEvent, PassthroughEvent, ScrollAmount, SessionBackend, VtProjection, frame_channel,
 };
 pub use command::{LayoutCommand, LayoutEffect, apply};
 pub use config::{Background, Config};

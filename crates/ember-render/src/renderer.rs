@@ -29,8 +29,8 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, bell_wash, build_about, build_fps, build_help, build_settings, build_tabs,
-    debug_emit, grid_quads, measure_cell_width, push_backdrop, selection_quads, shape_grid,
-    spark_quads,
+    debug_emit, grid_quads, measure_cell_width, push_backdrop, scrollbar, scrollbar_geometry,
+    selection_quads, shape_grid, spark_quads,
 };
 use crate::selection::Selection;
 
@@ -441,6 +441,63 @@ impl Renderer {
         crate::headless::capture(&shot, path)
     }
 
+    /// `(alt_screen, mouse_reporting)` for a session's pane (from the latest delta),
+    /// defaulting to `(false, false)`. Drives how the app treats the mouse wheel:
+    /// history-scroll on the primary screen, wheel→arrows in a full-screen app.
+    pub fn pane_modes(&self, session: &SessionId) -> (bool, bool) {
+        self.panes
+            .get(session)
+            .map(|p| (p.grid.alt_screen, p.grid.mouse_reporting))
+            .unwrap_or((false, false))
+    }
+
+    /// Which visible pane's scrollbar track contains logical `(x, y)`, if any — so
+    /// the app can grab it (with priority over text selection).
+    pub fn scrollbar_hit(&self, x: f32, y: f32) -> Option<SessionId> {
+        for vp in &self.visible {
+            let Some(p) = self.panes.get(&vp.session) else {
+                continue;
+            };
+            if p.grid.alt_screen {
+                continue;
+            }
+            if let Some((track, _)) = scrollbar_geometry(
+                p.grid.display_offset,
+                p.grid.history_len,
+                p.grid.dims.screen_lines,
+                vp.rect,
+            ) {
+                if x >= track[0]
+                    && x <= track[0] + track[2]
+                    && y >= track[1]
+                    && y <= track[1] + track[3]
+                {
+                    return Some(vp.session.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Map a mouse `y` (logical px) to a target display offset for `session`'s
+    /// scrollbar — used for the thumb drag + track click. Clamped to the history.
+    pub fn scroll_offset_at(&self, session: &SessionId, y: f32) -> Option<u16> {
+        let vp = self.visible.iter().find(|v| &v.session == session)?;
+        let p = self.panes.get(session)?;
+        let (_, thumb) = scrollbar_geometry(
+            p.grid.display_offset,
+            p.grid.history_len,
+            p.grid.dims.screen_lines,
+            vp.rect,
+        )?;
+        let py = vp.rect.y as f32;
+        let ph = vp.rect.height as f32;
+        let thumb_h = thumb[3];
+        let travel = (ph - thumb_h).max(1.0);
+        let top_frac = ((y - py - thumb_h / 2.0) / travel).clamp(0.0, 1.0);
+        Some(((1.0 - top_frac) * p.grid.history_len as f32).round() as u16)
+    }
+
     /// A read-only snapshot of a pane's grid — for the debug control surface. The
     /// `text` is the whole screen as text (trailing blanks trimmed per row).
     pub fn pane_snapshot(&self, session: &SessionId) -> Option<PaneSnapshot> {
@@ -828,6 +885,18 @@ impl Renderer {
                         if *sid == vp.session {
                             selection_quads(&p.grid, sel, vp.rect, cw, sf, &mut rects);
                         }
+                    }
+                    // Scrollbar (right edge): shown whenever the pane has history and
+                    // isn't on the alt screen (no scrollback there).
+                    if !p.grid.alt_screen {
+                        scrollbar(
+                            p.grid.display_offset,
+                            p.grid.history_len,
+                            p.grid.dims.screen_lines,
+                            vp.rect,
+                            sf,
+                            &mut rects,
+                        );
                     }
                 }
             }

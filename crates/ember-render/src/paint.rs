@@ -723,6 +723,73 @@ pub(crate) fn build_fps(
     (x + ipad, y + ipad)
 }
 
+/// Scrollbar width (logical px) and minimum thumb height.
+pub(crate) const SCROLLBAR_W: f32 = 8.0;
+const SCROLLBAR_MIN_THUMB: f32 = 20.0;
+
+/// Logical-px geometry of a pane's scrollbar as `(track, thumb)` each `[x,y,w,h]`,
+/// or `None` when there's no history to show. `screen_lines` = the pane's visible
+/// rows, `history_len` = lines of scrollback above. **Shared** by the draw and the
+/// app's hit-test so they can never drift. `display_offset` 0 = live bottom (thumb
+/// at the bottom); `history_len` = scrolled to the top.
+pub(crate) fn scrollbar_geometry(
+    display_offset: u16,
+    history_len: u16,
+    screen_lines: u16,
+    pane: Rect,
+) -> Option<([f32; 4], [f32; 4])> {
+    if history_len == 0 || screen_lines == 0 {
+        return None;
+    }
+    let total = history_len as f32 + screen_lines as f32;
+    let px = (pane.x + pane.width) as f32 - SCROLLBAR_W;
+    let py = pane.y as f32;
+    let ph = pane.height as f32;
+    let thumb_h = (screen_lines as f32 / total * ph).clamp(SCROLLBAR_MIN_THUMB.min(ph), ph);
+    let top_frac = history_len.saturating_sub(display_offset) as f32 / total;
+    let mut thumb_y = py + top_frac * ph;
+    if thumb_y + thumb_h > py + ph {
+        thumb_y = py + ph - thumb_h;
+    }
+    if thumb_y < py {
+        thumb_y = py;
+    }
+    Some((
+        [px, py, SCROLLBAR_W, ph],
+        [px + 1.0, thumb_y, SCROLLBAR_W - 2.0, thumb_h],
+    ))
+}
+
+/// Draw a pane's scrollbar (dark track + warm thumb) when it has history — Ember's
+/// discoverable "there's more, and here's where you are" affordance. A scrolled-up
+/// view (`display_offset > 0`) brightens the thumb to `ACCENT`.
+pub(crate) fn scrollbar(
+    display_offset: u16,
+    history_len: u16,
+    screen_lines: u16,
+    pane: Rect,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) {
+    let Some((track, thumb)) = scrollbar_geometry(display_offset, history_len, screen_lines, pane)
+    else {
+        return;
+    };
+    out.push((
+        scaled(track[0], track[1], track[2], track[3], sf),
+        lin_rgba(Rgb::new(0, 0, 0), 0.22),
+    ));
+    let (c, a) = if display_offset > 0 {
+        (ACCENT, 0.9)
+    } else {
+        (Rgb::new(0x9a, 0x9a, 0x9a), 0.55)
+    };
+    out.push((
+        scaled(thumb[0], thumb[1], thumb[2], thumb[3], sf),
+        lin_rgba(c, a),
+    ));
+}
+
 /// A `(rect_px, …)`-ready physical-pixel quad from logical `x,y,w,h` and the
 /// HiDPI scale factor.
 pub(crate) fn scaled(x: f32, y: f32, w: f32, h: f32, sf: f32) -> [f32; 4] {

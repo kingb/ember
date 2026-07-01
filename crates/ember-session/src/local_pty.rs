@@ -15,7 +15,7 @@ use std::thread;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use ember_core::{
     BackendControl, BackendEvent, BackendHandle, ExitStatus, FrameTx, GridDelta, GridDims,
-    SessionBackend, SessionId, VtProjection, frame_channel,
+    ScrollAmount, SessionBackend, SessionId, VtProjection, frame_channel,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -217,8 +217,16 @@ fn emulation_loop(
                 push_frame(&mut proj, &frame_tx);
             }
             Ev::Control(BackendControl::Input(bytes)) => {
+                // Typing snaps the view back to the live bottom (standard terminal
+                // behavior). No-op + no redraw if already there.
+                proj.scroll(ScrollAmount::Bottom);
+                push_frame(&mut proj, &frame_tx);
                 let _ = writer.write_all(&bytes);
                 let _ = writer.flush();
+            }
+            Ev::Control(BackendControl::Scroll(amount)) => {
+                proj.scroll(amount);
+                push_frame(&mut proj, &frame_tx);
             }
             Ev::Control(BackendControl::Resize(new_dims)) => {
                 let _ = master.resize(PtySize {

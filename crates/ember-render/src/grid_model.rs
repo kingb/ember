@@ -13,6 +13,11 @@ pub struct GridModel {
     styles: HashMap<StyleId, Style>,
     pub cursor: CursorState,
     pub epoch: u64,
+    /// Scrollback viewport state, carried from the latest delta.
+    pub display_offset: u16,
+    pub history_len: u16,
+    pub alt_screen: bool,
+    pub mouse_reporting: bool,
 }
 
 impl GridModel {
@@ -23,6 +28,10 @@ impl GridModel {
             styles: HashMap::new(),
             cursor: CursorState::default(),
             epoch: 0,
+            display_offset: 0,
+            history_len: 0,
+            alt_screen: false,
+            mouse_reporting: false,
         }
     }
 
@@ -45,6 +54,15 @@ impl GridModel {
         }
         self.cursor = delta.cursor;
         self.epoch = delta.epoch;
+        self.display_offset = delta.display_offset;
+        self.history_len = delta.history_len;
+        self.alt_screen = delta.alt_screen;
+        self.mouse_reporting = delta.mouse_reporting;
+    }
+
+    /// Whether the view is scrolled up into history (not at the live bottom).
+    pub fn scrolled(&self) -> bool {
+        self.display_offset > 0
     }
 
     pub fn style_of(&self, id: StyleId) -> Style {
