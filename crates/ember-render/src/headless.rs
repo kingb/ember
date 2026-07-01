@@ -23,7 +23,7 @@ use crate::grid_model::GridModel;
 use crate::paint::{
     AboutLayout, bell_wash, build_about, build_fps, build_help, build_settings, build_tabs,
     grid_quads, measure_cell_width, push_backdrop, scrollbar, selection_quads, shape_grid,
-    spark_quads,
+    spark_quads, split_preview,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
@@ -39,6 +39,8 @@ pub struct PaneShot<'a> {
     pub focused: bool,
     /// Text selection to highlight in this pane, if any.
     pub selection: Option<Selection>,
+    /// Ctrl+Opt split preview `(horizontal, ratio)` for this pane, if any.
+    pub split_preview: Option<(bool, f32)>,
 }
 
 /// A full scene to capture: logical window size, HiDPI scale, the panes, and the
@@ -244,6 +246,9 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             );
             if let Some(sel) = &pane.selection {
                 selection_quads(pane.grid, sel, pane.rect, cw, sf, &mut rects);
+            }
+            if let Some((horizontal, ratio)) = pane.split_preview {
+                split_preview(pane.rect, horizontal, ratio, sf, &mut rects);
             }
             if !pane.grid.alt_screen {
                 scrollbar(

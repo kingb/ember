@@ -291,6 +291,35 @@ pub(crate) fn selection_quads(
     }
 }
 
+/// Draw the visual-split drop-zone preview over a pane `rect`: a translucent
+/// ember-tinted overlay on the region the NEW pane would occupy (right half if
+/// `horizontal` = side-by-side, else bottom half), with a bright divider line at
+/// `ratio` (the existing pane's fraction). Held Ctrl+Opt + hover; click commits.
+pub(crate) fn split_preview(
+    rect: Rect,
+    horizontal: bool,
+    ratio: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) {
+    let (x, y, w, h) = (
+        rect.x as f32,
+        rect.y as f32,
+        rect.width as f32,
+        rect.height as f32,
+    );
+    let r = ratio.clamp(0.05, 0.95);
+    if horizontal {
+        let dx = x + w * r;
+        out.push((scaled(dx, y, w * (1.0 - r), h, sf), lin_rgba(ACCENT, 0.20)));
+        out.push((scaled(dx - 1.0, y, 2.0, h, sf), lin_rgba(ACCENT, 0.9)));
+    } else {
+        let dy = y + h * r;
+        out.push((scaled(x, dy, w, h * (1.0 - r), sf), lin_rgba(ACCENT, 0.20)));
+        out.push((scaled(x, dy - 1.0, w, 2.0, sf), lin_rgba(ACCENT, 0.9)));
+    }
+}
+
 /// Background of the tab strip (a touch lighter than the terminal, iTerm-style).
 const STRIP_BG: Rgb = Rgb::new(0x1b, 0x1b, 0x1b);
 /// Fill of the active tab button.
@@ -324,6 +353,7 @@ fn center(s: &str, width: usize) -> String {
 /// lighter with an Ember-orange underline + `⌘N` hint); with one tab the tab area
 /// is just an empty toolbar. Quads → `out`; the concatenated label line shapes into
 /// `chrome`. All geometry is logical px, scaled by `sf`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_tabs(
     font_system: &mut FontSystem,
     chrome: &mut Buffer,

@@ -36,6 +36,8 @@ pub struct Opts {
     pub tabs: usize,
     /// Tab-drag preview: `(dragged slot, cursor x logical)` — for the lifted tab.
     pub tab_drag: Option<(usize, f32)>,
+    /// Split drop-zone preview on the focused pane: `(horizontal, ratio)`.
+    pub split_preview: Option<(bool, f32)>,
     /// How long to let the shells produce output before capturing.
     pub settle_ms: u64,
     /// Draw the campfire backdrop (warm gradient + legibility scrim).
@@ -71,6 +73,7 @@ impl Default for Opts {
             runs: Vec::new(),
             tabs: 1,
             tab_drag: None,
+            split_preview: None,
             settle_ms: 700,
             backdrop: false,
             ember: false,
@@ -110,6 +113,13 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
                     .map_err(|e| format!("--tab-drag slot: {e}"))?;
                 let cx = next()?.parse().map_err(|e| format!("--tab-drag x: {e}"))?;
                 opts.tab_drag = Some((slot, cx));
+            }
+            "--split-preview" => {
+                let h = next()?.as_str() == "h"; // h = side-by-side, else stacked
+                let ratio = next()?
+                    .parse()
+                    .map_err(|e| format!("--split-preview ratio: {e}"))?;
+                opts.split_preview = Some((h, ratio));
             }
             "--settle" => opts.settle_ms = next()?.parse().map_err(|e| format!("--settle: {e}"))?,
             "--split" => {
@@ -272,6 +282,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
                 rect: *rect,
                 focused,
                 selection: if focused { selection } else { None },
+                split_preview: if focused { opts.split_preview } else { None },
             }
         })
         .collect();

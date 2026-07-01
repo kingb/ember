@@ -215,6 +215,8 @@ struct RunState {
     tab_drag: Option<TabDrag>,
     /// In-progress scrollbar-thumb drag: the session whose scrollbar is grabbed.
     scrollbar_drag: Option<SessionId>,
+    /// Live Ctrl+Opt split drop-zone preview (hover), committed on click.
+    split_preview: Option<SplitPreview>,
     /// Last tab-button mouse-down (time, tab index), for double-click-to-rename.
     last_tab_click: Option<(Instant, usize)>,
     /// Inline tab rename in progress: the tab index + the live edit buffer.
@@ -235,6 +237,14 @@ struct TabDrag {
 /// How far (logical px) the pointer must move horizontally before a tab press
 /// becomes a drag-reorder rather than a click.
 const TAB_DRAG_THRESHOLD: f64 = 6.0;
+
+/// Ctrl+Opt split drop-zone preview: the hovered pane + the split that a click
+/// would commit (new pane on the right if `horizontal`, else the bottom).
+struct SplitPreview {
+    pane: PaneId,
+    horizontal: bool,
+    ratio: f32,
+}
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
 pub(crate) fn inset(r: Rect, p: f64) -> Rect {
@@ -329,6 +339,7 @@ impl ApplicationHandler for App {
             clipboard: arboard::Clipboard::new().ok(),
             bracketed: HashMap::new(),
             tab_drag: None,
+            split_preview: None,
             scrollbar_drag: None,
             last_tab_click: None,
             editing_tab: None,
@@ -360,10 +371,21 @@ impl ApplicationHandler for App {
                     state.renderer.window().request_redraw();
                 }
             }
-            WindowEvent::ModifiersChanged(mods) => state.modifiers = mods.state(),
+            WindowEvent::ModifiersChanged(mods) => {
+                state.modifiers = mods.state();
+                // Releasing Ctrl+Opt hides the split drop-zone preview.
+                if !state.split_modifier_held() {
+                    state.clear_split_preview();
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let sf = state.renderer.window().scale_factor();
                 state.cursor = (position.x / sf, position.y / sf);
+                // Ctrl+Opt held → live split drop-zone preview over the hovered pane.
+                if state.split_modifier_held() {
+                    state.update_split_preview();
+                    return;
+                }
                 if state.tab_drag.is_some() {
                     state.drag_tab_to(state.cursor.0);
                 } else if let Some(sid) = state.scrollbar_drag.clone() {
@@ -1066,7 +1088,12 @@ impl RunState {
     }
 
     fn split_focused(&mut self, axis: Axis) {
-        let target = self.active_tab().focus;
+        self.split_pane(self.active_tab().focus, axis, 0.5);
+    }
+
+    /// Split `target` on `axis` at `ratio` (existing pane's fraction), spawning a
+    /// fresh shell in the new pane (right/bottom). Shared by Cmd+D + the visual split.
+    fn split_pane(&mut self, target: PaneId, axis: Axis, ratio: f64) {
         let new_pane = PaneId(self.next_pane);
         self.next_pane += 1;
         let new_session = SessionId::new(format!("s{}", self.next_session));
@@ -1081,7 +1108,7 @@ impl RunState {
             LayoutCommand::SplitPane {
                 target,
                 axis,
-                ratio: 0.5,
+                ratio,
                 new_pane,
                 new_session,
             },
@@ -1089,6 +1116,56 @@ impl RunState {
         );
         self.apply_effects(effects);
         self.sync_layout();
+    }
+
+    /// Whether Ctrl+Opt is currently held (the visual-split modifier).
+    fn split_modifier_held(&self) -> bool {
+        self.modifiers.control_key() && self.modifiers.alt_key()
+    }
+
+    /// Recompute the Ctrl+Opt split drop-zone preview from the cursor over a pane:
+    /// nearer the right edge → side-by-side (new pane right), nearer the bottom →
+    /// stacked (new pane below); the divider follows the cursor for the ratio.
+    fn update_split_preview(&mut self) {
+        let (x, y) = self.cursor;
+        let hit = self
+            .pane_rects
+            .iter()
+            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .map(|(s, r)| (s.clone(), *r));
+        let Some((sid, rect)) = hit else {
+            self.clear_split_preview();
+            return;
+        };
+        let fx = ((x - rect.x) / rect.width).clamp(0.0, 1.0) as f32;
+        let fy = ((y - rect.y) / rect.height).clamp(0.0, 1.0) as f32;
+        let horizontal = fx >= fy; // closer to the right edge than the bottom
+        let ratio = if horizontal { fx } else { fy }.clamp(0.1, 0.9);
+        let pane = self
+            .active_tab()
+            .root
+            .leaves()
+            .into_iter()
+            .find(|(_, s)| *s == sid)
+            .map(|(p, _)| p);
+        let Some(pane) = pane else {
+            self.clear_split_preview();
+            return;
+        };
+        self.renderer
+            .set_split_preview(Some((sid, horizontal, ratio)));
+        self.split_preview = Some(SplitPreview {
+            pane,
+            horizontal,
+            ratio,
+        });
+    }
+
+    /// Clear the split preview (modifier released / cursor left the panes).
+    fn clear_split_preview(&mut self) {
+        if self.split_preview.take().is_some() {
+            self.renderer.set_split_preview(None);
+        }
     }
 
     fn close_focused(&mut self) {
@@ -1158,6 +1235,17 @@ impl RunState {
             }
         }
         if self.dismiss_overlay() {
+            return;
+        }
+        // A click while the Ctrl+Opt split preview is up commits that split.
+        if let Some(p) = self.split_preview.take() {
+            self.renderer.set_split_preview(None);
+            let axis = if p.horizontal {
+                Axis::Horizontal
+            } else {
+                Axis::Vertical
+            };
+            self.split_pane(p.pane, axis, p.ratio as f64);
             return;
         }
         // Any click commits an in-progress tab rename first.
@@ -1809,7 +1897,9 @@ fn help_lines() -> Vec<(String, String)> {
         ("", "PANES"),
         ("Cmd+D", "Split right (side by side)"),
         ("Cmd+Shift+D", "Split down (stacked)"),
+        ("Ctrl+Opt+Click", "Split by drop zone (drag to preview)"),
         ("Cmd+W", "Close pane"),
+        ("Click pane", "Focus it"),
         ("Cmd+Arrows", "Focus pane"),
         ("", "TABS"),
         ("Cmd+T", "New tab"),
