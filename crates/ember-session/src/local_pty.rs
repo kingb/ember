@@ -51,6 +51,7 @@ impl LocalPtyConfig {
 }
 
 /// The v1 local-PTY backend.
+#[derive(Debug)]
 pub struct LocalPty;
 
 impl SessionBackend for LocalPty {

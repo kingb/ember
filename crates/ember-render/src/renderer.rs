@@ -121,6 +121,7 @@ impl Default for BackdropParams {
 /// How a backdrop image fills the window. Cover/contain/stretch use a
 /// clamped sampler with computed UVs; tile repeats the image at its native size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ImageFit {
     /// Scale to fill the window, cropping the overflowing axis (default).
     #[default]
@@ -147,6 +148,7 @@ impl ImageFit {
 
 /// What the tab strip was clicked on (from [`Renderer::tab_hit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TabHit {
     /// The tab button at this index.
     Tab(usize),

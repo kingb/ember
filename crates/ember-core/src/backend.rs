@@ -49,6 +49,7 @@ pub enum BackendControl {
 /// A scrollback movement, in engine-neutral terms. `Lines(+n)` scrolls **up**
 /// into history, `Lines(-n)` scrolls back down toward the live bottom.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ScrollAmount {
     /// Scroll by `n` lines: positive = up (into history), negative = down.
     Lines(i32),
@@ -115,18 +116,19 @@ pub enum BackendEvent {
 }
 
 /// The shared single slot behind the pixel lane.
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct FrameSlot {
     pending: Mutex<Option<GridDelta>>,
 }
 
 /// Producer end of the pixel lane (held by the emulation thread).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FrameTx {
     slot: Arc<FrameSlot>,
 }
 
 /// Consumer end of the pixel lane (held by render).
+#[derive(Debug)]
 pub struct FrameRx {
     slot: Arc<FrameSlot>,
 }
@@ -171,6 +173,7 @@ impl FrameRx {
 /// command-in (`control`), grid-out (`frames`, the pixel lane), and events-out
 /// (`events`, the semantic lane). Carries **no file descriptor** — the zero-PTY
 /// guard. The emulation thread lives behind these channels.
+#[derive(Debug)]
 pub struct BackendHandle {
     pub id: SessionId,
     /// Lane 0 — inbound control (Send).

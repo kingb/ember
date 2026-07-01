@@ -67,6 +67,7 @@ pub struct Style {
 /// A cell's printable content: a single char (the common case), a multi-codepoint
 /// grapheme cluster, or empty (blank — render fills the cell's bg, no glyph).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CellContent {
     #[default]
     Empty,
@@ -116,6 +117,7 @@ impl GridDims {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CursorShape {
     #[default]
     Block,
@@ -144,6 +146,7 @@ pub struct CellPatch {
 /// pane's left gutter at the command's prompt line. `Running` = command in flight
 /// (no exit yet); `Ok`/`Fail` from the command's exit code.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum MarkStatus {
     #[default]
     Running,

@@ -9,6 +9,7 @@
 
 /// A menu item the user chose, in platform-agnostic terms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MenuAction {
     /// Help → Keyboard Shortcuts (also bound to Cmd+/).
     ShowShortcuts,

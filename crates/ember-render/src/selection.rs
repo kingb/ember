@@ -12,6 +12,7 @@ use crate::grid_model::GridModel;
 
 /// How a drag selects: by cell, by word, or by whole line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SelectionMode {
     /// Cell-precise (single click + drag).
     Simple,
@@ -35,7 +36,7 @@ impl Point {
 }
 
 /// An in-progress or finalized selection.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
     pub anchor: Point,
     pub active: Point,

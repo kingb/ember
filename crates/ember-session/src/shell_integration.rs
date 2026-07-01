@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 /// The env vars + extra args to apply to a shell command so it emits OSC 133.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Injection {
     pub env: Vec<(String, String)>,
     pub args: Vec<String>,

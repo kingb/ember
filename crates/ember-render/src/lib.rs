@@ -8,7 +8,7 @@ mod background;
 pub mod grid_model;
 pub mod headless;
 mod paint;
-pub mod quads;
+mod quads;
 pub mod renderer;
 pub mod selection;
 

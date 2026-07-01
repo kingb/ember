@@ -24,12 +24,12 @@ pub trait PlatformBackend {
 }
 
 /// The v1 Linux platform backend (effects pending Epic E).
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct LinuxBackend;
 
 /// The v1 macOS platform backend — co-equal run/dev target (effects pending
 /// `MacBackend`, ).
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct MacBackend;
 
 macro_rules! todo_backend {
