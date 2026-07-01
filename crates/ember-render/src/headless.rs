@@ -79,12 +79,65 @@ pub fn cell_metrics() -> (f32, f32) {
     (measure_cell_width(&mut font_system), CELL_HEIGHT)
 }
 
+/// Why a headless [`capture`] (or [`crate::Renderer::capture_to_png`]) failed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CaptureError {
+    /// No suitable GPU adapter.
+    Adapter(String),
+    /// Failed to acquire the GPU device/queue.
+    Device(String),
+    /// glyphon text-prepare failed.
+    TextPrepare(String),
+    /// GPU poll / buffer-map failed.
+    Map(String),
+    /// PNG encoding failed.
+    Png(png::EncodingError),
+    /// Filesystem IO failed (creating/writing the PNG).
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Adapter(e) => write!(f, "request GPU adapter: {e}"),
+            Self::Device(e) => write!(f, "request GPU device: {e}"),
+            Self::TextPrepare(e) => write!(f, "prepare text: {e}"),
+            Self::Map(e) => write!(f, "read back GPU buffer: {e}"),
+            Self::Png(e) => write!(f, "encode PNG: {e}"),
+            Self::Io(e) => write!(f, "write PNG file: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Png(e) => Some(e),
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for CaptureError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<png::EncodingError> for CaptureError {
+    fn from(e: png::EncodingError) -> Self {
+        Self::Png(e)
+    }
+}
+
 /// Render `shot` and write it to `path` as a PNG. Blocks on GPU work.
-pub fn capture(shot: &Shot, path: &Path) -> Result<(), String> {
+pub fn capture(shot: &Shot, path: &Path) -> Result<(), CaptureError> {
     pollster::block_on(capture_async(shot, path))
 }
 
-async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
+async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError> {
     let sf = shot.scale.max(0.1);
     let phys_w = ((shot.logical_w * sf).ceil() as u32).max(1);
     let phys_h = ((shot.logical_h * sf).ceil() as u32).max(1);
@@ -96,11 +149,11 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             ..Default::default()
         })
         .await
-        .map_err(|e| format!("request adapter: {e:?}"))?;
+        .map_err(|e| CaptureError::Adapter(format!("{e:?}")))?;
     let (device, queue) = adapter
         .request_device(&DeviceDescriptor::default())
         .await
-        .map_err(|e| format!("request device: {e:?}"))?;
+        .map_err(|e| CaptureError::Device(format!("{e:?}")))?;
 
     // sRGB target so the read-back bytes are already gamma-encoded for PNG.
     let format = TextureFormat::Rgba8UnormSrgb;
@@ -396,7 +449,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             areas,
             &mut swash_cache,
         )
-        .map_err(|e| format!("text prepare: {e:?}"))?;
+        .map_err(|e| CaptureError::TextPrepare(format!("{e:?}")))?;
 
     // Read-back buffer with 256-byte-aligned rows (wgpu copy requirement).
     let bpp = 4u32;
@@ -474,10 +527,10 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             submission_index: None,
             timeout: None,
         })
-        .map_err(|e| format!("poll: {e:?}"))?;
+        .map_err(|e| CaptureError::Map(format!("{e:?}")))?;
     rx.recv()
-        .map_err(|e| format!("map channel: {e}"))?
-        .map_err(|e| format!("map buffer: {e:?}"))?;
+        .map_err(|e| CaptureError::Map(format!("{e}")))?
+        .map_err(|e| CaptureError::Map(format!("{e:?}")))?;
 
     let data = slice.get_mapped_range();
     let mut pixels = Vec::with_capacity((unpadded * phys_h) as usize);
@@ -491,16 +544,12 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
     write_png(path, phys_w, phys_h, &pixels)
 }
 
-fn write_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
+fn write_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), CaptureError> {
+    let file = std::fs::File::create(path)?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder
-        .write_header()
-        .map_err(|e| format!("png header: {e}"))?;
-    writer
-        .write_image_data(rgba)
-        .map_err(|e| format!("png data: {e}"))?;
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgba)?;
     Ok(())
 }

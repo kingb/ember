@@ -416,7 +416,7 @@ impl Renderer {
     /// Renders the live grids through the same headless path used by `--screenshot`,
     /// so the PNG is pixel-identical to the window. Builds a throwaway offscreen GPU
     /// context (no surface read-back needed).
-    pub fn capture_to_png(&self, path: &Path) -> Result<(), String> {
+    pub fn capture_to_png(&self, path: &Path) -> Result<(), crate::headless::CaptureError> {
         let sf = self.window.scale_factor() as f32;
         let panes: Vec<crate::headless::PaneShot> = self
             .visible

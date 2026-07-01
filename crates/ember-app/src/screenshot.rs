@@ -338,7 +338,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
             opts.bg_image.as_deref().unwrap_or("")
         ));
     }
-    headless::capture(&shot, Path::new(&opts.path))?;
+    headless::capture(&shot, Path::new(&opts.path)).map_err(|e| e.to_string())?;
 
     for (_, handle, _, _) in &panes {
         let _ = handle.control.send(BackendControl::Shutdown);

@@ -13,6 +13,7 @@ pub mod renderer;
 pub mod selection;
 
 pub use grid_model::GridModel;
+pub use headless::CaptureError;
 pub use renderer::{
     AboutInfo, BackdropParams, CELL_HEIGHT, CELL_WIDTH, ImageFit, PaneSnapshot, Renderer, TabHit,
     TabLabel, VisiblePane,
