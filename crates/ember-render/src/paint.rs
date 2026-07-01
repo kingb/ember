@@ -4,7 +4,7 @@
 //! identically. Stateless free functions over the renderer's colors/metrics; the
 //! `Renderer` struct + GPU plumbing live in `renderer.rs`.
 
-use ember_core::{Rect, Rgb};
+use ember_core::{MarkStatus, Rect, Rgb};
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
 
 use crate::grid_model::GridModel;
@@ -241,7 +241,28 @@ pub(crate) fn grid_quads(
             push_border(out, rect, ACCENT, sf);
         }
     }
+    // OSC 133 shell-integration gutter: a colored bar at each command's prompt line
+    // — green = exit 0, red = non-zero, amber = still running. Drawn in the left pad
+    // so it doesn't overlap text.
+    for &(row, status) in &grid.marks {
+        if (row as u16) < grid.dims.screen_lines {
+            let color = match status {
+                MarkStatus::Ok => GUTTER_OK,
+                MarkStatus::Fail => GUTTER_FAIL,
+                MarkStatus::Running => GUTTER_RUN,
+            };
+            out.push((
+                scaled(ox - 3.5, oy + row as f32 * ch + 1.0, 2.5, ch - 2.0, sf),
+                lin_rgba(color, 1.0),
+            ));
+        }
+    }
 }
+
+/// Shell-integration gutter mark colors (exit 0 / non-zero / running).
+const GUTTER_OK: Rgb = Rgb::new(0x3f, 0xb9, 0x50);
+const GUTTER_FAIL: Rgb = Rgb::new(0xe5, 0x48, 0x4d);
+const GUTTER_RUN: Rgb = Rgb::new(0xd0, 0x90, 0x30);
 
 /// Translucent selection-highlight color (a calm blue, drawn over the cell bg and
 /// under the glyphs so selected text stays readable).

@@ -18,6 +18,8 @@ pub struct GridModel {
     pub history_len: u16,
     pub alt_screen: bool,
     pub mouse_reporting: bool,
+    /// OSC 133 command marks visible this frame, as `(row, status)`.
+    pub marks: Vec<(u16, ember_core::MarkStatus)>,
 }
 
 impl GridModel {
@@ -32,6 +34,7 @@ impl GridModel {
             history_len: 0,
             alt_screen: false,
             mouse_reporting: false,
+            marks: Vec::new(),
         }
     }
 
@@ -58,6 +61,7 @@ impl GridModel {
         self.history_len = delta.history_len;
         self.alt_screen = delta.alt_screen;
         self.mouse_reporting = delta.mouse_reporting;
+        self.marks = delta.marks;
     }
 
     /// Whether the view is scrolled up into history (not at the live bottom).
