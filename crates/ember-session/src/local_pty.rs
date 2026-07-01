@@ -31,6 +31,10 @@ pub struct LocalPtyConfig {
     pub args: Vec<String>,
     /// Working directory; `None` → `$HOME`.
     pub cwd: Option<PathBuf>,
+    /// Auto-inject OSC 133 shell integration (zsh/bash) so the exit-status gutter
+    /// and jump-to-prompt work without the user editing their rc. Chains the user's
+    /// config, never replaces it.
+    pub shell_integration: bool,
 }
 
 impl LocalPtyConfig {
@@ -41,6 +45,7 @@ impl LocalPtyConfig {
             program: None,
             args: Vec::new(),
             cwd: None,
+            shell_integration: true,
         }
     }
 }
@@ -58,6 +63,7 @@ impl SessionBackend for LocalPty {
             program,
             args,
             cwd,
+            shell_integration,
         } = config;
 
         let pty = native_pty_system();
@@ -73,7 +79,21 @@ impl SessionBackend for LocalPty {
         let program = program
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(|| "/bin/sh".to_string());
-        let mut cmd = CommandBuilder::new(program);
+        let mut cmd = CommandBuilder::new(program.clone());
+        // Auto-inject OSC 133 shell integration (env + rcfile args), chaining the
+        // user's own config. Best-effort: unsupported shells / IO errors → no-op.
+        if shell_integration {
+            let inj = crate::shell_integration::prepare(
+                &program,
+                &crate::shell_integration::integration_dir(),
+            );
+            for a in inj.args {
+                cmd.arg(a);
+            }
+            for (k, v) in inj.env {
+                cmd.env(k, v);
+            }
+        }
         for a in args {
             cmd.arg(a);
         }
@@ -212,7 +232,9 @@ fn emulation_loop(
     for ev in irx {
         match ev {
             Ev::Pty(bytes) => {
-                proj.advance(&bytes);
+                for osc in proj.advance(&bytes) {
+                    let _ = event_tx.send(BackendEvent::Osc(osc));
+                }
                 flush_outbox(&outbox, &mut writer);
                 push_frame(&mut proj, &frame_tx);
             }
@@ -226,6 +248,10 @@ fn emulation_loop(
             }
             Ev::Control(BackendControl::Scroll(amount)) => {
                 proj.scroll(amount);
+                push_frame(&mut proj, &frame_tx);
+            }
+            Ev::Control(BackendControl::JumpMark(dir)) => {
+                proj.scroll_to_prompt(dir);
                 push_frame(&mut proj, &frame_tx);
             }
             Ev::Control(BackendControl::Resize(new_dims)) => {

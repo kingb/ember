@@ -13,6 +13,9 @@ pub struct Config {
     /// Visual bell: a terminal BEL flashes an ember pulse + lights the tab that
     /// belled, instead of an audible beep. On by default.
     pub visual_bell: bool,
+    /// Auto-inject OSC 133 shell integration (exit-status gutter + jump-to-prompt)
+    /// into spawned zsh/bash without editing the user's rc. On by default.
+    pub shell_integration: bool,
 }
 
 impl Default for Config {
@@ -20,6 +23,7 @@ impl Default for Config {
         Self {
             background: Background::default(),
             visual_bell: true,
+            shell_integration: true,
         }
     }
 }

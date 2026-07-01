@@ -14,9 +14,11 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use ember_core::{
-    Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, NeutralCell,
-    ScrollAmount, Style, StyleId, VtProjection,
+    Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, MarkStatus,
+    NeutralCell, OscEvent, ScrollAmount, Style, StyleId, VtProjection,
 };
+
+use crate::osc133::Osc133;
 
 use crate::palette::Palette;
 
@@ -63,6 +65,17 @@ pub struct AlacrittyProjection<L: EventListener> {
     /// Mirrors the engine's `display_offset`; read fresh each drain so it stays in
     /// sync whether it changed via a scroll command or output pushing history.
     display_offset: usize,
+    /// OSC 133 command marks, in emit order. Each is anchored to an absolute history
+    /// line (`history_size + prompt row` at emit) so it scrolls with content — valid
+    /// until scrollback saturates the history cap (a long session), then oldest
+    /// marks may drift; see the module note.
+    marks: Vec<Mark>,
+}
+
+/// One tracked OSC 133 command: its prompt's absolute history line + exit code.
+struct Mark {
+    abs_line: i64,
+    exit: Option<i32>,
 }
 
 impl<L: EventListener> AlacrittyProjection<L> {
@@ -77,12 +90,75 @@ impl<L: EventListener> AlacrittyProjection<L> {
             dims,
             epoch: 0,
             display_offset: 0,
+            marks: Vec::new(),
         }
     }
 
-    /// Feed raw PTY bytes through the VT parser into the engine.
-    pub fn advance(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.term, bytes);
+    /// Feed raw PTY bytes through the VT parser into the engine, and pre-scan them
+    /// for OSC 133 shell-integration marks (alacritty ignores OSC 133, so the bytes
+    /// still flow through unchanged). Returns the semantic marks found, in order,
+    /// and records prompt/exit state for the gutter.
+    pub fn advance(&mut self, bytes: &[u8]) -> Vec<OscEvent> {
+        let mut events = Vec::new();
+        let mut cut = 0usize;
+        for (past, m) in crate::osc133::scan_indexed(bytes) {
+            // Feed the engine up to and including this (invisible) mark, so the
+            // cursor sits exactly where the mark was emitted.
+            self.parser.advance(&mut self.term, &bytes[cut..past]);
+            cut = past;
+            match m {
+                Osc133::PromptStart => {
+                    let abs = self.term.grid().history_size() as i64
+                        + self.term.grid().cursor.point.line.0.max(0) as i64;
+                    self.marks.push(Mark {
+                        abs_line: abs,
+                        exit: None,
+                    });
+                    if self.marks.len() > 512 {
+                        self.marks.remove(0);
+                    }
+                    events.push(OscEvent::PromptStart);
+                }
+                Osc133::CommandStart => events.push(OscEvent::CommandStart),
+                Osc133::OutputStart => events.push(OscEvent::OutputStart),
+                Osc133::CommandEnd(code) => {
+                    // The exit belongs to the command whose prompt was the last mark.
+                    if let Some(last) = self.marks.last_mut() {
+                        last.exit = code;
+                    }
+                    events.push(OscEvent::CommandEnd(code));
+                }
+            }
+        }
+        // Feed the remainder.
+        self.parser.advance(&mut self.term, &bytes[cut..]);
+        events
+    }
+
+    /// Jump the viewport to the previous (`dir < 0`, older/up) / next (`dir > 0`,
+    /// newer/down) prompt mark. No-op on the alt screen or with no marks.
+    pub fn scroll_to_prompt(&mut self, dir: i8) {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) || self.marks.is_empty() {
+            return;
+        }
+        let hist = self.term.grid().history_size() as i64;
+        let screen = self.dims.screen_lines as i64;
+        let bottom_abs = hist + screen - 1;
+        // Absolute line currently at the top of the viewport.
+        let cur_top = bottom_abs - (screen - 1) - self.display_offset as i64;
+        // Candidate prompt lines (sorted ascending by abs_line).
+        let mut lines: Vec<i64> = self.marks.iter().map(|m| m.abs_line).collect();
+        lines.sort_unstable();
+        let target = if dir < 0 {
+            lines.iter().rev().find(|&&l| l < cur_top).copied()
+        } else {
+            lines.iter().find(|&&l| l > cur_top).copied()
+        };
+        if let Some(t) = target {
+            // Put the target prompt at the top of the viewport.
+            let offset = (bottom_abs - (screen - 1) - t).clamp(0, hist);
+            self.scroll(ScrollAmount::To(offset.min(u16::MAX as i64) as u16));
+        }
     }
 
     /// Scroll the display through scrollback history. **No-op on the alternate
@@ -184,6 +260,26 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
         out.mouse_reporting = mode.intersects(
             TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
         );
+        // OSC 133 gutter marks visible in the current viewport. The alt screen has no
+        // scrollback (and command marks belong to the primary screen), so none there.
+        out.marks.clear();
+        if !out.alt_screen {
+            let hist = self.term.grid().history_size() as i64;
+            let screen = self.dims.screen_lines as i64;
+            let bottom_abs = hist + screen - 1;
+            for m in &self.marks {
+                // visible row r: abs = bottom_abs - (screen-1) + r - display_offset
+                let r = m.abs_line - bottom_abs + (screen - 1) + self.display_offset as i64;
+                if (0..screen).contains(&r) {
+                    let status = match m.exit {
+                        None => MarkStatus::Running,
+                        Some(0) => MarkStatus::Ok,
+                        Some(_) => MarkStatus::Fail,
+                    };
+                    out.marks.push((r as u16, status));
+                }
+            }
+        }
     }
 }
 

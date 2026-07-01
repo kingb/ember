@@ -40,6 +40,8 @@ pub enum BackendControl {
     Focus(bool),
     /// Scroll the display through scrollback history (engine-agnostic).
     Scroll(ScrollAmount),
+    /// Jump the viewport to the previous (`-1`) / next (`+1`) OSC 133 prompt mark.
+    JumpMark(i8),
     /// Tear the session down.
     Shutdown,
 }
