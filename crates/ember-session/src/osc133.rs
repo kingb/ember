@@ -117,7 +117,8 @@ mod tests {
 
     #[test]
     fn embedded_in_surrounding_output() {
-        let s = b"user@host \x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07file\r\n\x1b]133;D;0\x07";
+        let s =
+            b"user@host \x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07file\r\n\x1b]133;D;0\x07";
         assert_eq!(
             scan(s),
             vec![

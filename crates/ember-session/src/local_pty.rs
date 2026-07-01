@@ -32,7 +32,7 @@ pub struct LocalPtyConfig {
     /// Working directory; `None` → `$HOME`.
     pub cwd: Option<PathBuf>,
     /// Auto-inject OSC 133 shell integration (zsh/bash) so the exit-status gutter
-    /// + jump-to-prompt work without the user editing their rc. Chains the user's
+    /// and jump-to-prompt work without the user editing their rc. Chains the user's
     /// config, never replaces it.
     pub shell_integration: bool,
 }

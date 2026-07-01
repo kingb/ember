@@ -245,7 +245,7 @@ pub(crate) fn grid_quads(
     // — green = exit 0, red = non-zero, amber = still running. Drawn in the left pad
     // so it doesn't overlap text.
     for &(row, status) in &grid.marks {
-        if (row as u16) < grid.dims.screen_lines {
+        if row < grid.dims.screen_lines {
             let color = match status {
                 MarkStatus::Ok => GUTTER_OK,
                 MarkStatus::Fail => GUTTER_FAIL,

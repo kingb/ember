@@ -69,9 +69,7 @@ fn prepare_zsh(dir: &Path) -> std::io::Result<Injection> {
     std::fs::write(dir.join(".zshenv"), zshenv)?;
 
     // .zshrc: chain the user's .zshrc, then install the hooks.
-    let zshrc = format!(
-        "[ -f \"$ZDOTDIR/.zshrc\" ] && source \"$ZDOTDIR/.zshrc\"\n{HOOKS_ZSH}"
-    );
+    let zshrc = format!("[ -f \"$ZDOTDIR/.zshrc\" ] && source \"$ZDOTDIR/.zshrc\"\n{HOOKS_ZSH}");
     std::fs::write(dir.join(".zshrc"), zshrc)?;
 
     Ok(Injection {
@@ -122,7 +120,11 @@ mod tests {
         assert!(dir.join(".zshrc").exists());
         assert!(dir.join(".zshenv").exists());
         // ZDOTDIR points at our dir; the original is preserved for chaining.
-        assert!(inj.env.iter().any(|(k, v)| k == "ZDOTDIR" && v == &dir.to_string_lossy()));
+        assert!(
+            inj.env
+                .iter()
+                .any(|(k, v)| k == "ZDOTDIR" && v == &dir.to_string_lossy())
+        );
         assert!(inj.env.iter().any(|(k, _)| k == "EMBER_ZDOTDIR_ORIG"));
         let rc = std::fs::read_to_string(dir.join(".zshrc")).unwrap();
         assert!(rc.contains("source \"$ZDOTDIR/.zshrc\"")); // chains user config
