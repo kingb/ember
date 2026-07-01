@@ -1307,6 +1307,26 @@ impl RunState {
         }
     }
 
+    /// Focus the pane backing `sid` in the active tab (click-to-focus). No-op if it
+    /// is already focused or the session isn't in this tab.
+    fn focus_pane_of_session(&mut self, sid: &SessionId) {
+        if self.focused_session_id().as_ref() == Some(sid) {
+            return;
+        }
+        let active = self.tree.active;
+        let pane = self.tree.tabs.get(active).and_then(|t| {
+            t.root
+                .leaves()
+                .into_iter()
+                .find(|(_, s)| s == sid)
+                .map(|(p, _)| p)
+        });
+        if let Some(pane) = pane {
+            self.tree.tabs[active].focus = pane;
+            self.sync_layout();
+        }
+    }
+
     /// Map a logical-px point to `(session, row, col)` in whichever visible pane
     /// contains it (clamped to that pane's grid), or `None` if outside all panes.
     fn pixel_to_cell(&self, x: f64, y: f64) -> Option<(SessionId, u16, u16)> {
@@ -1336,6 +1356,9 @@ impl RunState {
             self.clear_selection();
             return;
         };
+        // Clicking into a pane focuses it (also correct for single-pane selection:
+        // a selection is single-pane, so the click target must be the focused pane).
+        self.focus_pane_of_session(&sid);
         let now = Instant::now();
         let same = self.last_click.as_ref().is_some_and(|(t, s, r, c)| {
             now.duration_since(*t) < MULTI_CLICK && *s == sid && *r == row && *c == col
