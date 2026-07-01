@@ -393,6 +393,7 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 state.tab_drag = None;
+                state.renderer.set_tab_drag(None);
                 state.selecting = false;
                 state.scrollbar_drag = None;
             }
@@ -1229,21 +1230,28 @@ impl RunState {
                 d.active = true;
             }
         }
-        let Some(slot) = self.renderer.tab_slot_at(x as f32) else {
-            return;
-        };
-        if slot != from {
-            if let Some(d) = self.tab_drag.as_mut() {
-                d.tab = slot;
+        if let Some(slot) = self.renderer.tab_slot_at(x as f32) {
+            if slot != from {
+                if let Some(d) = self.tab_drag.as_mut() {
+                    d.tab = slot;
+                }
+                let vp = self.viewport();
+                apply(
+                    &mut self.tree,
+                    LayoutCommand::MoveTab { from, to: slot },
+                    vp,
+                );
+                self.sync_layout();
             }
-            let vp = self.viewport();
-            apply(
-                &mut self.tree,
-                LayoutCommand::MoveTab { from, to: slot },
-                vp,
-            );
-            self.sync_layout();
         }
+        // Push the lifted, cursor-following tab view every move (not just on a slot
+        // cross) so the drag reads as smooth motion.
+        let view = self
+            .tab_drag
+            .as_ref()
+            .filter(|d| d.active)
+            .map(|d| (d.tab, x as f32));
+        self.renderer.set_tab_drag(view);
     }
 
     /// Begin inline rename of tab `i` (double-click); seeds the buffer with its title.
@@ -1252,6 +1260,7 @@ impl RunState {
             return;
         }
         self.tab_drag = None;
+        self.renderer.set_tab_drag(None);
         self.editing_tab = Some(i);
         self.edit_buffer = self.tree.tabs[i].title.clone();
         self.sync_layout();

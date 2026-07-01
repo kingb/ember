@@ -200,6 +200,9 @@ pub struct Renderer {
     focused: Option<SessionId>,
     /// Tab strip entries (drawn only when more than one tab exists).
     tabs: Vec<TabLabel>,
+    /// In-progress tab drag: `(dragged slot, cursor x in logical px)` for the lifted,
+    /// cursor-following tab; `None` when not dragging.
+    tab_drag: Option<(usize, f32)>,
     /// Glyph buffer for the tab strip.
     chrome: Buffer,
     /// When `Some`, the cheat-sheet overlay is shown with these `(key, desc)` rows.
@@ -335,6 +338,7 @@ impl Renderer {
             visible: Vec::new(),
             focused: None,
             tabs: Vec::new(),
+            tab_drag: None,
             chrome,
             help: None,
             help_buffer,
@@ -433,6 +437,7 @@ impl Renderer {
             scale: sf,
             panes,
             tabs: self.tabs.clone(),
+            tab_drag: self.tab_drag,
             help: self.help.clone(),
             about: self
                 .about
@@ -549,6 +554,13 @@ impl Renderer {
         self.visible = visible;
         self.focused = Some(focused);
         self.tabs = tabs;
+    }
+
+    /// Set/clear the in-progress tab drag: `(dragged slot, cursor x in logical px)`.
+    /// Drives the lifted, cursor-following tab in the strip.
+    pub fn set_tab_drag(&mut self, drag: Option<(usize, f32)>) {
+        self.tab_drag = drag;
+        self.window.request_redraw();
     }
 
     /// Hit-test a click at logical `(x, y)` against the tab strip: a tab button, the
@@ -931,6 +943,7 @@ impl Renderer {
                 &mut self.font_system,
                 &mut self.chrome,
                 &self.tabs,
+                self.tab_drag,
                 cw,
                 logical_w,
                 sf,

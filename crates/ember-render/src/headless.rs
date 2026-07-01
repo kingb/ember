@@ -49,6 +49,8 @@ pub struct Shot<'a> {
     pub scale: f32,
     pub panes: Vec<PaneShot<'a>>,
     pub tabs: Vec<TabLabel>,
+    /// In-progress tab drag `(dragged slot, cursor x logical)`, for the lifted tab.
+    pub tab_drag: Option<(usize, f32)>,
     /// When set, the cheat-sheet overlay is drawn instead of the panes.
     pub help: Option<Vec<(String, String)>>,
     /// When set, the About overlay is drawn, with `(info, glow, elapsed_seconds)`.
@@ -258,6 +260,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), String> {
             &mut font_system,
             &mut chrome,
             &shot.tabs,
+            shot.tab_drag,
             cw,
             shot.logical_w,
             sf,
