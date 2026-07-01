@@ -158,11 +158,9 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
             effects.push(LayoutEffect::FocusChanged(pane));
         }
         LayoutCommand::MoveTab { from, to } => {
-            if from < tree.tabs.len() && to < tree.tabs.len() && from != to {
-                let tab = tree.tabs.remove(from);
-                tree.tabs.insert(to, tab);
-                tree.active = to;
-            }
+            // Active follows the tab the user is on (see WindowTree::move_tab), so
+            // reordering a background tab doesn't yank focus to it.
+            tree.move_tab(from, to);
         }
         LayoutCommand::RenameTab { tab, title } => {
             if let Some(t) = tree.tabs.iter_mut().find(|t| t.id == tab) {
