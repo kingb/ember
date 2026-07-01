@@ -432,11 +432,14 @@ pub(crate) fn build_help(
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
 ) -> Rect {
-    // Panel sized to content: title + dismiss hint + blank + one row per line.
-    let w = (logical_w * 0.7).clamp(280.0, 460.0);
-    let h = (lines.len() as f32 + 3.0) * LINE_HEIGHT + 2.0 * HELP_PAD;
+    // Panel sized to content: title + dismiss hint + one row per line. The amber
+    // section headers separate groups on their own (no blank line needed). Clamp to
+    // the window so a tiny (min-size) window never draws the panel off-screen.
+    let w = (logical_w * 0.7).clamp(300.0, 480.0);
+    // +1 for the title/hint line; the amber section headers need no extra spacing.
+    let h = ((lines.len() as f32 + 1.0) * LINE_HEIGHT + 2.0 * HELP_PAD).min(logical_h - 8.0);
     let x = ((logical_w - w) * 0.5).max(0.0);
-    let y = ((logical_h - h) * 0.5).max(0.0);
+    let y = ((logical_h - h) * 0.5).max(4.0);
     let panel = Rect::new(x as f64, y as f64, w as f64, h as f64);
 
     // Scrim over everything, then the panel fill + Ember-orange border.
@@ -458,19 +461,25 @@ pub(crate) fn build_help(
     );
     let mut spans: Vec<(String, Color)> = Vec::new();
     spans.push((
-        "Keyboard Shortcuts\n".to_string(),
+        "Keyboard Shortcuts".to_string(),
         Color::rgb(0xff, 0xff, 0xff),
     ));
     spans.push((
-        "press any key to dismiss\n\n".to_string(),
+        "   ·  any key to close\n".to_string(),
         Color::rgb(0x88, 0x88, 0x88),
     ));
+    // A row with an empty key is a section header (accent-amber); the rest are
+    // `key  description`. The amber headers separate groups without blank lines.
     for (key, desc) in lines {
-        spans.push((
-            format!("{key:<18}"),
-            Color::rgb(ACCENT.r, ACCENT.g, ACCENT.b),
-        ));
-        spans.push((format!("{desc}\n"), Color::rgb(FG.r, FG.g, FG.b)));
+        if key.is_empty() {
+            spans.push((format!("{desc}\n"), Color::rgb(AMBER.r, AMBER.g, AMBER.b)));
+        } else {
+            spans.push((
+                format!("{key:<18}"),
+                Color::rgb(ACCENT.r, ACCENT.g, ACCENT.b),
+            ));
+            spans.push((format!("{desc}\n"), Color::rgb(FG.r, FG.g, FG.b)));
+        }
     }
     let base = Attrs::new().family(Family::Monospace);
     buffer.set_rich_text(
@@ -491,6 +500,8 @@ pub(crate) struct AboutLayout {
     pub title_left: f32,
     pub title_top: f32,
     pub body_top: f32,
+    /// Logical `(x, y, w, h)` click rect per link button, in `info.links` order.
+    pub link_rects: Vec<[f32; 4]>,
 }
 
 /// Build the About overlay: a dark scrim, a pulsing ember-glow halo behind the
@@ -545,7 +556,13 @@ pub(crate) fn build_about(
 
     let title_h = ABOUT_TITLE_LINE;
     let gap = 22.0;
-    let content_h = title_h + gap + info.lines.len() as f32 * LINE_HEIGHT;
+    // Links render as a spacer line + one button line each, below the body lines.
+    let link_rows = if info.links.is_empty() {
+        0
+    } else {
+        1 + info.links.len()
+    };
+    let content_h = title_h + gap + (info.lines.len() + link_rows) as f32 * LINE_HEIGHT;
     let top = ((logical_h - content_h) * 0.5).max(0.0);
     let title_top = top;
     let body_top = top + title_h + gap;
@@ -594,27 +611,46 @@ pub(crate) fn build_about(
         .unwrap_or(0.0);
     let title_left = ((logical_w - title_w) * 0.5).max(0.0);
 
-    // Body lines — centered per line via leading spaces (monospace). Line 0 (the
-    // tagline) in amber, the rest dimmed.
+    // Body — centered per row via leading spaces (monospace): the info lines (line 0
+    // amber, rest dimmed), then a spacer, then the link buttons in accent. Link
+    // buttons also get a subtle accent-tinted background quad + a click rect.
     body_buf.set_size(font_system, Some(logical_w), Some(logical_h));
     let total_cols = (logical_w / cw).floor() as usize;
-    let mut spans: Vec<(String, Color)> = Vec::new();
-    let last = info.lines.len().saturating_sub(1);
+    let center_pad = |s: &str| {
+        let pad = total_cols.saturating_sub(s.chars().count()) / 2;
+        format!("{}{}", " ".repeat(pad), s)
+    };
+    let mut rows: Vec<(String, Color)> = Vec::new();
     for (i, line) in info.lines.iter().enumerate() {
-        let pad = total_cols.saturating_sub(line.chars().count()) / 2;
-        let centered = format!("{}{}", " ".repeat(pad), line);
-        let text = if i < last {
-            format!("{centered}\n")
-        } else {
-            centered
-        };
         let color = if i == 0 {
             Color::rgb(AMBER.r, AMBER.g, AMBER.b)
         } else {
             Color::rgb(0xaa, 0xaa, 0xaa)
         };
-        spans.push((text, color));
+        rows.push((center_pad(line), color));
     }
+    let mut link_rects: Vec<[f32; 4]> = Vec::new();
+    if !info.links.is_empty() {
+        rows.push((String::new(), Color::rgb(0, 0, 0))); // spacer
+        for (label, _url) in &info.links {
+            rows.push((center_pad(label), Color::rgb(ACCENT.r, ACCENT.g, ACCENT.b)));
+        }
+        for (i, (label, _url)) in info.links.iter().enumerate() {
+            let line_idx = info.lines.len() + 1 + i; // after the spacer
+            let y = body_top + line_idx as f32 * LINE_HEIGHT;
+            let w = label.chars().count() as f32 * cw;
+            let bx = ((logical_w - w) * 0.5).max(0.0) - cw; // pad the button
+            let bw = w + 2.0 * cw;
+            out.push((scaled(bx, y, bw, LINE_HEIGHT, sf), lin_rgba(ACCENT, 0.18)));
+            link_rects.push([bx, y, bw, LINE_HEIGHT]);
+        }
+    }
+    let n = rows.len();
+    let spans: Vec<(String, Color)> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, (t, c))| (if i + 1 < n { format!("{t}\n") } else { t }, c))
+        .collect();
     body_buf.set_rich_text(
         font_system,
         spans
@@ -630,6 +666,7 @@ pub(crate) fn build_about(
         title_left,
         title_top,
         body_top,
+        link_rects,
     }
 }
 
