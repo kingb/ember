@@ -265,6 +265,10 @@ impl ApplicationHandler for App {
         if self.state.is_some() {
             return;
         }
+        // Set the macOS menu-bar app name before the menu is built (matches the
+        // "Ember" window title + brand; a non-bundled binary otherwise shows the
+        // executable name "ember-term").
+        ember_platform::set_app_name("Ember");
         let w = DEFAULT_COLS as f32 * CELL_WIDTH + 2.0 * PAD;
         let h = DEFAULT_ROWS as f32 * CELL_HEIGHT + 2.0 * PAD;
         let attrs = ember_platform::window_attributes("Ember", w, h);
@@ -1143,6 +1147,15 @@ impl RunState {
     /// Handle a left click at the current cursor position: dismiss an open overlay,
     /// else hit-test the tab strip (switch tab / open a new tab).
     fn left_click(&mut self) {
+        // A click on an About-overlay link button (Docs/GitHub) opens the URL
+        // rather than dismissing the overlay.
+        if self.about {
+            let (x, y) = self.cursor;
+            if let Some(url) = self.renderer.about_link_at(x as f32, y as f32) {
+                ember_platform::open_url(url);
+                return;
+            }
+        }
         if self.dismiss_overlay() {
             return;
         }
@@ -1699,9 +1712,19 @@ fn about_info() -> ember_render::AboutInfo {
         lines: vec![
             "a native terminal".to_string(),
             String::new(),
-            format!("v{}", env!("CARGO_PKG_VERSION")),
+            format!("Version   {}", env!("CARGO_PKG_VERSION")),
+            format!("Commit    {}", env!("EMBER_GIT_HASH")),
             "MIT OR Apache-2.0".to_string(),
             "Brandon W. King · Claude Opus 4.8".to_string(),
+            String::new(),
+            "emberterm.com".to_string(),
+        ],
+        links: vec![
+            ("Docs".to_string(), "https://emberterm.com".to_string()),
+            (
+                "GitHub".to_string(),
+                "https://github.com/kingb/ember-term".to_string(),
+            ),
         ],
     }
 }
@@ -1746,21 +1769,31 @@ fn bracket_paste(text: &str, bracketed: bool) -> Vec<u8> {
     out
 }
 
+/// The keyboard cheat-sheet, grouped into sections. A row with an empty key is a
+/// **section header** (rendered as an accent heading by `build_help`); the rest are
+/// `(key, description)`. Keep in sync with [`RunState::handle_shortcut`].
 fn help_lines() -> Vec<(String, String)> {
     [
+        ("", "PANES"),
         ("Cmd+D", "Split right (side by side)"),
         ("Cmd+Shift+D", "Split down (stacked)"),
         ("Cmd+W", "Close pane"),
-        ("Cmd+T", "New tab"),
         ("Cmd+Arrows", "Focus pane"),
+        ("", "TABS"),
+        ("Cmd+T", "New tab"),
         ("Cmd+Shift+Arrows", "Switch tab"),
         ("Cmd+1..9", "Jump to tab"),
+        ("Drag / Double-click", "Reorder / rename tab"),
+        ("", "SELECTION & CLIPBOARD"),
         ("Drag / 2×/3× click", "Select text / word / line"),
-        ("Cmd+C / Cmd+V", "Copy selection / paste"),
-        ("Cmd+,", "Settings"),
+        ("Cmd+C / Cmd+V", "Copy / paste"),
+        ("", "SCROLLBACK"),
         ("Wheel / Shift+PgUp/Dn", "Scroll history"),
         ("Shift+Home/End", "Scroll to top / bottom"),
+        ("", "SHELL"),
         ("Cmd+[ / Cmd+]", "Jump to prev / next command"),
+        ("", "APP"),
+        ("Cmd+,", "Settings"),
         ("Cmd+/", "Show this help"),
     ]
     .iter()

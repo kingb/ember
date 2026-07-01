@@ -52,6 +52,17 @@ pub type HostBackend = MacBackend;
 #[cfg(not(target_os = "macos"))]
 pub type HostBackend = LinuxBackend;
 
+/// Open a URL (or path) in the user's default handler — an OS effect (design §7):
+/// macOS `open`, everything else `xdg-open`. Best-effort and non-blocking; a
+/// failure to spawn is ignored (About-page Docs/GitHub links, smart-selection).
+pub fn open_url(target: &str) {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(target_os = "macos"))]
+    let program = "xdg-open";
+    let _ = std::process::Command::new(program).arg(target).spawn();
+}
+
 /// Window attributes for the main terminal window, sized in logical pixels.
 pub fn window_attributes(title: &str, width: f32, height: f32) -> WindowAttributes {
     Window::default_attributes()
@@ -113,6 +124,25 @@ pub fn set_dock_icon(png_bytes: &[u8]) {
     let app = NSApplication::sharedApplication(mtm);
     // SAFETY: called on the main thread with a valid NSImage.
     unsafe { app.setApplicationIconImage(Some(&image)) };
+}
+
+/// Set the application's display name — the **bold app-menu name** in the macOS
+/// menu bar. A non-bundled binary (`cargo run`) has no `CFBundleName`, so macOS
+/// derives that name from the process name; we override it via `NSProcessInfo`.
+/// Best-effort for the dev binary — the robust fix is a real `.app` bundle with
+/// `CFBundleName` at distribution time. No-op off macOS. Call before `build_menu`.
+pub fn set_app_name(name: &str) {
+    #[cfg(target_os = "macos")]
+    set_process_name_macos(name);
+    #[cfg(not(target_os = "macos"))]
+    let _ = name;
+}
+
+#[cfg(target_os = "macos")]
+fn set_process_name_macos(name: &str) {
+    use objc2_foundation::{NSProcessInfo, NSString};
+    let info = NSProcessInfo::processInfo();
+    info.setProcessName(&NSString::from_str(name));
 }
 
 /// Returns the `ember-core` version this platform layer is built against.

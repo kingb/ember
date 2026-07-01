@@ -82,8 +82,11 @@ pub struct TabLabel {
 pub struct AboutInfo {
     /// Large wordmark (e.g. "ember").
     pub title: String,
-    /// Centered lines below the wordmark (tagline, version, license, authors).
+    /// Centered lines below the wordmark (tagline, version, commit, license, authors).
     pub lines: Vec<String>,
+    /// Clickable `(label, url)` buttons below the lines (Docs, GitHub). Opened via
+    /// the platform seam when clicked; hit-tested by [`Renderer::about_link_at`].
+    pub links: Vec<(String, String)>,
 }
 
 /// Campfire backdrop + ember-spark parameters. All off by default, so
@@ -212,6 +215,9 @@ pub struct Renderer {
     /// Large wordmark buffer + body-lines buffer for the About overlay.
     about_title: Buffer,
     about_body: Buffer,
+    /// Logical click rects + target URLs for the About overlay's link buttons
+    /// (Docs, GitHub), rebuilt each About frame. Empty when About is hidden.
+    about_links: Vec<([f32; 4], String)>,
     /// When `Some`, the Settings overlay is shown: `(rows of (label, value), selected)`.
     settings: Option<(Vec<(String, String)>, usize)>,
     /// Glyph buffer for the Settings overlay.
@@ -337,6 +343,7 @@ impl Renderer {
             about_time: 0.0,
             about_title,
             about_body,
+            about_links: Vec::new(),
             settings: None,
             settings_buffer,
             cell_w,
@@ -628,6 +635,9 @@ impl Renderer {
 
     /// Show the About overlay with this content, or hide it with `None`.
     pub fn set_about(&mut self, info: Option<AboutInfo>) {
+        if info.is_none() {
+            self.about_links.clear();
+        }
         self.about = info;
         self.window.request_redraw();
     }
@@ -635,6 +645,15 @@ impl Renderer {
     /// Whether the About overlay is shown.
     pub fn about_visible(&self) -> bool {
         self.about.is_some()
+    }
+
+    /// If the About overlay is open and logical point `(x, y)` is over a link button,
+    /// the target URL. Lets the app open Docs/GitHub instead of dismissing.
+    pub fn about_link_at(&self, x: f32, y: f32) -> Option<&str> {
+        self.about.as_ref()?;
+        self.about_links.iter().find_map(|([rx, ry, rw, rh], url)| {
+            (x >= *rx && x < rx + rw && y >= *ry && y < ry + rh).then_some(url.as_str())
+        })
     }
 
     /// Update the About overlay's animation inputs each frame: glow intensity
@@ -802,6 +821,13 @@ impl Renderer {
                 sf,
                 &mut rects,
             );
+            // Pair each link's click rect with its URL for hit-testing.
+            self.about_links = layout
+                .link_rects
+                .iter()
+                .zip(info.links.iter())
+                .map(|(r, (_label, url))| (*r, url.clone()))
+                .collect();
             areas.push(TextArea {
                 buffer: &self.about_title,
                 left: layout.title_left * sf,
