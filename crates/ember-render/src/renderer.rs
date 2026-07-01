@@ -28,8 +28,9 @@ use winit::window::Window;
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    BTN_COLS, build_about, build_fps, build_help, build_settings, build_tabs, debug_emit,
-    grid_quads, measure_cell_width, push_backdrop, selection_quads, shape_grid, spark_quads,
+    BTN_COLS, bell_wash, build_about, build_fps, build_help, build_settings, build_tabs,
+    debug_emit, grid_quads, measure_cell_width, push_backdrop, selection_quads, shape_grid,
+    spark_quads,
 };
 use crate::selection::Selection;
 
@@ -71,6 +72,9 @@ pub struct TabLabel {
     /// True while this tab's title is being edited inline (draw a caret + accent,
     /// omit the `⌘N` hint). The `title` then carries the live edit buffer.
     pub editing: bool,
+    /// True when this tab has an unseen bell (a background tab belled) — draws a
+    /// small amber indicator so the user can see which tab wants attention.
+    pub bell: bool,
 }
 
 /// Static content for the About overlay (the animated glow is separate).
@@ -231,6 +235,9 @@ pub struct Renderer {
     fps_overlay: Option<String>,
     /// Glyph buffer for the FPS overlay.
     fps_buffer: Buffer,
+    /// Visual-bell flash intensity (`0..1`); a warm amber wash over the panes that
+    /// the app decays to 0 after a BEL. `0.0` = no flash.
+    bell_flash: f32,
     // Keep the window LAST so it drops after the surface (winit/wgpu requirement).
     window: Arc<Window>,
 }
@@ -341,6 +348,7 @@ impl Renderer {
             selection: None,
             fps_overlay: None,
             fps_buffer,
+            bell_flash: 0.0,
             window,
         }
     }
@@ -428,6 +436,7 @@ impl Renderer {
             image: self.image_rgba.clone(),
             image_fit: self.image_fit,
             fps_overlay: self.fps_overlay.clone(),
+            bell_flash: self.bell_flash,
         };
         crate::headless::capture(&shot, path)
     }
@@ -614,6 +623,13 @@ impl Renderer {
     /// Set or clear the FPS/frame-time debug readout text (bottom-right).
     pub fn set_fps_overlay(&mut self, text: Option<String>) {
         self.fps_overlay = text;
+    }
+
+    /// Set the visual-bell flash intensity (`0..1`) — a warm amber wash over the
+    /// panes. The app drives this each frame, decaying it to 0 after a BEL.
+    pub fn set_bell_flash(&mut self, intensity: f32) {
+        self.bell_flash = intensity.clamp(0.0, 1.0);
+        self.window.request_redraw();
     }
 
     /// The currently selected text, if any (read from the owning pane's grid).
@@ -877,6 +893,8 @@ impl Renderer {
                     custom_glyphs: &[],
                 });
             }
+            // Visual-bell flash: a warm amber wash over everything (under the text).
+            bell_wash(&mut rects, self.bell_flash, logical_w, logical_h, sf);
         }
 
         self.quads.prepare(

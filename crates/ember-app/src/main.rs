@@ -179,6 +179,10 @@ struct RunState {
     last_frame: Option<Instant>,
     fps_ema_ms: f32,
     render_ema_ms: f32,
+    /// Visual bell: when the current ember flash started (None = no flash), and the
+    /// set of tabs with an unseen bell (a background tab belled).
+    bell_flash_since: Option<Instant>,
+    belled_tabs: std::collections::HashSet<TabId>,
     /// Native menu bar (macOS); inert elsewhere. Kept alive for the app's life.
     menu: ember_platform::AppMenu,
     /// Last cursor position in **logical** px.
@@ -298,6 +302,8 @@ impl ApplicationHandler for App {
             last_frame: None,
             fps_ema_ms: 0.0,
             render_ema_ms: 0.0,
+            bell_flash_since: None,
+            belled_tabs: std::collections::HashSet::new(),
             menu: ember_platform::build_menu(),
             cursor: (0.0, 0.0),
             pane_rects: Vec::new(),
@@ -460,6 +466,7 @@ impl ApplicationHandler for App {
         let focused = state.focused_session_id();
         let mut new_title: Option<String> = None;
         let mut exited: Vec<SessionId> = Vec::new();
+        let mut belled: Vec<SessionId> = Vec::new();
         for (id, handle) in &state.sessions {
             while let Ok(event) = handle.events.try_recv() {
                 match event {
@@ -469,6 +476,7 @@ impl ApplicationHandler for App {
                         }
                     }
                     BackendEvent::Exited(_) => exited.push(id.clone()),
+                    BackendEvent::Bell => belled.push(id.clone()),
                     _ => {}
                 }
             }
@@ -478,6 +486,9 @@ impl ApplicationHandler for App {
         }
         for session in exited {
             state.close_session(&session);
+        }
+        for session in belled {
+            state.on_bell(&session);
         }
         // Drain debug-control commands (EMBER_CONTROL) and act on them.
         let cmds: Vec<ControlMsg> = state
@@ -513,7 +524,7 @@ impl ApplicationHandler for App {
         // The About glow runs at ~60fps (brief, transient modal); the ambient
         // ember sparks honor the configurable `ember_fps` cap (default 30) — fewer
         // redraws ≈ proportionally less CPU, and embers drift fine at 30.
-        let wait = if state.about || state.fps_overlay {
+        let wait = if state.about || state.fps_overlay || state.bell_flashing() {
             ANIM_FRAME
         } else if state.backdrop_animating() {
             state.ember_frame()
@@ -543,6 +554,14 @@ impl ApplicationHandler for App {
             let params =
                 state.backdrop_params(now.duration_since(state.backdrop_since).as_secs_f32());
             state.renderer.set_backdrop(params);
+        }
+        // Decay the visual-bell ember flash; clear it once it reaches 0.
+        if let Some(since) = state.bell_flash_since {
+            let i = bell_flash_intensity(now.duration_since(since).as_secs_f32());
+            state.renderer.set_bell_flash(i);
+            if i <= 0.0 {
+                state.bell_flash_since = None;
+            }
         }
         // Keep frames flowing while the FPS overlay is on, so its readout stays live.
         if state.fps_overlay {
@@ -688,6 +707,20 @@ impl RunState {
             ControlMsg::Copy => self.copy_selection(),
             ControlMsg::Paste(text) => self.paste_into_focused(&text),
             ControlMsg::Fps => self.toggle_fps(),
+            ControlMsg::Bell(tab) => {
+                // `Some(i)` = a specific tab's first session; `None` = focused pane.
+                let session = match tab {
+                    Some(i) => self
+                        .tree
+                        .tabs
+                        .get(i)
+                        .and_then(|t| t.root.leaves().into_iter().next().map(|(_, s)| s)),
+                    None => self.focused_session_id(),
+                };
+                if let Some(s) = session {
+                    self.on_bell(&s);
+                }
+            }
             ControlMsg::ReorderTab(from, to) => {
                 let vp = self.viewport();
                 apply(&mut self.tree, LayoutCommand::MoveTab { from, to }, vp);
@@ -807,6 +840,11 @@ impl RunState {
 
         let active = self.tree.active;
         let editing_tab = self.editing_tab;
+        // Becoming the active tab clears its unseen-bell indicator.
+        if let Some(id) = self.tree.tabs.get(active).map(|t| t.id) {
+            self.belled_tabs.remove(&id);
+        }
+        let belled = &self.belled_tabs;
         let tabs: Vec<TabLabel> = self
             .tree
             .tabs
@@ -824,6 +862,7 @@ impl RunState {
                     },
                     active: i == active,
                     editing,
+                    bell: belled.contains(&t.id),
                 }
             })
             .collect();
@@ -1319,6 +1358,7 @@ impl RunState {
             ("Ember density".into(), format!("{:.1}", bg.ember_density)),
             ("Ember FPS".into(), format!("{}", bg.ember_fps)),
             ("Scrim".into(), format!("{:.2}", bg.scrim)),
+            ("Visual bell".into(), on(self.config.visual_bell)),
             ("Backdrop image".into(), image),
         ]
     }
@@ -1397,6 +1437,7 @@ impl RunState {
             2 => bg.ember_density = (bg.ember_density + 0.1 * dir).clamp(0.0, 2.0),
             3 => bg.ember_fps = (bg.ember_fps as i32 + (5.0 * dir) as i32).clamp(10, 120) as u32,
             4 => bg.scrim = (bg.scrim + 0.05 * dir).clamp(0.0, 1.0),
+            5 => self.config.visual_bell = !self.config.visual_bell,
             _ => {}
         }
         if let Err(e) = config::save(&self.config) {
@@ -1457,6 +1498,35 @@ impl RunState {
             && !self.settings_open
     }
 
+    /// Handle a BEL from `session` (visual bell): start/refresh the ember flash,
+    /// and if the belling tab isn't active, mark it with an unseen-bell indicator.
+    fn on_bell(&mut self, session: &SessionId) {
+        if !self.config.visual_bell {
+            return;
+        }
+        let tab_idx = self
+            .tree
+            .tabs
+            .iter()
+            .position(|t| t.root.leaves().iter().any(|(_, s)| s == session));
+        if let Some(i) = tab_idx {
+            if i != self.tree.active {
+                let id = self.tree.tabs[i].id;
+                if self.belled_tabs.insert(id) {
+                    self.sync_layout(); // repaint the tab with its bell dot
+                }
+            }
+        }
+        // Start (or refresh) the window flash; the animation loop decays it.
+        self.bell_flash_since = Some(Instant::now());
+        self.renderer.set_bell_flash(bell_flash_intensity(0.0));
+    }
+
+    /// Whether the visual-bell ember flash is currently animating.
+    fn bell_flashing(&self) -> bool {
+        self.bell_flash_since.is_some()
+    }
+
     /// Jump to tab `n` (1-based); no-op if out of range.
     fn select_tab(&mut self, n: usize) {
         if n >= 1 && n <= self.tree.tabs.len() {
@@ -1509,6 +1579,19 @@ fn about_info() -> ember_render::AboutInfo {
             "Brandon W. King · Claude Opus 4.8".to_string(),
         ],
     }
+}
+
+/// How long the visual-bell ember flash takes to fully decay (seconds).
+const BELL_FLASH_SECS: f32 = 0.6;
+
+/// Visual-bell flash intensity `[0,1]` given seconds since the BEL: full at 0,
+/// quadratic ease-out to 0 at [`BELL_FLASH_SECS`] (bright flare, soft fade).
+fn bell_flash_intensity(elapsed: f32) -> f32 {
+    if elapsed >= BELL_FLASH_SECS || elapsed < 0.0 {
+        return 0.0;
+    }
+    let x = 1.0 - elapsed / BELL_FLASH_SECS;
+    x * x
 }
 
 /// Continuous ember-glow intensity `[0,1]` for the About overlay: a slow breathe
@@ -1626,7 +1709,16 @@ fn encode_key(key: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::bracket_paste;
+    use super::{BELL_FLASH_SECS, bell_flash_intensity, bracket_paste};
+
+    #[test]
+    fn bell_flash_decays_from_full_to_zero() {
+        assert_eq!(bell_flash_intensity(0.0), 1.0); // full at the bel
+        assert_eq!(bell_flash_intensity(BELL_FLASH_SECS), 0.0); // gone at the end
+        assert_eq!(bell_flash_intensity(BELL_FLASH_SECS + 1.0), 0.0); // stays gone
+        let mid = bell_flash_intensity(BELL_FLASH_SECS * 0.5);
+        assert!(mid > 0.0 && mid < 1.0); // monotone decay through the middle
+    }
 
     #[test]
     fn paste_unbracketed_is_raw() {
