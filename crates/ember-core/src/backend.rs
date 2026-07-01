@@ -38,8 +38,26 @@ pub enum BackendControl {
     Resize(GridDims),
     /// Focus gained/lost (drives focus-reporting + cursor blink).
     Focus(bool),
+    /// Scroll the display through scrollback history (engine-agnostic).
+    Scroll(ScrollAmount),
     /// Tear the session down.
     Shutdown,
+}
+
+/// A scrollback movement, in engine-neutral terms. `Lines(+n)` scrolls **up**
+/// into history, `Lines(-n)` scrolls back down toward the live bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrollAmount {
+    /// Scroll by `n` lines: positive = up (into history), negative = down.
+    Lines(i32),
+    /// Up one screenful.
+    PageUp,
+    /// Down one screenful.
+    PageDown,
+    /// Jump to the oldest history line.
+    Top,
+    /// Jump to the live bottom.
+    Bottom,
 }
 
 /// Shell-integration / OSC semantic events (design §8.1: OSC 133 backbone + an
