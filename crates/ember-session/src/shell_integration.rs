@@ -53,7 +53,7 @@ fi
 "#;
 
 fn prepare_zsh(dir: &Path) -> std::io::Result<Injection> {
-    std::fs::create_dir_all(dir)?;
+    create_private_dir(dir)?;
     // The user's real ZDOTDIR (where their .zshrc lives).
     let orig = std::env::var("ZDOTDIR")
         .ok()
@@ -121,7 +121,7 @@ trap 'printf "\e]133;C\e\\"' DEBUG
 "#;
 
 fn prepare_bash(dir: &Path) -> std::io::Result<Injection> {
-    std::fs::create_dir_all(dir)?;
+    create_private_dir(dir)?;
     let rc = dir.join("ember-bash-rc");
     std::fs::write(&rc, RCFILE_BASH_HEAD)?;
     Ok(Injection {
@@ -130,9 +130,50 @@ fn prepare_bash(dir: &Path) -> std::io::Result<Injection> {
     })
 }
 
-/// A per-run integration dir under the system temp dir.
+/// The per-user integration dir. The shell SOURCES files from here, so on a
+/// shared /tmp (Linux; macOS's $TMPDIR is already per-user) a fixed name is a
+/// pre-squat target: another local user creates it first and their rc runs in
+/// your shell. Prefer $XDG_RUNTIME_DIR (per-user, 0700 by contract); else suffix
+/// the temp path with the uid. `prepare` additionally verifies ownership.
 pub fn integration_dir() -> PathBuf {
-    std::env::temp_dir().join("ember-shell-integration")
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(format!("ember-shell-integration-{}", process_uid()))
+}
+
+/// This process's uid, for dir names + ownership checks.
+#[cfg(unix)]
+#[allow(unsafe_code)] // getuid is unconditionally safe; std exposes no wrapper
+fn process_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+fn process_uid() -> u32 {
+    0
+}
+
+/// Create `dir` owner-only and confirm it is actually OURS — `create_dir_all`
+/// happily accepts a pre-existing attacker-owned dir on shared /tmp.
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    std::fs::create_dir_all(dir)?;
+    let meta = std::fs::metadata(dir)?;
+    if meta.uid() != process_uid() {
+        return Err(std::io::Error::other(format!(
+            "{} is owned by uid {}, not us — refusing shell integration",
+            dir.display(),
+            meta.uid()
+        )));
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 #[cfg(test)]

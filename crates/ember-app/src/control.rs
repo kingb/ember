@@ -102,14 +102,30 @@ mod unix {
 
     /// Bind the control socket and spawn the accept loop. Returns the receiver the
     /// event loop drains. Each connection carries one request line + one response.
+    ///
+    /// The socket accepts keystroke injection and full screen-text reads, so it
+    /// must be reachable by this user only: the dir is created 0700 (and must
+    /// be OURS — on shared /tmp another user could pre-squat the fixed name),
+    /// and the socket itself is chmod 0600.
     pub fn spawn_listener(bind_path: &Path) -> std::io::Result<Receiver<ControlMsg>> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if let Some(dir) = bind_path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir)?;
+            let meta = std::fs::metadata(dir)?;
+            if meta.uid() != process_uid() {
+                return Err(std::io::Error::other(format!(
+                    "control dir {} is owned by uid {} (not us) — refusing to bind",
+                    dir.display(),
+                    meta.uid()
+                )));
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
         // Only our own (per-PID) path is removed here, so we never clobber another
         // live instance's socket.
         let _ = std::fs::remove_file(bind_path);
         let listener = UnixListener::bind(bind_path)?;
+        std::fs::set_permissions(bind_path, std::fs::Permissions::from_mode(0o600))?;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -168,8 +184,15 @@ mod unix {
                 let path = v
                     .get("path")
                     .and_then(Value::as_str)
-                    .unwrap_or("/tmp/ember-live.png")
-                    .to_string();
+                    .map(str::to_string)
+                    // Default inside the owner-only control dir — a fixed
+                    // world-writable /tmp name is a symlink-clobber target.
+                    .unwrap_or_else(|| {
+                        socket_dir()
+                            .join(format!("{}-live.png", std::process::id()))
+                            .to_string_lossy()
+                            .into_owned()
+                    });
                 let (reply_tx, reply_rx) = mpsc::channel();
                 if tx.send(ControlMsg::Screenshot(path, reply_tx)).is_err() {
                     return err("event loop gone");
@@ -259,8 +282,17 @@ mod unix {
     fn ok() -> String {
         "{\"ok\":true}".to_string()
     }
+    /// Proper JSON encoding — `msg` may carry client-controlled text (a typo'd
+    /// cmd, a serde error quoting the input) and interpolation would emit an
+    /// unparsable response on any embedded quote.
     fn err(msg: &str) -> String {
-        format!("{{\"ok\":false,\"error\":\"{msg}\"}}")
+        serde_json::json!({"ok": false, "error": msg}).to_string()
+    }
+
+    /// This process's uid (for ownership checks on shared-tmp paths).
+    #[allow(unsafe_code)] // getuid is unconditionally safe; std exposes no wrapper
+    fn process_uid() -> u32 {
+        unsafe { libc::getuid() }
     }
 
     /// Live instances as `(pid, socket_path)`, by scanning the socket dir and

@@ -196,14 +196,13 @@ fn tools_call(params: Option<&Value>) -> Result<Value, String> {
             )))
         }
         "ember_live_screenshot" => {
-            let path = args
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("/tmp/ember-live.png");
-            Ok(text(send(
-                &args,
-                json!({"cmd": "screenshot", "path": path}),
-            )?))
+            // No default here: omitting `path` lets the server pick its
+            // per-instance file under the owner-only control dir.
+            let mut req = json!({"cmd": "screenshot"});
+            if let Some(path) = args.get("path").and_then(Value::as_str) {
+                req["path"] = json!(path);
+            }
+            Ok(text(send(&args, req)?))
         }
         other => Err(format!("unknown tool: {other}")),
     }
