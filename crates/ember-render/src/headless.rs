@@ -55,6 +55,8 @@ pub struct Shot<'a> {
     pub tab_drag: Option<(usize, f32)>,
     /// When set, the cheat-sheet overlay is drawn instead of the panes.
     pub help: Option<Vec<(String, String)>>,
+    /// Overrides the help panel's `(title, hint)`; `None` → shortcuts default.
+    pub help_title: Option<(String, String)>,
     /// When set, the About overlay is drawn, with `(info, glow, elapsed_seconds)`.
     pub about: Option<(AboutInfo, f32, f32)>,
     /// When set, the Settings overlay is drawn: `(rows of (label, value), selected)`.
@@ -238,9 +240,15 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
         ));
     } else if let Some(lines) = &shot.help {
         // Cheat-sheet overlay replaces the panes (same helper as on-screen).
+        let (htitle, hhint) = shot
+            .help_title
+            .clone()
+            .unwrap_or_else(|| ("Keyboard Shortcuts".into(), "any key to close".into()));
         help_panel = Some(build_help(
             &mut font_system,
             &mut help_buf,
+            &htitle,
+            &hhint,
             lines,
             shot.logical_w,
             shot.logical_h,

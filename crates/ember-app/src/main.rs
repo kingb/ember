@@ -24,8 +24,8 @@ use control::ControlMsg;
 
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, Direction, GridDims,
-    LayoutCommand, LayoutEffect, LayoutNode, PaneId, Rect, ScrollAmount, SessionBackend, SessionId,
-    Tab, TabId, apply, layout,
+    LayoutCommand, LayoutEffect, LayoutNode, OscEvent, PaneId, Rect, ScrollAmount, SessionBackend,
+    SessionId, Tab, TabId, apply, layout,
 };
 use ember_platform::MenuAction;
 use ember_render::{
@@ -264,6 +264,20 @@ struct RunState {
     mouse_press: Option<(SessionId, u8)>,
     /// Last (col, row) a motion report was sent for (dedup per cell).
     last_mouse_cell: Option<(u16, u16)>,
+    /// Sessions with an OSC 133 command in flight (Command/OutputStart seen, no
+    /// CommandEnd) — used to confirm before destroying a busy pane.
+    running: std::collections::HashSet<SessionId>,
+    /// A destructive close awaiting Enter/Esc confirmation (a busy pane).
+    pending_close: Option<PendingClose>,
+}
+
+/// A close action deferred behind a running-process confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingClose {
+    /// Close the focused pane (Cmd+W).
+    Pane,
+    /// Quit the whole app (Cmd+Q / window close).
+    Quit,
 }
 
 /// State for an in-progress tab drag-reorder.
@@ -386,6 +400,8 @@ impl ApplicationHandler for App {
             wheel_accum: 0.0,
             mouse_press: None,
             last_mouse_cell: None,
+            running: std::collections::HashSet::new(),
+            pending_close: None,
         };
         if !state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
             // No shell at startup means nothing to show; exit with the message
@@ -403,8 +419,10 @@ impl ApplicationHandler for App {
         };
         match event {
             WindowEvent::CloseRequested => {
-                state.shutdown_all();
-                event_loop.exit();
+                if state.request_close(PendingClose::Quit) {
+                    state.shutdown_all();
+                    event_loop.exit();
+                }
             }
             WindowEvent::Resized(size) => {
                 state.px = (size.width.max(1), size.height.max(1));
@@ -504,6 +522,29 @@ impl ApplicationHandler for App {
                 // Inline tab rename captures keys (title editor), not the PTY.
                 if state.editing_tab.is_some() {
                     state.rename_key(&key.logical_key);
+                    return;
+                }
+                // A running-process close confirmation: Enter closes, anything
+                // else cancels. Auto-repeat ignored so a held key can't confirm.
+                if state.pending_close.is_some() {
+                    if !key.repeat {
+                        let ok = matches!(&key.logical_key, Key::Named(NamedKey::Enter));
+                        if state.resolve_confirm(ok) {
+                            state.shutdown_all();
+                            event_loop.exit();
+                        }
+                    }
+                    return;
+                }
+                // Cmd+Q — quit (with confirmation if a command is running). Handled
+                // here so it exits regardless of tab count, unlike pane shortcuts.
+                if state.modifiers.super_key()
+                    && matches!(&key.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
+                {
+                    if state.request_close(PendingClose::Quit) {
+                        state.shutdown_all();
+                        event_loop.exit();
+                    }
                     return;
                 }
                 // While a modal overlay (help / About) is up, the next *fresh* key
@@ -620,6 +661,7 @@ impl ApplicationHandler for App {
         let mut exited: Vec<SessionId> = Vec::new();
         let mut belled: Vec<SessionId> = Vec::new();
         let mut clipboard_set: Option<String> = None;
+        let mut running_changes: Vec<(SessionId, bool)> = Vec::new();
         for (id, handle) in &state.sessions {
             while let Ok(event) = handle.events.try_recv() {
                 match event {
@@ -634,8 +676,25 @@ impl ApplicationHandler for App {
                     BackendEvent::Clipboard(ClipboardOp::Set(text)) => {
                         clipboard_set = Some(text);
                     }
+                    // OSC 133 command state → per-pane busy tracking (for the
+                    // close confirmation). Needs shell integration (default on).
+                    BackendEvent::Osc(OscEvent::CommandStart)
+                    | BackendEvent::Osc(OscEvent::OutputStart) => {
+                        running_changes.push((id.clone(), true));
+                    }
+                    BackendEvent::Osc(OscEvent::CommandEnd(_))
+                    | BackendEvent::Osc(OscEvent::PromptStart) => {
+                        running_changes.push((id.clone(), false));
+                    }
                     _ => {}
                 }
+            }
+        }
+        for (id, busy) in running_changes {
+            if busy {
+                state.running.insert(id);
+            } else {
+                state.running.remove(&id);
             }
         }
         if let Some(text) = clipboard_set {
@@ -685,6 +744,12 @@ impl ApplicationHandler for App {
                 MenuAction::ShowShortcuts => state.toggle_help(),
                 MenuAction::About => state.toggle_about(),
                 MenuAction::Settings => state.toggle_settings(),
+                MenuAction::Quit => {
+                    if state.request_close(PendingClose::Quit) {
+                        state.shutdown_all();
+                        event_loop.exit();
+                    }
+                }
             }
         }
         if state.tree.tabs.is_empty() {
@@ -1220,9 +1285,12 @@ impl RunState {
                 self.split_focused(axis);
                 true
             }
-            // Cmd+W — close the focused pane (and its tab if it was the last).
+            // Cmd+W — close the focused pane (and its tab if it was the last),
+            // confirming first if it's running a command. The caller's
+            // tabs-empty check still handles quit-on-last-pane for the
+            // no-confirm path; a deferred confirm leaves tabs intact.
             Key::Character(s) if s.eq_ignore_ascii_case("w") => {
-                self.close_focused();
+                self.request_close(PendingClose::Pane);
                 true
             }
             // Cmd+T — open a new tab with a fresh shell.
@@ -1896,6 +1964,74 @@ impl RunState {
         } else {
             self.show_about();
         }
+    }
+
+    /// Whether any session that a `kind` close would destroy is running a
+    /// command (OSC 133). For `Pane`, only the focused pane's session; for
+    /// `Quit`, any session anywhere.
+    fn close_hits_running(&self, kind: PendingClose) -> bool {
+        match kind {
+            PendingClose::Quit => !self.running.is_empty(),
+            PendingClose::Pane => self
+                .active_tab()
+                .root
+                .session_of(self.active_tab().focus)
+                .is_some_and(|s| self.running.contains(s)),
+        }
+    }
+
+    /// Run a close, or defer it behind a confirmation if it would kill a running
+    /// command. Returns true if the app should exit now.
+    fn request_close(&mut self, kind: PendingClose) -> bool {
+        if self.close_hits_running(kind) {
+            self.show_close_confirm(kind);
+            return false;
+        }
+        self.do_close(kind)
+    }
+
+    /// Actually perform a (possibly confirmed) close. Returns true to exit.
+    fn do_close(&mut self, kind: PendingClose) -> bool {
+        match kind {
+            PendingClose::Pane => {
+                self.close_focused();
+                self.tree.tabs.is_empty()
+            }
+            PendingClose::Quit => true,
+        }
+    }
+
+    /// Show the running-process confirmation (reuses the help-overlay panel).
+    fn show_close_confirm(&mut self, kind: PendingClose) {
+        self.hide_help();
+        self.hide_about();
+        self.hide_settings();
+        let what = match kind {
+            PendingClose::Pane => "Close this pane?",
+            PendingClose::Quit => "Quit Ember?",
+        };
+        let rows = vec![
+            (what.to_string(), "a command is still running".to_string()),
+            ("return".to_string(), "close anyway".to_string()),
+            ("esc".to_string(), "cancel".to_string()),
+        ];
+        self.pending_close = Some(kind);
+        self.renderer.set_help_title(Some((
+            "Running process".to_string(),
+            "⏎ close · esc cancel".to_string(),
+        )));
+        self.renderer.set_help(Some(rows));
+    }
+
+    /// Resolve a pending close confirmation. `Enter` performs it; any other key
+    /// cancels. Returns true if the app should exit.
+    fn resolve_confirm(&mut self, confirm: bool) -> bool {
+        let Some(kind) = self.pending_close.take() else {
+            return false;
+        };
+        self.renderer.set_help(None);
+        self.renderer.set_help_title(None);
+        if confirm { self.do_close(kind) } else { false }
     }
 
     /// Dismiss whichever modal overlay is open; returns whether one was showing.

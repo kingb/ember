@@ -18,6 +18,10 @@ pub enum MenuAction {
     About,
     /// Ember → Settings… (also bound to Cmd+,).
     Settings,
+    /// Ember → Quit Ember (Cmd+Q). Routed through the app (NOT muda's
+    /// predefined quit, which terminates NSApp directly and would bypass the
+    /// running-process confirmation and session shutdown entirely).
+    Quit,
 }
 
 #[cfg(target_os = "macos")]
@@ -37,6 +41,7 @@ mod imp {
         about_id: MenuId,
         settings_id: MenuId,
         shortcuts_id: MenuId,
+        quit_id: MenuId,
     }
 
     /// Build + install the menu bar as the NSApp main menu. Call once on the main
@@ -58,7 +63,13 @@ mod imp {
         let settings_id = settings.id().clone();
         let _ = app_menu.append(&settings);
         let _ = app_menu.append(&PredefinedMenuItem::separator());
-        let _ = app_menu.append(&PredefinedMenuItem::quit(None));
+        let quit = MenuItem::new(
+            "Quit Ember",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyQ)),
+        );
+        let quit_id = quit.id().clone();
+        let _ = app_menu.append(&quit);
         let _ = menu.append(&app_menu);
 
         // Help menu with the cheat-sheet shortcut (Cmd+/).
@@ -78,6 +89,7 @@ mod imp {
             about_id,
             settings_id,
             shortcuts_id,
+            quit_id,
         }
     }
 
@@ -91,6 +103,8 @@ mod imp {
                 action = Some(MenuAction::Settings);
             } else if event.id == menu.shortcuts_id {
                 action = Some(MenuAction::ShowShortcuts);
+            } else if event.id == menu.quit_id {
+                action = Some(MenuAction::Quit);
             }
         }
         action

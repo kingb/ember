@@ -309,6 +309,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
         tabs,
         tab_drag: opts.tab_drag,
         help: None,
+        help_title: None,
         about: None,
         settings: None,
         backdrop: ember_render::BackdropParams {

@@ -229,6 +229,9 @@ pub struct Renderer {
     chrome: Buffer,
     /// When `Some`, the cheat-sheet overlay is shown with these `(key, desc)` rows.
     help: Option<Vec<(String, String)>>,
+    /// Overrides the help panel's `(title, hint)`; `None` → the shortcuts
+    /// default. Lets the same panel serve confirmations.
+    help_title: Option<(String, String)>,
     /// Glyph buffer for the help overlay.
     help_buffer: Buffer,
     /// When `Some`, the About overlay is shown.
@@ -375,6 +378,7 @@ impl Renderer {
             tab_drag: None,
             chrome,
             help: None,
+            help_title: None,
             help_buffer,
             about: None,
             about_glow: 0.0,
@@ -479,6 +483,7 @@ impl Renderer {
             tabs: self.tabs.clone(),
             tab_drag: self.tab_drag,
             help: self.help.clone(),
+            help_title: self.help_title.clone(),
             about: self
                 .about
                 .clone()
@@ -687,6 +692,13 @@ impl Renderer {
 
     /// Show the cheat-sheet overlay with these `(key, description)` rows, or hide
     /// it with `None`. The next `render` draws (or stops drawing) the modal.
+    /// Override the help panel's `(title, hint)`, or reset to the shortcuts
+    /// default with `None`. Set before `set_help` when reusing the panel (e.g.
+    /// a close confirmation).
+    pub fn set_help_title(&mut self, title: Option<(String, String)>) {
+        self.help_title = title;
+    }
+
     pub fn set_help(&mut self, lines: Option<Vec<(String, String)>>) {
         self.help = lines;
         self.window.request_redraw();
@@ -802,9 +814,15 @@ impl Renderer {
         let logical_w = self.config.width as f32 / sf;
         let logical_h = self.config.height as f32 / sf;
         let rows = self.help.clone().unwrap_or_default();
+        let (title, hint) = self
+            .help_title
+            .clone()
+            .unwrap_or_else(|| ("Keyboard Shortcuts".into(), "any key to close".into()));
         build_help(
             &mut self.font_system,
             &mut self.help_buffer,
+            &title,
+            &hint,
             &rows,
             logical_w,
             logical_h,

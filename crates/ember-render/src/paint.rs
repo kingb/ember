@@ -593,6 +593,8 @@ pub(crate) fn build_tabs(
 pub(crate) fn build_help(
     font_system: &mut FontSystem,
     buffer: &mut Buffer,
+    title: &str,
+    hint: &str,
     lines: &[(String, String)],
     logical_w: f32,
     logical_h: f32,
@@ -627,14 +629,8 @@ pub(crate) fn build_help(
         Some(h - 2.0 * HELP_PAD),
     );
     let mut spans: Vec<(String, Color)> = Vec::new();
-    spans.push((
-        "Keyboard Shortcuts".to_string(),
-        Color::rgb(0xff, 0xff, 0xff),
-    ));
-    spans.push((
-        "   ·  any key to close\n".to_string(),
-        Color::rgb(0x88, 0x88, 0x88),
-    ));
+    spans.push((title.to_string(), Color::rgb(0xff, 0xff, 0xff)));
+    spans.push((format!("   ·  {hint}\n"), Color::rgb(0x88, 0x88, 0x88)));
     // A row with an empty key is a section header (accent-amber); the rest are
     // `key  description`. The amber headers separate groups without blank lines.
     for (key, desc) in lines {
