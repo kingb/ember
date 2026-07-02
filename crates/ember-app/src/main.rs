@@ -61,6 +61,20 @@ fn main() {
         print_banner();
         return;
     }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        return;
+    }
+    // A typo'd flag must not fall through to a full GUI launch (a window that
+    // steals focus and feeds keystrokes to a live shell). Bare `ember-term`
+    // launches the app; anything unrecognized errors out.
+    if args.len() > 1 && !args.iter().any(|a| a == "--screenshot") {
+        let cmd = args[1].as_str();
+        if cmd != "ctl" && cmd != "mcp" {
+            eprintln!("ember-term: unrecognized argument `{cmd}` (see --help)");
+            std::process::exit(2);
+        }
+    }
     // Debug control client: `ember-term ctl [--pid N|--sock P] <list|type|key|chord|state>`
     // talks to a running instance's EMBER_CONTROL socket. See `control`.
     if args.get(1).map(String::as_str) == Some("ctl") {
@@ -139,6 +153,19 @@ fn print_banner() {
         ember_session::core_version(),
         ember_render::core_version(),
         ember_platform::core_version(),
+    );
+}
+
+fn print_usage() {
+    println!(
+        "usage: ember-term [--version|-V] [--help|-h]\n\
+         \n\
+         \x20 ember-term                     launch the terminal\n\
+         \x20 ember-term ctl <cmd> …         drive a running instance (EMBER_CONTROL)\n\
+         \x20 ember-term mcp                 MCP stdio server over the control surface\n\
+         \x20 ember-term --screenshot <png>  headless render to a PNG (see screenshot flags)\n\
+         \n\
+         env: EMBER_CONTROL=1|<path>  bind the debug control socket"
     );
 }
 
@@ -345,7 +372,11 @@ impl ApplicationHandler for App {
             editing_tab: None,
             edit_buffer: String::new(),
         };
-        state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
+        if !state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
+            // No shell at startup means nothing to show; exit with the message
+            // spawn_session already printed instead of presenting a dead window.
+            std::process::exit(1);
+        }
         state.sync_layout();
         state.apply_appearance();
         self.state = Some(state);
@@ -512,7 +543,11 @@ impl ApplicationHandler for App {
                     )));
                 }
                 let t = Instant::now();
-                state.renderer.render();
+                if !state.renderer.render() {
+                    // Surface lost/outdated: it was reconfigured but this frame
+                    // never presented — repaint now, not at the next input.
+                    state.renderer.window().request_redraw();
+                }
                 let render_ms = t.elapsed().as_secs_f32() * 1000.0;
                 state.render_ema_ms = if state.render_ema_ms == 0.0 {
                     render_ms
@@ -700,13 +735,24 @@ impl RunState {
     }
 
     /// Spawn a shell-backed session and register its grid with the renderer.
-    fn spawn_session(&mut self, id: SessionId, dims: GridDims) {
+    /// On failure (stale `$SHELL`, fd exhaustion) the app must keep running:
+    /// report, flash the bell, and let the caller abort its layout change.
+    fn spawn_session(&mut self, id: SessionId, dims: GridDims) -> bool {
         let mut cfg = LocalPtyConfig::new(id.clone(), dims);
         cfg.shell_integration = self.config.shell_integration;
-        let handle = LocalPty::spawn(cfg).expect("spawn shell");
+        let handle = match LocalPty::spawn(cfg) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("ember: failed to spawn shell: {e}");
+                self.bell_flash_since = Some(Instant::now());
+                self.renderer.set_bell_flash(bell_flash_intensity(0.0));
+                return false;
+            }
+        };
         self.renderer.ensure_pane(&id, dims);
         self.dims_cache.insert(id.clone(), dims);
         self.sessions.insert(id, handle);
+        true
     }
 
     /// Tear down a session backend and forget its render/cache state.
@@ -1099,10 +1145,12 @@ impl RunState {
         self.next_pane += 1;
         let new_session = SessionId::new(format!("s{}", self.next_session));
         self.next_session += 1;
-        self.spawn_session(
+        if !self.spawn_session(
             new_session.clone(),
             GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
-        );
+        ) {
+            return;
+        }
         let vp = self.viewport();
         let effects = apply(
             &mut self.tree,
@@ -1186,7 +1234,9 @@ impl RunState {
         self.next_pane += 1;
         let session = SessionId::new(format!("s{}", self.next_session));
         self.next_session += 1;
-        self.spawn_session(session.clone(), GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
+        if !self.spawn_session(session.clone(), GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
+            return;
+        }
         let vp = self.viewport();
         let effects = apply(
             &mut self.tree,

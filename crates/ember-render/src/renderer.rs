@@ -21,7 +21,7 @@ use glyphon::{
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use wgpu::{
     CompositeAlphaMode, DeviceDescriptor, Instance, InstanceDescriptor, MultisampleState,
-    PresentMode, RequestAdapterOptions, SurfaceConfiguration, TextureUsages,
+    PresentMode, RequestAdapterOptions, SurfaceConfiguration, TextureFormat, TextureUsages,
 };
 use winit::window::Window;
 
@@ -300,7 +300,17 @@ impl Renderer {
             .expect("request device");
 
         let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats[0];
+        // The whole pipeline emits linear color and relies on an sRGB target to
+        // re-encode (quads/sparks convert manually; glyphon runs in Accurate
+        // mode). caps.formats[0] is Bgra8Unorm on Metal, which would display
+        // those linear values raw — gamma-darkening every color on screen —
+        // while the headless path (always Rgba8UnormSrgb) captures them right.
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(TextureFormat::is_srgb)
+            .unwrap_or(caps.formats[0]);
         // Present mode is the latency lever (§6): Mailbox where honored, else Fifo.
         let present_mode = if caps.present_modes.contains(&PresentMode::Mailbox) {
             PresentMode::Mailbox

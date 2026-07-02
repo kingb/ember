@@ -10,5 +10,8 @@ ember-core.workspace = true
 alacritty_terminal.workspace = true
 portable-pty.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

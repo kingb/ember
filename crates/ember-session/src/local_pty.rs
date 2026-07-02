@@ -8,9 +8,10 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use ember_core::{
@@ -124,7 +125,10 @@ impl SessionBackend for LocalPty {
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<BackendControl>();
         let (event_tx, event_rx) = mpsc::channel::<BackendEvent>();
         let (frame_tx, frame_rx) = frame_channel();
-        let (itx, irx) = mpsc::channel::<Ev>();
+        // Bounded: when emulation falls behind a firehose (`cat` of a huge
+        // file), the reader blocks and the kernel PTY buffer backpressures the
+        // child, instead of this queue growing without bound.
+        let (itx, irx) = mpsc::sync_channel::<Ev>(EV_QUEUE_CHUNKS);
 
         // Reader thread: PTY bytes → internal channel.
         {
@@ -145,11 +149,24 @@ impl SessionBackend for LocalPty {
         }
         drop(itx);
 
-        // Emulation thread: owns the engine + PTY write side.
+        // Writer thread: owns the PTY write side. A foreground process that
+        // stops draining input (`^S`, SIGSTOP) blocks THIS thread, not the
+        // emulation thread — so rendering and Shutdown keep working.
+        let (wtx, wrx) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            let mut writer = writer;
+            for buf in wrx {
+                if writer.write_all(&buf).is_err() || writer.flush().is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Emulation thread: owns the engine.
         {
             let event_tx = event_tx.clone();
             thread::spawn(move || {
-                emulation_loop(dims, event_tx, frame_tx, irx, writer, master, child)
+                emulation_loop(dims, event_tx, frame_tx, irx, wtx, master, child)
             });
         }
 
@@ -161,6 +178,9 @@ impl SessionBackend for LocalPty {
         })
     }
 }
+
+/// Reader→emulation queue depth, in 8 KB read chunks (~2 MB in flight).
+const EV_QUEUE_CHUNKS: usize = 256;
 
 /// Internal event funnel for the emulation thread.
 enum Ev {
@@ -196,7 +216,7 @@ impl EventListener for EmberListener {
     }
 }
 
-fn reader_loop(mut reader: Box<dyn Read + Send>, itx: Sender<Ev>) {
+fn reader_loop(mut reader: Box<dyn Read + Send>, itx: SyncSender<Ev>) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
@@ -218,7 +238,7 @@ fn emulation_loop(
     event_tx: Sender<BackendEvent>,
     frame_tx: FrameTx,
     irx: mpsc::Receiver<Ev>,
-    mut writer: Box<dyn Write + Send>,
+    wtx: Sender<Vec<u8>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
 ) {
@@ -228,7 +248,8 @@ fn emulation_loop(
         outbox: Arc::clone(&outbox),
     };
     let mut proj = AlacrittyProjection::new(dims, listener);
-    push_frame(&mut proj, &frame_tx);
+    let mut shipper = FrameShipper::default();
+    shipper.push(&mut proj, &frame_tx);
 
     for ev in irx {
         match ev {
@@ -236,24 +257,23 @@ fn emulation_loop(
                 for osc in proj.advance(&bytes) {
                     let _ = event_tx.send(BackendEvent::Osc(osc));
                 }
-                flush_outbox(&outbox, &mut writer);
-                push_frame(&mut proj, &frame_tx);
+                flush_outbox(&outbox, &wtx);
+                shipper.push(&mut proj, &frame_tx);
             }
             Ev::Control(BackendControl::Input(bytes)) => {
                 // Typing snaps the view back to the live bottom (standard terminal
                 // behavior). No-op + no redraw if already there.
                 proj.scroll(ScrollAmount::Bottom);
-                push_frame(&mut proj, &frame_tx);
-                let _ = writer.write_all(&bytes);
-                let _ = writer.flush();
+                shipper.push(&mut proj, &frame_tx);
+                let _ = wtx.send(bytes.into_vec());
             }
             Ev::Control(BackendControl::Scroll(amount)) => {
                 proj.scroll(amount);
-                push_frame(&mut proj, &frame_tx);
+                shipper.push(&mut proj, &frame_tx);
             }
             Ev::Control(BackendControl::JumpMark(dir)) => {
                 proj.scroll_to_prompt(dir);
-                push_frame(&mut proj, &frame_tx);
+                shipper.push(&mut proj, &frame_tx);
             }
             Ev::Control(BackendControl::Resize(new_dims)) => {
                 let _ = master.resize(PtySize {
@@ -263,11 +283,14 @@ fn emulation_loop(
                     pixel_height: 0,
                 });
                 proj.resize(new_dims);
-                push_frame(&mut proj, &frame_tx);
+                shipper.push(&mut proj, &frame_tx);
             }
             Ev::Control(BackendControl::Focus(_)) => {}
             Ev::Control(BackendControl::Shutdown) => {
                 let _ = child.kill();
+                // Reap off-thread: kill() is only SIGHUP, which children can
+                // ignore, and an unreaped child is a zombie until app exit.
+                thread::spawn(move || reap_child(child));
                 break;
             }
             Ev::Control(_) => {}
@@ -280,20 +303,78 @@ fn emulation_loop(
     }
 }
 
-fn push_frame(proj: &mut AlacrittyProjection<EmberListener>, frame_tx: &FrameTx) {
-    let mut delta = GridDelta::default();
-    proj.drain_damage_into(&mut delta);
-    if delta.reset || !delta.cells.is_empty() {
-        frame_tx.push(delta);
+/// Wait for a killed child, escalating SIGHUP → SIGKILL after a grace period so
+/// a HUP-ignoring process (hung ssh, nohup-style daemon) still dies and is
+/// reaped rather than left as a zombie.
+fn reap_child(mut child: Box<dyn portable_pty::Child + Send + Sync>) {
+    for _ in 0..40 {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => return,
+        }
+    }
+    #[cfg(unix)]
+    if let Some(pid) = child.process_id() {
+        sigkill(pid);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)] // no safe std API sends SIGKILL to a non-std child handle
+fn sigkill(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }
 }
 
-fn flush_outbox(outbox: &Arc<Mutex<Vec<u8>>>, writer: &mut Box<dyn Write + Send>) {
+/// Ships drained deltas on the frame lane. A delta with no cell damage still
+/// ships when terminal *state* changed — `ESC[?2004h` (bracketed paste), mouse
+/// reporting, or the alt screen toggle damage no cells, but the app routes
+/// pastes and wheel events off these snapshots and must not run on stale ones.
+#[derive(Default)]
+struct FrameShipper {
+    last_state: Option<TermState>,
+}
+
+/// The non-damage terminal state carried by every delta (latest-wins fields).
+#[derive(Clone, PartialEq, Eq)]
+struct TermState {
+    cursor: ember_core::CursorState,
+    bracketed_paste: bool,
+    alt_screen: bool,
+    mouse_reporting: bool,
+    display_offset: u16,
+    history_len: u16,
+    marks: Vec<(u16, ember_core::MarkStatus)>,
+}
+
+impl FrameShipper {
+    fn push(&mut self, proj: &mut AlacrittyProjection<EmberListener>, frame_tx: &FrameTx) {
+        let mut delta = GridDelta::default();
+        proj.drain_damage_into(&mut delta);
+        let state = TermState {
+            cursor: delta.cursor,
+            bracketed_paste: delta.bracketed_paste,
+            alt_screen: delta.alt_screen,
+            mouse_reporting: delta.mouse_reporting,
+            display_offset: delta.display_offset,
+            history_len: delta.history_len,
+            marks: delta.marks.clone(),
+        };
+        let state_changed = self.last_state.as_ref() != Some(&state);
+        if delta.reset || !delta.cells.is_empty() || state_changed {
+            self.last_state = Some(state);
+            frame_tx.push(delta);
+        }
+    }
+}
+
+fn flush_outbox(outbox: &Arc<Mutex<Vec<u8>>>, wtx: &Sender<Vec<u8>>) {
     let mut buf = outbox.lock().unwrap();
     if !buf.is_empty() {
-        let _ = writer.write_all(&buf);
-        let _ = writer.flush();
-        buf.clear();
+        let _ = wtx.send(std::mem::take(&mut *buf));
     }
 }
 

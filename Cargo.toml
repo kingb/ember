@@ -28,6 +28,7 @@ toml = "0.8"
 arboard = "3"
 bitflags = { version = "2", features = ["serde"] }
 portable-pty = "0.9"
+libc = "0.2"
 winit = "0.30"
 wgpu = "29"
 glyphon = "0.11"
