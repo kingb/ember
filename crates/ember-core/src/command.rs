@@ -47,6 +47,12 @@ pub enum LayoutCommand {
         target: PaneId,
         ratio: f64,
     },
+    /// Close a whole tab (by id), killing every session it holds. Works on any
+    /// tab, active or not — the app doesn't have to loop `ClosePane` or mutate
+    /// the tree by hand.
+    CloseTab {
+        tab: TabId,
+    },
 }
 
 /// A described side effect of applying a [`LayoutCommand`]. The owner (ember-app)
@@ -79,6 +85,29 @@ fn resize_all(tab: &Tab, viewport: Rect) -> Vec<LayoutEffect> {
 /// Apply `cmd` to `tree` within `viewport`, returning the side effects to run.
 pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<LayoutEffect> {
     let mut effects = Vec::new();
+    // The pure core must never panic on a valid command sequence. Every arm but
+    // NewTab indexes `tree.active`; an empty tree (last pane just closed) makes
+    // that an out-of-bounds panic. A winit app quits on the last pane, but a
+    // bus-driven consumer may replay commands — guard structurally instead.
+    if tree.tabs.is_empty() {
+        if let LayoutCommand::NewTab { id, session, pane } = cmd {
+            tree.tabs.push(Tab {
+                id,
+                title: String::new(),
+                root: LayoutNode::pane(pane, session.clone()),
+                focus: pane,
+            });
+            tree.active = 0;
+            effects.push(LayoutEffect::ResizeBackend(session, viewport));
+            effects.push(LayoutEffect::FocusChanged(pane));
+        }
+        return effects;
+    }
+    // A stale `active` (e.g. left dangling by an earlier close) would also panic;
+    // clamp it into range before any arm indexes it.
+    if tree.active >= tree.tabs.len() {
+        tree.active = tree.tabs.len() - 1;
+    }
     match cmd {
         LayoutCommand::SplitPane {
             target,
@@ -172,6 +201,31 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
             let tab = &mut tree.tabs[tree.active];
             if tab.root.set_split_ratio(target, ratio) {
                 effects.extend(resize_all(tab, viewport));
+            }
+        }
+        LayoutCommand::CloseTab { tab } => {
+            if let Some(idx) = tree.tabs.iter().position(|t| t.id == tab) {
+                // Kill every session the tab holds.
+                for (_, sess) in tree.tabs[idx].root.leaves() {
+                    effects.push(LayoutEffect::KillSession(sess));
+                }
+                let was_active = idx == tree.active;
+                tree.tabs.remove(idx);
+                // Keep `active` pointing at the same tab the user was on: closing
+                // a tab before it shifts the index down; closing the active tab
+                // lands on its neighbor.
+                if tree.tabs.is_empty() {
+                    // Caller (app) decides whether to quit; nothing to focus.
+                } else {
+                    if idx < tree.active || tree.active >= tree.tabs.len() {
+                        tree.active = tree.active.saturating_sub(1).min(tree.tabs.len() - 1);
+                    }
+                    if was_active {
+                        let focus = tree.tabs[tree.active].focus;
+                        effects.push(LayoutEffect::FocusChanged(focus));
+                    }
+                    effects.extend(resize_all(&tree.tabs[tree.active], viewport));
+                }
             }
         }
     }
@@ -383,6 +437,137 @@ mod tests {
         apply(&mut tree, LayoutCommand::MoveTab { from: 1, to: 0 }, vp());
         assert_eq!(tree.tabs[0].id, TabId(2));
         assert_eq!(tree.active, 0);
+    }
+
+    #[test]
+    fn empty_tree_does_not_panic_and_only_newtab_takes_effect() {
+        let mut tree = WindowTree {
+            tabs: Vec::new(),
+            active: 3, // deliberately stale/out-of-range
+        };
+        // Non-NewTab commands are no-ops on an empty tree (no panic).
+        let e = apply(
+            &mut tree,
+            LayoutCommand::FocusDir {
+                dir: Direction::Left,
+            },
+            vp(),
+        );
+        assert!(e.is_empty());
+        assert!(tree.tabs.is_empty());
+        let e = apply(
+            &mut tree,
+            LayoutCommand::ClosePane { target: PaneId(9) },
+            vp(),
+        );
+        assert!(e.is_empty());
+        // NewTab rebuilds a valid tree.
+        apply(
+            &mut tree,
+            LayoutCommand::NewTab {
+                id: TabId(1),
+                session: SessionId::new("s1"),
+                pane: PaneId(1),
+            },
+            vp(),
+        );
+        assert_eq!(tree.tabs.len(), 1);
+        assert_eq!(tree.active, 0);
+    }
+
+    #[test]
+    fn closing_last_pane_then_next_command_is_safe() {
+        // Reproduces the original panic: ClosePane empties the tree, leaving
+        // `active` stale; the NEXT command used to index out of bounds.
+        let mut tree = single_tab();
+        apply(
+            &mut tree,
+            LayoutCommand::ClosePane { target: PaneId(1) },
+            vp(),
+        );
+        assert!(tree.tabs.is_empty());
+        // Any follow-up command must not panic.
+        let e = apply(
+            &mut tree,
+            LayoutCommand::SplitPane {
+                target: PaneId(1),
+                axis: Axis::Vertical,
+                ratio: 0.5,
+                new_pane: PaneId(2),
+                new_session: SessionId::new("s2"),
+            },
+            vp(),
+        );
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn close_tab_kills_all_its_sessions_and_keeps_active_stable() {
+        let mut tree = single_tab();
+        // Add a 2nd tab, then split it so it has two sessions.
+        apply(
+            &mut tree,
+            LayoutCommand::NewTab {
+                id: TabId(2),
+                session: SessionId::new("s2"),
+                pane: PaneId(2),
+            },
+            vp(),
+        );
+        apply(
+            &mut tree,
+            LayoutCommand::SplitPane {
+                target: PaneId(2),
+                axis: Axis::Vertical,
+                ratio: 0.5,
+                new_pane: PaneId(3),
+                new_session: SessionId::new("s3"),
+            },
+            vp(),
+        );
+        // Focus is on tab 2 (index 1); close the BACKGROUND tab 1.
+        assert_eq!(tree.active, 1);
+        let e = apply(&mut tree, LayoutCommand::CloseTab { tab: TabId(1) }, vp());
+        let kills: Vec<_> = e
+            .iter()
+            .filter_map(|f| match f {
+                LayoutEffect::KillSession(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kills, vec![SessionId::new("s1")]);
+        assert_eq!(tree.tabs.len(), 1);
+        // Still on the same (formerly index 1, now 0) tab — no teleport.
+        assert_eq!(tree.tabs[tree.active].id, TabId(2));
+    }
+
+    #[test]
+    fn close_active_tab_with_multiple_panes_kills_both() {
+        let mut tree = single_tab();
+        apply(
+            &mut tree,
+            LayoutCommand::SplitPane {
+                target: PaneId(1),
+                axis: Axis::Horizontal,
+                ratio: 0.5,
+                new_pane: PaneId(2),
+                new_session: SessionId::new("s2"),
+            },
+            vp(),
+        );
+        let e = apply(&mut tree, LayoutCommand::CloseTab { tab: TabId(1) }, vp());
+        let kills: std::collections::HashSet<_> = e
+            .iter()
+            .filter_map(|f| match f {
+                LayoutEffect::KillSession(s) => Some(s.0.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kills,
+            ["s1".to_string(), "s2".to_string()].into_iter().collect()
+        );
+        assert!(tree.tabs.is_empty());
     }
 
     #[test]

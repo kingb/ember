@@ -305,6 +305,8 @@ struct RunState {
 enum PendingClose {
     /// Close the focused pane (Cmd+W).
     Pane,
+    /// Close a whole tab by id (middle-click).
+    Tab(TabId),
     /// Quit the whole app (Cmd+Q / window close).
     Quit,
 }
@@ -528,10 +530,20 @@ impl ApplicationHandler<EmberEvent> for App {
                 ..
             } => match button {
                 MouseButton::Left => state.left_click(),
-                // Middle/right have no local function — forward when the app
-                // listens (Shift forces local behavior, i.e. nothing).
+                // Middle-click on a tab closes it (standard gesture); elsewhere
+                // it forwards to a mouse-aware app.
                 MouseButton::Middle => {
-                    state.forward_mouse_press(1);
+                    let (x, y) = state.cursor;
+                    if let Some(TabHit::Tab(i)) = state.renderer.tab_hit(x as f32, y as f32) {
+                        if let Some(id) = state.tree.tabs.get(i).map(|t| t.id) {
+                            if state.request_close(PendingClose::Tab(id)) {
+                                state.shutdown_all();
+                                event_loop.exit();
+                            }
+                        }
+                    } else {
+                        state.forward_mouse_press(1);
+                    }
                 }
                 MouseButton::Right => {
                     state.forward_mouse_press(2);
@@ -2062,6 +2074,18 @@ impl RunState {
                 .root
                 .session_of(self.active_tab().focus)
                 .is_some_and(|s| self.running.contains(s)),
+            PendingClose::Tab(tab) => {
+                self.tree
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab)
+                    .is_some_and(|t| {
+                        t.root
+                            .leaves()
+                            .iter()
+                            .any(|(_, s)| self.running.contains(s))
+                    })
+            }
         }
     }
 
@@ -2082,6 +2106,7 @@ impl RunState {
                 self.close_focused();
                 self.tree.tabs.is_empty()
             }
+            PendingClose::Tab(tab) => self.do_close_tab(tab),
             PendingClose::Quit => true,
         }
     }
@@ -2093,6 +2118,7 @@ impl RunState {
         self.hide_settings();
         let what = match kind {
             PendingClose::Pane => "Close this pane?",
+            PendingClose::Tab(_) => "Close this tab?",
             PendingClose::Quit => "Quit Ember?",
         };
         let rows = vec![
@@ -2367,6 +2393,10 @@ impl RunState {
             self.kill_session(session);
             return;
         };
+        // Remember which tab the USER is on (by id) so closing a background
+        // tab's pane doesn't teleport them there. ClosePane targets the active
+        // tab, so switch to `ti`, close, then restore the user's tab.
+        let user_tab = self.tree.tabs.get(self.tree.active).map(|t| t.id);
         self.tree.active = ti;
         let vp = self.viewport();
         let effects = apply(
@@ -2378,8 +2408,31 @@ impl RunState {
         if self.tree.tabs.is_empty() {
             return;
         }
-        self.tree.active = self.tree.active.min(self.tree.tabs.len() - 1);
+        // Restore the user's tab if it still exists (it may have shifted index,
+        // or been the very tab whose last pane just closed).
+        self.tree.active = user_tab
+            .and_then(|id| self.tree.tabs.iter().position(|t| t.id == id))
+            .unwrap_or(self.tree.active)
+            .min(self.tree.tabs.len() - 1);
         self.sync_layout();
+    }
+
+    /// Perform a tab close (after any confirmation). Returns true to exit.
+    fn do_close_tab(&mut self, tab: TabId) -> bool {
+        let user_tab = self.tree.tabs.get(self.tree.active).map(|t| t.id);
+        let vp = self.viewport();
+        let effects = apply(&mut self.tree, LayoutCommand::CloseTab { tab }, vp);
+        self.apply_effects(effects);
+        if self.tree.tabs.is_empty() {
+            self.shutdown_all();
+            return true;
+        }
+        self.tree.active = user_tab
+            .and_then(|id| self.tree.tabs.iter().position(|t| t.id == id))
+            .unwrap_or(self.tree.active)
+            .min(self.tree.tabs.len() - 1);
+        self.sync_layout();
+        false
     }
 }
 
