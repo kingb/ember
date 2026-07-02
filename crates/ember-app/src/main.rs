@@ -23,9 +23,9 @@ use std::time::{Duration, Instant};
 use control::ControlMsg;
 
 use ember_core::{
-    Axis, BackendControl, BackendEvent, BackendHandle, Config, Direction, GridDims, LayoutCommand,
-    LayoutEffect, LayoutNode, PaneId, Rect, ScrollAmount, SessionBackend, SessionId, Tab, TabId,
-    apply, layout,
+    Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, Direction, GridDims,
+    LayoutCommand, LayoutEffect, LayoutNode, PaneId, Rect, ScrollAmount, SessionBackend, SessionId,
+    Tab, TabId, apply, layout,
 };
 use ember_platform::MenuAction;
 use ember_render::{
@@ -253,6 +253,9 @@ struct RunState {
     /// Inline tab rename in progress: the tab index + the live edit buffer.
     editing_tab: Option<usize>,
     edit_buffer: String,
+    /// The session last told it has focus (DEC 1004 focus reporting) — the
+    /// backend only writes `CSI I`/`CSI O` when the app enabled mode 1004.
+    focus_notified: Option<SessionId>,
 }
 
 /// State for an in-progress tab drag-reorder.
@@ -371,6 +374,7 @@ impl ApplicationHandler for App {
             last_tab_click: None,
             editing_tab: None,
             edit_buffer: String::new(),
+            focus_notified: None,
         };
         if !state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
             // No shell at startup means nothing to show; exit with the message
@@ -568,6 +572,7 @@ impl ApplicationHandler for App {
         let mut new_title: Option<String> = None;
         let mut exited: Vec<SessionId> = Vec::new();
         let mut belled: Vec<SessionId> = Vec::new();
+        let mut clipboard_set: Option<String> = None;
         for (id, handle) in &state.sessions {
             while let Ok(event) = handle.events.try_recv() {
                 match event {
@@ -578,7 +583,18 @@ impl ApplicationHandler for App {
                     }
                     BackendEvent::Exited(_) => exited.push(id.clone()),
                     BackendEvent::Bell => belled.push(id.clone()),
+                    // OSC 52 copy from any pane (tmux/nvim-over-ssh).
+                    BackendEvent::Clipboard(ClipboardOp::Set(text)) => {
+                        clipboard_set = Some(text);
+                    }
                     _ => {}
+                }
+            }
+        }
+        if let Some(text) = clipboard_set {
+            if let Some(cb) = state.clipboard.as_mut() {
+                if let Err(e) = cb.set_text(text) {
+                    eprintln!("[ember] OSC 52 clipboard copy failed: {e}");
                 }
             }
         }
@@ -590,6 +606,22 @@ impl ApplicationHandler for App {
         }
         for session in belled {
             state.on_bell(&session);
+        }
+        // Focus reporting (DEC 1004): tell sessions when their pane gains or
+        // loses focus (pane switch, tab switch, window focus/blur).
+        let focus_now = if state.window_focused { focused } else { None };
+        if focus_now != state.focus_notified {
+            if let Some(old) = state.focus_notified.take() {
+                if let Some(h) = state.sessions.get(&old) {
+                    let _ = h.control.send(BackendControl::Focus(false));
+                }
+            }
+            if let Some(new) = &focus_now {
+                if let Some(h) = state.sessions.get(new) {
+                    let _ = h.control.send(BackendControl::Focus(true));
+                }
+            }
+            state.focus_notified = focus_now;
         }
         // Drain debug-control commands (EMBER_CONTROL) and act on them.
         let cmds: Vec<ControlMsg> = state

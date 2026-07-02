@@ -199,6 +199,12 @@ impl<L: EventListener> AlacrittyProjection<L> {
         self.dims
     }
 
+    /// Whether the app enabled focus reporting (DEC 1004) — gates writing
+    /// `CSI I`/`CSI O` to the PTY on focus changes.
+    pub fn reports_focus(&self) -> bool {
+        self.term.mode().contains(TermMode::FOCUS_IN_OUT)
+    }
+
     fn cursor_state(&self) -> CursorState {
         let point = self.term.grid().cursor.point;
         let visible = self.term.mode().contains(TermMode::SHOW_CURSOR);
@@ -298,7 +304,7 @@ impl<L: EventListener> AlacrittyProjection<L> {
         let engine_line = line as i32 - self.display_offset as i32;
         let (content, style, wrapped) = {
             let cell = &self.term.grid()[Point::new(Line(engine_line), Column(col))];
-            neutral_of(cell, &self.palette)
+            neutral_of(cell, &self.palette, self.term.colors())
         };
         let id = self.interner.intern(style, first_seen);
         CellPatch {
@@ -314,10 +320,15 @@ impl<L: EventListener> AlacrittyProjection<L> {
 }
 
 /// Resolve one alacritty cell into neutral content + style + soft-wrap flag.
-fn neutral_of(cell: &Cell, palette: &Palette) -> (CellContent, Style, bool) {
+/// `colors` overlays runtime OSC 4/10/11 palette changes over our defaults.
+fn neutral_of(
+    cell: &Cell,
+    palette: &Palette,
+    colors: &alacritty_terminal::term::color::Colors,
+) -> (CellContent, Style, bool) {
     let flags = cell.flags;
-    let mut fg = palette.resolve(cell.fg);
-    let mut bg = palette.resolve(cell.bg);
+    let mut fg = palette.resolve_over(colors, cell.fg);
+    let mut bg = palette.resolve_over(colors, cell.bg);
     if flags.contains(Flags::INVERSE) {
         std::mem::swap(&mut fg, &mut bg);
     }

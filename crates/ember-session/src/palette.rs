@@ -41,6 +41,38 @@ impl Palette {
         }
     }
 
+    /// Like [`resolve`](Self::resolve), but honoring colors a program set at
+    /// runtime (OSC 4/10/11 — `term.colors()`) before falling back to ours.
+    pub fn resolve_over(
+        &self,
+        overlay: &alacritty_terminal::term::color::Colors,
+        color: Color,
+    ) -> Rgb {
+        let set = |c: Option<AlacRgb>| c.map(|c| Rgb::new(c.r, c.g, c.b));
+        match color {
+            Color::Spec(AlacRgb { r, g, b }) => Rgb::new(r, g, b),
+            Color::Indexed(i) => set(overlay[i as usize]).unwrap_or(self.colors[i as usize]),
+            Color::Named(named) => set(overlay[named]).unwrap_or_else(|| self.named(named)),
+        }
+    }
+
+    /// Answer an OSC 10/11/12 color *query* by palette index (alacritty's
+    /// `ColorRequest` uses indices ≥ 256 for the named defaults).
+    pub fn query(&self, index: usize) -> AlacRgb {
+        let rgb = match index {
+            0..=255 => self.colors[index],
+            i if i == NamedColor::Foreground as usize => self.default_fg,
+            i if i == NamedColor::Background as usize => self.default_bg,
+            i if i == NamedColor::Cursor as usize => self.cursor,
+            _ => self.default_fg,
+        };
+        AlacRgb {
+            r: rgb.r,
+            g: rgb.g,
+            b: rgb.b,
+        }
+    }
+
     fn named(&self, named: NamedColor) -> Rgb {
         match named {
             NamedColor::Foreground | NamedColor::BrightForeground => self.default_fg,

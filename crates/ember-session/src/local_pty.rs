@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use ember_core::{
-    BackendControl, BackendEvent, BackendHandle, ExitStatus, FrameTx, GridDelta, GridDims,
-    ScrollAmount, SessionBackend, SessionId, VtProjection, frame_channel,
+    BackendControl, BackendEvent, BackendHandle, ClipboardOp, ExitStatus, FrameTx, GridDelta,
+    GridDims, ScrollAmount, SessionBackend, SessionId, VtProjection, frame_channel,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -204,10 +204,14 @@ enum Ev {
 }
 
 /// Forwards alacritty engine events onto the semantic lane and routes engine
-/// query responses (`PtyWrite`) into a shared outbox the emulation thread drains.
+/// query responses (`PtyWrite`, color-query answers) into a shared outbox the
+/// emulation thread drains.
 struct EmberListener {
     events: Sender<BackendEvent>,
     outbox: Arc<Mutex<Vec<u8>>>,
+    /// For answering OSC 10/11 color queries (nvim's background detection
+    /// blocks on this at startup). Static defaults — good enough for queries.
+    palette: crate::palette::Palette,
 }
 
 impl EventListener for EmberListener {
@@ -224,6 +228,19 @@ impl EventListener for EmberListener {
                     .lock()
                     .unwrap()
                     .extend_from_slice(text.as_bytes());
+            }
+            // OSC 52 copy (tmux/nvim-over-ssh). The engine already base64-decoded.
+            AlacEvent::ClipboardStore(_, text) => {
+                let _ = self
+                    .events
+                    .send(BackendEvent::Clipboard(ClipboardOp::Set(text)));
+            }
+            // OSC 4/10/11 query: answer from the palette, straight to the PTY.
+            AlacEvent::ColorRequest(index, format) => {
+                self.outbox
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(format(self.palette.query(index)).as_bytes());
             }
             _ => {}
         }
@@ -260,6 +277,7 @@ fn emulation_loop(
     let listener = EmberListener {
         events: event_tx.clone(),
         outbox: Arc::clone(&outbox),
+        palette: crate::palette::Palette::dark(),
     };
     let mut proj = AlacrittyProjection::new(dims, listener);
     let mut shipper = FrameShipper::default();
@@ -299,7 +317,13 @@ fn emulation_loop(
                 proj.resize(new_dims);
                 shipper.push(&mut proj, &frame_tx);
             }
-            Ev::Control(BackendControl::Focus(_)) => {}
+            Ev::Control(BackendControl::Focus(focused)) => {
+                // DEC 1004 focus reporting (vim FocusGained/autoread, fish hooks).
+                if proj.reports_focus() {
+                    let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+                    let _ = wtx.send(seq.to_vec());
+                }
+            }
             Ev::Control(BackendControl::Shutdown) => {
                 let _ = child.kill();
                 // Reap off-thread: kill() is only SIGHUP, which children can
