@@ -120,10 +120,23 @@ pub enum BackendEvent {
     Exited(ExitStatus),
 }
 
+/// An edge-triggered wake callback: invoked when a delta is published into a
+/// previously-empty slot, so an idle event loop can sleep (ControlFlow::Wait)
+/// and be woken only when there's actually a frame to draw. Winit-free by
+/// design — the app injects a closure backed by its EventLoopProxy.
+type Waker = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// The shared single slot behind the pixel lane.
-#[derive(Default, Debug)]
+#[derive(Default)]
 struct FrameSlot {
     pending: Mutex<Option<GridDelta>>,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl std::fmt::Debug for FrameSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameSlot").finish_non_exhaustive()
+    }
 }
 
 /// Producer end of the pixel lane (held by the emulation thread).
@@ -156,12 +169,22 @@ impl FrameTx {
     /// so frames coalesce rather than queue.
     pub fn push(&self, delta: GridDelta) {
         let mut slot = self.slot.pending.lock().unwrap();
+        let was_empty = slot.is_none();
         match slot.take() {
             Some(mut pending) => {
                 pending.merge(delta);
                 *slot = Some(pending);
             }
             None => *slot = Some(delta),
+        }
+        drop(slot);
+        // Edge-trigger: only wake on the empty→pending transition. A burst
+        // coalesces into one wake until the consumer drains, so the loop isn't
+        // flooded with redraw requests.
+        if was_empty {
+            if let Some(w) = self.slot.waker.lock().unwrap().as_ref() {
+                w();
+            }
         }
     }
 }
@@ -171,6 +194,12 @@ impl FrameRx {
     /// `None` when nothing new has been produced.
     pub fn take(&self) -> Option<GridDelta> {
         self.slot.pending.lock().unwrap().take()
+    }
+
+    /// Register the edge-triggered wake callback (see [`Waker`]). Called once by
+    /// the app after it has an event-loop proxy.
+    pub fn set_waker(&self, waker: Waker) {
+        *self.slot.waker.lock().unwrap() = Some(waker);
     }
 }
 

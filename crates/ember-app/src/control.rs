@@ -107,7 +107,10 @@ mod unix {
     /// must be reachable by this user only: the dir is created 0700 (and must
     /// be OURS — on shared /tmp another user could pre-squat the fixed name),
     /// and the socket itself is chmod 0600.
-    pub fn spawn_listener(bind_path: &Path) -> std::io::Result<Receiver<ControlMsg>> {
+    pub fn spawn_listener(
+        bind_path: &Path,
+        waker: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> std::io::Result<Receiver<ControlMsg>> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if let Some(dir) = bind_path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -133,6 +136,10 @@ mod unix {
                 if let Err(e) = serve(stream, &tx) {
                     eprintln!("[ember-control] request error: {e}");
                 }
+                // The event loop sleeps on ControlFlow::Wait; wake it so the
+                // just-forwarded command is drained this cycle, not on the next
+                // unrelated event.
+                waker();
             }
         });
         Ok(rx)

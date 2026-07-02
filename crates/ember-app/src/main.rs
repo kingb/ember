@@ -49,6 +49,14 @@ const DEFAULT_ROWS: u16 = 24;
 /// How often the loop polls the pixel lanes when idle (~125 Hz). A proxy-waker on
 /// frame push is the noted refinement; this keeps CPU sane without it.
 const POLL: Duration = Duration::from_millis(8);
+
+/// The winit user-event type: a wake nudge from the PTY frame lane or the
+/// control socket, so the loop can idle on `ControlFlow::Wait` instead of
+/// polling and only run when there is genuinely something to do.
+#[derive(Debug, Clone, Copy)]
+enum EmberEvent {
+    Wake,
+}
 /// Redraw cadence (~60fps) while an animation (e.g. the About glow) is active.
 const ANIM_FRAME: Duration = Duration::from_millis(16);
 /// Max gap between clicks at the same cell to count as a double/triple click.
@@ -114,13 +122,27 @@ fn main() {
         }
         return;
     }
+    // Set the macOS app name BEFORE winit builds NSApplication (see below), and
+    // build the event loop early so its proxy can wake the loop from the PTY
+    // frame lane and the control socket (the loop idles on ControlFlow::Wait).
+    ember_platform::set_app_name("Ember");
+    let event_loop = EventLoop::<EmberEvent>::with_user_event()
+        .build()
+        .expect("create event loop");
+    let proxy = event_loop.create_proxy();
+    let wake: std::sync::Arc<dyn Fn() + Send + Sync> = {
+        let proxy = proxy.clone();
+        std::sync::Arc::new(move || {
+            let _ = proxy.send_event(EmberEvent::Wake);
+        })
+    };
     // Optional debug control surface. `EMBER_CONTROL=1` binds a per-PID socket
     // under $TMPDIR/ember-ctl/ (so multiple instances coexist); an explicit path
     // is used verbatim. `ember-term ctl`/`mcp` then drive + introspect this window.
     let control_rx = match std::env::var("EMBER_CONTROL") {
         Ok(val) if !val.is_empty() => {
             let bind = control::server_bind_path(&val);
-            match control::spawn_listener(&bind) {
+            match control::spawn_listener(&bind, wake.clone()) {
                 Ok(rx) => {
                     eprintln!("[ember] control socket listening at {}", bind.display());
                     Some(rx)
@@ -133,15 +155,11 @@ fn main() {
         }
         _ => None,
     };
-    // Set the macOS app name BEFORE winit creates NSApplication + the app menu —
-    // AppKit reads the process name when it builds that menu, so doing it in
-    // `resumed()` (after) is too late. Non-macOS: no-op.
-    ember_platform::set_app_name("Ember");
-    let event_loop = EventLoop::new().expect("create event loop");
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
         state: None,
         control_rx,
+        wake,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -174,6 +192,8 @@ struct App {
     state: Option<RunState>,
     /// Receiver for debug-control commands (Some when `EMBER_CONTROL` is set).
     control_rx: Option<Receiver<ControlMsg>>,
+    /// Wakes the event loop from the PTY frame lane; handed to each session.
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
 }
 
 struct RunState {
@@ -272,6 +292,12 @@ struct RunState {
     /// Latest OSC title per session, so the window title can be re-asserted on
     /// tab/pane switch (not just when a fresh Title event happens to arrive).
     titles: std::collections::HashMap<SessionId, String>,
+    /// Wakes the event loop when a session publishes a frame; registered on
+    /// every session's pixel lane so the loop can idle on `ControlFlow::Wait`.
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    /// The window is fully hidden (another window covers it): suppress the
+    /// ambient animation so an idle-but-covered window doesn't burn cycles.
+    occluded: bool,
 }
 
 /// A close action deferred behind a running-process confirmation.
@@ -329,7 +355,12 @@ pub(crate) fn dims_for_rect(r: Rect, cw: f32, ch: f32) -> GridDims {
     GridDims::new(cols as u16, rows as u16)
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<EmberEvent> for App {
+    /// A wake nudge (frame ready / control command): the real work happens in
+    /// `about_to_wait`, which drains the lanes and requests a redraw — this just
+    /// ensures the loop ran a cycle.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: EmberEvent) {}
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -406,6 +437,8 @@ impl ApplicationHandler for App {
             running: std::collections::HashSet::new(),
             pending_close: None,
             titles: std::collections::HashMap::new(),
+            wake: self.wake.clone(),
+            occluded: false,
         };
         if !state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
             // No shell at startup means nothing to show; exit with the message
@@ -414,6 +447,10 @@ impl ApplicationHandler for App {
         }
         state.sync_layout();
         state.apply_appearance();
+        // Paint once now: with ControlFlow::Wait the loop won't run again until
+        // an event or a frame-lane wake, and the very first frame may have been
+        // published before the waker was registered.
+        state.renderer.window().request_redraw();
         self.state = Some(state);
     }
 
@@ -436,6 +473,12 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(focused) => {
                 state.window_focused = focused;
                 if focused {
+                    state.renderer.window().request_redraw();
+                }
+            }
+            WindowEvent::Occluded(occluded) => {
+                state.occluded = occluded;
+                if !occluded {
                     state.renderer.window().request_redraw();
                 }
             }
@@ -826,7 +869,9 @@ impl ApplicationHandler for App {
             // events can't push it back indefinitely.
             event_loop.set_control_flow(ControlFlow::WaitUntil(state.last_anim + frame));
         } else {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(now + POLL));
+            // Nothing animating: sleep until an event, a frame-lane wake, or a
+            // control command wakes us — no more ~125 Hz idle polling.
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }
@@ -965,6 +1010,7 @@ impl RunState {
                 return false;
             }
         };
+        handle.frames.set_waker(self.wake.clone());
         self.renderer.ensure_pane(&id, dims);
         self.dims_cache.insert(id.clone(), dims);
         self.sessions.insert(id, handle);
@@ -2262,6 +2308,7 @@ impl RunState {
     fn backdrop_animating(&self) -> bool {
         self.config.background.ember_sparks
             && self.window_focused
+            && !self.occluded
             && !self.help
             && !self.about
             && !self.settings_open
