@@ -256,6 +256,8 @@ struct RunState {
     /// The session last told it has focus (DEC 1004 focus reporting) — the
     /// backend only writes `CSI I`/`CSI O` when the app enabled mode 1004.
     focus_notified: Option<SessionId>,
+    /// Fractional wheel-scroll carry (trackpad pixel deltas < one cell).
+    wheel_accum: f32,
 }
 
 /// State for an in-progress tab drag-reorder.
@@ -375,6 +377,7 @@ impl ApplicationHandler for App {
             editing_tab: None,
             edit_buffer: String::new(),
             focus_notified: None,
+            wheel_accum: 0.0,
         };
         if !state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
             // No shell at startup means nothing to show; exit with the message
@@ -431,12 +434,16 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y * WHEEL_LINES as f32).round() as i32,
-                    MouseScrollDelta::PixelDelta(p) => {
-                        (p.y as f32 / CELL_HEIGHT * WHEEL_LINES as f32).round() as i32
-                    }
+                // Notch wheels scroll WHEEL_LINES per notch; trackpads report
+                // pixel-precise deltas that map 1:1 to cells (no multiplier).
+                // Accumulate fractions so slow two-finger drags still move.
+                let cells = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y * WHEEL_LINES as f32,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / CELL_HEIGHT,
                 };
+                state.wheel_accum += cells;
+                let lines = state.wheel_accum.trunc() as i32;
+                state.wheel_accum -= lines as f32;
                 state.wheel_scroll(lines);
             }
             WindowEvent::MouseInput {
@@ -734,7 +741,12 @@ impl RunState {
         if lines == 0 {
             return;
         }
-        let Some(id) = self.focused_session_id() else {
+        // Scroll the pane under the pointer (every mainstream terminal), not
+        // the focused one; fall back to focused when hovering the chrome.
+        let Some(id) = self
+            .session_under_cursor()
+            .or_else(|| self.focused_session_id())
+        else {
             return;
         };
         let m = self.renderer.pane_modes(&id);
@@ -1202,6 +1214,15 @@ impl RunState {
     /// Whether Ctrl+Opt is currently held (the visual-split modifier).
     fn split_modifier_held(&self) -> bool {
         self.modifiers.control_key() && self.modifiers.alt_key()
+    }
+
+    /// The pane under the mouse cursor, if any.
+    fn session_under_cursor(&self) -> Option<SessionId> {
+        let (x, y) = self.cursor;
+        self.pane_rects
+            .iter()
+            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .map(|(s, _)| s.clone())
     }
 
     /// Recompute the Ctrl+Opt split drop-zone preview from the cursor over a pane:
