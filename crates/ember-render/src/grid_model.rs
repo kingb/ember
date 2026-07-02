@@ -100,11 +100,14 @@ impl GridModel {
         let end = (start + cols).min(self.cells.len());
         self.cells[start..end]
             .iter()
-            .map(|c| match &c.content {
-                CellContent::Char(ch) => *ch,
-                CellContent::Cluster(s) => s.chars().next().unwrap_or(' '),
-                CellContent::Empty => ' ',
-                _ => ' ',
+            .filter_map(|c| match &c.content {
+                CellContent::Char(ch) => Some(ch.to_string()),
+                CellContent::Cluster(s) => Some(s.to_string()),
+                CellContent::Empty => Some(" ".to_string()),
+                // The leader at col-1 owns the glyph; emitting a space here
+                // would put a phantom gap after every wide char in copies.
+                CellContent::WideSpacer => None,
+                _ => Some(" ".to_string()),
             })
             .collect()
     }
@@ -119,23 +122,32 @@ impl GridModel {
         let end = (start + cols).min(self.cells.len());
         let mut runs: Vec<(String, ember_core::Rgb, ember_core::Attrs)> = Vec::new();
         for cell in &self.cells[start..end] {
+            // The wide glyph's own advance covers the spacer's column — shaping
+            // a space there would shift the rest of the row right by a cell.
+            if matches!(cell.content, CellContent::WideSpacer) {
+                continue;
+            }
             let style = self.style_of(cell.style);
-            let ch = if style.attrs.contains(ember_core::Attrs::HIDDEN) {
-                ' '
-            } else {
-                match &cell.content {
-                    CellContent::Char(c) => *c,
-                    CellContent::Cluster(s) => s.chars().next().unwrap_or(' '),
-                    CellContent::Empty => ' ',
-                    _ => ' ',
+            let mut push = |txt: &str| {
+                let fg = style.fg;
+                match runs.last_mut() {
+                    Some((text, run_fg, run_attrs))
+                        if *run_fg == fg && *run_attrs == style.attrs =>
+                    {
+                        text.push_str(txt)
+                    }
+                    _ => runs.push((txt.to_string(), fg, style.attrs)),
                 }
             };
-            let fg = style.fg;
-            match runs.last_mut() {
-                Some((text, run_fg, run_attrs)) if *run_fg == fg && *run_attrs == style.attrs => {
-                    text.push(ch)
-                }
-                _ => runs.push((ch.to_string(), fg, style.attrs)),
+            if style.attrs.contains(ember_core::Attrs::HIDDEN) {
+                push(" ");
+                continue;
+            }
+            match &cell.content {
+                CellContent::Char(c) => push(&c.to_string()),
+                // Full cluster: combining accents / ZWJ emoji shape as one glyph.
+                CellContent::Cluster(s) => push(s),
+                _ => push(" "),
             }
         }
         // Trailing blanks have no glyph; drop them to keep the buffer small.

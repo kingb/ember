@@ -10,8 +10,8 @@ use std::path::Path;
 
 use ember_core::Rect;
 use glyphon::{
-    Buffer, Cache, Color, FontSystem, Metrics, Resolution, SwashCache, TextArea, TextAtlas,
-    TextBounds, TextRenderer, Viewport,
+    Buffer, Cache, Color, Metrics, Resolution, SwashCache, TextArea, TextAtlas, TextBounds,
+    TextRenderer, Viewport,
 };
 use wgpu::{
     DeviceDescriptor, Instance, InstanceDescriptor, MultisampleState, RequestAdapterOptions,
@@ -75,7 +75,7 @@ pub struct Shot<'a> {
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
 /// pane grid dimensions to match what `capture` will draw. CPU-only (no GPU).
 pub fn cell_metrics() -> (f32, f32) {
-    let mut font_system = FontSystem::new();
+    let mut font_system = crate::paint::new_font_system();
     (measure_cell_width(&mut font_system), CELL_HEIGHT)
 }
 
@@ -173,7 +173,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let mut font_system = FontSystem::new();
+    let mut font_system = crate::paint::new_font_system();
     let mut swash_cache = SwashCache::new();
     let cache = Cache::new(&device);
     let mut viewport = Viewport::new(&device, &cache);

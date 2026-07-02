@@ -329,7 +329,7 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let mut font_system = FontSystem::new();
+        let mut font_system = crate::paint::new_font_system();
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);

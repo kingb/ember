@@ -79,6 +79,11 @@ pub enum CellContent {
     Empty,
     Char(char),
     Cluster(Box<str>),
+    /// The second column of a 2-column (wide) glyph. Self-describing so a
+    /// spacer-only patch stays unambiguous (per-cell damage can legally split
+    /// the leader/spacer pair): render draws no glyph and no bg of its own —
+    /// the leader at `col - 1` owns both; cursor/selection snap to/span from it.
+    WideSpacer,
 }
 
 /// One neutral cell: resolved content + an interned style key.
@@ -90,6 +95,12 @@ pub struct NeutralCell {
     /// (alacritty's `WRAPLINE`). Lets copy join a wrapped logical line without a
     /// spurious newline. Meaningless on non-last cells.
     pub wrapped: bool,
+    /// This cell's glyph spans 2 columns (CJK, most emoji) — set for wide
+    /// `Char` AND wide `Cluster` leaders; the following cell is a
+    /// [`CellContent::WideSpacer`]. Defaulted so pre-wide serialized frames
+    /// parse as narrow.
+    #[serde(default)]
+    pub wide: bool,
 }
 
 impl NeutralCell {
@@ -98,6 +109,7 @@ impl NeutralCell {
             content,
             style,
             wrapped: false,
+            wide: false,
         }
     }
 }
@@ -366,5 +378,46 @@ mod tests {
             a.new_styles,
             vec![(StyleId(0), red), (StyleId(1), Style::default())]
         );
+    }
+
+    // ---  wide-char contract (B1 ruling ) ---------------
+
+    #[test]
+    fn pre_wide_serialized_cells_parse_as_narrow() {
+        // A frame recorded before the `wide` field existed must deserialize.
+        let json = r#"{"content":{"Char":"x"},"style":7,"wrapped":false}"#;
+        let cell: NeutralCell = serde_json::from_str(json).expect("old frame parses");
+        assert!(!cell.wide);
+        assert_eq!(cell.content, CellContent::Char('x'));
+    }
+
+    #[test]
+    fn wide_leader_cluster_and_spacer_round_trip() {
+        let mut cjk = NeutralCell::new(CellContent::Char('漢'), StyleId(1));
+        cjk.wide = true;
+        let mut emoji = NeutralCell::new(CellContent::Cluster("👩\u{200d}🚀".into()), StyleId(2));
+        emoji.wide = true;
+        let spacer = NeutralCell::new(CellContent::WideSpacer, StyleId(1));
+        for cell in [&cjk, &emoji, &spacer] {
+            let s = serde_json::to_string(cell).unwrap();
+            assert_eq!(&serde_json::from_str::<NeutralCell>(&s).unwrap(), cell);
+        }
+    }
+
+    #[test]
+    fn spacer_only_patch_stays_self_describing_through_merge() {
+        // Per-cell damage can deliver a spacer WITHOUT its leader; after any
+        // amount of coalescing it must still be identifiable in isolation.
+        let dims = GridDims::new(80, 24);
+        let mut a = GridDelta::new(1, dims);
+        let mut b = GridDelta::new(2, dims);
+        b.cells = vec![CellPatch {
+            row: 3,
+            col: 11,
+            cell: NeutralCell::new(CellContent::WideSpacer, StyleId(0)),
+        }];
+        a.merge(b);
+        assert_eq!(a.cells.len(), 1);
+        assert_eq!(a.cells[0].cell.content, CellContent::WideSpacer);
     }
 }

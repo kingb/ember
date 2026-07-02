@@ -127,6 +127,26 @@ pub(crate) fn spark_quads(
     }
     out
 }
+/// Build the shared `FontSystem`, dropping known-degenerate faces. macOS ships
+/// GB18030Bitmap, a legacy bitmap-only CJK font that fontdb classifies as
+/// monospaced — cosmic-text's monospace-preferring fallback then picks it for
+/// CJK, but its metrics are degenerate (infinite advance, NaN baseline) and one
+/// such glyph corrupts the entire frame's vertex stream. Excising it makes
+/// fallback land on a real CJK face (PingFang).
+pub(crate) fn new_font_system() -> FontSystem {
+    let mut fs = FontSystem::new();
+    let bad: Vec<glyphon::fontdb::ID> = fs
+        .db()
+        .faces()
+        .filter(|f| f.post_script_name == "GB18030Bitmap")
+        .map(|f| f.id)
+        .collect();
+    for id in bad {
+        fs.db_mut().remove_face(id);
+    }
+    fs
+}
+
 /// Measure the monospace advance for the current font/size, so background quads
 /// line up with the glyphs glyphon flows.
 pub(crate) fn measure_cell_width(font_system: &mut FontSystem) -> f32 {
@@ -184,6 +204,14 @@ fn dim_rgb(c: ember_core::Rgb) -> ember_core::Rgb {
 /// are quads (see [`grid_quads`]) — cosmic-text doesn't draw decorations.
 pub(crate) fn shape_grid(font_system: &mut FontSystem, buffer: &mut Buffer, grid: &GridModel) {
     use ember_core::Attrs as CellAttrs;
+    // One grid row = one visual line, always. With the default word-wrap a row
+    // whose shaped width overruns the pane (wide CJK/emoji advances aren't
+    // exactly 2·cw) soft-wraps, shifting every row below it and clipping the
+    // tail — the grid is the layout; the shaper must not re-flow it.
+    buffer.set_wrap(font_system, glyphon::Wrap::None);
+    // Nor may it scroll: a prior overflow (taller fallback line boxes) can
+    // leave a sticky scroll offset that shifts the whole grid up.
+    buffer.set_scroll(glyphon::cosmic_text::Scroll::default());
     let lines = grid.dims.screen_lines;
     let mut spans: Vec<(String, Color, CellAttrs)> = Vec::new();
     for row in 0..lines {
@@ -207,7 +235,13 @@ pub(crate) fn shape_grid(font_system: &mut FontSystem, buffer: &mut Buffer, grid
     buffer.set_rich_text(
         font_system,
         spans.iter().map(|(t, c, cell_attrs)| {
-            let mut a = Attrs::new().family(Family::Monospace).color(*c);
+            // Pin every span's line box to the grid metrics: CJK/emoji
+            // fallback fonts carry taller line heights that would otherwise
+            // stretch their row and push all later rows off the cell grid.
+            let mut a = Attrs::new()
+                .family(Family::Monospace)
+                .color(*c)
+                .metrics(Metrics::new(FONT_SIZE, LINE_HEIGHT));
             if cell_attrs.contains(CellAttrs::BOLD) {
                 a = a.weight(glyphon::Weight::BOLD);
             }
@@ -275,15 +309,27 @@ pub(crate) fn grid_quads(
     if focused {
         let cur = grid.cursor;
         if cur.visible && cur.shape != ember_core::CursorShape::Hidden {
-            let x = ox + cur.col as f32 * cw;
+            // A wide glyph's block cursor spans both columns; on a spacer the
+            // cursor snaps back to its leader (contract: leader owns the pair).
+            let (col, wide) = match grid.cell(cur.row, cur.col) {
+                Some(c) if matches!(c.content, ember_core::CellContent::WideSpacer) => {
+                    (cur.col.saturating_sub(1), true)
+                }
+                Some(c) => (cur.col, c.wide),
+                None => (cur.col, false),
+            };
+            let cw_cursor = if wide { cw * 2.0 } else { cw };
+            let x = ox + col as f32 * cw;
             let y = oy + cur.row as f32 * ch;
             // Shape follows DECSCUSR (vim mode-dependent cursors): a beam or
             // underline is a thin solid bar; the block stays translucent so
             // the glyph underneath remains readable.
             let (rect, alpha) = match cur.shape {
                 ember_core::CursorShape::Beam => (scaled(x, y, 2.0, ch, sf), 1.0),
-                ember_core::CursorShape::Underline => (scaled(x, y + ch - 2.0, cw, 2.0, sf), 1.0),
-                _ => (scaled(x, y, cw, ch, sf), 0.5),
+                ember_core::CursorShape::Underline => {
+                    (scaled(x, y + ch - 2.0, cw_cursor, 2.0, sf), 1.0)
+                }
+                _ => (scaled(x, y, cw_cursor, ch, sf), 0.5),
             };
             out.push((rect, lin_rgba(FG, alpha)));
         }

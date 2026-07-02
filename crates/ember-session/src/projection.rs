@@ -312,7 +312,7 @@ impl<L: EventListener> AlacrittyProjection<L> {
         // `v - display_offset` (history lines are negative). At the bottom
         // (`display_offset == 0`) this is just `Line(v)`.
         let engine_line = line as i32 - self.display_offset as i32;
-        let (content, style, wrapped) = {
+        let (content, style, wrapped, wide) = {
             let cell = &self.term.grid()[Point::new(Line(engine_line), Column(col))];
             neutral_of(cell, &self.palette, self.term.colors())
         };
@@ -324,18 +324,19 @@ impl<L: EventListener> AlacrittyProjection<L> {
                 content,
                 style: id,
                 wrapped,
+                wide,
             },
         }
     }
 }
 
-/// Resolve one alacritty cell into neutral content + style + soft-wrap flag.
+/// Resolve one alacritty cell into neutral content + style + soft-wrap + wide.
 /// `colors` overlays runtime OSC 4/10/11 palette changes over our defaults.
 fn neutral_of(
     cell: &Cell,
     palette: &Palette,
     colors: &alacritty_terminal::term::color::Colors,
-) -> (CellContent, Style, bool) {
+) -> (CellContent, Style, bool, bool) {
     let flags = cell.flags;
     let mut fg = palette.resolve_over(colors, cell.fg);
     let mut bg = palette.resolve_over(colors, cell.bg);
@@ -364,14 +365,30 @@ fn neutral_of(
     }
 
     let style = Style { fg, bg, attrs };
-    // Blanks (incl. the spacer after a wide char) carry no glyph; render fills bg.
-    let content = match cell.c {
-        ' ' | '\0' => CellContent::Empty,
-        c => CellContent::Char(c),
+    // Wide (2-column) glyphs: the leader carries `wide`; the following spacer
+    // cell ships as the self-describing `WideSpacer` (B1 ruling :
+    // per-cell damage can split the pair, so the spacer must stand alone).
+    let wide = flags.intersects(Flags::WIDE_CHAR);
+    let content = if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+        CellContent::WideSpacer
+    } else {
+        // Combining marks / ZWJ tails live in the cell's zerowidth storage —
+        // fold them into a Cluster so NFD accents survive the seam.
+        match (cell.c, cell.zerowidth()) {
+            (c, Some(zw)) if !zw.is_empty() => {
+                let mut s = String::with_capacity(1 + zw.len() * 4);
+                s.push(c);
+                s.extend(zw);
+                CellContent::Cluster(s.into_boxed_str())
+            }
+            (' ' | '\0', _) => CellContent::Empty,
+            (c, _) => CellContent::Char(c),
+        }
     };
+    let wide = wide && !matches!(content, CellContent::WideSpacer | CellContent::Empty);
     // Last cell of a soft-wrapped row carries WRAPLINE — the logical line continues.
     let wrapped = flags.contains(Flags::WRAPLINE);
-    (content, style, wrapped)
+    (content, style, wrapped, wide)
 }
 
 #[cfg(test)]
@@ -388,6 +405,27 @@ mod tests {
             .iter()
             .find(|p| p.row == row && p.col == col)
             .expect("cell present")
+    }
+
+    #[test]
+    fn wide_and_combining_cells_cross_the_seam() {
+        let mut p = proj();
+        p.advance("漢e\u{0301}".as_bytes());
+        let mut d = GridDelta::default();
+        p.drain_damage_into(&mut d);
+        let leader = find(&d, 0, 0);
+        assert_eq!(leader.cell.content, CellContent::Char('漢'));
+        assert!(leader.cell.wide, "CJK leader must carry wide");
+        let spacer = find(&d, 0, 1);
+        assert_eq!(spacer.cell.content, CellContent::WideSpacer);
+        assert!(!spacer.cell.wide);
+        let combining = find(&d, 0, 2);
+        assert_eq!(
+            combining.cell.content,
+            CellContent::Cluster("e\u{0301}".into()),
+            "NFD accent must fold into a Cluster"
+        );
+        assert!(!combining.cell.wide);
     }
 
     #[test]

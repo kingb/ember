@@ -145,6 +145,8 @@ impl Selection {
                 match grid.cell(row, col).map(|c| &c.content) {
                     Some(CellContent::Char(c)) => line.push(*c),
                     Some(CellContent::Cluster(cl)) => line.push_str(cl),
+                    // The wide leader already contributed both columns' text.
+                    Some(CellContent::WideSpacer) => {}
                     _ => line.push(' '),
                 }
                 col += 1;
