@@ -12,7 +12,7 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{CursorShape as AlacCursorShape, Processor};
 use ember_core::{
     Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, MarkStatus,
     NeutralCell, OscEvent, ScrollAmount, Style, StyleId, VtProjection,
@@ -207,11 +207,21 @@ impl<L: EventListener> AlacrittyProjection<L> {
 
     fn cursor_state(&self) -> CursorState {
         let point = self.term.grid().cursor.point;
-        let visible = self.term.mode().contains(TermMode::SHOW_CURSOR);
+        // The cursor lives on the live screen; scrolled into history it moves
+        // down out of the viewport (its viewport row is line + offset).
+        let row = point.line.0.max(0) as u32 + self.display_offset as u32;
+        let on_screen = row < self.dims.screen_lines as u32;
+        let visible = self.term.mode().contains(TermMode::SHOW_CURSOR) && on_screen;
+        let shape = match self.term.cursor_style().shape {
+            AlacCursorShape::Block | AlacCursorShape::HollowBlock => CursorShape::Block,
+            AlacCursorShape::Underline => CursorShape::Underline,
+            AlacCursorShape::Beam => CursorShape::Beam,
+            AlacCursorShape::Hidden => CursorShape::Hidden,
+        };
         CursorState {
-            row: point.line.0.max(0) as u16,
+            row: row.min(u16::MAX as u32) as u16,
             col: point.column.0 as u16,
-            shape: CursorShape::Block,
+            shape,
             visible,
         }
     }

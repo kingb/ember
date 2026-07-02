@@ -274,17 +274,18 @@ pub(crate) fn grid_quads(
     }
     if focused {
         let cur = grid.cursor;
-        if cur.visible {
-            out.push((
-                scaled(
-                    ox + cur.col as f32 * cw,
-                    oy + cur.row as f32 * ch,
-                    cw,
-                    ch,
-                    sf,
-                ),
-                lin_rgba(FG, 0.5),
-            ));
+        if cur.visible && cur.shape != ember_core::CursorShape::Hidden {
+            let x = ox + cur.col as f32 * cw;
+            let y = oy + cur.row as f32 * ch;
+            // Shape follows DECSCUSR (vim mode-dependent cursors): a beam or
+            // underline is a thin solid bar; the block stays translucent so
+            // the glyph underneath remains readable.
+            let (rect, alpha) = match cur.shape {
+                ember_core::CursorShape::Beam => (scaled(x, y, 2.0, ch, sf), 1.0),
+                ember_core::CursorShape::Underline => (scaled(x, y + ch - 2.0, cw, 2.0, sf), 1.0),
+                _ => (scaled(x, y, cw, ch, sf), 0.5),
+            };
+            out.push((rect, lin_rgba(FG, alpha)));
         }
         if split {
             push_border(out, rect, ACCENT, sf);
