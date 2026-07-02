@@ -80,6 +80,9 @@ pub struct AlacrittyProjection<L: EventListener> {
     /// Next drain emits a full reset + the complete style table
     /// ([`ember_core::BackendControl::RequestFull`]).
     resync: bool,
+    /// Tail of the previous read that may be a split OSC 133 sequence (its
+    /// bytes were already fed to the engine; kept only for the scanner).
+    scan_tail: Vec<u8>,
 }
 
 /// One tracked OSC 133 command: its prompt's absolute history line + exit code.
@@ -102,6 +105,7 @@ impl<L: EventListener> AlacrittyProjection<L> {
             display_offset: 0,
             marks: Vec::new(),
             resync: false,
+            scan_tail: Vec::new(),
         }
     }
 
@@ -111,12 +115,30 @@ impl<L: EventListener> AlacrittyProjection<L> {
     /// and records prompt/exit state for the gutter.
     pub fn advance(&mut self, bytes: &[u8]) -> Vec<OscEvent> {
         let mut events = Vec::new();
+        // Scan over (carried tail ++ new bytes): a mark split across the 8 KB
+        // read boundary is statistically inevitable in long sessions and used
+        // to be lost forever. The tail's bytes were already fed to the engine
+        // last read — the carry exists only for the scanner.
+        let tail_len = self.scan_tail.len();
+        let owned: Vec<u8>;
+        let scan_buf: &[u8] = if tail_len == 0 {
+            bytes
+        } else {
+            let mut v = std::mem::take(&mut self.scan_tail);
+            v.extend_from_slice(bytes);
+            owned = v;
+            &owned
+        };
+        let result = crate::osc133::scan_split(scan_buf);
         let mut cut = 0usize;
-        for (past, m) in crate::osc133::scan_indexed(bytes) {
+        for (past, m) in result.marks {
             // Feed the engine up to and including this (invisible) mark, so the
-            // cursor sits exactly where the mark was emitted.
-            self.parser.advance(&mut self.term, &bytes[cut..past]);
-            cut = past;
+            // cursor sits exactly where the mark was emitted. Positions inside
+            // the carried tail map to the start of this read (already fed).
+            let feed_to = past.saturating_sub(tail_len).min(bytes.len());
+            self.parser
+                .advance(&mut self.term, &bytes[cut..feed_to.max(cut)]);
+            cut = feed_to.max(cut);
             match m {
                 Osc133::PromptStart => {
                     let abs = self.term.grid().history_size() as i64
@@ -143,6 +165,12 @@ impl<L: EventListener> AlacrittyProjection<L> {
         }
         // Feed the remainder.
         self.parser.advance(&mut self.term, &bytes[cut..]);
+        // Carry a plausible split-sequence suffix into the next read (bounded —
+        // scan_split already rejects oversized garbage as malformed).
+        self.scan_tail.clear();
+        if let Some(inc) = result.incomplete {
+            self.scan_tail.extend_from_slice(&scan_buf[inc..]);
+        }
         events
     }
 
@@ -436,6 +464,23 @@ mod tests {
             .iter()
             .find(|p| p.row == row && p.col == col)
             .expect("cell present")
+    }
+
+    #[test]
+    fn osc133_marks_survive_read_boundaries() {
+        // Split every which way: mid-prefix, mid-params, and mid-ST.
+        let mut p = proj();
+        let mut ev = Vec::new();
+        ev.extend(p.advance(b"prompt \x1b]1"));
+        ev.extend(p.advance(b"33;A\x07 cmd \x1b]133;D;"));
+        ev.extend(p.advance(b"13\x1b"));
+        ev.extend(p.advance(b"\\ tail"));
+        assert_eq!(
+            ev,
+            vec![OscEvent::PromptStart, OscEvent::CommandEnd(Some(13))]
+        );
+        // The held-back tail must not leak into later scans.
+        assert_eq!(p.advance(b"plain output"), vec![]);
     }
 
     #[test]
