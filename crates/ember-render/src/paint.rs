@@ -590,6 +590,7 @@ pub(crate) fn build_tabs(
 /// sized to `lines`, with the `(key, desc)` rows shaped into `buffer`. Pushes quads
 /// to `out` and returns the panel rect (logical px) for text placement. Shared by
 /// the windowed renderer and the headless capture so they render identically.
+#[allow(clippy::too_many_arguments)] // a draw helper: title/hint/geometry/out
 pub(crate) fn build_help(
     font_system: &mut FontSystem,
     buffer: &mut Buffer,
