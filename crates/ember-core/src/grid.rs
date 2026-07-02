@@ -172,6 +172,21 @@ pub enum MarkStatus {
     Fail,
 }
 
+/// Which xterm mouse-reporting protocols the app enabled (terminal state,
+/// latest-wins on merge). `click`/`drag`/`motion` are cumulative levels
+/// (1000/1002/1003); `sgr` (1006) selects the modern encoding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MouseProto {
+    /// DECSET 1000: report button press/release.
+    pub click: bool,
+    /// DECSET 1002: also report motion while a button is held (drag).
+    pub drag: bool,
+    /// DECSET 1003: also report all motion.
+    pub motion: bool,
+    /// DECSET 1006: SGR extended encoding (unlimited coordinates).
+    pub sgr: bool,
+}
+
 /// Owned, `Send`, **mergeable** render-bound delta (the B1 contract signature 1).
 ///
 /// Under backpressure the producer merges successive drains into one delta (the
@@ -210,6 +225,9 @@ pub struct GridDelta {
     /// pre-field serialized frames parse.
     #[serde(default)]
     pub app_cursor: bool,
+    /// Which mouse protocols are enabled (refines `mouse_reporting`).
+    #[serde(default)]
+    pub mouse: MouseProto,
     /// OSC 133 command marks currently **visible** in the viewport, as
     /// `(visible_row, status)` — recomputed each drain from the marks' absolute
     /// history lines + `display_offset`, so they scroll with the content. Latest-
@@ -287,6 +305,7 @@ impl GridDelta {
         self.display_offset = newer.display_offset;
         self.history_len = newer.history_len;
         self.app_cursor = newer.app_cursor;
+        self.mouse = newer.mouse;
         self.alt_screen = newer.alt_screen;
         self.mouse_reporting = newer.mouse_reporting;
         self.marks = newer.marks;

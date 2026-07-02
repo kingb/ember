@@ -176,6 +176,8 @@ pub struct PaneModes {
     pub mouse_reporting: bool,
     /// Application cursor keys (DECCKM) — arrows encode as `ESC O A`….
     pub app_cursor: bool,
+    /// Which mouse-reporting protocols the app enabled.
+    pub mouse: ember_core::MouseProto,
 }
 
 /// A read-only snapshot of a pane's grid for the debug control surface.
@@ -501,6 +503,7 @@ impl Renderer {
                 alt_screen: p.grid.alt_screen,
                 mouse_reporting: p.grid.mouse_reporting,
                 app_cursor: p.grid.app_cursor,
+                mouse: p.grid.mouse,
             })
             .unwrap_or_default()
     }

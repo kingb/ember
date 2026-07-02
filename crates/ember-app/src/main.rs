@@ -259,6 +259,11 @@ struct RunState {
     focus_notified: Option<SessionId>,
     /// Fractional wheel-scroll carry (trackpad pixel deltas < one cell).
     wheel_accum: f32,
+    /// A mouse press being forwarded to an app (session + button code) — its
+    /// drag/release go to the same session even if the pointer leaves the pane.
+    mouse_press: Option<(SessionId, u8)>,
+    /// Last (col, row) a motion report was sent for (dedup per cell).
+    last_mouse_cell: Option<(u16, u16)>,
 }
 
 /// State for an in-progress tab drag-reorder.
@@ -379,6 +384,8 @@ impl ApplicationHandler for App {
             edit_buffer: String::new(),
             focus_notified: None,
             wheel_accum: 0.0,
+            mouse_press: None,
+            last_mouse_cell: None,
         };
         if !state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
             // No shell at startup means nothing to show; exit with the message
@@ -432,6 +439,9 @@ impl ApplicationHandler for App {
                 } else if state.selecting {
                     let (x, y) = state.cursor;
                     state.extend_selection(x, y);
+                } else {
+                    // Mouse-aware apps get drag (1002) / all-motion (1003) reports.
+                    state.forward_mouse_motion();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -449,18 +459,37 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
-                button: MouseButton::Left,
+                button,
                 ..
-            } => state.left_click(),
+            } => match button {
+                MouseButton::Left => state.left_click(),
+                // Middle/right have no local function — forward when the app
+                // listens (Shift forces local behavior, i.e. nothing).
+                MouseButton::Middle => {
+                    state.forward_mouse_press(1);
+                }
+                MouseButton::Right => {
+                    state.forward_mouse_press(2);
+                }
+                _ => {}
+            },
             WindowEvent::MouseInput {
                 state: ElementState::Released,
-                button: MouseButton::Left,
+                button,
                 ..
             } => {
-                state.tab_drag = None;
-                state.renderer.set_tab_drag(None);
-                state.selecting = false;
-                state.scrollbar_drag = None;
+                state.forward_mouse_release(match button {
+                    MouseButton::Left => 0,
+                    MouseButton::Middle => 1,
+                    MouseButton::Right => 2,
+                    _ => 0,
+                });
+                if button == MouseButton::Left {
+                    state.tab_drag = None;
+                    state.renderer.set_tab_drag(None);
+                    state.selecting = false;
+                    state.scrollbar_drag = None;
+                }
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
@@ -762,6 +791,34 @@ impl RunState {
         };
         let m = self.renderer.pane_modes(&id);
         let (alt, mouse) = (m.alt_screen, m.mouse_reporting);
+        // Mouse-aware app: the wheel is button 64 (up) / 65 (down), one report
+        // per line. Shift keeps the wheel local (scrollback), same as clicks.
+        if mouse && !self.modifiers.shift_key() {
+            let (x, y) = self.cursor;
+            if let Some((_, rect)) = self
+                .pane_rects
+                .iter()
+                .find(|(s, r)| {
+                    *s == id && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+                })
+                .cloned()
+            {
+                let (cw, ch) = self.renderer.cell_size();
+                let col = ((x - rect.x) / cw as f64).max(0.0) as u16;
+                let row = ((y - rect.y) / ch as f64).max(0.0) as u16;
+                let btn = if lines > 0 { 64 } else { 65 } + self.mouse_mod_bits();
+                let mut bytes = Vec::new();
+                for _ in 0..lines.abs() {
+                    bytes.extend(Self::mouse_report_bytes(m.mouse.sgr, btn, col, row, true));
+                }
+                if let Some(h) = self.sessions.get(&id) {
+                    let _ = h
+                        .control
+                        .send(BackendControl::Input(bytes.into_boxed_slice()));
+                }
+                return;
+            }
+        }
         let Some(h) = self.sessions.get(&id) else {
             return;
         };
@@ -1414,8 +1471,160 @@ impl RunState {
             self.scroll_to_at(&sid, y as f32);
             return;
         }
+        // Mouse-aware app (vim :set mouse=a, htop): forward the click instead
+        // of selecting — unless Shift is held, the universal local-selection
+        // escape hatch.
+        if self.forward_mouse_press(0) {
+            return;
+        }
         // A click in a pane body starts a selection (mode by click count).
         self.begin_selection(x, y);
+    }
+
+    /// Encode one xterm mouse report. SGR (1006) when the app enabled it, else
+    /// legacy X10 bytes (coordinates clamped to its 223 limit).
+    fn mouse_report_bytes(sgr: bool, btn: u8, col: u16, row: u16, press: bool) -> Vec<u8> {
+        if sgr {
+            format!(
+                "\x1b[<{btn};{};{}{}",
+                col + 1,
+                row + 1,
+                if press { 'M' } else { 'm' }
+            )
+            .into_bytes()
+        } else {
+            // X10 has no release button id — releases send 3.
+            let b = if press { btn } else { 3 };
+            let cx = (col + 1).min(223) as u8 + 32;
+            let cy = (row + 1).min(223) as u8 + 32;
+            vec![0x1b, b'[', b'M', 32 + b, cx, cy]
+        }
+    }
+
+    /// The pane under the pointer + the cell the pointer is over, when that
+    /// pane has mouse reporting enabled and Shift isn't overriding it.
+    fn mouse_target(&self) -> Option<(SessionId, ember_core::MouseProto, u16, u16)> {
+        if self.modifiers.shift_key() {
+            return None;
+        }
+        let (x, y) = self.cursor;
+        let (sid, rect) = self
+            .pane_rects
+            .iter()
+            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)?
+            .clone();
+        let modes = self.renderer.pane_modes(&sid);
+        if !modes.mouse_reporting {
+            return None;
+        }
+        let (cw, ch) = self.renderer.cell_size();
+        let col = ((x - rect.x) / cw as f64).max(0.0) as u16;
+        let row = ((y - rect.y) / ch as f64).max(0.0) as u16;
+        Some((sid, modes.mouse, col, row))
+    }
+
+    /// Modifier bits added to the button code (xterm: alt +8, ctrl +16; shift
+    /// +4 is never sent — Shift is reserved as the local-selection override).
+    fn mouse_mod_bits(&self) -> u8 {
+        (self.modifiers.alt_key() as u8) * 8 + (self.modifiers.control_key() as u8) * 16
+    }
+
+    /// Forward a button press to the pane under the pointer if it listens.
+    /// Returns true when consumed (the caller must not start a selection).
+    fn forward_mouse_press(&mut self, btn: u8) -> bool {
+        let Some((sid, proto, col, row)) = self.mouse_target() else {
+            return false;
+        };
+        if !proto.click {
+            return false;
+        }
+        let code = btn + self.mouse_mod_bits();
+        let bytes = Self::mouse_report_bytes(proto.sgr, code, col, row, true);
+        if let Some(h) = self.sessions.get(&sid) {
+            let _ = h
+                .control
+                .send(BackendControl::Input(bytes.into_boxed_slice()));
+        }
+        self.mouse_press = Some((sid, btn));
+        self.last_mouse_cell = Some((col, row));
+        true
+    }
+
+    /// Forward the matching release for an in-flight forwarded press.
+    fn forward_mouse_release(&mut self, btn: u8) {
+        let Some((sid, pressed)) = self.mouse_press.clone() else {
+            return;
+        };
+        if pressed != btn {
+            return;
+        }
+        self.mouse_press = None;
+        self.last_mouse_cell = None;
+        let proto = self.renderer.pane_modes(&sid).mouse;
+        // Coordinates relative to the pressed pane, clamped inside it.
+        let Some((_, rect)) = self.pane_rects.iter().find(|(s, _)| *s == sid) else {
+            return;
+        };
+        let (cw, ch) = self.renderer.cell_size();
+        let (x, y) = self.cursor;
+        let col = ((x - rect.x).max(0.0) / cw as f64) as u16;
+        let row = ((y - rect.y).max(0.0) / ch as f64) as u16;
+        let code = btn + self.mouse_mod_bits();
+        let bytes = Self::mouse_report_bytes(proto.sgr, code, col, row, false);
+        if let Some(h) = self.sessions.get(&sid) {
+            let _ = h
+                .control
+                .send(BackendControl::Input(bytes.into_boxed_slice()));
+        }
+    }
+
+    /// Forward pointer motion: drag reports (1002) while a forwarded button is
+    /// held, or all-motion reports (1003), deduped per cell.
+    fn forward_mouse_motion(&mut self) {
+        // Drag with a forwarded button held.
+        if let Some((sid, btn)) = self.mouse_press.clone() {
+            let proto = self.renderer.pane_modes(&sid).mouse;
+            if !(proto.drag || proto.motion) {
+                return;
+            }
+            let Some((_, rect)) = self.pane_rects.iter().find(|(s, _)| *s == sid) else {
+                return;
+            };
+            let (cw, ch) = self.renderer.cell_size();
+            let (x, y) = self.cursor;
+            let col = ((x - rect.x).max(0.0) / cw as f64) as u16;
+            let row = ((y - rect.y).max(0.0) / ch as f64) as u16;
+            if self.last_mouse_cell == Some((col, row)) {
+                return;
+            }
+            self.last_mouse_cell = Some((col, row));
+            let code = btn + 32 + self.mouse_mod_bits();
+            let bytes = Self::mouse_report_bytes(proto.sgr, code, col, row, true);
+            if let Some(h) = self.sessions.get(&sid) {
+                let _ = h
+                    .control
+                    .send(BackendControl::Input(bytes.into_boxed_slice()));
+            }
+            return;
+        }
+        // Button-less motion (1003 only).
+        let Some((sid, proto, col, row)) = self.mouse_target() else {
+            return;
+        };
+        if !proto.motion {
+            return;
+        }
+        if self.last_mouse_cell == Some((col, row)) {
+            return;
+        }
+        self.last_mouse_cell = Some((col, row));
+        let code = 3 + 32 + self.mouse_mod_bits();
+        let bytes = Self::mouse_report_bytes(proto.sgr, code, col, row, true);
+        if let Some(h) = self.sessions.get(&sid) {
+            let _ = h
+                .control
+                .send(BackendControl::Input(bytes.into_boxed_slice()));
+        }
     }
 
     /// Send an absolute scroll for `session` mapping the mouse `y` to a display
@@ -2287,6 +2496,34 @@ mod tests {
         assert_eq!(
             enc(Key::Named(NamedKey::Tab), ModifiersState::SHIFT).unwrap(),
             b"\x1b[Z"
+        );
+    }
+
+    #[test]
+    fn mouse_reports_encode_sgr_and_x10() {
+        use super::RunState;
+        // SGR press/release: 1-based coords, M/m terminator.
+        assert_eq!(
+            RunState::mouse_report_bytes(true, 0, 4, 9, true),
+            b"\x1b[<0;5;10M"
+        );
+        assert_eq!(
+            RunState::mouse_report_bytes(true, 0, 4, 9, false),
+            b"\x1b[<0;5;10m"
+        );
+        // Wheel up with ctrl (+16).
+        assert_eq!(
+            RunState::mouse_report_bytes(true, 64 + 16, 0, 0, true),
+            b"\x1b[<80;1;1M"
+        );
+        // X10: +32 offsets, release is button 3.
+        assert_eq!(
+            RunState::mouse_report_bytes(false, 0, 4, 9, true),
+            vec![0x1b, b'[', b'M', 32, 37, 42]
+        );
+        assert_eq!(
+            RunState::mouse_report_bytes(false, 0, 4, 9, false),
+            vec![0x1b, b'[', b'M', 35, 37, 42]
         );
     }
 

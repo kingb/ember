@@ -25,7 +25,7 @@ pub use focus::{Direction, focus_dir};
 pub use geom::Rect;
 pub use grid::{
     Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, MarkStatus,
-    NeutralCell, Rgb, Style, StyleId,
+    MouseProto, NeutralCell, Rgb, Style, StyleId,
 };
 pub use ids::{PaneId, SessionId, TabId};
 pub use layout::{Axis, LayoutNode, Tab, WindowTree, layout};

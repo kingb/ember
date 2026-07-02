@@ -21,6 +21,8 @@ pub struct GridModel {
     pub mouse_reporting: bool,
     /// Application cursor keys (DECCKM) — arrows encode as `ESC O A`….
     pub app_cursor: bool,
+    /// Which mouse-reporting protocols the app enabled.
+    pub mouse: ember_core::MouseProto,
     /// OSC 133 command marks visible this frame, as `(row, status)`.
     pub marks: Vec<(u16, ember_core::MarkStatus)>,
 }
@@ -38,6 +40,7 @@ impl GridModel {
             alt_screen: false,
             mouse_reporting: false,
             app_cursor: false,
+            mouse: ember_core::MouseProto::default(),
             marks: Vec::new(),
         }
     }
@@ -66,6 +69,7 @@ impl GridModel {
         self.alt_screen = delta.alt_screen;
         self.mouse_reporting = delta.mouse_reporting;
         self.app_cursor = delta.app_cursor;
+        self.mouse = delta.mouse;
         self.marks = delta.marks;
     }
 

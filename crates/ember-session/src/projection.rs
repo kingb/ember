@@ -277,6 +277,12 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
         out.mouse_reporting = mode.intersects(
             TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
         );
+        out.mouse = ember_core::MouseProto {
+            click: mode.contains(TermMode::MOUSE_REPORT_CLICK),
+            drag: mode.contains(TermMode::MOUSE_DRAG),
+            motion: mode.contains(TermMode::MOUSE_MOTION),
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+        };
         // OSC 133 gutter marks visible in the current viewport. The alt screen has no
         // scrollback (and command marks belong to the primary screen), so none there.
         out.marks.clear();
