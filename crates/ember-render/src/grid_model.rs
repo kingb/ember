@@ -109,31 +109,40 @@ impl GridModel {
             .collect()
     }
 
-    /// One row as runs of `(text, fg)`, merging consecutive same-fg cells and
-    /// trimming the trailing blank run. Drives per-cell foreground color.
-    pub fn row_runs(&self, row: u16) -> Vec<(String, ember_core::Rgb)> {
+    /// One row as runs of `(text, fg, attrs)`, merging consecutive same-styled
+    /// cells and trimming the trailing blank run. Drives per-cell foreground
+    /// color + text attributes. SGR 8 (conceal) cells shape as blanks here so
+    /// hidden text never reaches the glyph pass.
+    pub fn row_runs(&self, row: u16) -> Vec<(String, ember_core::Rgb, ember_core::Attrs)> {
         let cols = self.dims.columns as usize;
         let start = row as usize * cols;
         let end = (start + cols).min(self.cells.len());
-        let mut runs: Vec<(String, ember_core::Rgb)> = Vec::new();
+        let mut runs: Vec<(String, ember_core::Rgb, ember_core::Attrs)> = Vec::new();
         for cell in &self.cells[start..end] {
-            let ch = match &cell.content {
-                CellContent::Char(c) => *c,
-                CellContent::Cluster(s) => s.chars().next().unwrap_or(' '),
-                CellContent::Empty => ' ',
-                _ => ' ',
+            let style = self.style_of(cell.style);
+            let ch = if style.attrs.contains(ember_core::Attrs::HIDDEN) {
+                ' '
+            } else {
+                match &cell.content {
+                    CellContent::Char(c) => *c,
+                    CellContent::Cluster(s) => s.chars().next().unwrap_or(' '),
+                    CellContent::Empty => ' ',
+                    _ => ' ',
+                }
             };
-            let fg = self.style_of(cell.style).fg;
+            let fg = style.fg;
             match runs.last_mut() {
-                Some((text, run_fg)) if *run_fg == fg => text.push(ch),
-                _ => runs.push((ch.to_string(), fg)),
+                Some((text, run_fg, run_attrs)) if *run_fg == fg && *run_attrs == style.attrs => {
+                    text.push(ch)
+                }
+                _ => runs.push((ch.to_string(), fg, style.attrs)),
             }
         }
         // Trailing blanks have no glyph; drop them to keep the buffer small.
-        while runs.last().is_some_and(|(t, _)| t.trim().is_empty()) {
+        while runs.last().is_some_and(|(t, _, _)| t.trim().is_empty()) {
             runs.pop();
         }
-        if let Some((text, _)) = runs.last_mut() {
+        if let Some((text, _, _)) = runs.last_mut() {
             let trimmed = text.trim_end().to_string();
             *text = trimmed;
         }
@@ -228,8 +237,72 @@ mod tests {
         let runs = g.row_runs(0);
         // "ab" (red) merges into one run; "c" (default) is its own; blanks trimmed.
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0], ("ab".to_string(), Rgb::new(255, 0, 0)));
+        assert_eq!(
+            runs[0],
+            (
+                "ab".to_string(),
+                Rgb::new(255, 0, 0),
+                ember_core::Attrs::empty()
+            )
+        );
         assert_eq!(runs[1].0, "c");
+    }
+
+    #[test]
+    fn runs_split_on_attr_change_and_conceal_blanks() {
+        let dims = GridDims::new(10, 1);
+        let mut g = GridModel::new(dims);
+        let bold = Style {
+            attrs: ember_core::Attrs::BOLD,
+            ..Style::default()
+        };
+        let hidden = Style {
+            attrs: ember_core::Attrs::HIDDEN,
+            ..Style::default()
+        };
+        let mut d = delta_with(1, dims, Vec::new(), false);
+        d.cells = vec![
+            CellPatch {
+                row: 0,
+                col: 0,
+                cell: NeutralCell::new(CellContent::Char('a'), StyleId(0)),
+            },
+            CellPatch {
+                row: 0,
+                col: 1,
+                cell: NeutralCell::new(CellContent::Char('b'), StyleId(1)),
+            },
+            CellPatch {
+                row: 0,
+                col: 2,
+                cell: NeutralCell::new(CellContent::Char('s'), StyleId(2)),
+            },
+            CellPatch {
+                row: 0,
+                col: 3,
+                cell: NeutralCell::new(CellContent::Char('z'), StyleId(0)),
+            },
+        ];
+        d.new_styles = vec![
+            (StyleId(0), Style::default()),
+            (StyleId(1), bold),
+            (StyleId(2), hidden),
+        ];
+        g.apply(d);
+        let runs = g.row_runs(0);
+        // Same fg throughout, but attrs split the runs; the concealed 's'
+        // shapes as a blank.
+        assert_eq!(runs.len(), 4);
+        assert_eq!(runs[0].0, "a");
+        assert_eq!(
+            (runs[1].0.as_str(), runs[1].2),
+            ("b", ember_core::Attrs::BOLD)
+        );
+        assert_eq!(
+            (runs[2].0.as_str(), runs[2].2),
+            (" ", ember_core::Attrs::HIDDEN)
+        );
+        assert_eq!(runs[3].0, "z");
     }
 
     #[test]

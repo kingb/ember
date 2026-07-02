@@ -170,25 +170,52 @@ pub(crate) fn lin_rgba(c: Rgb, a: f32) -> [f32; 4] {
 // These free fns are the single source of truth for how a grid becomes glyphs +
 // quads, so the headless PNG matches what ships on screen pixel-for-pixel.
 
-/// Shape one grid's rows into `buffer` as per-cell fg-colored runs (one logical
-/// line per grid row).
+/// SGR 2 (dim): scale the fg toward the background (2/3 keeps ANSI colors apart).
+fn dim_rgb(c: ember_core::Rgb) -> ember_core::Rgb {
+    ember_core::Rgb {
+        r: (c.r as u16 * 2 / 3) as u8,
+        g: (c.g as u16 * 2 / 3) as u8,
+        b: (c.b as u16 * 2 / 3) as u8,
+    }
+}
+
+/// Shape one grid's rows into `buffer` as per-cell styled runs (one logical
+/// line per grid row): fg color + bold/italic/dim. Underline/strikeout/overline
+/// are quads (see [`grid_quads`]) — cosmic-text doesn't draw decorations.
 pub(crate) fn shape_grid(font_system: &mut FontSystem, buffer: &mut Buffer, grid: &GridModel) {
+    use ember_core::Attrs as CellAttrs;
     let lines = grid.dims.screen_lines;
-    let mut spans: Vec<(String, Color)> = Vec::new();
+    let mut spans: Vec<(String, Color, CellAttrs)> = Vec::new();
     for row in 0..lines {
-        for (text, fg) in grid.row_runs(row) {
-            spans.push((text, Color::rgb(fg.r, fg.g, fg.b)));
+        for (text, fg, attrs) in grid.row_runs(row) {
+            let fg = if attrs.contains(CellAttrs::DIM) {
+                dim_rgb(fg)
+            } else {
+                fg
+            };
+            spans.push((text, Color::rgb(fg.r, fg.g, fg.b), attrs));
         }
         if row + 1 < lines {
-            spans.push(("\n".to_string(), Color::rgb(FG.r, FG.g, FG.b)));
+            spans.push((
+                "\n".to_string(),
+                Color::rgb(FG.r, FG.g, FG.b),
+                CellAttrs::empty(),
+            ));
         }
     }
     let base = Attrs::new().family(Family::Monospace);
     buffer.set_rich_text(
         font_system,
-        spans
-            .iter()
-            .map(|(t, c)| (t.as_str(), Attrs::new().family(Family::Monospace).color(*c))),
+        spans.iter().map(|(t, c, cell_attrs)| {
+            let mut a = Attrs::new().family(Family::Monospace).color(*c);
+            if cell_attrs.contains(CellAttrs::BOLD) {
+                a = a.weight(glyphon::Weight::BOLD);
+            }
+            if cell_attrs.contains(CellAttrs::ITALIC) {
+                a = a.style(glyphon::Style::Italic);
+            }
+            (t.as_str(), a)
+        }),
         &base,
         Shaping::Advanced,
         None,
@@ -207,18 +234,40 @@ pub(crate) fn grid_quads(
     split: bool,
     out: &mut Vec<([f32; 4], [f32; 4])>,
 ) {
+    use ember_core::Attrs as CellAttrs;
     let ox = rect.x as f32;
     let oy = rect.y as f32;
     let ch = CELL_HEIGHT;
+    const DECOR: CellAttrs = CellAttrs::UNDERLINE
+        .union(CellAttrs::STRIKEOUT)
+        .union(CellAttrs::OVERLINE);
     for row in 0..grid.dims.screen_lines {
         for col in 0..grid.dims.columns {
             if let Some(cell) = grid.cell(row, col) {
-                let bg = grid.style_of(cell.style).bg;
-                if bg != BG {
-                    out.push((
-                        scaled(ox + col as f32 * cw, oy + row as f32 * ch, cw, ch, sf),
-                        lin_rgba(bg, 1.0),
-                    ));
+                let style = grid.style_of(cell.style);
+                let x = ox + col as f32 * cw;
+                let y = oy + row as f32 * ch;
+                if style.bg != BG {
+                    out.push((scaled(x, y, cw, ch, sf), lin_rgba(style.bg, 1.0)));
+                }
+                // Line decorations (same fg as the glyph, so draw order vs text
+                // is invisible). Hidden cells get neither glyph nor lines.
+                if style.attrs.intersects(DECOR) && !style.attrs.contains(CellAttrs::HIDDEN) {
+                    let fg = if style.attrs.contains(CellAttrs::DIM) {
+                        dim_rgb(style.fg)
+                    } else {
+                        style.fg
+                    };
+                    let line = lin_rgba(fg, 1.0);
+                    if style.attrs.contains(CellAttrs::UNDERLINE) {
+                        out.push((scaled(x, y + ch - 1.5, cw, 1.0, sf), line));
+                    }
+                    if style.attrs.contains(CellAttrs::STRIKEOUT) {
+                        out.push((scaled(x, y + ch * 0.5, cw, 1.0, sf), line));
+                    }
+                    if style.attrs.contains(CellAttrs::OVERLINE) {
+                        out.push((scaled(x, y + 0.5, cw, 1.0, sf), line));
+                    }
                 }
             }
         }
