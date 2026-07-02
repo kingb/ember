@@ -174,6 +174,8 @@ pub struct PaneModes {
     pub alt_screen: bool,
     /// The app enabled mouse reporting — forward the wheel as mouse events.
     pub mouse_reporting: bool,
+    /// Application cursor keys (DECCKM) — arrows encode as `ESC O A`….
+    pub app_cursor: bool,
 }
 
 /// A read-only snapshot of a pane's grid for the debug control surface.
@@ -498,6 +500,7 @@ impl Renderer {
             .map(|p| PaneModes {
                 alt_screen: p.grid.alt_screen,
                 mouse_reporting: p.grid.mouse_reporting,
+                app_cursor: p.grid.app_cursor,
             })
             .unwrap_or_default()
     }

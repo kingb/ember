@@ -19,6 +19,8 @@ pub struct GridModel {
     pub history_len: u16,
     pub alt_screen: bool,
     pub mouse_reporting: bool,
+    /// Application cursor keys (DECCKM) — arrows encode as `ESC O A`….
+    pub app_cursor: bool,
     /// OSC 133 command marks visible this frame, as `(row, status)`.
     pub marks: Vec<(u16, ember_core::MarkStatus)>,
 }
@@ -35,6 +37,7 @@ impl GridModel {
             history_len: 0,
             alt_screen: false,
             mouse_reporting: false,
+            app_cursor: false,
             marks: Vec::new(),
         }
     }
@@ -62,6 +65,7 @@ impl GridModel {
         self.history_len = delta.history_len;
         self.alt_screen = delta.alt_screen;
         self.mouse_reporting = delta.mouse_reporting;
+        self.app_cursor = delta.app_cursor;
         self.marks = delta.marks;
     }
 

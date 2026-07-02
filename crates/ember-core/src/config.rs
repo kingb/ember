@@ -16,6 +16,10 @@ pub struct Config {
     /// Auto-inject OSC 133 shell integration (exit-status gutter + jump-to-prompt)
     /// into spawned zsh/bash without editing the user's rc. On by default.
     pub shell_integration: bool,
+    /// macOS: treat Option as Meta — Opt+key sends `ESC key` (readline `M-b`,
+    /// emacs `M-x`) instead of composing (`å`, `é`). Off by default, matching
+    /// Terminal.app/Alacritty/kitty/Ghostty; composing wins for most users.
+    pub option_as_meta: bool,
 }
 
 impl Default for Config {
@@ -24,6 +28,7 @@ impl Default for Config {
             background: Background::default(),
             visual_bell: true,
             shell_integration: true,
+            option_as_meta: false,
         }
     }
 }

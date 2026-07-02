@@ -205,6 +205,11 @@ pub struct GridDelta {
     /// The app has enabled mouse reporting — the wheel should go to it as mouse
     /// events, not be translated to arrow keys.
     pub mouse_reporting: bool,
+    /// Application cursor keys (DECCKM, mode ?1): arrows must be sent as
+    /// `ESC O A`… instead of `CSI A`…. Latest-wins on merge; defaulted so
+    /// pre-field serialized frames parse.
+    #[serde(default)]
+    pub app_cursor: bool,
     /// OSC 133 command marks currently **visible** in the viewport, as
     /// `(visible_row, status)` — recomputed each drain from the marks' absolute
     /// history lines + `display_offset`, so they scroll with the content. Latest-
@@ -281,6 +286,7 @@ impl GridDelta {
         self.bracketed_paste = newer.bracketed_paste;
         self.display_offset = newer.display_offset;
         self.history_len = newer.history_len;
+        self.app_cursor = newer.app_cursor;
         self.alt_screen = newer.alt_screen;
         self.mouse_reporting = newer.mouse_reporting;
         self.marks = newer.marks;

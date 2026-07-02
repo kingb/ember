@@ -37,6 +37,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::WindowId;
 
 /// The Ember app icon (embedded). Set on the window + the macOS dock at startup.
@@ -520,7 +521,17 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
-                if let Some(bytes) = encode_key(&key.logical_key, mods) {
+                // DECCKM from the focused pane; Option-as-Meta strips the
+                // macOS compose (Opt+b = "∫") back to the plain key for the
+                // ESC prefix. With the option off, composing wins (é, ñ).
+                let app_cursor = state.focused_app_cursor();
+                let alt_meta = mods.alt_key() && state.config.option_as_meta;
+                let logical = if alt_meta {
+                    key.key_without_modifiers()
+                } else {
+                    key.logical_key.clone()
+                };
+                if let Some(bytes) = encode_key(&logical, mods, app_cursor, alt_meta) {
                     if let Some(h) = state.focused_session() {
                         let _ = h
                             .control
@@ -848,7 +859,10 @@ impl RunState {
             ControlMsg::Type(text) => self.send_to_focused(text.into_bytes()),
             ControlMsg::Key(name) => {
                 if let Some(key) = named_key(&name) {
-                    if let Some(bytes) = encode_key(&key, ModifiersState::empty()) {
+                    let app_cursor = self.focused_app_cursor();
+                    if let Some(bytes) =
+                        encode_key(&key, ModifiersState::empty(), app_cursor, false)
+                    {
                         self.send_to_focused(bytes);
                     }
                 }
@@ -860,7 +874,9 @@ impl RunState {
                             self.shutdown_all();
                             event_loop.exit();
                         }
-                    } else if let Some(bytes) = encode_key(&key, mods) {
+                    } else if let Some(bytes) =
+                        encode_key(&key, mods, self.focused_app_cursor(), false)
+                    {
                         self.send_to_focused(bytes);
                     }
                 }
@@ -1214,6 +1230,13 @@ impl RunState {
     /// Whether Ctrl+Opt is currently held (the visual-split modifier).
     fn split_modifier_held(&self) -> bool {
         self.modifiers.control_key() && self.modifiers.alt_key()
+    }
+
+    /// DECCKM state of the focused pane (drives arrow/Home/End encoding).
+    fn focused_app_cursor(&self) -> bool {
+        self.focused_session_id()
+            .map(|id| self.renderer.pane_modes(&id).app_cursor)
+            .unwrap_or(false)
     }
 
     /// The pane under the mouse cursor, if any.
@@ -2070,25 +2093,116 @@ fn parse_chord(combo: &str) -> Option<(Key, ModifiersState)> {
 /// Map a key press to the bytes to send to the PTY. Covers the essentials for a
 /// usable shell (printable text, Enter/Backspace/Tab/Esc, arrows, Ctrl-letter);
 /// fuller keymap + IME routing land with Epic E.
-fn encode_key(key: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
+/// Encode a key press as the bytes a VT terminal sends (xterm-compatible).
+///
+/// `app_cursor` = DECCKM (arrows/Home/End become `ESC O x`); `alt_meta` = the
+/// user holds Option with option-as-meta enabled, so simple keys get an ESC
+/// prefix (readline/emacs Meta). CSI-form keys carry all modifiers in the
+/// standard `;m` parameter instead (m = 1 + shift·1 + alt·2 + ctrl·4).
+fn encode_key(
+    key: &Key,
+    mods: ModifiersState,
+    app_cursor: bool,
+    alt_meta: bool,
+) -> Option<Vec<u8>> {
+    let m =
+        1 + mods.shift_key() as u8 + (mods.alt_key() as u8) * 2 + (mods.control_key() as u8) * 4;
+    let modified = m > 1;
+    // "PC-style" cursor keys: CSI-with-modifiers > SS3 (app cursor) > CSI.
+    let cursor = |ch: char| -> Vec<u8> {
+        if modified {
+            format!("\x1b[1;{m}{ch}").into_bytes()
+        } else if app_cursor {
+            format!("\x1bO{ch}").into_bytes()
+        } else {
+            format!("\x1b[{ch}").into_bytes()
+        }
+    };
+    // VT220-style editing/function keys: `CSI n ~`, modifiers as `CSI n;m~`.
+    let tilde = |n: u8| -> Vec<u8> {
+        if modified {
+            format!("\x1b[{n};{m}~").into_bytes()
+        } else {
+            format!("\x1b[{n}~").into_bytes()
+        }
+    };
+    // F1–F4 are SS3 legacy; with modifiers they switch to the CSI form.
+    let ss3_f = |ch: char| -> Vec<u8> {
+        if modified {
+            format!("\x1b[1;{m}{ch}").into_bytes()
+        } else {
+            format!("\x1bO{ch}").into_bytes()
+        }
+    };
+    // ESC-prefix for Meta on the simple byte-form keys.
+    let meta = |bytes: Vec<u8>| -> Vec<u8> {
+        if alt_meta {
+            let mut v = Vec::with_capacity(bytes.len() + 1);
+            v.push(0x1b);
+            v.extend(bytes);
+            v
+        } else {
+            bytes
+        }
+    };
     match key {
-        Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
-        Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
-        Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
-        Key::Named(NamedKey::Escape) => Some(vec![0x1b]),
-        Key::Named(NamedKey::Space) => Some(b" ".to_vec()),
-        Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
-        Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
-        Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
-        Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
+        Key::Named(named) => {
+            let bytes = match named {
+                NamedKey::Enter => meta(b"\r".to_vec()),
+                NamedKey::Backspace => meta(vec![0x7f]),
+                NamedKey::Tab if mods.shift_key() => b"\x1b[Z".to_vec(), // backtab
+                NamedKey::Tab => meta(b"\t".to_vec()),
+                NamedKey::Escape => vec![0x1b],
+                NamedKey::Space if mods.control_key() => meta(vec![0x00]), // NUL (C-SPC)
+                NamedKey::Space => meta(b" ".to_vec()),
+                NamedKey::ArrowUp => cursor('A'),
+                NamedKey::ArrowDown => cursor('B'),
+                NamedKey::ArrowRight => cursor('C'),
+                NamedKey::ArrowLeft => cursor('D'),
+                NamedKey::Home => cursor('H'),
+                NamedKey::End => cursor('F'),
+                NamedKey::Insert => tilde(2),
+                NamedKey::Delete => tilde(3),
+                NamedKey::PageUp => tilde(5),
+                NamedKey::PageDown => tilde(6),
+                NamedKey::F1 => ss3_f('P'),
+                NamedKey::F2 => ss3_f('Q'),
+                NamedKey::F3 => ss3_f('R'),
+                NamedKey::F4 => ss3_f('S'),
+                NamedKey::F5 => tilde(15),
+                NamedKey::F6 => tilde(17),
+                NamedKey::F7 => tilde(18),
+                NamedKey::F8 => tilde(19),
+                NamedKey::F9 => tilde(20),
+                NamedKey::F10 => tilde(21),
+                NamedKey::F11 => tilde(23),
+                NamedKey::F12 => tilde(24),
+                _ => return None,
+            };
+            Some(bytes)
+        }
         Key::Character(s) => {
             if mods.control_key() {
                 let c = s.chars().next()?;
-                if c.is_ascii_alphabetic() {
-                    return Some(vec![(c.to_ascii_lowercase() as u8) & 0x1f]);
+                // Classic control-byte mapping, incl. the punctuation the old
+                // path dropped (C-[ = ESC, C-\, C-], C-^, C-_, C-? = DEL) and
+                // the xterm digit aliases (C-2 = NUL … C-8 = DEL).
+                let ctrl = match c.to_ascii_lowercase() {
+                    '@' | '2' => Some(0x00),
+                    'a'..='z' => Some(c.to_ascii_lowercase() as u8 & 0x1f),
+                    '[' | '3' => Some(0x1b),
+                    '\\' | '4' => Some(0x1c),
+                    ']' | '5' => Some(0x1d),
+                    '^' | '6' => Some(0x1e),
+                    '_' | '7' | '/' => Some(0x1f),
+                    '?' | '8' => Some(0x7f),
+                    _ => None,
+                };
+                if let Some(b) = ctrl {
+                    return Some(meta(vec![b]));
                 }
             }
-            Some(s.as_bytes().to_vec())
+            Some(meta(s.as_bytes().to_vec()))
         }
         _ => None,
     }
@@ -2096,7 +2210,100 @@ fn encode_key(key: &Key, mods: ModifiersState) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BELL_FLASH_SECS, bell_flash_intensity, bracket_paste};
+    use super::{BELL_FLASH_SECS, bell_flash_intensity, bracket_paste, encode_key};
+    use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
+
+    fn enc(key: Key, mods: ModifiersState) -> Option<Vec<u8>> {
+        encode_key(&key, mods, false, false)
+    }
+
+    #[test]
+    fn named_editing_and_function_keys_encode() {
+        let n = ModifiersState::empty();
+        assert_eq!(enc(Key::Named(NamedKey::Home), n).unwrap(), b"\x1b[H");
+        assert_eq!(enc(Key::Named(NamedKey::End), n).unwrap(), b"\x1b[F");
+        assert_eq!(enc(Key::Named(NamedKey::PageUp), n).unwrap(), b"\x1b[5~");
+        assert_eq!(enc(Key::Named(NamedKey::PageDown), n).unwrap(), b"\x1b[6~");
+        assert_eq!(enc(Key::Named(NamedKey::Delete), n).unwrap(), b"\x1b[3~");
+        assert_eq!(enc(Key::Named(NamedKey::Insert), n).unwrap(), b"\x1b[2~");
+        assert_eq!(enc(Key::Named(NamedKey::F1), n).unwrap(), b"\x1bOP");
+        assert_eq!(enc(Key::Named(NamedKey::F5), n).unwrap(), b"\x1b[15~");
+        assert_eq!(enc(Key::Named(NamedKey::F12), n).unwrap(), b"\x1b[24~");
+    }
+
+    #[test]
+    fn arrows_follow_decckm_and_modifiers() {
+        let n = ModifiersState::empty();
+        let up = Key::Named(NamedKey::ArrowUp);
+        let right = Key::Named(NamedKey::ArrowRight);
+        assert_eq!(enc(up.clone(), n).unwrap(), b"\x1b[A");
+        // DECCKM: application cursor keys use SS3.
+        assert_eq!(encode_key(&up, n, true, false).unwrap(), b"\x1bOA");
+        // Ctrl+Right = CSI 1;5C (word-jump); modifiers beat app-cursor form.
+        assert_eq!(
+            encode_key(&right, ModifiersState::CONTROL, true, false).unwrap(),
+            b"\x1b[1;5C"
+        );
+        // Shift+Alt+Down = 1 + 1 + 2 = 4.
+        assert_eq!(
+            enc(
+                Key::Named(NamedKey::ArrowDown),
+                ModifiersState::SHIFT | ModifiersState::ALT
+            )
+            .unwrap(),
+            b"\x1b[1;4B"
+        );
+    }
+
+    #[test]
+    fn control_specials_encode() {
+        let c = ModifiersState::CONTROL;
+        // C-SPC = NUL (emacs set-mark), the old path sent a plain space.
+        assert_eq!(enc(Key::Named(NamedKey::Space), c).unwrap(), vec![0x00]);
+        assert_eq!(
+            enc(Key::Character(SmolStr::new("[")), c).unwrap(),
+            vec![0x1b]
+        );
+        assert_eq!(
+            enc(Key::Character(SmolStr::new("]")), c).unwrap(),
+            vec![0x1d]
+        );
+        assert_eq!(
+            enc(Key::Character(SmolStr::new("_")), c).unwrap(),
+            vec![0x1f]
+        );
+        assert_eq!(
+            enc(Key::Character(SmolStr::new("?")), c).unwrap(),
+            vec![0x7f]
+        );
+        assert_eq!(
+            enc(Key::Character(SmolStr::new("c")), c).unwrap(),
+            vec![0x03]
+        );
+    }
+
+    #[test]
+    fn shift_tab_is_backtab() {
+        assert_eq!(
+            enc(Key::Named(NamedKey::Tab), ModifiersState::SHIFT).unwrap(),
+            b"\x1b[Z"
+        );
+    }
+
+    #[test]
+    fn option_as_meta_prefixes_esc() {
+        let alt = ModifiersState::ALT;
+        // Opt+b with option_as_meta: ESC b (readline backward-word).
+        assert_eq!(
+            encode_key(&Key::Character(SmolStr::new("b")), alt, false, true).unwrap(),
+            b"\x1bb"
+        );
+        // Without the option, the composed char passes through untouched.
+        assert_eq!(
+            encode_key(&Key::Character(SmolStr::new("\u{222b}")), alt, false, false).unwrap(),
+            "\u{222b}".as_bytes()
+        );
+    }
 
     #[test]
     fn bell_flash_decays_from_full_to_zero() {
