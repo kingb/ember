@@ -22,6 +22,14 @@ pub enum MenuAction {
     /// predefined quit, which terminates NSApp directly and would bypass the
     /// running-process confirmation and session shutdown entirely).
     Quit,
+    /// File → New Tab (Cmd+T).
+    NewTab,
+    /// File → Close Tab / pane (Cmd+W).
+    Close,
+    /// Edit → Copy (Cmd+C). Also lets macOS route to Services/dictation.
+    Copy,
+    /// Edit → Paste (Cmd+V).
+    Paste,
 }
 
 #[cfg(target_os = "macos")]
@@ -42,6 +50,10 @@ mod imp {
         settings_id: MenuId,
         shortcuts_id: MenuId,
         quit_id: MenuId,
+        new_tab_id: MenuId,
+        close_id: MenuId,
+        copy_id: MenuId,
+        paste_id: MenuId,
     }
 
     /// Build + install the menu bar as the NSApp main menu. Call once on the main
@@ -72,6 +84,48 @@ mod imp {
         let _ = app_menu.append(&quit);
         let _ = menu.append(&app_menu);
 
+        // File menu.
+        let file = Submenu::new("File", true);
+        let new_tab = MenuItem::new(
+            "New Tab",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyT)),
+        );
+        let new_tab_id = new_tab.id().clone();
+        let close = MenuItem::new(
+            "Close",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyW)),
+        );
+        let close_id = close.id().clone();
+        let _ = file.append(&new_tab);
+        let _ = file.append(&close);
+        let _ = menu.append(&file);
+
+        // Edit menu — Copy/Paste (also exposes Ember to macOS Services).
+        let edit = Submenu::new("Edit", true);
+        let copy = MenuItem::new(
+            "Copy",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyC)),
+        );
+        let copy_id = copy.id().clone();
+        let paste = MenuItem::new(
+            "Paste",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyV)),
+        );
+        let paste_id = paste.id().clone();
+        let _ = edit.append(&copy);
+        let _ = edit.append(&paste);
+        let _ = menu.append(&edit);
+
+        // Window menu — native minimize/zoom (predefined; no app routing needed).
+        let window = Submenu::new("Window", true);
+        let _ = window.append(&PredefinedMenuItem::minimize(None));
+        let _ = window.append(&PredefinedMenuItem::maximize(None));
+        let _ = menu.append(&window);
+
         // Help menu with the cheat-sheet shortcut (Cmd+/).
         let help = Submenu::new("Help", true);
         let shortcuts = MenuItem::new(
@@ -90,6 +144,10 @@ mod imp {
             settings_id,
             shortcuts_id,
             quit_id,
+            new_tab_id,
+            close_id,
+            copy_id,
+            paste_id,
         }
     }
 
@@ -105,6 +163,14 @@ mod imp {
                 action = Some(MenuAction::ShowShortcuts);
             } else if event.id == menu.quit_id {
                 action = Some(MenuAction::Quit);
+            } else if event.id == menu.new_tab_id {
+                action = Some(MenuAction::NewTab);
+            } else if event.id == menu.close_id {
+                action = Some(MenuAction::Close);
+            } else if event.id == menu.copy_id {
+                action = Some(MenuAction::Copy);
+            } else if event.id == menu.paste_id {
+                action = Some(MenuAction::Paste);
             }
         }
         action

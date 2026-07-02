@@ -269,6 +269,9 @@ struct RunState {
     running: std::collections::HashSet<SessionId>,
     /// A destructive close awaiting Enter/Esc confirmation (a busy pane).
     pending_close: Option<PendingClose>,
+    /// Latest OSC title per session, so the window title can be re-asserted on
+    /// tab/pane switch (not just when a fresh Title event happens to arrive).
+    titles: std::collections::HashMap<SessionId, String>,
 }
 
 /// A close action deferred behind a running-process confirmation.
@@ -402,6 +405,7 @@ impl ApplicationHandler for App {
             last_mouse_cell: None,
             running: std::collections::HashSet::new(),
             pending_close: None,
+            titles: std::collections::HashMap::new(),
         };
         if !state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
             // No shell at startup means nothing to show; exit with the message
@@ -519,8 +523,10 @@ impl ApplicationHandler for App {
                     state.settings_key(&key.logical_key);
                     return;
                 }
-                // Inline tab rename captures keys (title editor), not the PTY.
-                if state.editing_tab.is_some() {
+                // Inline tab rename captures typing, but NOT Cmd combos — those
+                // stay app shortcuts (Cmd+W must not insert "w"), so fall through
+                // to the Super branch below when Cmd is held.
+                if state.editing_tab.is_some() && !state.modifiers.super_key() {
                     state.rename_key(&key.logical_key);
                     return;
                 }
@@ -547,14 +553,24 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
-                // While a modal overlay (help / About) is up, the next *fresh* key
-                // press dismisses it. Auto-repeat is ignored — otherwise holding
-                // Cmd+/ for a moment repeats "/" and closes it right after it opens.
+                // While a modal overlay (help / About) is up, the next *fresh*
+                // key dismisses it. Escape/Enter just dismiss; any other key
+                // dismisses AND falls through so the keystroke still reaches the
+                // shell (typing `ls` at the help screen shouldn't eat the `l`).
+                // Auto-repeat is ignored so holding Cmd+/ can't close on open.
                 if state.help || state.about {
-                    if !key.repeat {
-                        state.dismiss_overlay();
+                    if key.repeat {
+                        return;
                     }
-                    return;
+                    state.dismiss_overlay();
+                    let swallow = matches!(
+                        &key.logical_key,
+                        Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)
+                    ) || state.modifiers.super_key();
+                    if swallow {
+                        return;
+                    }
+                    // else: fall through and process this key normally.
                 }
                 let mods = state.modifiers;
                 if std::env::var_os("EMBER_DEBUG").is_some() {
@@ -662,10 +678,12 @@ impl ApplicationHandler for App {
         let mut belled: Vec<SessionId> = Vec::new();
         let mut clipboard_set: Option<String> = None;
         let mut running_changes: Vec<(SessionId, bool)> = Vec::new();
+        let mut title_updates: Vec<(SessionId, String)> = Vec::new();
         for (id, handle) in &state.sessions {
             while let Ok(event) = handle.events.try_recv() {
                 match event {
                     BackendEvent::Title(t) => {
+                        title_updates.push((id.clone(), t.clone()));
                         if Some(id) == focused.as_ref() {
                             new_title = Some(t);
                         }
@@ -690,6 +708,11 @@ impl ApplicationHandler for App {
                 }
             }
         }
+        for (id, title) in title_updates {
+            state.titles.insert(id, title);
+        }
+        // Drop titles for sessions that no longer exist.
+        state.titles.retain(|id, _| state.sessions.contains_key(id));
         for (id, busy) in running_changes {
             if busy {
                 state.running.insert(id);
@@ -727,6 +750,14 @@ impl ApplicationHandler for App {
                     let _ = h.control.send(BackendControl::Focus(true));
                 }
             }
+            // Re-assert the newly focused pane's title (or the app name if it
+            // hasn't set one) so a tab/pane switch never leaves a stale title.
+            let title = focus_now
+                .as_ref()
+                .and_then(|id| state.titles.get(id).cloned())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "ember".to_string());
+            state.renderer.window().set_title(&title);
             state.focus_notified = focus_now;
         }
         // Drain debug-control commands (EMBER_CONTROL) and act on them.
@@ -744,8 +775,16 @@ impl ApplicationHandler for App {
                 MenuAction::ShowShortcuts => state.toggle_help(),
                 MenuAction::About => state.toggle_about(),
                 MenuAction::Settings => state.toggle_settings(),
-                MenuAction::Quit => {
-                    if state.request_close(PendingClose::Quit) {
+                MenuAction::NewTab => state.new_tab(),
+                MenuAction::Copy => state.copy_selection(),
+                MenuAction::Paste => state.paste_clipboard(),
+                MenuAction::Close | MenuAction::Quit => {
+                    let kind = if matches!(action, MenuAction::Quit) {
+                        PendingClose::Quit
+                    } else {
+                        PendingClose::Pane
+                    };
+                    if state.request_close(kind) {
                         state.shutdown_all();
                         event_loop.exit();
                     }
