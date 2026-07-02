@@ -60,22 +60,48 @@ fn prepare_zsh(dir: &Path) -> std::io::Result<Injection> {
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("HOME").ok())
         .unwrap_or_default();
+    let ours = dir.to_string_lossy().into_owned();
 
-    // .zshenv: restore ZDOTDIR + chain the user's .zshenv (runs for every zsh).
+    // zsh re-evaluates $ZDOTDIR before EACH startup file, so ZDOTDIR must keep
+    // pointing at our dir until the LAST file we need (.zshrc) has been read —
+    // restoring it any earlier makes zsh read the user's files directly and
+    // skip ours (the kitty/ghostty pattern). Each of our files chains the
+    // user's counterpart with ZDOTDIR temporarily restored.
+
+    // .zshenv (every zsh): chain the user's, then re-point ZDOTDIR at us for
+    // interactive shells only — scripts keep the user's env untouched.
     let zshenv = format!(
         "export ZDOTDIR=\"${{EMBER_ZDOTDIR_ORIG:-{orig}}}\"\n\
-         [ -f \"$ZDOTDIR/.zshenv\" ] && source \"$ZDOTDIR/.zshenv\"\n"
+         [ -f \"$ZDOTDIR/.zshenv\" ] && source \"$ZDOTDIR/.zshenv\"\n\
+         export EMBER_ZDOTDIR_ORIG=\"$ZDOTDIR\"\n\
+         [[ -o interactive ]] && export ZDOTDIR={ours:?}\n\
+         true\n"
     );
     std::fs::write(dir.join(".zshenv"), zshenv)?;
 
-    // .zshrc: chain the user's .zshrc, then install the hooks.
-    let zshrc = format!("[ -f \"$ZDOTDIR/.zshrc\" ] && source \"$ZDOTDIR/.zshrc\"\n{HOOKS_ZSH}");
+    // .zprofile (login shells, e.g. launched from Finder): chain the user's —
+    // this is where Homebrew PATH etc. comes from — then point back at us.
+    let zprofile = format!(
+        "export ZDOTDIR=\"$EMBER_ZDOTDIR_ORIG\"\n\
+         [ -f \"$ZDOTDIR/.zprofile\" ] && source \"$ZDOTDIR/.zprofile\"\n\
+         export ZDOTDIR={ours:?}\n\
+         true\n"
+    );
+    std::fs::write(dir.join(".zprofile"), zprofile)?;
+
+    // .zshrc: final restore (so .zlogin + subshells see the user's ZDOTDIR),
+    // chain the user's .zshrc, then install the hooks.
+    let zshrc = format!(
+        "export ZDOTDIR=\"$EMBER_ZDOTDIR_ORIG\"\n\
+         unset EMBER_ZDOTDIR_ORIG\n\
+         [ -f \"$ZDOTDIR/.zshrc\" ] && source \"$ZDOTDIR/.zshrc\"\n{HOOKS_ZSH}"
+    );
     std::fs::write(dir.join(".zshrc"), zshrc)?;
 
     Ok(Injection {
         env: vec![
             ("EMBER_ZDOTDIR_ORIG".into(), orig),
-            ("ZDOTDIR".into(), dir.to_string_lossy().into_owned()),
+            ("ZDOTDIR".into(), ours),
         ],
         args: Vec::new(),
     })
@@ -147,5 +173,85 @@ mod tests {
     fn unsupported_shell_is_noop() {
         let inj = prepare("fish", &std::env::temp_dir());
         assert!(inj.env.is_empty() && inj.args.is_empty());
+    }
+
+    /// Drive a REAL zsh through the injection and prove (a) ember's hooks
+    /// install, (b) the user's own .zshrc still runs, (c) ZDOTDIR is restored —
+    /// i.e. the "zsh re-evaluates ZDOTDIR per startup file" trap is handled.
+    fn run_real_zsh(login: bool) -> Option<String> {
+        if !std::path::Path::new("/bin/zsh").exists() {
+            return None; // no zsh on this runner — skip
+        }
+        let base =
+            std::env::temp_dir().join(format!("ember-si-e2e-{}-{login}", std::process::id()));
+        let user = base.join("user");
+        let ember = base.join("ember");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join(".zshrc"), "echo USER-ZSHRC-RAN\n").unwrap();
+        std::fs::write(user.join(".zprofile"), "echo USER-ZPROFILE-RAN\n").unwrap();
+
+        // Compute the injection as if the user's ZDOTDIR were `user`.
+        // (prepare() reads the env; emulate its output for a hermetic test.)
+        let inj = {
+            let _ = prepare_zsh(&ember).unwrap();
+            Injection {
+                env: vec![
+                    ("EMBER_ZDOTDIR_ORIG".into(), user.to_string_lossy().into()),
+                    ("ZDOTDIR".into(), ember.to_string_lossy().into()),
+                ],
+                args: Vec::new(),
+            }
+        };
+
+        let mut cmd = std::process::Command::new("/bin/zsh");
+        if login {
+            cmd.arg("-l");
+        }
+        cmd.args([
+            "-ic",
+            "whence _ember_precmd >/dev/null && echo HOOKS-OK; echo ZD=$ZDOTDIR",
+        ]);
+        for (k, v) in &inj.env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn real_zsh_installs_hooks_and_chains_user_rc() {
+        let Some(out) = run_real_zsh(false) else {
+            return;
+        };
+        assert!(out.contains("USER-ZSHRC-RAN"), "user rc skipped: {out:?}");
+        assert!(
+            out.contains("HOOKS-OK"),
+            "ember hooks not installed: {out:?}"
+        );
+        let zd = out
+            .lines()
+            .find_map(|l| l.strip_prefix("ZD="))
+            .unwrap_or_default();
+        assert!(
+            zd.ends_with("/user"),
+            "ZDOTDIR not restored to the user's dir: {out:?}"
+        );
+    }
+
+    #[test]
+    fn real_login_zsh_chains_zprofile_too() {
+        let Some(out) = run_real_zsh(true) else {
+            return;
+        };
+        assert!(
+            out.contains("USER-ZPROFILE-RAN"),
+            "user .zprofile skipped: {out:?}"
+        );
+        assert!(out.contains("USER-ZSHRC-RAN"), "user rc skipped: {out:?}");
+        assert!(
+            out.contains("HOOKS-OK"),
+            "ember hooks not installed: {out:?}"
+        );
     }
 }

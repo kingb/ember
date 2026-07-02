@@ -78,10 +78,19 @@ impl SessionBackend for LocalPty {
             })
             .map_err(std::io::Error::other)?;
 
+        let is_default_shell = program.is_none();
         let program = program
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(|| "/bin/sh".to_string());
         let mut cmd = CommandBuilder::new(program.clone());
+        // The user's default zsh runs as a login shell (macOS terminal
+        // convention): launched from Finder there is no inherited login env,
+        // so without `.zprofile` the Homebrew PATH etc. would be missing.
+        // (bash is left non-login: login bash ignores the --rcfile our shell
+        // integration depends on.)
+        if is_default_shell && program.rsplit('/').next() == Some("zsh") {
+            cmd.arg("-l");
+        }
         // Auto-inject OSC 133 shell integration (env + rcfile args), chaining the
         // user's own config. Best-effort: unsupported shells / IO errors → no-op.
         if shell_integration {
@@ -100,6 +109,11 @@ impl SessionBackend for LocalPty {
             cmd.arg(a);
         }
         cmd.env("TERM", "xterm-256color");
+        // Advertise truecolor + identify ourselves (standard TERM_PROGRAM
+        // protocol); without COLORTERM, capable apps downgrade to 256 colors.
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "ember");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         match cwd {
             Some(dir) => cmd.cwd(dir),
             None => {
