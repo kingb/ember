@@ -348,8 +348,11 @@ pub(crate) fn grid_quads(
                 MarkStatus::Running => GUTTER_RUN,
                 _ => GUTTER_RUN,
             };
+            // Inside the pane's own left edge (not `ox - 3.5`, which reaches
+            // into the padding/divider — and, for a right-hand split pane, the
+            // neighbor). Quads aren't clipped per-pane, so keep it in-bounds.
             out.push((
-                scaled(ox - 3.5, oy + row as f32 * ch + 1.0, 2.5, ch - 2.0, sf),
+                scaled(ox + 0.5, oy + row as f32 * ch + 1.0, 2.5, ch - 2.0, sf),
                 lin_rgba(color, 1.0),
             ));
         }

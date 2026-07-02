@@ -217,15 +217,19 @@ impl QuadRenderer {
         self.count = instances.len() as u32;
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if self.count == 0 {
+    /// Draw a sub-range of the prepared instances, so a caller can interleave
+    /// another pass (e.g. the additive sparks) between the backdrop quads and
+    /// the cell/chrome quads — keeping the sparks behind opaque content.
+    pub fn draw_range(&self, pass: &mut wgpu::RenderPass<'_>, range: std::ops::Range<u32>) {
+        let range = range.start.min(self.count)..range.end.min(self.count);
+        if range.is_empty() {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.unit.slice(..));
         pass.set_vertex_buffer(1, self.instances.slice(..));
-        pass.draw(0..6, 0..self.count);
+        pass.draw(0..6, range);
     }
 }
 

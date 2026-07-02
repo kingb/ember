@@ -857,6 +857,11 @@ impl Renderer {
         };
         let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
         let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
+        // Index into `rects` where the additive spark pass is interleaved:
+        // everything before is backdrop (gradient/scrim), everything after is
+        // cells + chrome, so opaque content covers the embers. 0 = no backdrop
+        // (overlays): all quads draw after the (empty) spark pass.
+        let mut spark_layer: usize = 0;
         let mut areas: Vec<TextArea> = Vec::new();
         // Whether to draw the backdrop image this frame (pane view only — never
         // over the Settings/About/help overlays).
@@ -954,6 +959,7 @@ impl Renderer {
                 bp.gradient = false;
             }
             push_backdrop(&mut rects, &bp, logical_w, logical_h, sf);
+            spark_layer = rects.len();
             if draw_image {
                 self.image.prepare(
                     &self.device,
@@ -1206,8 +1212,13 @@ impl Renderer {
             if draw_image {
                 self.image.draw(&mut pass);
             }
-            self.quads.draw(&mut pass);
+            // Backdrop quads → sparks (additive) → cells + chrome → text. The
+            // embers glow over the gradient but sit behind opaque cell bgs, the
+            // selection, and the tab strip.
+            let split = spark_layer as u32;
+            self.quads.draw_range(&mut pass, 0..split);
             self.sparks.draw(&mut pass);
+            self.quads.draw_range(&mut pass, split..u32::MAX);
             let _ = self
                 .text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass);

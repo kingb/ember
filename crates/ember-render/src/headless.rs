@@ -206,6 +206,9 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
     let mut fps_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
+    // Where the additive spark pass is interleaved (see the live renderer):
+    // backdrop before, cells + chrome after, so content covers the embers.
+    let mut spark_layer: usize = 0;
     let mut help_panel: Option<Rect> = None;
     let mut about_layout: Option<AboutLayout> = None;
     let mut settings_origin: Option<(f32, f32)> = None;
@@ -274,6 +277,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
             bp.gradient = false;
         }
         push_backdrop(&mut rects, &bp, shot.logical_w, shot.logical_h, sf);
+        spark_layer = rects.len();
         if shot.backdrop.sparks {
             spark_rects = spark_quads(
                 shot.backdrop.density,
@@ -498,8 +502,10 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
         if draw_image {
             image.draw(&mut pass);
         }
-        quads.draw(&mut pass);
+        let split = spark_layer as u32;
+        quads.draw_range(&mut pass, 0..split);
         sparks.draw(&mut pass);
+        quads.draw_range(&mut pass, split..u32::MAX);
         let _ = text_renderer.render(&atlas, &viewport, &mut pass);
     }
     encoder.copy_texture_to_buffer(
