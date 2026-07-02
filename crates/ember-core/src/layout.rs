@@ -104,19 +104,91 @@ impl LayoutNode {
         }
     }
 
-    /// Set the ratio of the split that directly encloses `target`. Returns
-    /// whether such a split was found. Ratio is clamped to `[0.05, 0.95]`.
-    pub fn set_split_ratio(&mut self, target: PaneId, new_ratio: f64) -> bool {
-        if let LayoutNode::Split { ratio, a, b, .. } = self {
-            let immediate = matches!(a.as_ref(), LayoutNode::Pane { id, .. } if *id == target)
-                || matches!(b.as_ref(), LayoutNode::Pane { id, .. } if *id == target);
-            if immediate {
-                *ratio = new_ratio.clamp(0.05, 0.95);
-                return true;
-            }
-            return a.set_split_ratio(target, new_ratio) || b.set_split_ratio(target, new_ratio);
+    /// Whether `target` is a leaf anywhere in this subtree.
+    pub fn contains(&self, target: PaneId) -> bool {
+        match self {
+            LayoutNode::Pane { id, .. } => *id == target,
+            LayoutNode::Split { a, b, .. } => a.contains(target) || b.contains(target),
         }
-        false
+    }
+
+    /// Grow `target`'s side of the **nearest enclosing split of `axis`** (walking
+    /// up from the leaf) by `delta`, a fraction of that split's extent along the
+    /// axis. Positive `delta` grows the target. `area` is this node's current
+    /// rect; `min_px` is the smallest extent either child may shrink to (the
+    /// clamp, per the layout-seam ruling). Returns whether a matching split was
+    /// found and adjusted.
+    pub fn resize_pane(
+        &mut self,
+        target: PaneId,
+        axis: Axis,
+        delta: f64,
+        area: Rect,
+        min_px: f64,
+    ) -> bool {
+        let LayoutNode::Split {
+            axis: split_axis,
+            ratio,
+            a,
+            b,
+        } = self
+        else {
+            return false;
+        };
+        let split_axis = *split_axis;
+        let in_a = a.contains(target);
+        if !in_a && !b.contains(target) {
+            return false;
+        }
+        let (ra, rb) = split_child_rects(split_axis, *ratio, area);
+        // Nearest enclosing = deepest: try to adjust a matching split further
+        // down first; only handle it here if nothing deeper did.
+        let (child, child_area) = if in_a { (a, ra) } else { (b, rb) };
+        if child.resize_pane(target, axis, delta, child_area, min_px) {
+            return true;
+        }
+        if split_axis != axis {
+            return false;
+        }
+        let extent = axis_extent(axis, area);
+        if extent <= 0.0 {
+            return false;
+        }
+        // Clamp so neither child drops below `min_px` (best-effort: if the split
+        // can't even hold two minimums, pin to the midpoint rather than refuse —
+        // resize is continuous, unlike a split which refuses outright).
+        let min_r = (min_px / extent).min(0.5);
+        let signed = if in_a { delta } else { -delta };
+        *ratio = (*ratio + signed).clamp(min_r, 1.0 - min_r);
+        true
+    }
+}
+
+/// The two child rects of a split, given its axis/ratio and outer area.
+pub(crate) fn split_child_rects(axis: Axis, ratio: f64, area: Rect) -> (Rect, Rect) {
+    match axis {
+        Axis::Horizontal => {
+            let wa = area.width * ratio;
+            (
+                Rect::new(area.x, area.y, wa, area.height),
+                Rect::new(area.x + wa, area.y, area.width - wa, area.height),
+            )
+        }
+        Axis::Vertical => {
+            let ha = area.height * ratio;
+            (
+                Rect::new(area.x, area.y, area.width, ha),
+                Rect::new(area.x, area.y + ha, area.width, area.height - ha),
+            )
+        }
+    }
+}
+
+/// A rect's extent along `axis` (width for horizontal splits, height for vertical).
+pub(crate) fn axis_extent(axis: Axis, area: Rect) -> f64 {
+    match axis {
+        Axis::Horizontal => area.width,
+        Axis::Vertical => area.height,
     }
 }
 
@@ -224,22 +296,7 @@ fn layout_into(node: &LayoutNode, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
     match node {
         LayoutNode::Pane { id, .. } => out.push((*id, area)),
         LayoutNode::Split { axis, ratio, a, b } => {
-            let (ra, rb) = match axis {
-                Axis::Horizontal => {
-                    let wa = area.width * ratio;
-                    (
-                        Rect::new(area.x, area.y, wa, area.height),
-                        Rect::new(area.x + wa, area.y, area.width - wa, area.height),
-                    )
-                }
-                Axis::Vertical => {
-                    let ha = area.height * ratio;
-                    (
-                        Rect::new(area.x, area.y, area.width, ha),
-                        Rect::new(area.x, area.y + ha, area.width, area.height - ha),
-                    )
-                }
-            };
+            let (ra, rb) = split_child_rects(*axis, *ratio, area);
             layout_into(a, ra, out);
             layout_into(b, rb, out);
         }

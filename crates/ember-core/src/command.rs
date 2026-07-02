@@ -2,8 +2,6 @@
 //! serde, bus-ready enum; [`apply`] mutates the [`WindowTree`] and *returns*
 //! side-effect descriptions ([`LayoutEffect`]) — it performs no IO itself.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::focus::{Direction, focus_dir};
@@ -23,6 +21,10 @@ pub enum LayoutCommand {
         ratio: f64,
         new_pane: PaneId,
         new_session: SessionId,
+        /// Smallest extent (px) either resulting pane may have along `axis`; the
+        /// app computes it from `min_cells * cell + pad`. The split is REFUSED
+        /// (no effect) if the target can't hold two panes this size.
+        min_px: f64,
     },
     ClosePane {
         target: PaneId,
@@ -43,9 +45,14 @@ pub enum LayoutCommand {
         tab: TabId,
         title: String,
     },
-    ResizeSplit {
+    /// Grow `target`'s side of the nearest enclosing split of `axis` by `delta`
+    /// (a fraction of that split's extent). Pane-relative — no divider identity.
+    ResizePane {
         target: PaneId,
-        ratio: f64,
+        axis: Axis,
+        delta: f64,
+        /// Minimum extent (px) either child may shrink to (the clamp).
+        min_px: f64,
     },
     /// Close a whole tab (by id), killing every session it holds. Works on any
     /// tab, active or not — the app doesn't have to loop `ClosePane` or mutate
@@ -62,25 +69,14 @@ pub enum LayoutCommand {
 pub enum LayoutEffect {
     /// The pane's session must be terminated.
     KillSession(SessionId),
-    /// The session's backend must be resized to this rect.
-    ResizeBackend(SessionId, Rect),
     /// Focus moved to this pane.
     FocusChanged(PaneId),
 }
 
-/// Re-layout `tab` and emit a `ResizeBackend` for every pane in it. Over-emitting
-/// is harmless — a resize is idempotent — and keeps the affected-set logic simple.
-fn resize_all(tab: &Tab, viewport: Rect) -> Vec<LayoutEffect> {
-    let sessions: HashMap<PaneId, SessionId> = tab.root.leaves().into_iter().collect();
-    layout(&tab.root, viewport)
-        .into_iter()
-        .filter_map(|(id, rect)| {
-            sessions
-                .get(&id)
-                .map(|s| LayoutEffect::ResizeBackend(s.clone(), rect))
-        })
-        .collect()
-}
+// NOTE (layout-seam ruling, 2026-07-02): there is deliberately no resize effect.
+// Pane geometry is DERIVED state — the app reconciles it in `sync_layout` by
+// walking `layout()` and sending `BackendControl::Resize` on a dims change. See
+// docs/design/2026-07-02-layout-seam.md.
 
 /// Apply `cmd` to `tree` within `viewport`, returning the side effects to run.
 pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<LayoutEffect> {
@@ -98,7 +94,7 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
                 focus: pane,
             });
             tree.active = 0;
-            effects.push(LayoutEffect::ResizeBackend(session, viewport));
+            let _ = &session; // geometry is reconciled by the app, not signaled
             effects.push(LayoutEffect::FocusChanged(pane));
         }
         return effects;
@@ -115,8 +111,22 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
             ratio,
             new_pane,
             new_session,
+            min_px,
         } => {
             let tab = &mut tree.tabs[tree.active];
+            // Refuse a split the target can't fit two min-size panes into (the
+            // fix for compounding nested splits shrinking to sub-pixel).
+            let extent = layout(&tab.root, viewport)
+                .into_iter()
+                .find(|(id, _)| *id == target)
+                .map(|(_, r)| crate::layout::axis_extent(axis, r));
+            let fits = extent.is_some_and(|e| e >= 2.0 * min_px && e > 0.0);
+            if !fits {
+                return effects;
+            }
+            let extent = extent.unwrap();
+            let min_r = (min_px / extent).min(0.5);
+            let ratio = ratio.clamp(min_r, 1.0 - min_r);
             if let Some(existing) = tab.root.session_of(target).cloned() {
                 let replacement = LayoutNode::split(
                     axis,
@@ -127,7 +137,6 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
                 if tab.root.replace_pane(target, replacement).is_ok() {
                     tab.focus = new_pane;
                     effects.push(LayoutEffect::FocusChanged(new_pane));
-                    effects.extend(resize_all(tab, viewport));
                 }
             }
         }
@@ -154,14 +163,12 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
                                     effects.push(LayoutEffect::FocusChanged(first));
                                 }
                             }
-                            effects.extend(resize_all(&tree.tabs[active], viewport));
                         }
                         None => {
                             // Closed the last pane in the tab → close the tab.
                             tree.tabs.remove(active);
                             if !tree.tabs.is_empty() {
                                 tree.active = active.min(tree.tabs.len() - 1);
-                                effects.extend(resize_all(&tree.tabs[tree.active], viewport));
                             }
                         }
                     }
@@ -184,7 +191,7 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
                 focus: pane,
             });
             tree.active = tree.tabs.len() - 1;
-            effects.push(LayoutEffect::ResizeBackend(session, viewport));
+            let _ = &session; // geometry reconciled by the app
             effects.push(LayoutEffect::FocusChanged(pane));
         }
         LayoutCommand::MoveTab { from, to } => {
@@ -197,11 +204,16 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
                 t.title = title;
             }
         }
-        LayoutCommand::ResizeSplit { target, ratio } => {
+        LayoutCommand::ResizePane {
+            target,
+            axis,
+            delta,
+            min_px,
+        } => {
             let tab = &mut tree.tabs[tree.active];
-            if tab.root.set_split_ratio(target, ratio) {
-                effects.extend(resize_all(tab, viewport));
-            }
+            // Geometry (and thus the backend resize) is reconciled by the app;
+            // core only mutates the ratio.
+            tab.root.resize_pane(target, axis, delta, viewport, min_px);
         }
         LayoutCommand::CloseTab { tab } => {
             if let Some(idx) = tree.tabs.iter().position(|t| t.id == tab) {
@@ -224,7 +236,6 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
                         let focus = tree.tabs[tree.active].focus;
                         effects.push(LayoutEffect::FocusChanged(focus));
                     }
-                    effects.extend(resize_all(&tree.tabs[tree.active], viewport));
                 }
             }
         }
@@ -263,6 +274,7 @@ mod tests {
                 ratio: 0.5,
                 new_pane: PaneId(2),
                 new_session: SessionId::new("s2"),
+                min_px: 0.0,
             },
             vp(),
         );
@@ -272,15 +284,15 @@ mod tests {
         );
         assert_eq!(tree.active_tab().focus, PaneId(2));
         assert!(effects.contains(&LayoutEffect::FocusChanged(PaneId(2))));
-        // Both panes resized to their halves.
-        assert!(effects.contains(&LayoutEffect::ResizeBackend(
-            SessionId::new("s1"),
-            Rect::new(0.0, 0.0, 50.0, 100.0)
-        )));
-        assert!(effects.contains(&LayoutEffect::ResizeBackend(
-            SessionId::new("s2"),
-            Rect::new(50.0, 0.0, 50.0, 100.0)
-        )));
+        // Geometry is derived (no resize effect): the tree lays out into halves.
+        let rects = layout(&tree.active_tab().root, vp());
+        assert_eq!(
+            rects,
+            vec![
+                (PaneId(1), Rect::new(0.0, 0.0, 50.0, 100.0)),
+                (PaneId(2), Rect::new(50.0, 0.0, 50.0, 100.0)),
+            ]
+        );
     }
 
     #[test]
@@ -294,6 +306,7 @@ mod tests {
                 ratio: 0.5,
                 new_pane: PaneId(2),
                 new_session: SessionId::new("s2"),
+                min_px: 0.0,
             },
             vp(),
         );
@@ -305,7 +318,11 @@ mod tests {
         assert!(effects.contains(&LayoutEffect::KillSession(SessionId::new("s2"))));
         // Sibling promoted: tree is a lone pane 1 filling the viewport.
         assert_eq!(tree.active_tab().root.pane_ids(), vec![PaneId(1)]);
-        assert!(effects.contains(&LayoutEffect::ResizeBackend(SessionId::new("s1"), vp())));
+        // Promoted sibling fills the viewport (geometry derived, not signaled).
+        assert_eq!(
+            layout(&tree.active_tab().root, vp()),
+            vec![(PaneId(1), vp())]
+        );
     }
 
     #[test]
@@ -319,6 +336,7 @@ mod tests {
                 ratio: 0.5,
                 new_pane: PaneId(2),
                 new_session: SessionId::new("s2"),
+                min_px: 0.0,
             },
             vp(),
         );
@@ -368,6 +386,7 @@ mod tests {
                 ratio: 0.5,
                 new_pane: PaneId(2),
                 new_session: SessionId::new("s2"),
+                min_px: 0.0,
             },
             vp(),
         );
@@ -384,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_split_changes_ratio() {
+    fn resize_pane_grows_targets_side() {
         let mut tree = single_tab();
         apply(
             &mut tree,
@@ -394,22 +413,96 @@ mod tests {
                 ratio: 0.5,
                 new_pane: PaneId(2),
                 new_session: SessionId::new("s2"),
+                min_px: 0.0,
             },
             vp(),
         );
+        // Shrink pane 1 by 25% of the split extent (delta grows the target's
+        // side, so a negative delta shrinks it).
+        apply(
+            &mut tree,
+            LayoutCommand::ResizePane {
+                target: PaneId(1),
+                axis: Axis::Horizontal,
+                delta: -0.25,
+                min_px: 0.0,
+            },
+            vp(),
+        );
+        let rects = layout(&tree.active_tab().root, vp());
+        assert_eq!(rects[0], (PaneId(1), Rect::new(0.0, 0.0, 25.0, 100.0)));
+        assert_eq!(rects[1], (PaneId(2), Rect::new(25.0, 0.0, 75.0, 100.0)));
+    }
+
+    #[test]
+    fn resize_pane_reaches_enclosing_split_from_nested_leaf() {
+        // Layout: H-split [ p1 | V-split[ p2 / p3 ] ]. Resizing p3 along the
+        // HORIZONTAL axis must move the OUTER divider (its nearest enclosing
+        // horizontal split), which set_split_ratio could never reach.
+        let mut tree = single_tab();
+        apply(
+            &mut tree,
+            LayoutCommand::SplitPane {
+                target: PaneId(1),
+                axis: Axis::Horizontal,
+                ratio: 0.5,
+                new_pane: PaneId(2),
+                new_session: SessionId::new("s2"),
+                min_px: 0.0,
+            },
+            vp(),
+        );
+        apply(
+            &mut tree,
+            LayoutCommand::SplitPane {
+                target: PaneId(2),
+                axis: Axis::Vertical,
+                ratio: 0.5,
+                new_pane: PaneId(3),
+                new_session: SessionId::new("s3"),
+                min_px: 0.0,
+            },
+            vp(),
+        );
+        let before = layout(&tree.active_tab().root, vp());
+        apply(
+            &mut tree,
+            LayoutCommand::ResizePane {
+                target: PaneId(3),
+                axis: Axis::Horizontal,
+                delta: 0.1,
+                min_px: 0.0,
+            },
+            vp(),
+        );
+        let after = layout(&tree.active_tab().root, vp());
+        // p3 is in the outer split's `b` subtree, so growing p3 shrinks p1
+        // (proof the op reached the OUTER divider from a doubly-nested leaf).
+        let w = |rs: &[(PaneId, Rect)], id| rs.iter().find(|(p, _)| *p == id).unwrap().1.width;
+        assert!(
+            w(&after, PaneId(1)) < w(&before, PaneId(1)),
+            "p3 grew → p1 should shrink: {after:?}"
+        );
+    }
+
+    #[test]
+    fn split_refused_when_pane_too_small_for_two_minimums() {
+        // vp is 100x100; a min of 60px can't fit two panes across a 100px pane.
+        let mut tree = single_tab();
         let effects = apply(
             &mut tree,
-            LayoutCommand::ResizeSplit {
+            LayoutCommand::SplitPane {
                 target: PaneId(1),
-                ratio: 0.25,
+                axis: Axis::Horizontal,
+                ratio: 0.5,
+                new_pane: PaneId(2),
+                new_session: SessionId::new("s2"),
+                min_px: 60.0,
             },
             vp(),
         );
-        // Pane 1 now occupies the left 25%.
-        assert!(effects.contains(&LayoutEffect::ResizeBackend(
-            SessionId::new("s1"),
-            Rect::new(0.0, 0.0, 25.0, 100.0)
-        )));
+        assert!(effects.is_empty(), "split should be refused");
+        assert_eq!(tree.active_tab().root.pane_ids(), vec![PaneId(1)]);
     }
 
     #[test]
@@ -495,6 +588,7 @@ mod tests {
                 ratio: 0.5,
                 new_pane: PaneId(2),
                 new_session: SessionId::new("s2"),
+                min_px: 0.0,
             },
             vp(),
         );
@@ -522,6 +616,7 @@ mod tests {
                 ratio: 0.5,
                 new_pane: PaneId(3),
                 new_session: SessionId::new("s3"),
+                min_px: 0.0,
             },
             vp(),
         );
@@ -552,6 +647,7 @@ mod tests {
                 ratio: 0.5,
                 new_pane: PaneId(2),
                 new_session: SessionId::new("s2"),
+                min_px: 0.0,
             },
             vp(),
         );
@@ -576,6 +672,7 @@ mod tests {
             target: PaneId(7),
             axis: Axis::Vertical,
             ratio: 0.3,
+            min_px: 0.0,
             new_pane: PaneId(8),
             new_session: SessionId::new("s8"),
         };

@@ -209,6 +209,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
                 ratio: 0.5,
                 new_pane: p2,
                 new_session: s2,
+                min_px: 0.0, // screenshot scenes are fixed-size; no min constraint
             },
             vp,
         );

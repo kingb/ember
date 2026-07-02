@@ -1407,6 +1407,19 @@ impl RunState {
             // arrows so Shift wins.)
             Key::Named(NamedKey::ArrowRight) if mods.shift_key() => self.cycle_tab(1),
             Key::Named(NamedKey::ArrowLeft) if mods.shift_key() => self.cycle_tab(-1),
+            // Cmd+Ctrl+Arrows — resize the focused pane (grow toward the arrow).
+            Key::Named(NamedKey::ArrowRight) if mods.control_key() => {
+                self.resize_focused(Axis::Horizontal, 0.05)
+            }
+            Key::Named(NamedKey::ArrowLeft) if mods.control_key() => {
+                self.resize_focused(Axis::Horizontal, -0.05)
+            }
+            Key::Named(NamedKey::ArrowDown) if mods.control_key() => {
+                self.resize_focused(Axis::Vertical, 0.05)
+            }
+            Key::Named(NamedKey::ArrowUp) if mods.control_key() => {
+                self.resize_focused(Axis::Vertical, -0.05)
+            }
             // Cmd+Arrows — move focus geometrically between panes.
             Key::Named(NamedKey::ArrowLeft) => self.focus_dir(Direction::Left),
             Key::Named(NamedKey::ArrowRight) => self.focus_dir(Direction::Right),
@@ -1422,18 +1435,27 @@ impl RunState {
 
     /// Split `target` on `axis` at `ratio` (existing pane's fraction), spawning a
     /// fresh shell in the new pane (right/bottom). Shared by Cmd+D + the visual split.
+    /// Minimum pane extent (px) along `axis`, from a floor of cells + padding —
+    /// the value core clamps splits/resizes against (metrics live app-side).
+    fn min_px(&self, axis: Axis) -> f64 {
+        const MIN_COLS: f32 = 8.0;
+        const MIN_ROWS: f32 = 3.0;
+        let (cw, ch) = self.renderer.cell_size();
+        let px = match axis {
+            Axis::Horizontal => MIN_COLS * cw + 2.0 * PAD,
+            Axis::Vertical => MIN_ROWS * ch + 2.0 * PAD,
+        };
+        px as f64
+    }
+
     fn split_pane(&mut self, target: PaneId, axis: Axis, ratio: f64) {
         let new_pane = PaneId(self.next_pane);
-        self.next_pane += 1;
         let new_session = SessionId::new(format!("s{}", self.next_session));
-        self.next_session += 1;
-        if !self.spawn_session(
-            new_session.clone(),
-            GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
-        ) {
-            return;
-        }
         let vp = self.viewport();
+        let min_px = self.min_px(axis);
+        // Spawn only if the split is actually accepted (min-size may refuse it),
+        // so a refused split never leaks a shell. Probe by applying first, then
+        // spawn on success — apply is pure and the session isn't wired yet.
         let effects = apply(
             &mut self.tree,
             LayoutCommand::SplitPane {
@@ -1441,10 +1463,29 @@ impl RunState {
                 axis,
                 ratio,
                 new_pane,
-                new_session,
+                new_session: new_session.clone(),
+                min_px,
             },
             vp,
         );
+        if effects.is_empty() {
+            return; // refused (pane too small) — nothing spawned, nothing to undo
+        }
+        self.next_pane += 1;
+        self.next_session += 1;
+        if !self.spawn_session(new_session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
+            // Spawn failed after the tree accepted the split: roll the pane back
+            // out so we don't render a dead pane.
+            let vp = self.viewport();
+            let rollback = apply(
+                &mut self.tree,
+                LayoutCommand::ClosePane { target: new_pane },
+                vp,
+            );
+            self.apply_effects(rollback);
+            self.sync_layout();
+            return;
+        }
         self.apply_effects(effects);
         self.sync_layout();
     }
@@ -1543,6 +1584,26 @@ impl RunState {
         );
         self.apply_effects(effects);
         self.sync_layout();
+    }
+
+    /// Resize the focused pane along `axis` by `delta` (a fraction of the
+    /// nearest enclosing split of that axis). Core clamps against `min_px`.
+    fn resize_focused(&mut self, axis: Axis, delta: f64) -> bool {
+        let target = self.active_tab().focus;
+        let vp = self.viewport();
+        let min_px = self.min_px(axis);
+        apply(
+            &mut self.tree,
+            LayoutCommand::ResizePane {
+                target,
+                axis,
+                delta,
+                min_px,
+            },
+            vp,
+        );
+        self.sync_layout();
+        true
     }
 
     fn focus_dir(&mut self, dir: Direction) -> bool {
