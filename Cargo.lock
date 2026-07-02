@@ -716,6 +716,7 @@ dependencies = [
  "ember-platform",
  "ember-render",
  "ember-session",
+ "libc",
  "serde_json",
  "toml",
  "winit",
