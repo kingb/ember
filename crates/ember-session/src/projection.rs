@@ -38,6 +38,13 @@ impl StyleInterner {
         }
     }
 
+    /// The complete table, for a resync delta (consumer lost its cache).
+    fn all(&self) -> Vec<(StyleId, Style)> {
+        let mut v: Vec<(StyleId, Style)> = self.map.iter().map(|(s, id)| (*id, *s)).collect();
+        v.sort_unstable_by_key(|(id, _)| *id);
+        v
+    }
+
     fn intern(&mut self, style: Style, first_seen: &mut Vec<(StyleId, Style)>) -> StyleId {
         if let Some(id) = self.map.get(&style) {
             *id
@@ -70,6 +77,9 @@ pub struct AlacrittyProjection<L: EventListener> {
     /// until scrollback saturates the history cap (a long session), then oldest
     /// marks may drift; see the module note.
     marks: Vec<Mark>,
+    /// Next drain emits a full reset + the complete style table
+    /// ([`ember_core::BackendControl::RequestFull`]).
+    resync: bool,
 }
 
 /// One tracked OSC 133 command: its prompt's absolute history line + exit code.
@@ -91,6 +101,7 @@ impl<L: EventListener> AlacrittyProjection<L> {
             epoch: 0,
             display_offset: 0,
             marks: Vec::new(),
+            resync: false,
         }
     }
 
@@ -205,6 +216,12 @@ impl<L: EventListener> AlacrittyProjection<L> {
         self.term.mode().contains(TermMode::FOCUS_IN_OUT)
     }
 
+    /// Make the next drain a full reset carrying the complete style table —
+    /// for a consumer that lost its accumulated grid/style state.
+    pub fn request_full(&mut self) {
+        self.resync = true;
+    }
+
     fn cursor_state(&self) -> CursorState {
         let point = self.term.grid().cursor.point;
         // The cursor lives on the live screen; scrolled into history it moves
@@ -249,6 +266,7 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
             TermDamage::Partial(it) => (false, it.map(|ld| (ld.line, ld.left, ld.right)).collect()),
         };
         self.term.reset_damage();
+        let full = full || std::mem::take(&mut self.resync);
 
         let mut first_seen = Vec::new();
         if full {
@@ -266,7 +284,14 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
                 }
             }
         }
-        out.new_styles = first_seen;
+        // MERGE into whatever the caller left pending (the trait contract) —
+        // assigning here would clobber styles from a superseded drain and
+        // re-open the black-on-black coalescing bug fixed in GridDelta::merge.
+        out.new_styles.extend(first_seen);
+        if out.reset {
+            // A resync consumer has no style cache at all: ship the full table.
+            out.new_styles = self.interner.all();
+        }
         out.cursor = self.cursor_state();
         let mode = self.term.mode();
         out.bracketed_paste = mode.contains(TermMode::BRACKETED_PASTE);
@@ -411,6 +436,49 @@ mod tests {
             .iter()
             .find(|p| p.row == row && p.col == col)
             .expect("cell present")
+    }
+
+    #[test]
+    fn request_full_reships_reset_plus_complete_style_table() {
+        let mut p = proj();
+        p.advance(b"\x1b[31mred\x1b[0m plain");
+        let mut d1 = GridDelta::default();
+        p.drain_damage_into(&mut d1); // consumer learned the styles here
+        assert!(!d1.new_styles.is_empty());
+
+        // Steady state: nothing new.
+        p.advance(b"x");
+        let mut d2 = GridDelta::default();
+        p.drain_damage_into(&mut d2);
+
+        // A fresh consumer asks for everything.
+        p.request_full();
+        let mut d3 = GridDelta::default();
+        p.drain_damage_into(&mut d3);
+        assert!(d3.reset, "resync must be a full reset");
+        assert_eq!(
+            d3.new_styles.len(),
+            d1.new_styles.len() + d2.new_styles.len(),
+            "resync must carry the COMPLETE style table"
+        );
+        assert!(!d3.cells.is_empty());
+    }
+
+    #[test]
+    fn drain_merges_into_pending_styles_instead_of_clobbering() {
+        let mut p = proj();
+        p.advance(b"hi");
+        let mut d = GridDelta::default();
+        // Simulate a pending style from a superseded (non-reset) drain.
+        let sentinel = (StyleId(9999), Style::default());
+        d.new_styles.push(sentinel);
+        p.drain_damage_into(&mut d);
+        if !d.reset {
+            assert!(
+                d.new_styles.contains(&sentinel),
+                "non-reset drain must not clobber pending styles"
+            );
+        }
     }
 
     #[test]

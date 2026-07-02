@@ -42,6 +42,11 @@ pub enum BackendControl {
     Scroll(ScrollAmount),
     /// Jump the viewport to the previous (`-1`) / next (`+1`) OSC 133 prompt mark.
     JumpMark(i8),
+    /// Re-ship everything: a full-reset delta carrying the complete style
+    /// table. For consumers with no accumulated state — a rebuilt renderer
+    /// (GPU device loss) or a pane re-hosted to a new window — since styles
+    /// otherwise ship first-seen-once and can never be re-learned.
+    RequestFull,
     /// Tear the session down.
     Shutdown,
 }

@@ -317,6 +317,10 @@ fn emulation_loop(
                 proj.resize(new_dims);
                 shipper.push(&mut proj, &frame_tx);
             }
+            Ev::Control(BackendControl::RequestFull) => {
+                proj.request_full();
+                shipper.push(&mut proj, &frame_tx);
+            }
             Ev::Control(BackendControl::Focus(focused)) => {
                 // DEC 1004 focus reporting (vim FocusGained/autoread, fish hooks).
                 if proj.reports_focus() {
