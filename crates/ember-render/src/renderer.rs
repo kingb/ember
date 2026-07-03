@@ -251,6 +251,9 @@ pub struct Renderer {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
+    /// Second text pass for the confirm modal's dialog text, drawn *after* the
+    /// opaque panel quad so pane glyphs (htop etc.) can't bleed through it.
+    overlay_text: TextRenderer,
     quads: QuadRenderer,
     /// One grid + glyph buffer per live session (visible or backgrounded).
     panes: HashMap<SessionId, PaneRender>,
@@ -402,6 +405,8 @@ impl Renderer {
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+        let overlay_text =
+            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
         let mut chrome = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         chrome.set_size(&mut font_system, Some(width as f32), Some(LINE_HEIGHT));
@@ -442,6 +447,7 @@ impl Renderer {
             viewport,
             atlas,
             text_renderer,
+            overlay_text,
             quads,
             panes: HashMap::new(),
             visible: Vec::new(),
@@ -1012,6 +1018,8 @@ impl Renderer {
         // (overlays): all quads draw after the (empty) spark pass.
         let mut spark_layer: usize = 0;
         let mut areas: Vec<TextArea> = Vec::new();
+        // Confirm-modal dialog text: a second pass, drawn after the panel quad.
+        let mut overlay_areas: Vec<TextArea> = Vec::new();
         // Whether to draw the backdrop image this frame (pane view only — never
         // over the Settings/About/help overlays).
         let mut draw_image = false;
@@ -1265,6 +1273,10 @@ impl Renderer {
         }
 
         // Blocking confirm modal — drawn OVER everything (panes, tabs, overlays).
+        // Its scrim + panel + button quads are appended to `rounded` *after* this
+        // point, so this boundary splits base rounded quads (tab pills, drawn
+        // before the pane text) from the confirm quads (drawn after it).
+        let rounded_pre_confirm = rounded.len() as u32;
         self.confirm_buttons.clear();
         if let Some(view) = self.confirm.clone() {
             let lw = self.config.width as f32 / sf;
@@ -1290,7 +1302,9 @@ impl Renderer {
                 (&self.confirm_cancel, cl.cancel_origin),
                 (&self.confirm_ok, cl.ok_origin),
             ] {
-                areas.push(TextArea {
+                // Overlay pass: drawn after the opaque panel, so it can't be
+                // overpainted by pane text underneath.
+                overlay_areas.push(TextArea {
                     buffer: buf,
                     left: ox * sf,
                     top: oy * sf,
@@ -1382,6 +1396,24 @@ impl Renderer {
             self.window.request_redraw();
             return true;
         }
+        // Confirm-dialog text (empty unless the modal is up), prepared into the
+        // shared atlas for its own post-panel render pass.
+        let prepared_overlay = self.overlay_text.prepare(
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &mut self.atlas,
+            &self.viewport,
+            overlay_areas,
+            &mut self.swash_cache,
+        );
+        if let Err(e) = prepared_overlay {
+            debug_emit(&format!(
+                "[ember] overlay text prepare failed this frame: {e:?}"
+            ));
+            self.window.request_redraw();
+            return true;
+        }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
@@ -1433,12 +1465,22 @@ impl Renderer {
             // selection, and the tab strip.
             let split = spark_layer as u32;
             let sharp = self.quads.sharp_count();
+            // Rounded quads split into base (tab pills, before pane text) and the
+            // confirm modal's scrim+panel+buttons (after it, so the opaque panel
+            // covers pane glyphs instead of them bleeding through).
+            let base_rounded_end = sharp + rounded_pre_confirm;
             self.quads.draw_range(&mut pass, 0..split);
             self.sparks.draw(&mut pass);
             self.quads.draw_range(&mut pass, split..sharp); // cells + chrome
-            self.quads.draw_range(&mut pass, sharp..u32::MAX); // rounded tab pills
+            self.quads.draw_range(&mut pass, sharp..base_rounded_end); // tab pills
             let _ = self
                 .text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass); // panes + chrome
+            // Confirm modal on top: scrim dims the (painted) panes, the opaque
+            // panel covers its box, then the dialog text renders over it.
+            self.quads.draw_range(&mut pass, base_rounded_end..u32::MAX);
+            let _ = self
+                .overlay_text
                 .render(&self.atlas, &self.viewport, &mut pass);
         }
         self.queue.submit(Some(encoder.finish()));

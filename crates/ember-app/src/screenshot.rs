@@ -38,6 +38,8 @@ pub struct Opts {
     pub tab_drag: Option<(usize, f32)>,
     /// Hovered tab (0-based) — draws the hover highlight + "✕" close affordance.
     pub hover_tab: Option<usize>,
+    /// Draw a sample "Close this tab?" confirm modal over the panes.
+    pub confirm: bool,
     /// Split drop-zone preview on the focused pane: `(horizontal, ratio)`.
     pub split_preview: Option<(bool, f32)>,
     /// How long to let the shells produce output before capturing.
@@ -80,6 +82,7 @@ impl Default for Opts {
             tabs: 1,
             tab_drag: None,
             hover_tab: None,
+            confirm: false,
             split_preview: None,
             settle_ms: 700,
             backdrop: false,
@@ -123,6 +126,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--hover-tab" => {
                 opts.hover_tab = Some(next()?.parse().map_err(|e| format!("--hover-tab: {e}"))?)
             }
+            "--confirm" => opts.confirm = true,
             "--tab-drag" => {
                 let slot = next()?
                     .parse()
@@ -352,7 +356,13 @@ pub fn run(opts: Opts) -> Result<String, String> {
         bell_flash: opts.bell,
         font_size: opts.font_size,
         font_family: opts.font.clone(),
-        confirm: None,
+        confirm: opts.confirm.then(|| ember_render::ConfirmView {
+            title: "Close this tab?".to_string(),
+            message: "The command is still running.".to_string(),
+            cancel_label: "Cancel".to_string(),
+            confirm_label: "Close".to_string(),
+            focused: 0,
+        }),
     };
     if opts.bg_image.is_some() && shot.image.is_none() {
         return Err(format!(

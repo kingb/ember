@@ -212,6 +212,9 @@ pub fn capture_reusing(
     let mut atlas = TextAtlas::new(device, queue, &cache, format);
     let mut text_renderer =
         TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
+    // Second pass for the confirm dialog's text (drawn after its opaque panel),
+    // mirroring the windowed renderer so screenshots match on-screen.
+    let mut overlay_text = TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
     let mut quads = QuadRenderer::new(device, format);
     let mut sparks = SparkRenderer::new(device, format);
     let mut image = ImageRenderer::new(device, format);
@@ -410,6 +413,9 @@ pub fn capture_reusing(
             sf,
         );
     }
+    // Boundary between base rounded quads (tab pills) and the confirm modal's
+    // scrim+panel+buttons, appended next — so the panel draws after pane text.
+    let rounded_pre_confirm = rounded.len() as u32;
     if let Some(view) = &shot.confirm {
         confirm_layout = Some(build_confirm(
             font_system,
@@ -534,6 +540,8 @@ pub fn capture_reusing(
             });
         }
     }
+    // Confirm dialog text goes to the overlay pass (drawn after its opaque panel).
+    let mut overlay_areas: Vec<TextArea> = Vec::new();
     if let Some(cl) = &confirm_layout {
         for (buf, (ox, oy)) in [
             (&cf_title, cl.title_origin),
@@ -541,7 +549,7 @@ pub fn capture_reusing(
             (&cf_cancel, cl.cancel_origin),
             (&cf_ok, cl.ok_origin),
         ] {
-            areas.push(TextArea {
+            overlay_areas.push(TextArea {
                 buffer: buf,
                 left: ox * sf,
                 top: oy * sf,
@@ -560,6 +568,17 @@ pub fn capture_reusing(
             &mut atlas,
             &viewport,
             areas,
+            &mut swash_cache,
+        )
+        .map_err(|e| CaptureError::TextPrepare(format!("{e:?}")))?;
+    overlay_text
+        .prepare(
+            device,
+            queue,
+            font_system,
+            &mut atlas,
+            &viewport,
+            overlay_areas,
             &mut swash_cache,
         )
         .map_err(|e| CaptureError::TextPrepare(format!("{e:?}")))?;
@@ -605,11 +624,16 @@ pub fn capture_reusing(
         }
         let split = spark_layer as u32;
         let sharp = quads.sharp_count();
+        // Base rounded quads (tab pills) before pane text; the confirm modal's
+        // scrim+panel+buttons after it, so the opaque panel covers pane glyphs.
+        let base_rounded_end = sharp + rounded_pre_confirm;
         quads.draw_range(&mut pass, 0..split);
         sparks.draw(&mut pass);
         quads.draw_range(&mut pass, split..sharp); // cells + chrome
-        quads.draw_range(&mut pass, sharp..u32::MAX); // rounded tab pills
-        let _ = text_renderer.render(&atlas, &viewport, &mut pass);
+        quads.draw_range(&mut pass, sharp..base_rounded_end); // tab pills
+        let _ = text_renderer.render(&atlas, &viewport, &mut pass); // panes + chrome
+        quads.draw_range(&mut pass, base_rounded_end..u32::MAX); // confirm panel
+        let _ = overlay_text.render(&atlas, &viewport, &mut pass); // dialog text
     }
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
