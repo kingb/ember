@@ -1443,6 +1443,13 @@ impl Renderer {
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+        // Advance wgpu's resource lifecycle so completed per-frame GPU resources
+        // (command buffers, temporary/destroyed staging buffers) are actually
+        // reclaimed. The windowed loop runs on ControlFlow::Wait and never
+        // otherwise polls, so without this every redraw leaks GPU allocations —
+        // they pile up as thousands of IOAccelerator regions and balloon the
+        // process footprint (purgeable, but it thrashes swap). Non-blocking.
+        let _ = self.device.poll(wgpu::PollType::Poll);
         self.atlas.trim();
         true
     }
