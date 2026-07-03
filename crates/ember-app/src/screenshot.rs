@@ -36,6 +36,8 @@ pub struct Opts {
     pub tabs: usize,
     /// Tab-drag preview: `(dragged slot, cursor x logical)` — for the lifted tab.
     pub tab_drag: Option<(usize, f32)>,
+    /// Hovered tab (0-based) — draws the hover highlight + "✕" close affordance.
+    pub hover_tab: Option<usize>,
     /// Split drop-zone preview on the focused pane: `(horizontal, ratio)`.
     pub split_preview: Option<(bool, f32)>,
     /// How long to let the shells produce output before capturing.
@@ -77,6 +79,7 @@ impl Default for Opts {
             runs: Vec::new(),
             tabs: 1,
             tab_drag: None,
+            hover_tab: None,
             split_preview: None,
             settle_ms: 700,
             backdrop: false,
@@ -117,6 +120,9 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--width" => opts.width = next()?.parse().map_err(|e| format!("--width: {e}"))?,
             "--height" => opts.height = next()?.parse().map_err(|e| format!("--height: {e}"))?,
             "--tabs" => opts.tabs = next()?.parse().map_err(|e| format!("--tabs: {e}"))?,
+            "--hover-tab" => {
+                opts.hover_tab = Some(next()?.parse().map_err(|e| format!("--hover-tab: {e}"))?)
+            }
             "--tab-drag" => {
                 let slot = next()?
                     .parse()
@@ -319,6 +325,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
         panes: shots,
         tabs,
         tab_drag: opts.tab_drag,
+        hovered_tab: opts.hover_tab,
         help: None,
         help_title: None,
         about: None,

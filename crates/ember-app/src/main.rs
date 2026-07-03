@@ -539,9 +539,14 @@ impl ApplicationHandler<EmberEvent> for App {
                     let (x, y) = state.cursor;
                     state.extend_selection(x, y);
                 } else {
+                    let (x, y) = state.cursor;
+                    // Tab strip: track hover (highlight + "✕"); motion over the
+                    // strip is chrome, not pane motion, so stop here.
+                    if state.update_tab_hover(x, y) {
+                        return;
+                    }
                     // Show a resize cursor over a divider; else forward motion to
                     // mouse-aware apps.
-                    let (x, y) = state.cursor;
                     let over = state.divider_at(x, y).map(|(_, a)| a);
                     if over != state.resize_cursor {
                         state.resize_cursor = over;
@@ -555,6 +560,11 @@ impl ApplicationHandler<EmberEvent> for App {
                         state.forward_mouse_motion();
                     }
                 }
+            }
+            // Cursor left the window — drop any tab hover so the highlight/"✕"
+            // don't linger.
+            WindowEvent::CursorLeft { .. } => {
+                state.renderer.set_hovered_tab(None);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Notch wheels scroll WHEEL_LINES per notch; trackpads report
@@ -1792,8 +1802,28 @@ impl RunState {
         self.renderer.set_help(Some(help_lines()));
     }
 
+    /// Track which tab the cursor is over, driving the hover highlight + "✕"
+    /// close affordance. Returns `true` when the cursor is over the tab strip, so
+    /// the caller treats the motion as chrome (not pane) input. Also clears a
+    /// stale resize cursor when moving off a divider onto the strip.
+    fn update_tab_hover(&mut self, x: f64, y: f64) -> bool {
+        let hit = self.renderer.tab_hit(x as f32, y as f32);
+        match hit {
+            Some(TabHit::Tab(i)) | Some(TabHit::CloseTab(i)) => {
+                self.renderer.set_hovered_tab(Some(i))
+            }
+            _ => self.renderer.set_hovered_tab(None),
+        }
+        let on_strip = hit.is_some();
+        if on_strip && self.resize_cursor.is_some() {
+            self.resize_cursor = None;
+            self.renderer.window().set_cursor(CursorIcon::Default);
+        }
+        on_strip
+    }
+
     /// Handle a left click at the current cursor position: dismiss an open overlay,
-    /// else hit-test the tab strip (switch tab / open a new tab).
+    /// else hit-test the tab strip (switch tab / close a tab / open a new tab).
     fn left_click(&mut self) {
         // A click on an About-overlay link button (Docs/GitHub) opens the URL
         // rather than dismissing the overlay.
@@ -1842,6 +1872,14 @@ impl RunState {
                             press_x: x,
                             active: false,
                         });
+                    }
+                }
+                TabHit::CloseTab(i) => {
+                    // The "✕" only renders with ≥2 tabs, so closing one never
+                    // empties the app (no exit path needed). Same close flow as
+                    // middle-click: confirm-if-busy via request_close.
+                    if let Some(id) = self.tree.tabs.get(i).map(|t| t.id) {
+                        let _ = self.request_close(PendingClose::Tab(id));
                     }
                 }
                 TabHit::NewTab => self.new_tab(),

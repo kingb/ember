@@ -456,8 +456,15 @@ pub(crate) fn split_preview(
 const STRIP_BG: Rgb = Rgb::new(0x1b, 0x1b, 0x1b);
 /// Fill of the active tab button.
 const TAB_ACTIVE: Rgb = Rgb::new(0x3a, 0x3a, 0x3d);
+/// Fill of a hovered *inactive* tab — a subtle lift between [`STRIP_BG`] and
+/// [`TAB_ACTIVE`] (iTerm-style), no accent ring so it reads as hover, not select.
+const TAB_HOVER: Rgb = Rgb::new(0x2b, 0x2b, 0x2e);
 /// Width (in columns) of each trailing tab-strip utility button ("+", "?", "⚙").
 pub(crate) const BTN_COLS: usize = 3;
+/// Columns reserved at the left of a *hovered* tab for the "✕ " close affordance.
+/// [`build_tabs`] draws it and [`Renderer::tab_hit`](crate::Renderer::tab_hit)
+/// must mirror this to route a click there to a close.
+pub(crate) const CLOSE_COLS: usize = 2;
 
 /// Center `s` in a field `width` **display columns** wide (truncating with `…`
 /// if too long). Uses Unicode display width — a CJK title char is 2 columns —
@@ -506,6 +513,26 @@ fn center(s: &str, width: usize) -> String {
 /// Push a rounded tab "pill" (iTerm-style): a fill inset from the strip edges,
 /// with an optional 1px accent ring behind it. `x`/`w` are the tab segment in
 /// logical px; `cw` gives a small horizontal gap so adjacent pills don't touch.
+/// Geometry of a tab pill for segment `x`/`w`: `(left, top, width, height,
+/// radius)` in logical px. Single source of truth so the fill, the accent ring,
+/// and the hover "✕" (centered in the left cap) all agree.
+fn pill_geom(x: f32, w: f32, strip_h: f32, cw: f32) -> (f32, f32, f32, f32, f32) {
+    let inset_y = 3.0;
+    let gap_x = (cw * 0.4).clamp(3.0, 8.0);
+    let px = x + gap_x;
+    let pw = (w - 2.0 * gap_x).max(1.0);
+    let ph = (strip_h - 2.0 * inset_y).max(1.0);
+    let radius = (ph * 0.5).min(9.0);
+    (px, inset_y, pw, ph, radius)
+}
+
+/// Center of a pill's left rounded cap (logical px) — where the hover "✕" sits so
+/// an inscribed circle matches the corner. Mirrors [`pill_geom`].
+fn pill_cap_center(x: f32, w: f32, strip_h: f32, cw: f32) -> (f32, f32) {
+    let (px, inset_y, _pw, ph, radius) = pill_geom(x, w, strip_h, cw);
+    (px + radius, inset_y + ph * 0.5)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_pill(
     rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
@@ -517,12 +544,7 @@ fn push_pill(
     fill: Rgb,
     ring: Option<Rgb>,
 ) {
-    let inset_y = 3.0;
-    let gap_x = (cw * 0.4).clamp(3.0, 8.0);
-    let px = x + gap_x;
-    let pw = (w - 2.0 * gap_x).max(1.0);
-    let ph = (strip_h - 2.0 * inset_y).max(1.0);
-    let radius = (ph * 0.5).min(9.0);
+    let (px, inset_y, pw, ph, radius) = pill_geom(x, w, strip_h, cw);
     if let Some(c) = ring {
         // A slightly larger rounded rect behind the fill = a 1px accent ring.
         rounded.push((
@@ -542,16 +564,21 @@ fn push_pill(
 pub(crate) fn build_tabs(
     font_system: &mut FontSystem,
     chrome: &mut Buffer,
+    close_buf: &mut Buffer,
     tabs: &[TabLabel],
     drag: Option<(usize, f32)>,
+    hovered: Option<usize>,
     cw: f32,
     logical_w: f32,
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
     rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
-) {
+) -> Option<f32> {
     chrome.set_size(font_system, Some(logical_w), Some(LINE_HEIGHT));
     let strip_h = CELL_HEIGHT + 2.0 * PAD;
+    // Center-x of the hovered tab's "✕" (in the pill's left cap); `None` when no
+    // tab is hovered. The caller positions `close_buf` there.
+    let mut close_cx: Option<f32> = None;
     // Full-width strip background.
     out.push((
         scaled(0.0, 0.0, logical_w, strip_h, sf),
@@ -593,6 +620,15 @@ pub(crate) fn build_tabs(
             } else if tab.active {
                 // iTerm-style: an inset rounded pill with a subtle ember ring.
                 push_pill(rounded, x, w, strip_h, cw, sf, TAB_ACTIVE, Some(ACCENT));
+            } else if hovered == Some(i) {
+                // Hover lift on an inactive tab: a subtle fill, no ring.
+                push_pill(rounded, x, w, strip_h, cw, sf, TAB_HOVER, None);
+            }
+            // Hovering a tab (active or not) reveals a "✕" centered in the pill's
+            // left rounded cap; the caller draws close_buf there. Suppressed while
+            // renaming or dragging that tab.
+            if hovered == Some(i) && !tab.editing && !dragging_this {
+                close_cx = Some(pill_cap_center(x, w, strip_h, cw).0);
             }
             // Unseen-bell indicator: a small amber dot in the tab's top-right.
             if tab.bell {
@@ -667,6 +703,21 @@ pub(crate) fn build_tabs(
         None,
     );
     chrome.shape_until_scroll(font_system, false);
+
+    // Shape the hover "✕" into its own buffer so the caller can pixel-center it in
+    // the pill cap (the column-based chrome line can't hit that spot exactly).
+    if close_cx.is_some() {
+        close_buf.set_size(font_system, Some(cw * 2.0), Some(LINE_HEIGHT));
+        close_buf.set_text(
+            font_system,
+            "✕",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        close_buf.shape_until_scroll(font_system, false);
+    }
+    close_cx
 }
 
 /// Build the cheat-sheet overlay: a full scrim + a centered panel (accent border)

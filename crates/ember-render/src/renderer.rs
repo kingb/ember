@@ -28,9 +28,9 @@ use winit::window::Window;
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    BTN_COLS, bell_wash, build_about, build_confirm, build_fps, build_help, build_settings,
-    build_tabs, debug_emit, grid_quads, measure_cell_width, push_backdrop, scrollbar,
-    scrollbar_geometry, selection_quads, shape_grid, spark_quads, split_preview,
+    BTN_COLS, CLOSE_COLS, bell_wash, build_about, build_confirm, build_fps, build_help,
+    build_settings, build_tabs, debug_emit, grid_quads, measure_cell_width, push_backdrop,
+    scrollbar, scrollbar_geometry, selection_quads, shape_grid, spark_quads, split_preview,
 };
 use crate::selection::Selection;
 
@@ -173,12 +173,36 @@ impl From<&str> for ImageFit {
 pub enum TabHit {
     /// The tab button at this index.
     Tab(usize),
+    /// The "✕" close zone of the hovered tab at this index (left edge).
+    CloseTab(usize),
     /// The trailing "+" button (open a new tab).
     NewTab,
     /// The trailing "?" button (toggle the shortcuts overlay).
     Help,
     /// The trailing "⚙" button (toggle the Settings overlay).
     Settings,
+}
+
+/// Resolve a tab-area column to a hit, mirroring the equal-width slot math in
+/// [`build_tabs`]. `hovered` gates the left `CLOSE_COLS` "✕" close zone (only the
+/// hovered tab exposes it). Pure so the geometry is unit-testable without a GPU.
+fn tab_col_hit(n: usize, tab_cols: usize, hovered: Option<usize>, col: usize) -> Option<TabHit> {
+    if n <= 1 {
+        return None;
+    }
+    let seg = tab_cols / n;
+    let mut acc = 0;
+    for i in 0..n {
+        let width = if i == n - 1 { tab_cols - acc } else { seg };
+        if col >= acc && col < acc + width {
+            if hovered == Some(i) && width > CLOSE_COLS && col - acc < CLOSE_COLS {
+                return Some(TabHit::CloseTab(i));
+            }
+            return Some(TabHit::Tab(i));
+        }
+        acc += width;
+    }
+    None
 }
 
 /// A pane's terminal modes (from the latest delta), driving mouse-wheel handling.
@@ -239,8 +263,13 @@ pub struct Renderer {
     /// In-progress tab drag: `(dragged slot, cursor x in logical px)` for the lifted,
     /// cursor-following tab; `None` when not dragging.
     tab_drag: Option<(usize, f32)>,
+    /// Tab the cursor is currently over, or `None`. Drives the hover highlight +
+    /// the "✕" close affordance; also gates the close zone in [`Self::tab_hit`].
+    hovered_tab: Option<usize>,
     /// Glyph buffer for the tab strip.
     chrome: Buffer,
+    /// Glyph buffer for the hovered tab's "✕", positioned in the pill's left cap.
+    close_buffer: Buffer,
     /// When `Some`, the cheat-sheet overlay is shown with these `(key, desc)` rows.
     help: Option<Vec<(String, String)>>,
     /// Overrides the help panel's `(title, hint)`; `None` → the shortcuts
@@ -376,6 +405,7 @@ impl Renderer {
 
         let mut chrome = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         chrome.set_size(&mut font_system, Some(width as f32), Some(LINE_HEIGHT));
+        let close_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let help_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let about_title = Buffer::new(
             &mut font_system,
@@ -418,7 +448,9 @@ impl Renderer {
             focused: None,
             tabs: Vec::new(),
             tab_drag: None,
+            hovered_tab: None,
             chrome,
+            close_buffer,
             help: None,
             help_title: None,
             help_buffer,
@@ -566,6 +598,7 @@ impl Renderer {
             panes,
             tabs: self.tabs.clone(),
             tab_drag: self.tab_drag,
+            hovered_tab: self.hovered_tab,
             help: self.help.clone(),
             help_title: self.help_title.clone(),
             about: self
@@ -714,6 +747,15 @@ impl Renderer {
         self.window.request_redraw();
     }
 
+    /// Set/clear the hovered tab. Redraws only on a real change so per-pixel
+    /// cursor motion inside one tab doesn't churn frames.
+    pub fn set_hovered_tab(&mut self, hovered: Option<usize>) {
+        if self.hovered_tab != hovered {
+            self.hovered_tab = hovered;
+            self.window.request_redraw();
+        }
+    }
+
     /// Set/clear the Ctrl+Opt split drop-zone preview: `(hovered session,
     /// horizontal = side-by-side, ratio = existing pane fraction)`.
     pub fn set_split_preview(&mut self, preview: Option<(SessionId, bool, f32)>) {
@@ -752,19 +794,7 @@ impl Renderer {
             return Some(TabHit::NewTab);
         }
         // Tab buttons only exist when there's more than one tab.
-        let n = self.tabs.len();
-        if n > 1 {
-            let seg = tab_cols / n;
-            let mut acc = 0;
-            for i in 0..n {
-                let width = if i == n - 1 { tab_cols - acc } else { seg };
-                if col >= acc && col < acc + width {
-                    return Some(TabHit::Tab(i));
-                }
-                acc += width;
-            }
-        }
-        None
+        tab_col_hit(self.tabs.len(), tab_cols, self.hovered_tab, col)
     }
 
     /// Which tab slot logical-x falls over, clamped to a valid tab index — used
@@ -1151,11 +1181,13 @@ impl Renderer {
                 }
             }
             let logical_w = self.config.width as f32 / sf;
-            build_tabs(
+            let close_cx = build_tabs(
                 &mut self.font_system,
                 &mut self.chrome,
+                &mut self.close_buffer,
                 &self.tabs,
                 self.tab_drag,
+                self.hovered_tab,
                 cw,
                 logical_w,
                 sf,
@@ -1192,6 +1224,20 @@ impl Renderer {
                 default_color: Color::rgb(FG.r, FG.g, FG.b),
                 custom_glyphs: &[],
             });
+            // The hovered tab's "✕", pixel-centered in the pill's left cap. `cw/2`
+            // recenters the 1-cell glyph on the cap center; `top: PAD` matches the
+            // chrome baseline (already vertically centered in the strip).
+            if let Some(cx) = close_cx {
+                areas.push(TextArea {
+                    buffer: &self.close_buffer,
+                    left: (cx - cw * 0.5) * sf,
+                    top: PAD * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(0xcc, 0xcc, 0xcc),
+                    custom_glyphs: &[],
+                });
+            }
             // FPS/frame-time debug readout, on top of the panes (bottom-right).
             if let Some(text) = self.fps_overlay.clone() {
                 let (left, top) = build_fps(
@@ -1399,5 +1445,43 @@ impl Renderer {
         frame.present();
         self.atlas.trim();
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TabHit, tab_col_hit};
+
+    // 3 equal tabs over 30 columns → 10 cols each (slots 0-9, 10-19, 20-29).
+    const N: usize = 3;
+    const COLS: usize = 30;
+
+    #[test]
+    fn no_tab_buttons_with_one_tab() {
+        assert_eq!(tab_col_hit(1, COLS, None, 5), None);
+    }
+
+    #[test]
+    fn plain_column_selects_its_tab() {
+        assert_eq!(tab_col_hit(N, COLS, None, 5), Some(TabHit::Tab(0)));
+        assert_eq!(tab_col_hit(N, COLS, None, 15), Some(TabHit::Tab(1)));
+        assert_eq!(tab_col_hit(N, COLS, None, 25), Some(TabHit::Tab(2)));
+    }
+
+    #[test]
+    fn hovered_tab_left_zone_is_a_close() {
+        // Hovering tab 1 (cols 10-19): its first CLOSE_COLS (10,11) close it...
+        assert_eq!(tab_col_hit(N, COLS, Some(1), 10), Some(TabHit::CloseTab(1)));
+        assert_eq!(tab_col_hit(N, COLS, Some(1), 11), Some(TabHit::CloseTab(1)));
+        // ...but the rest of the tab still selects.
+        assert_eq!(tab_col_hit(N, COLS, Some(1), 12), Some(TabHit::Tab(1)));
+    }
+
+    #[test]
+    fn close_zone_only_on_the_hovered_tab() {
+        // Tab 0's left columns are NOT a close zone when tab 1 is the hovered one.
+        assert_eq!(tab_col_hit(N, COLS, Some(1), 0), Some(TabHit::Tab(0)));
+        // No hover at all → never a close.
+        assert_eq!(tab_col_hit(N, COLS, None, 10), Some(TabHit::Tab(1)));
     }
 }

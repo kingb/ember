@@ -53,6 +53,8 @@ pub struct Shot<'a> {
     pub tabs: Vec<TabLabel>,
     /// In-progress tab drag `(dragged slot, cursor x logical)`, for the lifted tab.
     pub tab_drag: Option<(usize, f32)>,
+    /// Tab the cursor is over (hover highlight + "✕" close affordance), or `None`.
+    pub hovered_tab: Option<usize>,
     /// When set, the cheat-sheet overlay is drawn instead of the panes.
     pub help: Option<Vec<(String, String)>>,
     /// Overrides the help panel's `(title, hint)`; `None` → shortcuts default.
@@ -228,6 +230,7 @@ pub fn capture_reusing(
     let mut buffers: Vec<Buffer> = Vec::new();
     let mut help_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut chrome = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut close_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut about_title = Buffer::new(
         font_system,
         Metrics::new(ABOUT_TITLE_SIZE, ABOUT_TITLE_LINE),
@@ -250,6 +253,8 @@ pub fn capture_reusing(
     let mut about_layout: Option<AboutLayout> = None;
     let mut settings_origin: Option<(f32, f32)> = None;
     let mut fps_origin: Option<(f32, f32)> = None;
+    // Center-x of the hovered tab's "✕" (pill left cap), when a tab is hovered.
+    let mut close_cx: Option<f32> = None;
 
     if let Some((rows, sel)) = &shot.settings {
         settings_origin = Some(build_settings(
@@ -372,11 +377,13 @@ pub fn capture_reusing(
                 );
             }
         }
-        build_tabs(
+        close_cx = build_tabs(
             font_system,
             &mut chrome,
+            &mut close_buf,
             &shot.tabs,
             shot.tab_drag,
+            shot.hovered_tab,
             cw,
             shot.logical_w,
             sf,
@@ -502,6 +509,19 @@ pub fn capture_reusing(
             default_color: Color::rgb(FG.r, FG.g, FG.b),
             custom_glyphs: &[],
         });
+        // The hovered tab's "✕", pixel-centered in the pill's left cap (matches
+        // the windowed renderer).
+        if let Some(cx) = close_cx {
+            areas.push(TextArea {
+                buffer: &close_buf,
+                left: (cx - cw * 0.5) * sf,
+                top: PAD * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(0xcc, 0xcc, 0xcc),
+                custom_glyphs: &[],
+            });
+        }
         if let Some((left, top)) = fps_origin {
             areas.push(TextArea {
                 buffer: &fps_buf,
