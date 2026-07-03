@@ -1099,7 +1099,7 @@ impl Renderer {
             // Pass 1: (re)shape only panes whose grid/size changed since last frame.
             // Buffers persist in `PaneRender`, so unchanged panes reuse their shaping
             // — the TextArea below just references the existing buffer.
-            let (size, lh) = (self.font_size, self.line_height);
+            let (size, lh, cw) = (self.font_size, self.line_height, self.cell_w);
             let family = crate::paint::family_of(self.family_name.as_deref());
             for vp in &self.visible {
                 if let Some(p) = self.panes.get_mut(&vp.session) {
@@ -1110,6 +1110,7 @@ impl Renderer {
                             &p.grid,
                             size,
                             lh,
+                            cw,
                             family,
                         );
                         p.dirty = false;

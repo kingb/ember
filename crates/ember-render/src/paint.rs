@@ -218,15 +218,23 @@ fn dim_rgb(c: ember_core::Rgb) -> ember_core::Rgb {
 /// Shape one grid's rows into `buffer` as per-cell styled runs (one logical
 /// line per grid row): fg color + bold/italic/dim. Underline/strikeout/overline
 /// are quads (see [`grid_quads`]) — cosmic-text doesn't draw decorations.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn shape_grid(
     font_system: &mut FontSystem,
     buffer: &mut Buffer,
     grid: &GridModel,
     size: f32,
     line_height: f32,
+    cw: f32,
     family: Family,
 ) {
     use ember_core::Attrs as CellAttrs;
+    // Snap every glyph's advance to a multiple of the cell width — a terminal
+    // is a grid, so a symbol/emoji/CJK glyph whose natural advance isn't one
+    // cell must NOT shift the cells after it (the spinner-jitter bug). cosmic-
+    // text rounds each advance to `round(advance/cw)*cw`: narrow symbols → 1
+    // cell, wide glyphs → 2.
+    buffer.set_monospace_width(font_system, Some(cw));
     // One grid row = one visual line, always. With the default word-wrap a row
     // whose shaped width overruns the pane (wide CJK/emoji advances aren't
     // exactly 2·cw) soft-wraps, shifting every row below it and clipping the

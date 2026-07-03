@@ -338,6 +338,7 @@ pub fn capture_reusing(
                 pane.grid,
                 font_size,
                 line_height,
+                cw,
                 font_family,
             );
             buffers.push(buffer);
