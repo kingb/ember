@@ -427,18 +427,36 @@ const TAB_ACTIVE: Rgb = Rgb::new(0x2e, 0x2e, 0x2e);
 /// Width (in columns) of each trailing tab-strip utility button ("+", "?", "⚙").
 pub(crate) const BTN_COLS: usize = 3;
 
-/// Center `s` in a field `width` columns wide (truncating with `…` if too long).
+/// Center `s` in a field `width` **display columns** wide (truncating with `…`
+/// if too long). Uses Unicode display width — a CJK title char is 2 columns —
+/// so wide tab titles stay aligned with their column-based button quads instead
+/// of overflowing (a raw `chars().count()` under-measured them).
 fn center(s: &str, width: usize) -> String {
-    let n = s.chars().count();
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     if width == 0 {
         return String::new();
     }
+    let n = UnicodeWidthStr::width(s);
     if n >= width {
         if width == 1 {
             return "…".to_string();
         }
-        let keep: String = s.chars().take(width - 1).collect();
-        return format!("{keep}…");
+        // Keep whole chars until one more would exceed `width - 1` columns,
+        // leaving a column for the ellipsis.
+        let mut keep = String::new();
+        let mut used = 0usize;
+        for ch in s.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + w > width - 1 {
+                break;
+            }
+            keep.push(ch);
+            used += w;
+        }
+        // Pad if the truncation landed mid-way (dropping a wide char) so the
+        // field stays exactly `width` columns.
+        let pad = width - 1 - used;
+        return format!("{keep}{}…", " ".repeat(pad));
     }
     let total = width - n;
     let left = total / 2;
@@ -1056,4 +1074,34 @@ pub(crate) fn push_border(rects: &mut Vec<([f32; 4], [f32; 4])>, rect: Rect, col
     rects.push((scaled(x, y + h - t, w, t, sf), c)); // bottom
     rects.push((scaled(x, y, t, h, sf), c)); // left
     rects.push((scaled(x + w - t, y, t, h, sf), c)); // right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::center;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn center_pads_ascii_to_width() {
+        let out = center("ab", 6);
+        assert_eq!(out, "  ab  ");
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 6);
+    }
+
+    #[test]
+    fn center_measures_cjk_as_two_columns() {
+        // "你好" is 4 display columns; centering in 8 adds 2 spaces each side.
+        let out = center("你好", 8);
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 8);
+        assert_eq!(out, "  你好  ");
+    }
+
+    #[test]
+    fn center_truncates_by_display_width_not_char_count() {
+        // Four CJK chars = 8 columns; a 5-column field keeps 2 columns + "…"
+        // and pads to exactly 5 (never overflows the tab button).
+        let out = center("漢字漢字", 5);
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
+        assert!(out.ends_with('…'));
+    }
 }

@@ -755,6 +755,7 @@ dependencies = [
  "glyphon",
  "png 0.17.16",
  "pollster",
+ "unicode-width",
  "wgpu",
  "winit",
 ]
