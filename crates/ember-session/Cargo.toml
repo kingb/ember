@@ -13,5 +13,12 @@ portable-pty.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "throughput"
+harness = false
+
 [lints]
 workspace = true
