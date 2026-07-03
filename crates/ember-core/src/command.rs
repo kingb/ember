@@ -46,7 +46,7 @@ pub enum LayoutCommand {
         title: String,
     },
     /// Grow `target`'s side of the nearest enclosing split of `axis` by `delta`
-    /// (a fraction of that split's extent). Pane-relative — no divider identity.
+    /// physical pixels. Pane-relative — no divider identity.
     ResizePane {
         target: PaneId,
         axis: Axis,
@@ -417,14 +417,13 @@ mod tests {
             },
             vp(),
         );
-        // Shrink pane 1 by 25% of the split extent (delta grows the target's
-        // side, so a negative delta shrinks it).
+        // Shrink pane 1 by 25 px (delta is px; negative shrinks the target).
         apply(
             &mut tree,
             LayoutCommand::ResizePane {
                 target: PaneId(1),
                 axis: Axis::Horizontal,
-                delta: -0.25,
+                delta: -25.0,
                 min_px: 0.0,
             },
             vp(),

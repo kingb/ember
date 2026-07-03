@@ -113,11 +113,11 @@ impl LayoutNode {
     }
 
     /// Grow `target`'s side of the **nearest enclosing split of `axis`** (walking
-    /// up from the leaf) by `delta`, a fraction of that split's extent along the
-    /// axis. Positive `delta` grows the target. `area` is this node's current
-    /// rect; `min_px` is the smallest extent either child may shrink to (the
-    /// clamp, per the layout-seam ruling). Returns whether a matching split was
-    /// found and adjusted.
+    /// up from the leaf) by `delta` **physical pixels** — core converts px→ratio
+    /// using the split's own extent, so both a keyboard step and a mouse-drag
+    /// delta work uniformly. Positive `delta` grows the target. `area` is this
+    /// node's current rect; `min_px` is the smallest extent either child may
+    /// shrink to (the clamp). Returns whether a matching split was adjusted.
     pub fn resize_pane(
         &mut self,
         target: PaneId,
@@ -159,7 +159,7 @@ impl LayoutNode {
         // resize is continuous, unlike a split which refuses outright).
         let min_r = (min_px / extent).min(0.5);
         let signed = if in_a { delta } else { -delta };
-        *ratio = (*ratio + signed).clamp(min_r, 1.0 - min_r);
+        *ratio = (*ratio + signed / extent).clamp(min_r, 1.0 - min_r);
         true
     }
 }

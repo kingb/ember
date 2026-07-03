@@ -38,7 +38,7 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::WindowId;
+use winit::window::{CursorIcon, WindowId};
 
 /// The Ember app icon (embedded). Set on the window + the macOS dock at startup.
 const ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.png"));
@@ -267,6 +267,11 @@ struct RunState {
     tab_drag: Option<TabDrag>,
     /// In-progress scrollbar-thumb drag: the session whose scrollbar is grabbed.
     scrollbar_drag: Option<SessionId>,
+    /// In-progress divider drag to resize a split: `(a-side pane, split axis,
+    /// last cursor position along that axis in logical px)`.
+    divider_drag: Option<(PaneId, Axis, f64)>,
+    /// The resize cursor currently shown (so we don't reset it every move).
+    resize_cursor: Option<Axis>,
     /// Live Ctrl+Opt split drop-zone preview (hover), committed on click.
     split_preview: Option<SplitPreview>,
     /// Last tab-button mouse-down (time, tab index), for double-click-to-rename.
@@ -430,6 +435,8 @@ impl ApplicationHandler<EmberEvent> for App {
             tab_drag: None,
             split_preview: None,
             scrollbar_drag: None,
+            divider_drag: None,
+            resize_cursor: None,
             last_tab_click: None,
             editing_tab: None,
             edit_buffer: String::new(),
@@ -500,7 +507,16 @@ impl ApplicationHandler<EmberEvent> for App {
                     state.update_split_preview();
                     return;
                 }
-                if state.tab_drag.is_some() {
+                if let Some((target, axis, last)) = state.divider_drag {
+                    let (x, y) = state.cursor;
+                    let pos = if matches!(axis, Axis::Horizontal) {
+                        x
+                    } else {
+                        y
+                    };
+                    state.resize_pane_px(target, axis, pos - last);
+                    state.divider_drag = Some((target, axis, pos));
+                } else if state.tab_drag.is_some() {
                     state.drag_tab_to(state.cursor.0);
                 } else if let Some(sid) = state.scrollbar_drag.clone() {
                     state.scroll_to_at(&sid, state.cursor.1 as f32);
@@ -508,8 +524,21 @@ impl ApplicationHandler<EmberEvent> for App {
                     let (x, y) = state.cursor;
                     state.extend_selection(x, y);
                 } else {
-                    // Mouse-aware apps get drag (1002) / all-motion (1003) reports.
-                    state.forward_mouse_motion();
+                    // Show a resize cursor over a divider; else forward motion to
+                    // mouse-aware apps.
+                    let (x, y) = state.cursor;
+                    let over = state.divider_at(x, y).map(|(_, a)| a);
+                    if over != state.resize_cursor {
+                        state.resize_cursor = over;
+                        state.renderer.window().set_cursor(match over {
+                            Some(Axis::Horizontal) => CursorIcon::EwResize,
+                            Some(Axis::Vertical) => CursorIcon::NsResize,
+                            None => CursorIcon::Default,
+                        });
+                    }
+                    if over.is_none() {
+                        state.forward_mouse_motion();
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -530,7 +559,19 @@ impl ApplicationHandler<EmberEvent> for App {
                 button,
                 ..
             } => match button {
-                MouseButton::Left => state.left_click(),
+                MouseButton::Left => {
+                    let (x, y) = state.cursor;
+                    if let Some((target, axis)) = state.divider_at(x, y) {
+                        let pos = if matches!(axis, Axis::Horizontal) {
+                            x
+                        } else {
+                            y
+                        };
+                        state.divider_drag = Some((target, axis, pos));
+                    } else {
+                        state.left_click();
+                    }
+                }
                 // Middle-click on a tab closes it (standard gesture); elsewhere
                 // it forwards to a mouse-aware app.
                 MouseButton::Middle => {
@@ -567,6 +608,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     state.renderer.set_tab_drag(None);
                     state.selecting = false;
                     state.scrollbar_drag = None;
+                    state.divider_drag = None;
                 }
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
@@ -1424,16 +1466,16 @@ impl RunState {
             Key::Named(NamedKey::ArrowLeft) if mods.shift_key() => self.cycle_tab(-1),
             // Cmd+Ctrl+Arrows — resize the focused pane (grow toward the arrow).
             Key::Named(NamedKey::ArrowRight) if mods.control_key() => {
-                self.resize_focused(Axis::Horizontal, 0.05)
+                self.resize_focused(Axis::Horizontal, 1.0)
             }
             Key::Named(NamedKey::ArrowLeft) if mods.control_key() => {
-                self.resize_focused(Axis::Horizontal, -0.05)
+                self.resize_focused(Axis::Horizontal, -1.0)
             }
             Key::Named(NamedKey::ArrowDown) if mods.control_key() => {
-                self.resize_focused(Axis::Vertical, 0.05)
+                self.resize_focused(Axis::Vertical, 1.0)
             }
             Key::Named(NamedKey::ArrowUp) if mods.control_key() => {
-                self.resize_focused(Axis::Vertical, -0.05)
+                self.resize_focused(Axis::Vertical, -1.0)
             }
             // Cmd+Arrows — move focus geometrically between panes.
             Key::Named(NamedKey::ArrowLeft) => self.focus_dir(Direction::Left),
@@ -1601,10 +1643,24 @@ impl RunState {
         self.sync_layout();
     }
 
-    /// Resize the focused pane along `axis` by `delta` (a fraction of the
-    /// nearest enclosing split of that axis). Core clamps against `min_px`.
-    fn resize_focused(&mut self, axis: Axis, delta: f64) -> bool {
+    /// Keyboard resize of the focused pane: `dir` (±1) grows/shrinks it by a few
+    /// cells along `axis` (key-repeat makes it fast). Core takes a px delta.
+    fn resize_focused(&mut self, axis: Axis, dir: f64) -> bool {
+        let (cw, ch) = self.renderer.cell_size();
+        let step = 3.0
+            * if matches!(axis, Axis::Horizontal) {
+                cw
+            } else {
+                ch
+            } as f64;
         let target = self.active_tab().focus;
+        self.resize_pane_px(target, axis, dir * step);
+        true
+    }
+
+    /// Resize the split enclosing `target` along `axis` by `delta` px. Shared by
+    /// keyboard resize and mouse divider drag. Core clamps against `min_px`.
+    fn resize_pane_px(&mut self, target: PaneId, axis: Axis, delta: f64) {
         let vp = self.viewport();
         let min_px = self.min_px(axis);
         apply(
@@ -1618,7 +1674,49 @@ impl RunState {
             vp,
         );
         self.sync_layout();
-        true
+    }
+
+    /// The split divider under logical `(x, y)`, as `(a-side pane, axis)`, when
+    /// the cursor is in the gap between two adjacent panes. `None` otherwise.
+    fn divider_at(&self, x: f64, y: f64) -> Option<(PaneId, Axis)> {
+        let leaves: HashMap<SessionId, PaneId> = self
+            .active_tab()
+            .root
+            .leaves()
+            .into_iter()
+            .map(|(p, s)| (s, p))
+            .collect();
+        let grab = PAD as f64 + 3.0; // gap half-width + a little slop
+        let gap = 2.0 * PAD as f64; // inner-rect gap between adjacent panes
+        for (sid, r) in &self.pane_rects {
+            let right = r.x + r.width;
+            let bottom = r.y + r.height;
+            // Vertical divider on this pane's right edge (a neighbor abuts it).
+            if (x - right).abs() <= grab
+                && y >= r.y
+                && y < r.y + r.height
+                && self.pane_rects.iter().any(|(_, o)| {
+                    (o.x - (right + gap)).abs() <= grab && y >= o.y && y < o.y + o.height
+                })
+            {
+                if let Some(&p) = leaves.get(sid) {
+                    return Some((p, Axis::Horizontal));
+                }
+            }
+            // Horizontal divider on this pane's bottom edge.
+            if (y - bottom).abs() <= grab
+                && x >= r.x
+                && x < r.x + r.width
+                && self.pane_rects.iter().any(|(_, o)| {
+                    (o.y - (bottom + gap)).abs() <= grab && x >= o.x && x < o.x + o.width
+                })
+            {
+                if let Some(&p) = leaves.get(sid) {
+                    return Some((p, Axis::Vertical));
+                }
+            }
+        }
+        None
     }
 
     fn focus_dir(&mut self, dir: Direction) -> bool {
