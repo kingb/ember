@@ -62,7 +62,9 @@ pub enum ControlMsg {
 }
 
 #[cfg(unix)]
-pub use unix::{client, list_instances, resolve_socket, send, server_bind_path, spawn_listener};
+pub use unix::{
+    ControlServer, client, list_instances, resolve_socket, send, server_bind_path, spawn_listener,
+};
 
 #[cfg(unix)]
 mod unix {
@@ -107,10 +109,31 @@ mod unix {
     /// must be reachable by this user only: the dir is created 0700 (and must
     /// be OURS — on shared /tmp another user could pre-squat the fixed name),
     /// and the socket itself is chmod 0600.
+    /// A running control listener you can stop (unbinds + removes the socket).
+    pub struct ControlServer {
+        bind_path: PathBuf,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ControlServer {
+        /// The socket path clients connect to.
+        pub fn path(&self) -> &Path {
+            &self.bind_path
+        }
+
+        /// Stop accepting, then remove the socket. Unblocks the accept loop with
+        /// a throwaway self-connection.
+        pub fn stop(self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = UnixStream::connect(&self.bind_path);
+            let _ = std::fs::remove_file(&self.bind_path);
+        }
+    }
+
     pub fn spawn_listener(
         bind_path: &Path,
         waker: std::sync::Arc<dyn Fn() + Send + Sync>,
-    ) -> std::io::Result<Receiver<ControlMsg>> {
+    ) -> std::io::Result<(Receiver<ControlMsg>, ControlServer)> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if let Some(dir) = bind_path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -130,8 +153,13 @@ mod unix {
         let listener = UnixListener::bind(bind_path)?;
         std::fs::set_permissions(bind_path, std::fs::Permissions::from_mode(0o600))?;
         let (tx, rx) = mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = std::sync::Arc::clone(&stop);
         thread::spawn(move || {
             for stream in listener.incoming() {
+                if stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                    break; // stop() self-connected to unblock us
+                }
                 let Ok(stream) = stream else { continue };
                 if let Err(e) = serve(stream, &tx) {
                     eprintln!("[ember-control] request error: {e}");
@@ -142,7 +170,13 @@ mod unix {
                 waker();
             }
         });
-        Ok(rx)
+        Ok((
+            rx,
+            ControlServer {
+                bind_path: bind_path.to_path_buf(),
+                stop,
+            },
+        ))
     }
 
     fn serve(mut stream: UnixStream, tx: &Sender<ControlMsg>) -> std::io::Result<()> {

@@ -139,26 +139,31 @@ fn main() {
     // Optional debug control surface. `EMBER_CONTROL=1` binds a per-PID socket
     // under $TMPDIR/ember-ctl/ (so multiple instances coexist); an explicit path
     // is used verbatim. `ember-term ctl`/`mcp` then drive + introspect this window.
-    let control_rx = match std::env::var("EMBER_CONTROL") {
+    // EMBER_CONTROL still force-binds at startup (dev/testing). The normal path
+    // is the `remote_control` config toggle, bound by the app once config loads.
+    let (control_rx, control_server) = match std::env::var("EMBER_CONTROL") {
         Ok(val) if !val.is_empty() => {
-            let bind = control::server_bind_path(&val);
-            match control::spawn_listener(&bind, wake.clone()) {
-                Ok(rx) => {
-                    eprintln!("[ember] control socket listening at {}", bind.display());
-                    Some(rx)
+            match control::spawn_listener(&control::server_bind_path(&val), wake.clone()) {
+                Ok((rx, server)) => {
+                    eprintln!(
+                        "[ember] control socket listening at {}",
+                        server.path().display()
+                    );
+                    (Some(rx), Some(server))
                 }
                 Err(e) => {
                     eprintln!("[ember] control socket failed: {e}");
-                    None
+                    (None, None)
                 }
             }
         }
-        _ => None,
+        _ => (None, None),
     };
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
         state: None,
         control_rx,
+        control_server,
         wake,
     };
     event_loop.run_app(&mut app).expect("run event loop");
@@ -190,8 +195,10 @@ fn print_usage() {
 
 struct App {
     state: Option<RunState>,
-    /// Receiver for debug-control commands (Some when `EMBER_CONTROL` is set).
+    /// Receiver for debug-control commands (Some while the control socket is bound).
     control_rx: Option<Receiver<ControlMsg>>,
+    /// The bound control listener (from EMBER_CONTROL); moved into RunState.
+    control_server: Option<control::ControlServer>,
     /// Wakes the event loop from the PTY frame lane; handed to each session.
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
 }
@@ -212,6 +219,9 @@ struct RunState {
     next_tab: u64,
     /// Debug-control command receiver (drained each poll tick).
     control_rx: Option<Receiver<ControlMsg>>,
+    /// The bound control listener, if the socket is currently open (Settings
+    /// toggle / EMBER_CONTROL). Dropping/stopping it closes the socket.
+    control_server: Option<control::ControlServer>,
     /// Whether the keyboard cheat-sheet overlay is showing.
     help: bool,
     /// Whether the About overlay is showing, and when it opened (for the glow clock).
@@ -408,6 +418,7 @@ impl ApplicationHandler<EmberEvent> for App {
             next_session: 2,
             next_tab: 2,
             control_rx: self.control_rx.take(),
+            control_server: self.control_server.take(),
             help: false,
             about: false,
             about_since: Instant::now(),
@@ -458,6 +469,9 @@ impl ApplicationHandler<EmberEvent> for App {
         }
         state.sync_layout();
         state.apply_appearance();
+        if state.config.remote_control && state.control_server.is_none() {
+            state.set_remote_control(true);
+        }
         // Paint once now: with ControlFlow::Wait the loop won't run again until
         // an event or a frame-lane wake, and the very first frame may have been
         // published before the waker was registered.
@@ -2366,6 +2380,32 @@ impl RunState {
     }
 
     /// The Settings overlay rows as `(label, value)`, derived from the config.
+    /// Bind or unbind the debug control socket at runtime (the Settings toggle).
+    /// When enabling, logs the socket path so it can be handed off for inspection.
+    fn set_remote_control(&mut self, on: bool) {
+        if on {
+            if self.control_server.is_some() {
+                return; // already bound (e.g. via EMBER_CONTROL)
+            }
+            let bind = control::server_bind_path("1"); // per-PID socket
+            match control::spawn_listener(&bind, self.wake.clone()) {
+                Ok((rx, server)) => {
+                    eprintln!(
+                        "[ember] remote control ON — socket at {}",
+                        server.path().display()
+                    );
+                    self.control_rx = Some(rx);
+                    self.control_server = Some(server);
+                }
+                Err(e) => eprintln!("[ember] remote control failed to bind: {e}"),
+            }
+        } else if let Some(server) = self.control_server.take() {
+            server.stop();
+            self.control_rx = None;
+            eprintln!("[ember] remote control OFF");
+        }
+    }
+
     fn settings_rows(&self) -> Vec<(String, String)> {
         let bg = &self.config.background;
         let on = |b: bool| if b { "on" } else { "off" }.to_string();
@@ -2388,6 +2428,7 @@ impl RunState {
             ("Ember FPS".into(), format!("{}", bg.ember_fps)),
             ("Scrim".into(), format!("{:.2}", bg.scrim)),
             ("Visual bell".into(), on(self.config.visual_bell)),
+            ("Remote control".into(), on(self.config.remote_control)),
             ("Backdrop image".into(), image),
         ]
     }
@@ -2467,6 +2508,10 @@ impl RunState {
             3 => bg.ember_fps = (bg.ember_fps as i32 + (5.0 * dir) as i32).clamp(10, 120) as u32,
             4 => bg.scrim = (bg.scrim + 0.05 * dir).clamp(0.0, 1.0),
             5 => self.config.visual_bell = !self.config.visual_bell,
+            6 => {
+                self.config.remote_control = !self.config.remote_control;
+                self.set_remote_control(self.config.remote_control);
+            }
             _ => {}
         }
         if let Err(e) = config::save(&self.config) {
