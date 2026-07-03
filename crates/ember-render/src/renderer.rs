@@ -450,7 +450,7 @@ impl Renderer {
     /// Renders the live grids through the same headless path used by `--screenshot`,
     /// so the PNG is pixel-identical to the window. Builds a throwaway offscreen GPU
     /// context (no surface read-back needed).
-    pub fn capture_to_png(&self, path: &Path) -> Result<(), crate::headless::CaptureError> {
+    pub fn capture_to_png(&mut self, path: &Path) -> Result<(), crate::headless::CaptureError> {
         let sf = self.window.scale_factor() as f32;
         let panes: Vec<crate::headless::PaneShot> = self
             .visible
@@ -495,7 +495,13 @@ impl Renderer {
             fps_overlay: self.fps_overlay.clone(),
             bell_flash: self.bell_flash,
         };
-        crate::headless::capture(&shot, path)
+        crate::headless::capture_reusing(
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &shot,
+            path,
+        )
     }
 
     /// `(alt_screen, mouse_reporting)` for a session's pane (from the latest delta),

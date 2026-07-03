@@ -10,8 +10,8 @@ use std::path::Path;
 
 use ember_core::Rect;
 use glyphon::{
-    Buffer, Cache, Color, Metrics, Resolution, SwashCache, TextArea, TextAtlas, TextBounds,
-    TextRenderer, Viewport,
+    Buffer, Cache, Color, FontSystem, Metrics, Resolution, SwashCache, TextArea, TextAtlas,
+    TextBounds, TextRenderer, Viewport,
 };
 use wgpu::{
     DeviceDescriptor, Instance, InstanceDescriptor, MultisampleState, RequestAdapterOptions,
@@ -134,28 +134,44 @@ impl From<png::EncodingError> for CaptureError {
     }
 }
 
-/// Render `shot` and write it to `path` as a PNG. Blocks on GPU work.
+/// Render `shot` to a PNG, building a throwaway GPU device and font system.
+/// Used by the standalone `--screenshot` CLI, where the one-time cost is fine.
+/// The live control/MCP screenshot path calls [`capture_reusing`] instead, so a
+/// repeated screenshot doesn't rebuild the GPU stack or re-scan system fonts
+/// (~100ms) every time.
 pub fn capture(shot: &Shot, path: &Path) -> Result<(), CaptureError> {
-    pollster::block_on(capture_async(shot, path))
+    let (device, queue) = pollster::block_on(async {
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                compatible_surface: None,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| CaptureError::Adapter(format!("{e:?}")))?;
+        adapter
+            .request_device(&DeviceDescriptor::default())
+            .await
+            .map_err(|e| CaptureError::Device(format!("{e:?}")))
+    })?;
+    let mut font_system = crate::paint::new_font_system();
+    capture_reusing(&device, &queue, &mut font_system, shot, path)
 }
 
-async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError> {
+/// Render `shot` reusing an existing device/queue/font system (the live
+/// renderer's). Only a per-call offscreen texture + format-specific pipelines
+/// are created; the expensive device creation and system-font enumeration are
+/// skipped. Synchronous — the only GPU wait is `device.poll(Wait)` on read-back.
+pub fn capture_reusing(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    font_system: &mut FontSystem,
+    shot: &Shot,
+    path: &Path,
+) -> Result<(), CaptureError> {
     let sf = shot.scale.max(0.1);
     let phys_w = ((shot.logical_w * sf).ceil() as u32).max(1);
     let phys_h = ((shot.logical_h * sf).ceil() as u32).max(1);
-
-    let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
-    let adapter = instance
-        .request_adapter(&RequestAdapterOptions {
-            compatible_surface: None,
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| CaptureError::Adapter(format!("{e:?}")))?;
-    let (device, queue) = adapter
-        .request_device(&DeviceDescriptor::default())
-        .await
-        .map_err(|e| CaptureError::Device(format!("{e:?}")))?;
 
     // sRGB target so the read-back bytes are already gamma-encoded for PNG.
     let format = TextureFormat::Rgba8UnormSrgb;
@@ -175,18 +191,17 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let mut font_system = crate::paint::new_font_system();
     let mut swash_cache = SwashCache::new();
-    let cache = Cache::new(&device);
-    let mut viewport = Viewport::new(&device, &cache);
-    let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
+    let cache = Cache::new(device);
+    let mut viewport = Viewport::new(device, &cache);
+    let mut atlas = TextAtlas::new(device, queue, &cache, format);
     let mut text_renderer =
-        TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
-    let mut quads = QuadRenderer::new(&device, format);
-    let mut sparks = SparkRenderer::new(&device, format);
-    let mut image = ImageRenderer::new(&device, format);
+        TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
+    let mut quads = QuadRenderer::new(device, format);
+    let mut sparks = SparkRenderer::new(device, format);
+    let mut image = ImageRenderer::new(device, format);
     let mut draw_image = false;
-    let cw = measure_cell_width(&mut font_system);
+    let cw = measure_cell_width(font_system);
 
     let full_bounds = TextBounds {
         left: 0,
@@ -195,15 +210,15 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
         bottom: phys_h as i32,
     };
     let mut buffers: Vec<Buffer> = Vec::new();
-    let mut help_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-    let mut chrome = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut help_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut chrome = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut about_title = Buffer::new(
-        &mut font_system,
+        font_system,
         Metrics::new(ABOUT_TITLE_SIZE, ABOUT_TITLE_LINE),
     );
-    let mut about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-    let mut settings_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-    let mut fps_buf = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut about_body = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut settings_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut fps_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     // Where the additive spark pass is interleaved (see the live renderer):
@@ -216,7 +231,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
 
     if let Some((rows, sel)) = &shot.settings {
         settings_origin = Some(build_settings(
-            &mut font_system,
+            font_system,
             &mut settings_buf,
             rows,
             *sel,
@@ -229,7 +244,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
     } else if let Some((info, glow, t)) = &shot.about {
         // About overlay replaces the panes (same helper as on-screen).
         about_layout = Some(build_about(
-            &mut font_system,
+            font_system,
             &mut about_title,
             &mut about_body,
             info,
@@ -248,7 +263,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
             .clone()
             .unwrap_or_else(|| ("Keyboard Shortcuts".into(), "any key to close".into()));
         help_panel = Some(build_help(
-            &mut font_system,
+            font_system,
             &mut help_buf,
             &htitle,
             &hhint,
@@ -263,10 +278,10 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
         // sparks. A backdrop image is the base layer drawn in the render pass; it
         // replaces the gradient (scrim still applies).
         if let Some((rgba, w, h)) = &shot.image {
-            image.set_image(&device, &queue, rgba, *w, *h);
+            image.set_image(device, queue, rgba, *w, *h);
             image.prepare(
-                &device,
-                &queue,
+                device,
+                queue,
                 (phys_w as f32, phys_h as f32),
                 shot.image_fit,
             );
@@ -289,13 +304,13 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
         }
         // Shape each pane into its own logical-sized buffer, then build quads.
         for pane in &shot.panes {
-            let mut buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+            let mut buffer = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
             buffer.set_size(
-                &mut font_system,
+                font_system,
                 Some(pane.rect.width as f32),
                 Some(pane.rect.height as f32),
             );
-            shape_grid(&mut font_system, &mut buffer, pane.grid);
+            shape_grid(font_system, &mut buffer, pane.grid);
             buffers.push(buffer);
         }
         let split = shot.panes.len() > 1;
@@ -327,7 +342,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
             }
         }
         build_tabs(
-            &mut font_system,
+            font_system,
             &mut chrome,
             &shot.tabs,
             shot.tab_drag,
@@ -338,7 +353,7 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
         );
         if let Some(text) = &shot.fps_overlay {
             fps_origin = Some(build_fps(
-                &mut font_system,
+                font_system,
                 &mut fps_buf,
                 text,
                 cw,
@@ -356,16 +371,11 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
             sf,
         );
     }
-    quads.prepare(&device, &queue, (phys_w as f32, phys_h as f32), &rects);
-    sparks.prepare(
-        &device,
-        &queue,
-        (phys_w as f32, phys_h as f32),
-        &spark_rects,
-    );
+    quads.prepare(device, queue, (phys_w as f32, phys_h as f32), &rects);
+    sparks.prepare(device, queue, (phys_w as f32, phys_h as f32), &spark_rects);
 
     viewport.update(
-        &queue,
+        queue,
         Resolution {
             width: phys_w,
             height: phys_h,
@@ -453,9 +463,9 @@ async fn capture_async(shot: &Shot<'_>, path: &Path) -> Result<(), CaptureError>
     }
     text_renderer
         .prepare(
-            &device,
-            &queue,
-            &mut font_system,
+            device,
+            queue,
+            font_system,
             &mut atlas,
             &viewport,
             areas,
