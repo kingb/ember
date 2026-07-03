@@ -40,7 +40,37 @@ scripts/bundle-macos.sh --debug      # debug build (faster iteration)
 CODESIGN_ID="Developer ID Application: …" scripts/bundle-macos.sh   # signed
 ```
 
-Then `open target/Ember.app`, or `cp -r target/Ember.app /Applications`. The
-ad-hoc build launches fine locally; on first open Gatekeeper warns an
-un-notarized app — right-click → **Open** once. For distribution, sign with a
-Developer ID and notarize.
+Then `open target/Ember.app`, or `cp -r target/Ember.app /Applications`.
+
+### Distributing via Homebrew
+
+The cask lives in [`Casks/ember.rb`](Casks/ember.rb) and installs from a GitHub
+release artifact. To cut a release:
+
+```sh
+scripts/release-macos.sh            # build + zip (+ --dmg), stamp the cask's
+                                    # version + sha256 from the built artifact
+gh release create v0.1.0 target/dist/Ember-0.1.0.zip \
+    --title "Ember 0.1.0" --generate-notes
+```
+
+Upload **the exact zip `release-macos.sh` just built** (the `ditto` zip embeds
+timestamps, so re-packaging changes the hash). Then publish the cask through a
+[tap](https://docs.brew.sh/Taps) — a repo named `homebrew-ember`:
+
+```sh
+# one-time: create github.com/kingb/homebrew-ember with a Casks/ dir
+cp Casks/ember.rb ../homebrew-ember/Casks/ && (cd ../homebrew-ember && git commit -am "ember 0.1.0" && git push)
+```
+
+Users then install with:
+
+```sh
+brew install --cask kingb/ember/ember     # brew maps kingb/ember → homebrew-ember
+```
+
+Because the build is ad-hoc signed (not notarized), the first launch still hits
+a Gatekeeper warning — the cask's `caveats` tell users to right-click → Open or
+strip the quarantine attribute. Sign with a Developer ID and notarize to remove
+that step; `scripts/bundle-macos.sh` already accepts `CODESIGN_ID`.
+
