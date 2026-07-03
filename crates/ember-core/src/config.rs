@@ -22,10 +22,11 @@ pub struct Config {
     /// emacs `M-x`) instead of composing (`å`, `é`). Off by default, matching
     /// Terminal.app/Alacritty/kitty/Ghostty; composing wins for most users.
     pub option_as_meta: bool,
-    /// Bind the debug control socket (drive + screenshot the live window from
-    /// `ember-term ctl` / MCP). OFF by default — a keystroke-injection + screen-
-    /// read surface. Toggle in Settings when you want to hand off inspection.
-    pub remote_control: bool,
+    /// Developer Mode: enables the debug control socket (drive + screenshot the
+    /// live window from `ember-term ctl` / MCP) — and a home for future dev
+    /// features. OFF by default: it's a keystroke-injection + screen-read
+    /// surface. Toggle in Settings when you want to hand off inspection.
+    pub developer_mode: bool,
 }
 
 impl Default for Config {
@@ -36,7 +37,7 @@ impl Default for Config {
             visual_bell: true,
             shell_integration: true,
             option_as_meta: false,
-            remote_control: false,
+            developer_mode: false,
         }
     }
 }

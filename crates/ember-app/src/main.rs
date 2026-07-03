@@ -140,7 +140,7 @@ fn main() {
     // under $TMPDIR/ember-ctl/ (so multiple instances coexist); an explicit path
     // is used verbatim. `ember-term ctl`/`mcp` then drive + introspect this window.
     // EMBER_CONTROL still force-binds at startup (dev/testing). The normal path
-    // is the `remote_control` config toggle, bound by the app once config loads.
+    // is the Developer Mode config toggle, bound by the app once config loads.
     let (control_rx, control_server) = match std::env::var("EMBER_CONTROL") {
         Ok(val) if !val.is_empty() => {
             match control::spawn_listener(&control::server_bind_path(&val), wake.clone()) {
@@ -469,8 +469,8 @@ impl ApplicationHandler<EmberEvent> for App {
         }
         state.sync_layout();
         state.apply_appearance();
-        if state.config.remote_control && state.control_server.is_none() {
-            state.set_remote_control(true);
+        if state.config.developer_mode && state.control_server.is_none() {
+            state.set_developer_mode(true);
         }
         // Paint once now: with ControlFlow::Wait the loop won't run again until
         // an event or a frame-lane wake, and the very first frame may have been
@@ -2382,7 +2382,7 @@ impl RunState {
     /// The Settings overlay rows as `(label, value)`, derived from the config.
     /// Bind or unbind the debug control socket at runtime (the Settings toggle).
     /// When enabling, logs the socket path so it can be handed off for inspection.
-    fn set_remote_control(&mut self, on: bool) {
+    fn set_developer_mode(&mut self, on: bool) {
         if on {
             if self.control_server.is_some() {
                 return; // already bound (e.g. via EMBER_CONTROL)
@@ -2391,18 +2391,18 @@ impl RunState {
             match control::spawn_listener(&bind, self.wake.clone()) {
                 Ok((rx, server)) => {
                     eprintln!(
-                        "[ember] remote control ON — socket at {}",
+                        "[ember] Developer Mode ON — control socket at {}",
                         server.path().display()
                     );
                     self.control_rx = Some(rx);
                     self.control_server = Some(server);
                 }
-                Err(e) => eprintln!("[ember] remote control failed to bind: {e}"),
+                Err(e) => eprintln!("[ember] Developer Mode: control socket failed to bind: {e}"),
             }
         } else if let Some(server) = self.control_server.take() {
             server.stop();
             self.control_rx = None;
-            eprintln!("[ember] remote control OFF");
+            eprintln!("[ember] Developer Mode OFF");
         }
     }
 
@@ -2428,7 +2428,7 @@ impl RunState {
             ("Ember FPS".into(), format!("{}", bg.ember_fps)),
             ("Scrim".into(), format!("{:.2}", bg.scrim)),
             ("Visual bell".into(), on(self.config.visual_bell)),
-            ("Remote control".into(), on(self.config.remote_control)),
+            ("Developer Mode".into(), on(self.config.developer_mode)),
             ("Backdrop image".into(), image),
         ]
     }
@@ -2509,8 +2509,8 @@ impl RunState {
             4 => bg.scrim = (bg.scrim + 0.05 * dir).clamp(0.0, 1.0),
             5 => self.config.visual_bell = !self.config.visual_bell,
             6 => {
-                self.config.remote_control = !self.config.remote_control;
-                self.set_remote_control(self.config.remote_control);
+                self.config.developer_mode = !self.config.developer_mode;
+                self.set_developer_mode(self.config.developer_mode);
             }
             _ => {}
         }
