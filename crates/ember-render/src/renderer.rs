@@ -638,8 +638,16 @@ impl Renderer {
     /// Apply an owned delta to the pane backing `session`, off the pixel lane.
     pub fn apply_delta(&mut self, session: &SessionId, delta: GridDelta) {
         if let Some(p) = self.panes.get_mut(session) {
+            // Reshape (the expensive part) only when glyph content actually
+            // changed. Cursor-only, mode-only, marks-only, and scroll-offset
+            // deltas — which the projection ships on any state change — leave
+            // the glyphs untouched; the cursor/overlay quads rebuild every frame
+            // regardless, so those deltas need a redraw but not a reshape.
+            let content_changed = delta.reset || !delta.cells.is_empty();
             p.grid.apply(delta);
-            p.dirty = true;
+            if content_changed {
+                p.dirty = true;
+            }
         }
     }
 
