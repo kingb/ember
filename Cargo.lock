@@ -765,6 +765,7 @@ name = "ember-session"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "criterion",
  "ember-core",
  "libc",
  "portable-pty",
