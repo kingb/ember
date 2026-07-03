@@ -40,7 +40,16 @@ scripts/bundle-macos.sh --debug      # debug build (faster iteration)
 CODESIGN_ID="Developer ID Application: …" scripts/bundle-macos.sh   # signed
 ```
 
-Then `open target/Ember.app`, or `cp -r target/Ember.app /Applications`.
+Then `open target/Ember.app` to launch, or install to /Applications:
+
+```sh
+scripts/bundle-macos.sh --install   # clean replace (rm -rf + ditto)
+```
+
+Don't `cp -r` over an existing `/Applications/Ember.app` — copying *into* the
+old bundle merges files and leaves a stale code signature, which macOS refuses
+with "the application can't be opened." The `--install` flag removes the old one
+first.
 
 ### Distributing via Homebrew
 

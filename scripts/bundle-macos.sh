@@ -12,10 +12,13 @@ cd "$(dirname "$0")/.."
 
 PROFILE="release"
 CARGO_FLAGS=(--release)
-if [[ "${1:-}" == "--debug" ]]; then
-  PROFILE="debug"
-  CARGO_FLAGS=()
-fi
+INSTALL=0
+for arg in "$@"; do
+  case "$arg" in
+    --debug)   PROFILE="debug"; CARGO_FLAGS=() ;;
+    --install) INSTALL=1 ;;
+  esac
+done
 
 APP_NAME="Ember"
 BIN_NAME="ember-term"
@@ -67,4 +70,16 @@ codesign --force --deep --sign "${SIGN_ID}" "${APP}"
 codesign --verify --verbose "${APP}" 2>&1 | sed 's/^/   /'
 
 echo "✓ built ${APP}  (v${VERSION})"
-echo "   open ${APP}    # launch    ·    cp -r ${APP} /Applications    # install"
+
+if [[ "${INSTALL}" == "1" ]]; then
+  DEST="/Applications/${APP_NAME}.app"
+  echo "→ installing to ${DEST} (clean replace)…"
+  # Remove the old bundle FIRST. Copying into an existing .app merges files and
+  # leaves a stale _CodeSignature, which macOS then refuses ("can't be opened").
+  rm -rf "${DEST}"
+  ditto "${APP}" "${DEST}"   # ditto preserves the bundle + code signature
+  echo "✓ installed ${DEST}"
+else
+  echo "   open ${APP}                          # launch"
+  echo "   scripts/bundle-macos.sh --install    # clean-install to /Applications"
+fi
