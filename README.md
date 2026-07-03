@@ -29,3 +29,18 @@ seam, the two-lane event sink, and the v1 → phase-2 → phase-3 roadmap.
 
 `winit` · `wgpu` · `glyphon`/`cosmic-text` · `alacritty_terminal` (swappable) ·
 `portable-pty` · `egui`.
+
+## Packaging (macOS)
+
+Build a double-clickable `Ember.app`:
+
+```sh
+scripts/bundle-macos.sh              # release, ad-hoc signed → target/Ember.app
+scripts/bundle-macos.sh --debug      # debug build (faster iteration)
+CODESIGN_ID="Developer ID Application: …" scripts/bundle-macos.sh   # signed
+```
+
+Then `open target/Ember.app`, or `cp -r target/Ember.app /Applications`. The
+ad-hoc build launches fine locally; on first open Gatekeeper warns an
+un-notarized app — right-click → **Open** once. For distribution, sign with a
+Developer ID and notarize.
