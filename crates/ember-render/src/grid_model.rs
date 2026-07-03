@@ -27,6 +27,32 @@ pub struct GridModel {
     pub marks: Vec<(u16, ember_core::MarkStatus)>,
 }
 
+/// Display-only glyph substitution for symbols the terminal engine widths as a
+/// single cell but whose default (no variation-selector) font glyph is a color
+/// emoji the shaper draws ~2 cells wide — which would shove the rest of the row
+/// one column right (the ⏺-toggle "flicker"). cosmic-text ignores the U+FE0E
+/// text-presentation selector, so we swap in a monochrome look-alike that shapes
+/// to one cell. This runs only on the glyph pass ([`GridModel::row_runs`]); the
+/// text path ([`GridModel::row_text`]/[`GridModel::screen_text`]) keeps the real
+/// scalar, so copy/paste and selection are unaffected.
+fn monochrome_glyph(c: char) -> char {
+    match c {
+        // ⏺ RECORD (Claude Code's tool-activity bullet) → ● BLACK CIRCLE.
+        '\u{23FA}' => '\u{25CF}',
+        _ => c,
+    }
+}
+
+/// Apply [`monochrome_glyph`] across a grapheme cluster, returning `Some` only
+/// when a scalar actually changed (so the common path keeps borrowing the
+/// original). Covers clusters like `⏺\u{FE0F}` where the emoji carries a
+/// presentation selector.
+fn remap_cluster(s: &str) -> Option<String> {
+    s.chars()
+        .any(|c| monochrome_glyph(c) != c)
+        .then(|| s.chars().map(monochrome_glyph).collect())
+}
+
 impl GridModel {
     pub fn new(dims: GridDims) -> Self {
         Self {
@@ -152,9 +178,12 @@ impl GridModel {
                 continue;
             }
             match &cell.content {
-                CellContent::Char(c) => push(&c.to_string()),
+                CellContent::Char(c) => push(&monochrome_glyph(*c).to_string()),
                 // Full cluster: combining accents / ZWJ emoji shape as one glyph.
-                CellContent::Cluster(s) => push(s),
+                CellContent::Cluster(s) => match remap_cluster(s) {
+                    Some(remapped) => push(&remapped),
+                    None => push(s),
+                },
                 _ => push(" "),
             }
         }
@@ -323,6 +352,21 @@ mod tests {
             (" ", ember_core::Attrs::HIDDEN)
         );
         assert_eq!(runs[3].0, "z");
+    }
+
+    #[test]
+    fn wide_color_emoji_remapped_to_monochrome_for_display_only() {
+        // U+23FA (⏺, Claude Code's tool-activity bullet) is engine-width 1 but
+        // its bare font glyph is a color emoji the shaper draws ~2 cells wide,
+        // shoving the rest of the row. The glyph pass swaps in the monochrome
+        // U+25CF (●) look-alike, which shapes to one cell.
+        let dims = GridDims::new(10, 1);
+        let mut g = GridModel::new(dims);
+        g.apply(delta_with(1, dims, vec![patch(0, 0, '\u{23FA}')], true));
+        // Display path (row_runs → glyph pass) gets the monochrome circle...
+        assert_eq!(g.row_runs(0)[0].0, "\u{25CF}");
+        // ...but the text path (copy/paste, selection) keeps the real char.
+        assert_eq!(g.row_text(0).trim_end(), "\u{23FA}");
     }
 
     #[test]
