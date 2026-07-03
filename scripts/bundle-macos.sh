@@ -22,7 +22,7 @@ done
 
 APP_NAME="Ember"
 BIN_NAME="ember-term"
-BUNDLE_ID="com.local-tooling.ember"
+BUNDLE_ID="com.emberterm.ember"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 ICON="crates/ember-app/assets/icon.icns"
 

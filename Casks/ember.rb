@@ -6,7 +6,7 @@ cask "ember" do
       verified: "github.com/kingb/ember-term/"
   name "Ember"
   desc "GPU-accelerated campfire terminal emulator"
-  homepage "https://github.com/kingb/ember-term"
+  homepage "https://emberterm.com"
 
   # Auto-detect new versions from GitHub releases (brew livecheck / bump).
   livecheck do
