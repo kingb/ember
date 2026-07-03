@@ -10,8 +10,8 @@ use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
 use crate::grid_model::GridModel;
 use crate::quads::srgb_to_linear;
 use crate::renderer::{
-    ABOUT_TITLE_LINE, ACCENT, AMBER, AboutInfo, BG, BackdropParams, CELL_HEIGHT, FG, FONT_SIZE,
-    HELP_PAD, LINE_HEIGHT, PAD, TabLabel,
+    ABOUT_TITLE_LINE, ACCENT, AMBER, AboutInfo, BG, BackdropParams, CELL_HEIGHT, FG, HELP_PAD,
+    LINE_HEIGHT, PAD, TabLabel,
 };
 use crate::selection::Selection;
 
@@ -147,14 +147,24 @@ pub(crate) fn new_font_system() -> FontSystem {
     fs
 }
 
-/// Measure the monospace advance for the current font/size, so background quads
-/// line up with the glyphs glyphon flows.
-pub(crate) fn measure_cell_width(font_system: &mut FontSystem) -> f32 {
-    let mut probe = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+/// Resolve a config family name to a cosmic-text `Family` (empty/none → the
+/// platform monospace default, which also catches an unresolvable name).
+pub(crate) fn family_of(name: Option<&str>) -> Family<'_> {
+    match name {
+        Some(n) if !n.is_empty() => Family::Name(n),
+        _ => Family::Monospace,
+    }
+}
+
+/// Measure the monospace advance for `size`/`family`, so background quads line
+/// up with the glyphs glyphon flows. Re-measured whenever the font zooms.
+pub(crate) fn measure_cell_width(font_system: &mut FontSystem, size: f32, family: Family) -> f32 {
+    let line_height = line_height_for(size);
+    let mut probe = Buffer::new(font_system, Metrics::new(size, line_height));
     probe.set_text(
         font_system,
         "MMMMMMMMMM",
-        &Attrs::new().family(Family::Monospace),
+        &Attrs::new().family(family),
         Shaping::Advanced,
         None,
     );
@@ -166,7 +176,13 @@ pub(crate) fn measure_cell_width(font_system: &mut FontSystem) -> f32 {
             return span / (glyphs.len() - 1) as f32;
         }
     }
-    FONT_SIZE * 0.6
+    size * 0.6
+}
+
+/// Line height (cell height) for a font size — the fixed 1.25 ratio the default
+/// 12pt/15px pair uses, rounded so cell rows land on whole pixels.
+pub(crate) fn line_height_for(size: f32) -> f32 {
+    (size * 1.25).round().max(1.0)
 }
 
 /// Linear interpolation between two sRGB colors (`t` clamped to `[0,1]`).
@@ -202,7 +218,14 @@ fn dim_rgb(c: ember_core::Rgb) -> ember_core::Rgb {
 /// Shape one grid's rows into `buffer` as per-cell styled runs (one logical
 /// line per grid row): fg color + bold/italic/dim. Underline/strikeout/overline
 /// are quads (see [`grid_quads`]) — cosmic-text doesn't draw decorations.
-pub(crate) fn shape_grid(font_system: &mut FontSystem, buffer: &mut Buffer, grid: &GridModel) {
+pub(crate) fn shape_grid(
+    font_system: &mut FontSystem,
+    buffer: &mut Buffer,
+    grid: &GridModel,
+    size: f32,
+    line_height: f32,
+    family: Family,
+) {
     use ember_core::Attrs as CellAttrs;
     // One grid row = one visual line, always. With the default word-wrap a row
     // whose shaped width overruns the pane (wide CJK/emoji advances aren't
@@ -231,7 +254,7 @@ pub(crate) fn shape_grid(font_system: &mut FontSystem, buffer: &mut Buffer, grid
             ));
         }
     }
-    let base = Attrs::new().family(Family::Monospace);
+    let base = Attrs::new().family(family);
     buffer.set_rich_text(
         font_system,
         spans.iter().map(|(t, c, cell_attrs)| {
@@ -239,9 +262,9 @@ pub(crate) fn shape_grid(font_system: &mut FontSystem, buffer: &mut Buffer, grid
             // fallback fonts carry taller line heights that would otherwise
             // stretch their row and push all later rows off the cell grid.
             let mut a = Attrs::new()
-                .family(Family::Monospace)
+                .family(family)
                 .color(*c)
-                .metrics(Metrics::new(FONT_SIZE, LINE_HEIGHT));
+                .metrics(Metrics::new(size, line_height));
             if cell_attrs.contains(CellAttrs::BOLD) {
                 a = a.weight(glyphon::Weight::BOLD);
             }
@@ -259,10 +282,12 @@ pub(crate) fn shape_grid(font_system: &mut FontSystem, buffer: &mut Buffer, grid
 
 /// Append a grid's bg fills + (when focused) cursor + (when focused && split)
 /// focus border, for a pane at logical `rect`, scaled to physical px by `sf`.
+#[allow(clippy::too_many_arguments)] // a draw helper: grid + geometry + flags + out
 pub(crate) fn grid_quads(
     grid: &GridModel,
     rect: Rect,
     cw: f32,
+    ch: f32,
     sf: f32,
     focused: bool,
     split: bool,
@@ -271,7 +296,6 @@ pub(crate) fn grid_quads(
     use ember_core::Attrs as CellAttrs;
     let ox = rect.x as f32;
     let oy = rect.y as f32;
-    let ch = CELL_HEIGHT;
     const DECOR: CellAttrs = CellAttrs::UNDERLINE
         .union(CellAttrs::STRIKEOUT)
         .union(CellAttrs::OVERLINE);
@@ -375,12 +399,12 @@ pub(crate) fn selection_quads(
     selection: &Selection,
     rect: Rect,
     cw: f32,
+    ch: f32,
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
 ) {
     let ox = rect.x as f32;
     let oy = rect.y as f32;
-    let ch = CELL_HEIGHT;
     for row in 0..grid.dims.screen_lines {
         if let Some((c0, c1)) = selection.row_span(grid, row) {
             let x = ox + c0 as f32 * cw;

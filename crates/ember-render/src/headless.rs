@@ -27,8 +27,8 @@ use crate::paint::{
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
-    ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, BG, BackdropParams, CELL_HEIGHT, FG,
-    FONT_SIZE, HELP_PAD, ImageFit, LINE_HEIGHT, PAD, TabLabel,
+    ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, BG, BackdropParams, FG, FONT_SIZE,
+    HELP_PAD, ImageFit, LINE_HEIGHT, PAD, TabLabel,
 };
 use crate::selection::Selection;
 
@@ -72,13 +72,24 @@ pub struct Shot<'a> {
     pub fps_overlay: Option<String>,
     /// Visual-bell flash intensity (`0..1`) — a warm amber wash over the panes.
     pub bell_flash: f32,
+    /// Terminal font point size (matches the live renderer's current zoom).
+    pub font_size: f32,
+    /// Font family name (`None` → monospace default).
+    pub font_family: Option<String>,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
 /// pane grid dimensions to match what `capture` will draw. CPU-only (no GPU).
 pub fn cell_metrics() -> (f32, f32) {
+    cell_metrics_for(FONT_SIZE, None)
+}
+
+/// Cell `(width, height)` px for a given font size + family — lets the headless
+/// caller derive grid dims that match a non-default zoom/font.
+pub fn cell_metrics_for(size: f32, family: Option<&str>) -> (f32, f32) {
     let mut font_system = crate::paint::new_font_system();
-    (measure_cell_width(&mut font_system), CELL_HEIGHT)
+    let cw = measure_cell_width(&mut font_system, size, crate::paint::family_of(family));
+    (cw, crate::paint::line_height_for(size))
 }
 
 /// Why a headless [`capture`] (or [`crate::Renderer::capture_to_png`]) failed.
@@ -201,7 +212,10 @@ pub fn capture_reusing(
     let mut sparks = SparkRenderer::new(device, format);
     let mut image = ImageRenderer::new(device, format);
     let mut draw_image = false;
-    let cw = measure_cell_width(font_system);
+    let font_size = shot.font_size.clamp(6.0, 48.0);
+    let line_height = crate::paint::line_height_for(font_size);
+    let font_family = crate::paint::family_of(shot.font_family.as_deref());
+    let cw = measure_cell_width(font_system, font_size, font_family);
 
     let full_bounds = TextBounds {
         left: 0,
@@ -304,13 +318,20 @@ pub fn capture_reusing(
         }
         // Shape each pane into its own logical-sized buffer, then build quads.
         for pane in &shot.panes {
-            let mut buffer = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+            let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
             buffer.set_size(
                 font_system,
                 Some(pane.rect.width as f32),
                 Some(pane.rect.height as f32),
             );
-            shape_grid(font_system, &mut buffer, pane.grid);
+            shape_grid(
+                font_system,
+                &mut buffer,
+                pane.grid,
+                font_size,
+                line_height,
+                font_family,
+            );
             buffers.push(buffer);
         }
         let split = shot.panes.len() > 1;
@@ -319,13 +340,14 @@ pub fn capture_reusing(
                 pane.grid,
                 pane.rect,
                 cw,
+                line_height,
                 sf,
                 pane.focused,
                 split,
                 &mut rects,
             );
             if let Some(sel) = &pane.selection {
-                selection_quads(pane.grid, sel, pane.rect, cw, sf, &mut rects);
+                selection_quads(pane.grid, sel, pane.rect, cw, line_height, sf, &mut rects);
             }
             if let Some((horizontal, ratio)) = pane.split_preview {
                 split_preview(pane.rect, horizontal, ratio, sf, &mut rects);

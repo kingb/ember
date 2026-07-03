@@ -375,7 +375,8 @@ impl ApplicationHandler<EmberEvent> for App {
 
         let size = window.inner_size();
         let px = (size.width.max(1), size.height.max(1));
-        let renderer = Renderer::new(Arc::clone(&window));
+        let config = config::load();
+        let renderer = Renderer::new(Arc::clone(&window), &config.font);
 
         // The seed tab: one pane backed by one shell.
         let pane = PaneId(1);
@@ -404,7 +405,7 @@ impl ApplicationHandler<EmberEvent> for App {
             help: false,
             about: false,
             about_since: Instant::now(),
-            config: config::load(),
+            config,
             settings_open: false,
             settings_sel: 0,
             image_loaded: None,
@@ -1393,6 +1394,20 @@ impl RunState {
             // Cmd+T — open a new tab with a fresh shell.
             Key::Character(s) if s.eq_ignore_ascii_case("t") => {
                 self.new_tab();
+                true
+            }
+            // Cmd+0 — reset the font size to the config baseline.
+            Key::Character(s) if s.as_str() == "0" => {
+                self.zoom_to(self.config.font.size);
+                true
+            }
+            // Cmd+= / Cmd++ — zoom in; Cmd+- / Cmd+_ — zoom out (1pt steps).
+            Key::Character(s) if s.as_str() == "=" || s.as_str() == "+" => {
+                self.zoom_by(1.0);
+                true
+            }
+            Key::Character(s) if s.as_str() == "-" || s.as_str() == "_" => {
+                self.zoom_by(-1.0);
                 true
             }
             // Cmd+1..9 — jump straight to a tab (Option/Alt is awkward on macOS, so
@@ -2431,6 +2446,20 @@ impl RunState {
     }
 
     /// Jump to tab `n` (1-based); no-op if out of range.
+    /// Live-zoom the terminal font by `delta` points (Cmd +/-).
+    fn zoom_by(&mut self, delta: f32) {
+        let target = self.renderer.font_size() + delta;
+        self.zoom_to(target);
+    }
+
+    /// Set the terminal font to `size` and re-layout (the cell size, hence every
+    /// pane's grid dims, changed). No-op if the size didn't change.
+    fn zoom_to(&mut self, size: f32) {
+        if self.renderer.set_font_size(size) {
+            self.sync_layout();
+        }
+    }
+
     fn select_tab(&mut self, n: usize) {
         if n >= 1 && n <= self.tree.tabs.len() {
             self.tree.active = n - 1;

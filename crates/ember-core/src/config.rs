@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub background: Background,
+    /// Terminal font (family + size). Size is the live-zoom baseline (Cmd+0).
+    pub font: Font,
     /// Visual bell: a terminal BEL flashes an ember pulse + lights the tab that
     /// belled, instead of an audible beep. On by default.
     pub visual_bell: bool,
@@ -26,9 +28,30 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             background: Background::default(),
+            font: Font::default(),
             visual_bell: true,
             shell_integration: true,
             option_as_meta: false,
+        }
+    }
+}
+
+/// Terminal font configuration.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Font {
+    /// Font family name (e.g. "Menlo", "JetBrains Mono"). `None`/missing → the
+    /// platform monospace default. A missing/unresolvable name falls back to it.
+    pub family: Option<String>,
+    /// Baseline point size (the Cmd+0 reset target). Clamped to a sane range.
+    pub size: f32,
+}
+
+impl Default for Font {
+    fn default() -> Self {
+        Self {
+            family: None,
+            size: 12.0,
         }
     }
 }

@@ -60,6 +60,10 @@ pub struct Opts {
     pub bell: f32,
     /// Mark this tab index as having an unseen bell (draws the amber dot).
     pub bell_tab: Option<usize>,
+    /// Terminal font point size.
+    pub font_size: f32,
+    /// Terminal font family (None → monospace default).
+    pub font: Option<String>,
 }
 
 impl Default for Opts {
@@ -85,6 +89,8 @@ impl Default for Opts {
             fps: None,
             bell: 0.0,
             bell_tab: None,
+            font_size: 12.0,
+            font: None,
         }
     }
 }
@@ -104,6 +110,10 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
         match arg.as_str() {
             "--screenshot" => opts.path = next()?,
             "--scale" => opts.scale = next()?.parse().map_err(|e| format!("--scale: {e}"))?,
+            "--font-size" => {
+                opts.font_size = next()?.parse().map_err(|e| format!("--font-size: {e}"))?
+            }
+            "--font" => opts.font = Some(next()?),
             "--width" => opts.width = next()?.parse().map_err(|e| format!("--width: {e}"))?,
             "--height" => opts.height = next()?.parse().map_err(|e| format!("--height: {e}"))?,
             "--tabs" => opts.tabs = next()?.parse().map_err(|e| format!("--tabs: {e}"))?,
@@ -168,7 +178,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
 
 /// Build the scene, run it, and write the PNG. Returns the output path.
 pub fn run(opts: Opts) -> Result<String, String> {
-    let (cw, ch) = headless::cell_metrics();
+    let (cw, ch) = headless::cell_metrics_for(opts.font_size, opts.font.as_deref());
     let pad = PAD as f64;
     let chrome = Renderer::chrome_height() as f64;
     let vp = Rect::new(
@@ -333,6 +343,8 @@ pub fn run(opts: Opts) -> Result<String, String> {
         image_fit: ember_render::ImageFit::parse(&opts.bg_fit),
         fps_overlay: opts.fps.clone(),
         bell_flash: opts.bell,
+        font_size: opts.font_size,
+        font_family: opts.font.clone(),
     };
     if opts.bg_image.is_some() && shot.image.is_none() {
         return Err(format!(

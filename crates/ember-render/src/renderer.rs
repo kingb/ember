@@ -36,6 +36,9 @@ use crate::selection::Selection;
 
 pub(crate) const FONT_SIZE: f32 = 12.0;
 pub(crate) const LINE_HEIGHT: f32 = 15.0;
+/// Live-zoom bounds for the terminal font (Cmd +/-). Chrome stays fixed-size.
+pub(crate) const MIN_FONT_SIZE: f32 = 6.0;
+pub(crate) const MAX_FONT_SIZE: f32 = 48.0;
 /// Approximate monospace advance as a fraction of font size — used only to pick a
 /// sensible default window size; glyphon does the real per-glyph advance.
 pub const CELL_WIDTH: f32 = FONT_SIZE * 0.6;
@@ -252,6 +255,12 @@ pub struct Renderer {
     settings_buffer: Buffer,
     /// Measured monospace advance (px) — keeps bg quads aligned with glyphs.
     cell_w: f32,
+    /// Current terminal font point size (mutated by live zoom).
+    font_size: f32,
+    /// Current cell/line height (px), derived from `font_size`.
+    line_height: f32,
+    /// Configured font family name (`None` → monospace default).
+    family_name: Option<String>,
     /// Campfire backdrop + ember-spark settings (off by default).
     backdrop: BackdropParams,
     /// Additive pipeline for the glowing ember sparks.
@@ -280,11 +289,11 @@ pub struct Renderer {
 
 impl Renderer {
     /// Build the renderer for an existing window. Blocks on async GPU init.
-    pub fn new(window: Arc<Window>) -> Self {
-        pollster::block_on(Self::new_async(window))
+    pub fn new(window: Arc<Window>, font: &ember_core::Font) -> Self {
+        pollster::block_on(Self::new_async(window, font))
     }
 
-    async fn new_async(window: Arc<Window>) -> Self {
+    async fn new_async(window: Arc<Window>, font: &ember_core::Font) -> Self {
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
 
@@ -355,7 +364,15 @@ impl Renderer {
         let settings_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let fps_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
 
-        let cell_w = measure_cell_width(&mut font_system);
+        // Runtime font state (Cmd +/-/0 mutate size at runtime; family from cfg).
+        let family_name = font.family.clone();
+        let font_size = font.size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        let line_height = crate::paint::line_height_for(font_size);
+        let cell_w = measure_cell_width(
+            &mut font_system,
+            font_size,
+            crate::paint::family_of(family_name.as_deref()),
+        );
         let quads = QuadRenderer::new(&device, format);
         let sparks = SparkRenderer::new(&device, format);
         let image = ImageRenderer::new(&device, format);
@@ -389,6 +406,9 @@ impl Renderer {
             settings: None,
             settings_buffer,
             cell_w,
+            font_size,
+            line_height,
+            family_name,
             backdrop: BackdropParams::default(),
             sparks,
             image,
@@ -414,7 +434,37 @@ impl Renderer {
     /// Measured `(cell_width, cell_height)` in px — the app derives pane grid
     /// dimensions from these.
     pub fn cell_size(&self) -> (f32, f32) {
-        (self.cell_w, CELL_HEIGHT)
+        (self.cell_w, self.line_height)
+    }
+
+    /// The current terminal font point size (for the app's zoom step math).
+    pub fn font_size(&self) -> f32 {
+        self.font_size
+    }
+
+    /// Set the terminal font size (live zoom), clamped to `[MIN, MAX]`. Re-measures
+    /// the cell advance and re-metrics every pane buffer (re-shaped next frame).
+    /// Returns whether it changed — the caller must re-layout (the cell size, and
+    /// thus every pane's grid dimensions, changed). Chrome/overlays stay fixed.
+    pub fn set_font_size(&mut self, size: f32) -> bool {
+        let size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        if (size - self.font_size).abs() < f32::EPSILON {
+            return false;
+        }
+        self.font_size = size;
+        self.line_height = crate::paint::line_height_for(size);
+        self.cell_w = measure_cell_width(
+            &mut self.font_system,
+            size,
+            crate::paint::family_of(self.family_name.as_deref()),
+        );
+        let metrics = Metrics::new(self.font_size, self.line_height);
+        for p in self.panes.values_mut() {
+            p.buffer.set_metrics(&mut self.font_system, metrics);
+            p.dirty = true;
+        }
+        self.window.request_redraw();
+        true
     }
 
     /// Height in px reserved for the tab strip. The strip is **always** drawn (it
@@ -429,7 +479,10 @@ impl Renderer {
         if self.panes.contains_key(session) {
             return;
         }
-        let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let mut buffer = Buffer::new(
+            &mut self.font_system,
+            Metrics::new(self.font_size, self.line_height),
+        );
         buffer.set_size(&mut self.font_system, Some(1.0), Some(1.0));
         self.panes.insert(
             session.clone(),
@@ -494,6 +547,8 @@ impl Renderer {
             image_fit: self.image_fit,
             fps_overlay: self.fps_overlay.clone(),
             bell_flash: self.bell_flash,
+            font_size: self.font_size,
+            font_family: self.family_name.clone(),
         };
         crate::headless::capture_reusing(
             &self.device,
@@ -986,24 +1041,34 @@ impl Renderer {
             // Pass 1: (re)shape only panes whose grid/size changed since last frame.
             // Buffers persist in `PaneRender`, so unchanged panes reuse their shaping
             // — the TextArea below just references the existing buffer.
+            let (size, lh) = (self.font_size, self.line_height);
+            let family = crate::paint::family_of(self.family_name.as_deref());
             for vp in &self.visible {
                 if let Some(p) = self.panes.get_mut(&vp.session) {
                     if p.dirty {
-                        shape_grid(&mut self.font_system, &mut p.buffer, &p.grid);
+                        shape_grid(
+                            &mut self.font_system,
+                            &mut p.buffer,
+                            &p.grid,
+                            size,
+                            lh,
+                            family,
+                        );
                         p.dirty = false;
                     }
                 }
             }
             // Pass 2: bg fills, cursor, focus border, tab strip (logical px * sf).
             let cw = self.cell_w;
+            let ch = self.line_height;
             let split = self.visible.len() > 1;
             for vp in &self.visible {
                 if let Some(p) = self.panes.get(&vp.session) {
                     let focused = self.focused.as_ref() == Some(&vp.session);
-                    grid_quads(&p.grid, vp.rect, cw, sf, focused, split, &mut rects);
+                    grid_quads(&p.grid, vp.rect, cw, ch, sf, focused, split, &mut rects);
                     if let Some((sid, sel)) = &self.selection {
                         if *sid == vp.session {
-                            selection_quads(&p.grid, sel, vp.rect, cw, sf, &mut rects);
+                            selection_quads(&p.grid, sel, vp.rect, cw, ch, sf, &mut rects);
                         }
                     }
                     // Ctrl+Opt split drop-zone preview over the hovered pane.
