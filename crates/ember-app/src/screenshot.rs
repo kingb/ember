@@ -345,6 +345,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
         bell_flash: opts.bell,
         font_size: opts.font_size,
         font_family: opts.font.clone(),
+        confirm: None,
     };
     if opts.bg_image.is_some() && shot.image.is_none() {
         return Err(format!(

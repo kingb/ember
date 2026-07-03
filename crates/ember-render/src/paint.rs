@@ -1130,6 +1130,149 @@ pub(crate) fn push_border(rects: &mut Vec<([f32; 4], [f32; 4])>, rect: Rect, col
     rects.push((scaled(x + w - t, y, t, h, sf), c)); // right
 }
 
+/// Text-placement result from [`build_confirm`] (logical px).
+pub(crate) struct ConfirmLayout {
+    pub msg_origin: (f32, f32),
+    pub title_origin: (f32, f32),
+    pub cancel_origin: (f32, f32),
+    pub ok_origin: (f32, f32),
+    /// `[(button_rect_logical, index)]` — index 0 = cancel, 1 = confirm.
+    pub buttons: Vec<([f32; 4], usize)>,
+}
+
+/// Draw the blocking confirm modal: a scrim + a centered rounded panel with a
+/// title, a message, and two rounded buttons (Cancel, Confirm). The focused
+/// button gets an ember ring; the confirm button is ember-tinted (danger).
+/// Everything goes into `rounded` (scrim is radius 0) so the modal draws over
+/// all content incl. the tab pills. Returns text origins for the caller's
+/// TextAreas + the button hit rects.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_confirm(
+    font_system: &mut FontSystem,
+    title_buf: &mut Buffer,
+    msg_buf: &mut Buffer,
+    cancel_buf: &mut Buffer,
+    ok_buf: &mut Buffer,
+    view: &crate::renderer::ConfirmView,
+    cw: f32,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+    rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
+) -> ConfirmLayout {
+    let pad = 20.0;
+    let btn_h = 30.0;
+    let btn_gap = 10.0;
+    let label_w = |s: &str| s.chars().count() as f32 * cw + 26.0;
+    let cancel_w = label_w(&view.cancel_label).max(72.0);
+    let ok_w = label_w(&view.confirm_label).max(72.0);
+
+    let w = (logical_w * 0.5).clamp(340.0, 470.0);
+    let h = pad + LINE_HEIGHT + 6.0 + LINE_HEIGHT + 18.0 + btn_h + pad;
+    let x = ((logical_w - w) * 0.5).max(0.0);
+    let y = ((logical_h - h) * 0.5).max(4.0);
+
+    // Scrim (radius 0) then the panel (rounded, ember border via a ring).
+    rounded.push((
+        scaled(0.0, 0.0, logical_w, logical_h, sf),
+        lin_rgba(Rgb::new(0, 0, 0), 0.62),
+        0.0,
+    ));
+    let r = 10.0;
+    rounded.push((
+        scaled(x - 1.5, y - 1.5, w + 3.0, h + 3.0, sf),
+        lin_rgba(ACCENT, 0.9),
+        (r + 1.5) * sf,
+    ));
+    rounded.push((
+        scaled(x, y, w, h, sf),
+        lin_rgba(Rgb::new(0x20, 0x22, 0x28), 1.0),
+        r * sf,
+    ));
+
+    // Buttons: bottom-right, Confirm rightmost.
+    let by = y + h - pad - btn_h;
+    let ok_x = x + w - pad - ok_w;
+    let cancel_x = ok_x - btn_gap - cancel_w;
+    let focused = view.focused;
+    // Cancel (neutral; ring when focused).
+    if focused == 0 {
+        rounded.push((
+            scaled(cancel_x - 1.5, by - 1.5, cancel_w + 3.0, btn_h + 3.0, sf),
+            lin_rgba(ACCENT, 0.9),
+            (8.0 + 1.5) * sf,
+        ));
+    }
+    rounded.push((
+        scaled(cancel_x, by, cancel_w, btn_h, sf),
+        lin_rgba(Rgb::new(0x3a, 0x3a, 0x3d), 1.0),
+        8.0 * sf,
+    ));
+    // Confirm (ember-tinted danger; ring when focused).
+    if focused == 1 {
+        rounded.push((
+            scaled(ok_x - 1.5, by - 1.5, ok_w + 3.0, btn_h + 3.0, sf),
+            lin_rgba(Rgb::new(0xff, 0xff, 0xff), 0.8),
+            (8.0 + 1.5) * sf,
+        ));
+    }
+    rounded.push((
+        scaled(ok_x, by, ok_w, btn_h, sf),
+        lin_rgba(ACCENT, 0.92),
+        8.0 * sf,
+    ));
+
+    // Shape text. Title (white), message (gray); labels centered in buttons.
+    let shape = |fs: &mut FontSystem, buf: &mut Buffer, text: &str, color: Color| {
+        buf.set_size(fs, Some(w), Some(LINE_HEIGHT));
+        buf.set_text(
+            fs,
+            text,
+            &Attrs::new().family(Family::Monospace).color(color),
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(fs, false);
+    };
+    shape(
+        font_system,
+        title_buf,
+        &view.title,
+        Color::rgb(0xff, 0xff, 0xff),
+    );
+    shape(
+        font_system,
+        msg_buf,
+        &view.message,
+        Color::rgb(0x9a, 0x9a, 0x9a),
+    );
+    shape(
+        font_system,
+        cancel_buf,
+        &view.cancel_label,
+        Color::rgb(0xf0, 0xf0, 0xf0),
+    );
+    shape(
+        font_system,
+        ok_buf,
+        &view.confirm_label,
+        Color::rgb(0xff, 0xff, 0xff),
+    );
+
+    let label_x = |bx: f32, bw: f32, s: &str| bx + (bw - s.chars().count() as f32 * cw) * 0.5;
+    let btn_text_y = by + (btn_h - LINE_HEIGHT) * 0.5;
+    ConfirmLayout {
+        title_origin: (x + pad, y + pad),
+        msg_origin: (x + pad, y + pad + LINE_HEIGHT + 6.0),
+        cancel_origin: (label_x(cancel_x, cancel_w, &view.cancel_label), btn_text_y),
+        ok_origin: (label_x(ok_x, ok_w, &view.confirm_label), btn_text_y),
+        buttons: vec![
+            ([cancel_x, by, cancel_w, btn_h], 0),
+            ([ok_x, by, ok_w, btn_h], 1),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::center;

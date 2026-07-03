@@ -21,9 +21,9 @@ use wgpu::{
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    AboutLayout, bell_wash, build_about, build_fps, build_help, build_settings, build_tabs,
-    grid_quads, measure_cell_width, push_backdrop, scrollbar, selection_quads, shape_grid,
-    spark_quads, split_preview,
+    AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help, build_settings,
+    build_tabs, grid_quads, measure_cell_width, push_backdrop, scrollbar, selection_quads,
+    shape_grid, spark_quads, split_preview,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
@@ -76,6 +76,8 @@ pub struct Shot<'a> {
     pub font_size: f32,
     /// Font family name (`None` → monospace default).
     pub font_family: Option<String>,
+    /// A blocking confirm modal drawn over everything, if shown.
+    pub confirm: Option<crate::renderer::ConfirmView>,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
@@ -233,6 +235,11 @@ pub fn capture_reusing(
     let mut about_body = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut settings_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut fps_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut cf_title = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut cf_msg = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut cf_cancel = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut cf_ok = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut confirm_layout: Option<crate::paint::ConfirmLayout> = None;
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut rounded: Vec<([f32; 4], [f32; 4], f32)> = Vec::new();
     let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
@@ -395,6 +402,21 @@ pub fn capture_reusing(
             sf,
         );
     }
+    if let Some(view) = &shot.confirm {
+        confirm_layout = Some(build_confirm(
+            font_system,
+            &mut cf_title,
+            &mut cf_msg,
+            &mut cf_cancel,
+            &mut cf_ok,
+            view,
+            cw,
+            shot.logical_w,
+            shot.logical_h,
+            sf,
+            &mut rounded,
+        ));
+    }
     quads.prepare(
         device,
         queue,
@@ -487,6 +509,24 @@ pub fn capture_reusing(
                 scale: sf,
                 bounds: full_bounds,
                 default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
+                custom_glyphs: &[],
+            });
+        }
+    }
+    if let Some(cl) = &confirm_layout {
+        for (buf, (ox, oy)) in [
+            (&cf_title, cl.title_origin),
+            (&cf_msg, cl.msg_origin),
+            (&cf_cancel, cl.cancel_origin),
+            (&cf_ok, cl.ok_origin),
+        ] {
+            areas.push(TextArea {
+                buffer: buf,
+                left: ox * sf,
+                top: oy * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(FG.r, FG.g, FG.b),
                 custom_glyphs: &[],
             });
         }

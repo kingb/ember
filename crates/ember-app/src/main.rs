@@ -24,13 +24,13 @@ use control::ControlMsg;
 
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, Direction, GridDims,
-    LayoutCommand, LayoutEffect, LayoutNode, OscEvent, PaneId, Rect, ScrollAmount, SessionBackend,
-    SessionId, Tab, TabId, apply, layout,
+    LayoutCommand, LayoutEffect, LayoutNode, PaneId, Rect, ScrollAmount, SessionBackend, SessionId,
+    Tab, TabId, apply, layout,
 };
 use ember_platform::MenuAction;
 use ember_render::{
-    BackdropParams, CELL_HEIGHT, CELL_WIDTH, ImageFit, Point, Renderer, Selection, SelectionMode,
-    TabHit, TabLabel, VisiblePane,
+    BackdropParams, CELL_HEIGHT, CELL_WIDTH, ConfirmView, ImageFit, Point, Renderer, Selection,
+    SelectionMode, TabHit, TabLabel, VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
@@ -291,9 +291,10 @@ struct RunState {
     last_mouse_cell: Option<(u16, u16)>,
     /// Sessions with an OSC 133 command in flight (Command/OutputStart seen, no
     /// CommandEnd) — used to confirm before destroying a busy pane.
-    running: std::collections::HashSet<SessionId>,
-    /// A destructive close awaiting Enter/Esc confirmation (a busy pane).
+    /// A destructive close awaiting confirmation (a busy pane).
     pending_close: Option<PendingClose>,
+    /// The focused confirm button: 0 = Cancel (safe default), 1 = Close/Quit.
+    confirm_focus: usize,
     /// Latest OSC title per session, so the window title can be re-asserted on
     /// tab/pane switch (not just when a fresh Title event happens to arrive).
     titles: std::collections::HashMap<SessionId, String>,
@@ -444,8 +445,8 @@ impl ApplicationHandler<EmberEvent> for App {
             wheel_accum: 0.0,
             mouse_press: None,
             last_mouse_cell: None,
-            running: std::collections::HashSet::new(),
             pending_close: None,
+            confirm_focus: 0,
             titles: std::collections::HashMap::new(),
             wake: self.wake.clone(),
             occluded: false,
@@ -561,7 +562,16 @@ impl ApplicationHandler<EmberEvent> for App {
             } => match button {
                 MouseButton::Left => {
                     let (x, y) = state.cursor;
-                    if let Some((target, axis)) = state.divider_at(x, y) {
+                    // A blocking confirm modal captures the click: a button
+                    // resolves it, elsewhere is a no-op (stays modal).
+                    if state.pending_close.is_some() {
+                        if let Some(idx) = state.renderer.confirm_button_at(x as f32, y as f32) {
+                            if state.resolve_confirm(idx == 1) {
+                                state.shutdown_all();
+                                event_loop.exit();
+                            }
+                        }
+                    } else if let Some((target, axis)) = state.divider_at(x, y) {
                         let pos = if matches!(axis, Axis::Horizontal) {
                             x
                         } else {
@@ -628,14 +638,30 @@ impl ApplicationHandler<EmberEvent> for App {
                     state.rename_key(&key.logical_key);
                     return;
                 }
-                // A running-process close confirmation: Enter closes, anything
-                // else cancels. Auto-repeat ignored so a held key can't confirm.
+                // A running-process close confirmation (modal): Left/Right/Tab
+                // move focus, Enter activates it, Esc cancels. Auto-repeat is
+                // ignored so a held key can't confirm.
                 if state.pending_close.is_some() {
                     if !key.repeat {
-                        let ok = matches!(&key.logical_key, Key::Named(NamedKey::Enter));
-                        if state.resolve_confirm(ok) {
-                            state.shutdown_all();
-                            event_loop.exit();
+                        match &key.logical_key {
+                            Key::Named(NamedKey::Escape) => {
+                                state.resolve_confirm(false);
+                            }
+                            Key::Named(NamedKey::Enter) => {
+                                let ok = state.confirm_focus == 1;
+                                if state.resolve_confirm(ok) {
+                                    state.shutdown_all();
+                                    event_loop.exit();
+                                }
+                            }
+                            Key::Named(
+                                NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::Tab,
+                            ) => {
+                                state.confirm_focus ^= 1;
+                                state.update_confirm_view();
+                                state.renderer.window().request_redraw();
+                            }
+                            _ => {}
                         }
                     }
                     return;
@@ -775,7 +801,6 @@ impl ApplicationHandler<EmberEvent> for App {
         let mut exited: Vec<SessionId> = Vec::new();
         let mut belled: Vec<SessionId> = Vec::new();
         let mut clipboard_set: Option<String> = None;
-        let mut running_changes: Vec<(SessionId, bool)> = Vec::new();
         let mut title_updates: Vec<(SessionId, String)> = Vec::new();
         for (id, handle) in &state.sessions {
             while let Ok(event) = handle.events.try_recv() {
@@ -792,16 +817,6 @@ impl ApplicationHandler<EmberEvent> for App {
                     BackendEvent::Clipboard(ClipboardOp::Set(text)) => {
                         clipboard_set = Some(text);
                     }
-                    // OSC 133 command state → per-pane busy tracking (for the
-                    // close confirmation). Needs shell integration (default on).
-                    BackendEvent::Osc(OscEvent::CommandStart)
-                    | BackendEvent::Osc(OscEvent::OutputStart) => {
-                        running_changes.push((id.clone(), true));
-                    }
-                    BackendEvent::Osc(OscEvent::CommandEnd(_))
-                    | BackendEvent::Osc(OscEvent::PromptStart) => {
-                        running_changes.push((id.clone(), false));
-                    }
                     _ => {}
                 }
             }
@@ -811,13 +826,6 @@ impl ApplicationHandler<EmberEvent> for App {
         }
         // Drop titles for sessions that no longer exist.
         state.titles.retain(|id, _| state.sessions.contains_key(id));
-        for (id, busy) in running_changes {
-            if busy {
-                state.running.insert(id);
-            } else {
-                state.running.remove(&id);
-            }
-        }
         if let Some(text) = clipboard_set {
             if let Some(cb) = state.clipboard.as_mut() {
                 if let Err(e) = cb.set_text(text) {
@@ -1108,6 +1116,31 @@ impl RunState {
                 }
                 return;
             }
+        }
+        // Mirror the keyboard: the close-confirm modal captures input (arrows/Tab
+        // move focus, Enter activates, Esc cancels).
+        if self.pending_close.is_some() {
+            if let ControlMsg::Key(name) = &msg {
+                match name.as_str() {
+                    "Escape" => {
+                        self.resolve_confirm(false);
+                    }
+                    "Enter" | "Return" => {
+                        let ok = self.confirm_focus == 1;
+                        if self.resolve_confirm(ok) {
+                            self.shutdown_all();
+                            event_loop.exit();
+                        }
+                    }
+                    "ArrowLeft" | "ArrowRight" | "Tab" => {
+                        self.confirm_focus ^= 1;
+                        self.update_confirm_view();
+                        self.renderer.window().request_redraw();
+                    }
+                    _ => {}
+                }
+            }
+            return;
         }
         // Mirror the keyboard: while a modal overlay is up, any input dismisses it
         // (but state/screenshot still work, so the overlay can be inspected).
@@ -2240,26 +2273,25 @@ impl RunState {
     /// Whether any session that a `kind` close would destroy is running a
     /// command (OSC 133). For `Pane`, only the focused pane's session; for
     /// `Quit`, any session anywhere.
+    /// Whether a session is running a foreground command (idle shell → false).
+    fn session_busy(&self, sid: &SessionId) -> bool {
+        self.sessions.get(sid).is_some_and(|h| h.is_busy())
+    }
+
     fn close_hits_running(&self, kind: PendingClose) -> bool {
         match kind {
-            PendingClose::Quit => !self.running.is_empty(),
+            PendingClose::Quit => self.sessions.values().any(|h| h.is_busy()),
             PendingClose::Pane => self
                 .active_tab()
                 .root
                 .session_of(self.active_tab().focus)
-                .is_some_and(|s| self.running.contains(s)),
-            PendingClose::Tab(tab) => {
-                self.tree
-                    .tabs
-                    .iter()
-                    .find(|t| t.id == tab)
-                    .is_some_and(|t| {
-                        t.root
-                            .leaves()
-                            .iter()
-                            .any(|(_, s)| self.running.contains(s))
-                    })
-            }
+                .is_some_and(|s| self.session_busy(s)),
+            PendingClose::Tab(tab) => self
+                .tree
+                .tabs
+                .iter()
+                .find(|t| t.id == tab)
+                .is_some_and(|t| t.root.leaves().iter().any(|(_, s)| self.session_busy(s))),
         }
     }
 
@@ -2290,22 +2322,28 @@ impl RunState {
         self.hide_help();
         self.hide_about();
         self.hide_settings();
-        let what = match kind {
-            PendingClose::Pane => "Close this pane?",
-            PendingClose::Tab(_) => "Close this tab?",
-            PendingClose::Quit => "Quit Ember?",
-        };
-        let rows = vec![
-            (what.to_string(), "a command is still running".to_string()),
-            ("return".to_string(), "close anyway".to_string()),
-            ("esc".to_string(), "cancel".to_string()),
-        ];
         self.pending_close = Some(kind);
-        self.renderer.set_help_title(Some((
-            "Running process".to_string(),
-            "⏎ close · esc cancel".to_string(),
-        )));
-        self.renderer.set_help(Some(rows));
+        self.confirm_focus = 0; // Cancel is the safe default.
+        self.update_confirm_view();
+    }
+
+    /// (Re)build the confirm modal from `pending_close` + `confirm_focus`.
+    fn update_confirm_view(&mut self) {
+        let Some(kind) = self.pending_close else {
+            return;
+        };
+        let (title, confirm_label) = match kind {
+            PendingClose::Pane => ("Close this pane?", "Close"),
+            PendingClose::Tab(_) => ("Close this tab?", "Close"),
+            PendingClose::Quit => ("Quit Ember?", "Quit"),
+        };
+        self.renderer.set_confirm(Some(ConfirmView {
+            title: title.to_string(),
+            message: "A command is still running.".to_string(),
+            cancel_label: "Cancel".to_string(),
+            confirm_label: confirm_label.to_string(),
+            focused: self.confirm_focus,
+        }));
     }
 
     /// Resolve a pending close confirmation. `Enter` performs it; any other key
@@ -2314,8 +2352,7 @@ impl RunState {
         let Some(kind) = self.pending_close.take() else {
             return false;
         };
-        self.renderer.set_help(None);
-        self.renderer.set_help_title(None);
+        self.renderer.set_confirm(None);
         if confirm { self.do_close(kind) } else { false }
     }
 

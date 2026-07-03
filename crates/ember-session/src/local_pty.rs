@@ -8,6 +8,7 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -176,11 +177,16 @@ impl SessionBackend for LocalPty {
             }
         });
 
+        // Foreground-process-group state (idle shell vs running command), kept
+        // current by the emulation thread from the PTY's `tcgetpgrp`.
+        let busy = Arc::new(AtomicBool::new(false));
+
         // Emulation thread: owns the engine.
         {
             let event_tx = event_tx.clone();
+            let busy = Arc::clone(&busy);
             thread::spawn(move || {
-                emulation_loop(dims, event_tx, frame_tx, irx, wtx, master, child)
+                emulation_loop(dims, event_tx, frame_tx, irx, wtx, master, child, busy)
             });
         }
 
@@ -189,6 +195,7 @@ impl SessionBackend for LocalPty {
             control: ctrl_tx,
             frames: frame_rx,
             events: event_rx,
+            busy,
         })
     }
 }
@@ -264,6 +271,7 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, itx: SyncSender<Ev>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emulation_loop(
     dims: GridDims,
     event_tx: Sender<BackendEvent>,
@@ -272,7 +280,17 @@ fn emulation_loop(
     wtx: Sender<Vec<u8>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    busy: Arc<AtomicBool>,
 ) {
+    // The shell is its own process-group leader; when a foreground command runs,
+    // the PTY's foreground pgrp differs from the shell pid. Recompute after each
+    // event so `is_busy()` is current for the close confirmation.
+    let shell_pid = child.process_id().map(|p| p as i32);
+    let refresh_busy = |master: &(dyn portable_pty::MasterPty + Send)| {
+        let fg = master.process_group_leader();
+        let running = matches!((fg, shell_pid), (Some(f), Some(s)) if f != s);
+        busy.store(running, Ordering::Relaxed);
+    };
     let outbox = Arc::new(Mutex::new(Vec::<u8>::new()));
     let listener = EmberListener {
         events: event_tx.clone(),
@@ -283,7 +301,19 @@ fn emulation_loop(
     let mut shipper = FrameShipper::default();
     shipper.push(&mut proj, &frame_tx);
 
-    for ev in irx {
+    // Poll the foreground pgrp on a timeout too: a command that produces no
+    // output (`sleep`, a blocking read) sends no events, so an event-only
+    // refresh would miss it.
+    const BUSY_POLL: Duration = Duration::from_millis(250);
+    loop {
+        let ev = match irx.recv_timeout(BUSY_POLL) {
+            Ok(ev) => ev,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                refresh_busy(master.as_ref());
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match ev {
             Ev::Pty(bytes) => {
                 for osc in proj.advance(&bytes) {
@@ -291,6 +321,7 @@ fn emulation_loop(
                 }
                 flush_outbox(&outbox, &wtx);
                 shipper.push(&mut proj, &frame_tx);
+                refresh_busy(master.as_ref());
             }
             Ev::Control(BackendControl::Input(bytes)) => {
                 // Typing snaps the view back to the live bottom (standard terminal
@@ -298,6 +329,7 @@ fn emulation_loop(
                 proj.scroll(ScrollAmount::Bottom);
                 shipper.push(&mut proj, &frame_tx);
                 let _ = wtx.send(bytes.into_vec());
+                refresh_busy(master.as_ref());
             }
             Ev::Control(BackendControl::Scroll(amount)) => {
                 proj.scroll(amount);

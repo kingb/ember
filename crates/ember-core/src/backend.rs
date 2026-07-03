@@ -216,6 +216,17 @@ pub struct BackendHandle {
     pub frames: FrameRx,
     /// Lane 2 — semantic: ordered, reliable.
     pub events: Receiver<BackendEvent>,
+    /// Whether a **foreground command** is running (vs an idle shell prompt) —
+    /// the backend keeps this current from the PTY's foreground process group.
+    /// Drives the "close a busy pane?" confirmation without exposing the fd.
+    pub busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BackendHandle {
+    /// Whether a foreground command is currently running in this session.
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// A session backend (design §4). Implementors spawn a session on a dedicated

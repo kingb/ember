@@ -28,9 +28,9 @@ use winit::window::Window;
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    BTN_COLS, bell_wash, build_about, build_fps, build_help, build_settings, build_tabs,
-    debug_emit, grid_quads, measure_cell_width, push_backdrop, scrollbar, scrollbar_geometry,
-    selection_quads, shape_grid, spark_quads, split_preview,
+    BTN_COLS, bell_wash, build_about, build_confirm, build_fps, build_help, build_settings,
+    build_tabs, debug_emit, grid_quads, measure_cell_width, push_backdrop, scrollbar,
+    scrollbar_geometry, selection_quads, shape_grid, spark_quads, split_preview,
 };
 use crate::selection::Selection;
 
@@ -78,6 +78,17 @@ pub struct TabLabel {
     /// True when this tab has an unseen bell (a background tab belled) — draws a
     /// small amber indicator so the user can see which tab wants attention.
     pub bell: bool,
+}
+
+/// A blocking confirm modal: a title, a one-line message, and two buttons.
+/// `focused` is the highlighted/default button (0 = cancel, 1 = confirm).
+#[derive(Clone, Debug)]
+pub struct ConfirmView {
+    pub title: String,
+    pub message: String,
+    pub cancel_label: String,
+    pub confirm_label: String,
+    pub focused: usize,
 }
 
 /// Static content for the About overlay (the animated glow is separate).
@@ -253,6 +264,16 @@ pub struct Renderer {
     settings: Option<(Vec<(String, String)>, usize)>,
     /// Glyph buffer for the Settings overlay.
     settings_buffer: Buffer,
+    /// When `Some`, a blocking confirm modal is shown.
+    confirm: Option<ConfirmView>,
+    /// Buffers for the confirm modal's message + two button labels.
+    confirm_title: Buffer,
+    confirm_msg: Buffer,
+    confirm_cancel: Buffer,
+    confirm_ok: Buffer,
+    /// The confirm modal's `[cancel, confirm]` button rects (logical px), for
+    /// hit-testing clicks. Empty when the modal is hidden.
+    confirm_buttons: Vec<([f32; 4], usize)>,
     /// Measured monospace advance (px) — keeps bg quads aligned with glyphs.
     cell_w: f32,
     /// Current terminal font point size (mutated by live zoom).
@@ -362,6 +383,10 @@ impl Renderer {
         );
         let about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let settings_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let confirm_title = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let confirm_msg = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let confirm_cancel = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let confirm_ok = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let fps_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
 
         // Runtime font state (Cmd +/-/0 mutate size at runtime; family from cfg).
@@ -405,6 +430,12 @@ impl Renderer {
             about_links: Vec::new(),
             settings: None,
             settings_buffer,
+            confirm: None,
+            confirm_title,
+            confirm_msg,
+            confirm_cancel,
+            confirm_ok,
+            confirm_buttons: Vec::new(),
             cell_w,
             font_size,
             line_height,
@@ -549,6 +580,7 @@ impl Renderer {
             bell_flash: self.bell_flash,
             font_size: self.font_size,
             font_family: self.family_name.clone(),
+            confirm: self.confirm.clone(),
         };
         crate::headless::capture_reusing(
             &self.device,
@@ -779,6 +811,22 @@ impl Renderer {
     }
 
     /// Show the About overlay with this content, or hide it with `None`.
+    /// Show/hide the blocking confirm modal.
+    pub fn set_confirm(&mut self, view: Option<ConfirmView>) {
+        self.confirm = view;
+    }
+
+    pub fn confirm_shown(&self) -> bool {
+        self.confirm.is_some()
+    }
+
+    /// Which confirm button (`0` cancel, `1` confirm) is at logical `(x, y)`.
+    pub fn confirm_button_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.confirm_buttons.iter().find_map(|(r, idx)| {
+            (x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]).then_some(*idx)
+        })
+    }
+
     pub fn set_about(&mut self, info: Option<AboutInfo>) {
         if info.is_none() {
             self.about_links.clear();
@@ -1167,6 +1215,44 @@ impl Renderer {
             }
             // Visual-bell flash: a warm amber wash over everything (under the text).
             bell_wash(&mut rects, self.bell_flash, logical_w, logical_h, sf);
+        }
+
+        // Blocking confirm modal — drawn OVER everything (panes, tabs, overlays).
+        self.confirm_buttons.clear();
+        if let Some(view) = self.confirm.clone() {
+            let lw = self.config.width as f32 / sf;
+            let lh = self.config.height as f32 / sf;
+            let cw = self.cell_w;
+            let cl = build_confirm(
+                &mut self.font_system,
+                &mut self.confirm_title,
+                &mut self.confirm_msg,
+                &mut self.confirm_cancel,
+                &mut self.confirm_ok,
+                &view,
+                cw,
+                lw,
+                lh,
+                sf,
+                &mut rounded,
+            );
+            self.confirm_buttons = cl.buttons;
+            for (buf, (ox, oy)) in [
+                (&self.confirm_title, cl.title_origin),
+                (&self.confirm_msg, cl.msg_origin),
+                (&self.confirm_cancel, cl.cancel_origin),
+                (&self.confirm_ok, cl.ok_origin),
+            ] {
+                areas.push(TextArea {
+                    buffer: buf,
+                    left: ox * sf,
+                    top: oy * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(FG.r, FG.g, FG.b),
+                    custom_glyphs: &[],
+                });
+            }
         }
 
         self.quads.prepare(
