@@ -447,7 +447,7 @@ pub(crate) fn split_preview(
 /// Background of the tab strip (a touch lighter than the terminal, iTerm-style).
 const STRIP_BG: Rgb = Rgb::new(0x1b, 0x1b, 0x1b);
 /// Fill of the active tab button.
-const TAB_ACTIVE: Rgb = Rgb::new(0x2e, 0x2e, 0x2e);
+const TAB_ACTIVE: Rgb = Rgb::new(0x3a, 0x3a, 0x3d);
 /// Width (in columns) of each trailing tab-strip utility button ("+", "?", "⚙").
 pub(crate) const BTN_COLS: usize = 3;
 
@@ -495,6 +495,41 @@ fn center(s: &str, width: usize) -> String {
 /// lighter with an Ember-orange underline + `⌘N` hint); with one tab the tab area
 /// is just an empty toolbar. Quads → `out`; the concatenated label line shapes into
 /// `chrome`. All geometry is logical px, scaled by `sf`.
+/// Push a rounded tab "pill" (iTerm-style): a fill inset from the strip edges,
+/// with an optional 1px accent ring behind it. `x`/`w` are the tab segment in
+/// logical px; `cw` gives a small horizontal gap so adjacent pills don't touch.
+#[allow(clippy::too_many_arguments)]
+fn push_pill(
+    rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
+    x: f32,
+    w: f32,
+    strip_h: f32,
+    cw: f32,
+    sf: f32,
+    fill: Rgb,
+    ring: Option<Rgb>,
+) {
+    let inset_y = 3.0;
+    let gap_x = (cw * 0.4).clamp(3.0, 8.0);
+    let px = x + gap_x;
+    let pw = (w - 2.0 * gap_x).max(1.0);
+    let ph = (strip_h - 2.0 * inset_y).max(1.0);
+    let radius = (ph * 0.5).min(9.0);
+    if let Some(c) = ring {
+        // A slightly larger rounded rect behind the fill = a 1px accent ring.
+        rounded.push((
+            scaled(px - 1.0, inset_y - 1.0, pw + 2.0, ph + 2.0, sf),
+            lin_rgba(c, 0.85),
+            (radius + 1.0) * sf,
+        ));
+    }
+    rounded.push((
+        scaled(px, inset_y, pw, ph, sf),
+        lin_rgba(fill, 1.0),
+        radius * sf,
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_tabs(
     font_system: &mut FontSystem,
@@ -505,6 +540,7 @@ pub(crate) fn build_tabs(
     logical_w: f32,
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
+    rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
 ) {
     chrome.set_size(font_system, Some(logical_w), Some(LINE_HEIGHT));
     let strip_h = CELL_HEIGHT + 2.0 * PAD;
@@ -543,18 +579,12 @@ pub(crate) fn build_tabs(
                     lin_rgba(Rgb::new(0x0c, 0x0c, 0x0c), 1.0),
                 ));
             } else if tab.editing {
-                // Inline rename: accent fill + full border so it reads as an input.
-                out.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(TAB_ACTIVE, 1.0)));
-                push_border(
-                    out,
-                    Rect::new(x as f64, 0.0, w as f64, strip_h as f64),
-                    ACCENT,
-                    sf,
-                );
+                // Inline rename: an accent-ringed rounded pill so it reads as an
+                // editable field.
+                push_pill(rounded, x, w, strip_h, cw, sf, TAB_ACTIVE, Some(ACCENT));
             } else if tab.active {
-                out.push((scaled(x, 0.0, w, strip_h, sf), lin_rgba(TAB_ACTIVE, 1.0)));
-                // Ember-orange underline accent on the active tab.
-                out.push((scaled(x, strip_h - 2.0, w, 2.0, sf), lin_rgba(ACCENT, 1.0)));
+                // iTerm-style: an inset rounded pill with a subtle ember ring.
+                push_pill(rounded, x, w, strip_h, cw, sf, TAB_ACTIVE, Some(ACCENT));
             }
             // Unseen-bell indicator: a small amber dot in the tab's top-right.
             if tab.bell {

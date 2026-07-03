@@ -12,6 +12,9 @@ struct Instance {
     rect: [f32; 4],
     /// Linear RGBA.
     color: [f32; 4],
+    /// Corner radius in physical px (`0` = sharp rect, the fast path).
+    radius: f32,
+    _pad: [f32; 3],
 }
 
 #[repr(C)]
@@ -29,10 +32,14 @@ struct VsIn {
     @location(0) unit: vec2<f32>,
     @location(1) rect: vec4<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) radius: f32,
 };
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) local: vec2<f32>,   // px offset from the rect center
+    @location(2) half_size: vec2<f32>,
+    @location(3) radius: f32,
 };
 
 @vertex
@@ -42,12 +49,24 @@ fn vs(in: VsIn) -> VsOut {
     var out: VsOut;
     out.pos = vec4<f32>(ndc, 0.0, 1.0);
     out.color = in.color;
+    out.half_size = in.rect.zw * 0.5;
+    out.local = (in.unit - vec2<f32>(0.5, 0.5)) * in.rect.zw;
+    out.radius = in.radius;
     return out;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    return in.color;
+    // Sharp fast path: cell fills etc. must tile seamlessly (no edge AA).
+    if (in.radius < 0.5) {
+        return in.color;
+    }
+    // Rounded-rect signed distance; 1px anti-aliased edge.
+    let r = min(in.radius, min(in.half_size.x, in.half_size.y));
+    let q = abs(in.local) - (in.half_size - vec2<f32>(r, r));
+    let d = length(max(q, vec2<f32>(0.0, 0.0))) - r;
+    let alpha = 1.0 - smoothstep(0.0, 1.0, d);
+    return vec4<f32>(in.color.rgb, in.color.a * alpha);
 }
 "#;
 
@@ -68,6 +87,7 @@ pub struct QuadRenderer {
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     count: u32,
+    sharp_count: u32,
 }
 
 impl QuadRenderer {
@@ -111,9 +131,11 @@ impl QuadRenderer {
                         attributes: &wgpu::vertex_attr_array![0 => Float32x2],
                     },
                     wgpu::VertexBufferLayout {
-                        array_stride: 32,
+                        array_stride: 48,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4],
+                        attributes: &wgpu::vertex_attr_array![
+                            1 => Float32x4, 2 => Float32x4, 3 => Float32
+                        ],
                     },
                 ],
             },
@@ -174,16 +196,26 @@ impl QuadRenderer {
             uniforms,
             bind_group,
             count: 0,
+            sharp_count: 0,
         }
     }
 
-    /// Upload this frame's quads. `rects` are `(rect_px, linear_rgba)`.
+    /// Index where rounded quads begin (== number of sharp quads this frame).
+    pub fn sharp_count(&self) -> u32 {
+        self.sharp_count
+    }
+
+    /// Upload this frame's quads: sharp `rects` (radius 0) first, then `rounded`
+    /// `(rect, color, radius_px)` appended. The sharp/rounded boundary is
+    /// [`Self::sharp_count`], so the caller can `draw_range` them separately
+    /// (rounded pills draw over the chrome, before text).
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         resolution: (f32, f32),
         rects: &[([f32; 4], [f32; 4])],
+        rounded: &[([f32; 4], [f32; 4], f32)],
     ) {
         queue.write_buffer(
             &self.uniforms,
@@ -194,13 +226,22 @@ impl QuadRenderer {
             }]),
         );
 
-        let instances: Vec<Instance> = rects
+        let sharp = |rect: [f32; 4], color: [f32; 4], radius: f32| Instance {
+            rect,
+            color,
+            radius,
+            _pad: [0.0; 3],
+        };
+        let mut instances: Vec<Instance> = rects
             .iter()
-            .map(|(rect, color)| Instance {
-                rect: *rect,
-                color: *color,
-            })
+            .map(|(rect, color)| sharp(*rect, *color, 0.0))
             .collect();
+        self.sharp_count = instances.len() as u32;
+        instances.extend(
+            rounded
+                .iter()
+                .map(|(rect, color, r)| sharp(*rect, *color, *r)),
+        );
 
         if instances.len() > self.cap {
             self.cap = instances.len().next_power_of_two();

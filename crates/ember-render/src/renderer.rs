@@ -925,6 +925,8 @@ impl Renderer {
             bottom: self.config.height as i32,
         };
         let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
+        // Rounded quads (tab pills) — drawn after the sharp chrome, before text.
+        let mut rounded: Vec<([f32; 4], [f32; 4], f32)> = Vec::new();
         let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
         // Index into `rects` where the additive spark pass is interleaved:
         // everything before is backdrop (gradient/scrim), everything after is
@@ -1109,6 +1111,7 @@ impl Renderer {
                 logical_w,
                 sf,
                 &mut rects,
+                &mut rounded,
             );
 
             // Pass 3: one TextArea per visible pane (clipped to its rect) + the strip.
@@ -1171,6 +1174,7 @@ impl Renderer {
             &self.queue,
             (self.config.width as f32, self.config.height as f32),
             &rects,
+            &rounded,
         );
         self.sparks.prepare(
             &self.device,
@@ -1295,9 +1299,11 @@ impl Renderer {
             // embers glow over the gradient but sit behind opaque cell bgs, the
             // selection, and the tab strip.
             let split = spark_layer as u32;
+            let sharp = self.quads.sharp_count();
             self.quads.draw_range(&mut pass, 0..split);
             self.sparks.draw(&mut pass);
-            self.quads.draw_range(&mut pass, split..u32::MAX);
+            self.quads.draw_range(&mut pass, split..sharp); // cells + chrome
+            self.quads.draw_range(&mut pass, sharp..u32::MAX); // rounded tab pills
             let _ = self
                 .text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass);

@@ -812,7 +812,7 @@ impl ApplicationHandler<EmberEvent> for App {
                 .as_ref()
                 .and_then(|id| state.titles.get(id).cloned())
                 .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| "ember".to_string());
+                .unwrap_or_else(|| "Ember".to_string());
             state.renderer.window().set_title(&title);
             state.focus_notified = focus_now;
         }

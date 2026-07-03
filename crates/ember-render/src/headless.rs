@@ -234,6 +234,7 @@ pub fn capture_reusing(
     let mut settings_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut fps_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
+    let mut rounded: Vec<([f32; 4], [f32; 4], f32)> = Vec::new();
     let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     // Where the additive spark pass is interleaved (see the live renderer):
     // backdrop before, cells + chrome after, so content covers the embers.
@@ -372,6 +373,7 @@ pub fn capture_reusing(
             shot.logical_w,
             sf,
             &mut rects,
+            &mut rounded,
         );
         if let Some(text) = &shot.fps_overlay {
             fps_origin = Some(build_fps(
@@ -393,7 +395,13 @@ pub fn capture_reusing(
             sf,
         );
     }
-    quads.prepare(device, queue, (phys_w as f32, phys_h as f32), &rects);
+    quads.prepare(
+        device,
+        queue,
+        (phys_w as f32, phys_h as f32),
+        &rects,
+        &rounded,
+    );
     sparks.prepare(device, queue, (phys_w as f32, phys_h as f32), &spark_rects);
 
     viewport.update(
@@ -535,9 +543,11 @@ pub fn capture_reusing(
             image.draw(&mut pass);
         }
         let split = spark_layer as u32;
+        let sharp = quads.sharp_count();
         quads.draw_range(&mut pass, 0..split);
         sparks.draw(&mut pass);
-        quads.draw_range(&mut pass, split..u32::MAX);
+        quads.draw_range(&mut pass, split..sharp); // cells + chrome
+        quads.draw_range(&mut pass, sharp..u32::MAX); // rounded tab pills
         let _ = text_renderer.render(&atlas, &viewport, &mut pass);
     }
     encoder.copy_texture_to_buffer(
