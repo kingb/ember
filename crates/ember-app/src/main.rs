@@ -29,8 +29,8 @@ use ember_core::{
 };
 use ember_platform::MenuAction;
 use ember_render::{
-    BackdropParams, CELL_HEIGHT, CELL_WIDTH, ConfirmView, ImageFit, Point, Renderer, Selection,
-    SelectionMode, TabHit, TabLabel, VisiblePane,
+    BackdropParams, CELL_HEIGHT, CELL_WIDTH, ConfirmView, ImageFit, Point, RenderOutcome, Renderer,
+    Selection, SelectionMode, TabHit, TabLabel, VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
@@ -498,12 +498,21 @@ impl ApplicationHandler<EmberEvent> for App {
             WindowEvent::Focused(focused) => {
                 state.window_focused = focused;
                 if focused {
+                    // A focused window is never occluded. Focus events are the
+                    // reliable reveal signal when an Occluded(false) got lost
+                    // (e.g. around display sleep/unlock), so also clear the
+                    // renderer's starve throttle before the repaint.
+                    state.occluded = false;
+                    state.renderer.surface_revealed();
                     state.renderer.window().request_redraw();
                 }
             }
             WindowEvent::Occluded(occluded) => {
                 state.occluded = occluded;
                 if !occluded {
+                    // Lift the renderer's starve throttle BEFORE requesting the
+                    // reveal repaint, so it isn't swallowed by the holdoff.
+                    state.renderer.surface_revealed();
                     state.renderer.window().request_redraw();
                 }
             }
@@ -799,10 +808,18 @@ impl ApplicationHandler<EmberEvent> for App {
                     )));
                 }
                 let t = Instant::now();
-                if !state.renderer.render() {
+                match state.renderer.render() {
+                    // A drawable came through — the surface is ground truth, so
+                    // whatever winit last said, we are visible.
+                    RenderOutcome::Presented => state.occluded = false,
                     // Surface lost/outdated: it was reconfigured but this frame
                     // never presented — repaint now, not at the next input.
-                    state.renderer.window().request_redraw();
+                    RenderOutcome::Retry => state.renderer.window().request_redraw(),
+                    // Starved (occluded window / asleep display): mark occluded
+                    // even if winit never said so, and do NOT re-request — that
+                    // loop is the  OOM spin. Occluded(false)/Focused(true)
+                    // triggers the repaint.
+                    RenderOutcome::Starved => state.occluded = true,
                 }
                 let render_ms = t.elapsed().as_secs_f32() * 1000.0;
                 state.render_ema_ms = if state.render_ema_ms == 0.0 {
@@ -926,8 +943,11 @@ impl ApplicationHandler<EmberEvent> for App {
             event_loop.exit();
             return;
         }
-        // Poll the pixel lanes; redraw only when something changed.
-        if state.drain_frames() {
+        // Poll the pixel lanes; redraw only when something changed — and only
+        // when someone can see it. While occluded, content-driven redraws would
+        // re-enter frame prep at PTY rate for frames that can never present
+        //; the grids still update here, and Occluded(false) repaints.
+        if state.drain_frames() && !state.occluded {
             state.renderer.window().request_redraw();
         }
         // Pace animations by WALL-CLOCK elapsed since the last frame, checked here on
@@ -950,7 +970,11 @@ impl ApplicationHandler<EmberEvent> for App {
             if now.duration_since(state.last_anim) >= frame {
                 state.last_anim = now;
                 state.advance_animations(now);
-                state.renderer.window().request_redraw();
+                // Animations advance on wall-clock regardless, but don't ask an
+                // occluded window to paint them (same  spin, slower burn).
+                if !state.occluded {
+                    state.renderer.window().request_redraw();
+                }
             }
             // Fixed deadline relative to the last frame (not `now`), so incoming
             // events can't push it back indefinitely.

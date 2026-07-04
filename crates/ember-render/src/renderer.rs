@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ember_core::{GridDelta, GridDims, Rect, Rgb, SessionId};
 use glyphon::{
@@ -241,6 +242,60 @@ struct PaneRender {
     dirty: bool,
 }
 
+/// What [`Renderer::render`] did with the frame — tells the app whether (and
+/// whether NOT) to schedule another redraw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderOutcome {
+    /// Frame presented normally.
+    Presented,
+    /// The surface was stale (resize / device loss) and has been reconfigured;
+    /// this frame never presented. Redraw now, or the window shows stale
+    /// pixels until the next input.
+    Retry,
+    /// No drawable: the window is occluded or the display is asleep. Drawing
+    /// is pointless and *retrying in a loop is the OOM spin*: each
+    /// attempt burns full frame prep + staging allocations at PTY-event rate.
+    /// Do NOT auto-retry — the repaint arrives with `Occluded(false)` or the
+    /// next content change once visible.
+    Starved,
+}
+
+/// Rate-limits render attempts while the surface is starved of drawables
+/// (occluded window / asleep display). The app already gates redraw requests
+/// on winit's `Occluded` events; this is the renderer-side backstop for
+/// occlusions winit never reports (e.g. display sleep → `Timeout`). Without
+/// it, content-driven redraws re-enter full frame prep at PTY rate — the
+///  spin that leaked ~3,500 GPU allocations/s and OOM'd the machine.
+/// A successful present clears the gate, so a revealed window never waits.
+struct StarveGate {
+    starved_at: Option<Instant>,
+}
+
+impl StarveGate {
+    /// Max attempt rate while starved: one per 250ms (4/s) bounds the waste.
+    const HOLDOFF: Duration = Duration::from_millis(250);
+
+    fn new() -> Self {
+        Self { starved_at: None }
+    }
+
+    /// Whether a render attempt is allowed at `now`.
+    fn should_attempt(&self, now: Instant) -> bool {
+        self.starved_at
+            .is_none_or(|t| now.duration_since(t) >= Self::HOLDOFF)
+    }
+
+    /// Record a starved attempt at `now`; holds off retries for [`Self::HOLDOFF`].
+    fn starve(&mut self, now: Instant) {
+        self.starved_at = Some(now);
+    }
+
+    /// A drawable came through — stop gating.
+    fn clear(&mut self) {
+        self.starved_at = None;
+    }
+}
+
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -336,6 +391,8 @@ pub struct Renderer {
     /// Visual-bell flash intensity (`0..1`); a warm amber wash over the panes that
     /// the app decays to 0 after a BEL. `0.0` = no flash.
     bell_flash: f32,
+    /// Throttles render attempts while the surface has no drawable.
+    starve_gate: StarveGate,
     // Keep the window LAST so it drops after the surface (winit/wgpu requirement).
     window: Arc<Window>,
 }
@@ -397,6 +454,12 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        // Which mode we actually got matters when debugging pacing/leak issues
+        // (Metal offers Fifo+Immediate only — the Mailbox branch never wins there).
+        debug_emit(&format!(
+            "[ember] surface: present_mode={present_mode:?} caps={:?} latency=2",
+            caps.present_modes
+        ));
 
         let mut font_system = crate::paint::new_font_system();
         let swash_cache = SwashCache::new();
@@ -488,12 +551,19 @@ impl Renderer {
             fps_overlay: None,
             fps_buffer,
             bell_flash: 0.0,
+            starve_gate: StarveGate::new(),
             window,
         }
     }
 
     pub fn present_mode(&self) -> PresentMode {
         self.config.present_mode
+    }
+
+    /// The window just became visible again (winit `Occluded(false)`): lift the
+    /// starve throttle so the reveal repaint isn't delayed by the holdoff.
+    pub fn surface_revealed(&mut self) {
+        self.starve_gate.clear();
     }
 
     pub fn window(&self) -> &Arc<Window> {
@@ -998,7 +1068,15 @@ impl Renderer {
 
     /// Draw all visible panes (each in its rect) plus the tab strip. Returns
     /// `false` if the surface needs reconfiguring (request another redraw).
-    pub fn render(&mut self) -> bool {
+    pub fn render(&mut self) -> RenderOutcome {
+        // Starved of drawables (occluded / display asleep)? Skip the whole
+        // frame — prep below allocates GPU staging buffers, and doing that at
+        // PTY-event rate with no present is the  OOM spin. Checked FIRST
+        // so a starved frame costs nothing.
+        let frame_start = Instant::now();
+        if !self.starve_gate.should_attempt(frame_start) {
+            return RenderOutcome::Starved;
+        }
         // The app works in logical px; the surface is physical. Scale every draw
         // coordinate by the live HiDPI factor (handles Retina + display moves).
         let sf = self.window.scale_factor() as f32;
@@ -1391,10 +1469,12 @@ impl Renderer {
         if let Err(e) = prepared {
             // Don't freeze on a transient atlas/prepare error: log it (always, since
             // it means glyphs won't paint this frame) and ask for another redraw.
+            // Poll first so the staging buffers this frame already wrote get
+            // reclaimed — early returns must never skip reclamation.
             debug_emit(&format!("[ember] text prepare failed this frame: {e:?}"));
             eprintln!("[ember] text prepare failed, skipping glyphs this frame: {e:?}");
-            self.window.request_redraw();
-            return true;
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            return RenderOutcome::Retry;
         }
         // Confirm-dialog text (empty unless the modal is up), prepared into the
         // shared atlas for its own post-panel render pass.
@@ -1411,22 +1491,36 @@ impl Renderer {
             debug_emit(&format!(
                 "[ember] overlay text prepare failed this frame: {e:?}"
             ));
-            self.window.request_redraw();
-            return true;
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            return RenderOutcome::Retry;
         }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
             wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            // No drawable because nobody can see us (occluded window, asleep
+            // display). The surface is NOT broken — reconfiguring here would
+            // allocate a fresh swapchain per attempt, which at retry rate is
+            // exactly the  leak (~3,500 IOAccelerator regions/s → OOM).
+            // Poll so in-flight work still gets reclaimed, arm the starve
+            // gate, and tell the app not to retry.
+            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
+                debug_emit("[ember] no drawable (occluded/timeout): starving redraws");
+                self.starve_gate.starve(frame_start);
+                let _ = self.device.poll(wgpu::PollType::Poll);
+                return RenderOutcome::Starved;
+            }
+            // The surface genuinely needs rebuilding (resize race, device
+            // loss, validation): reconfigure and ask for one immediate retry.
             wgpu::CurrentSurfaceTexture::Outdated
             | wgpu::CurrentSurfaceTexture::Lost
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Timeout
             | wgpu::CurrentSurfaceTexture::Validation => {
                 self.surface.configure(&self.device, &self.config);
-                return false;
+                let _ = self.device.poll(wgpu::PollType::Poll);
+                return RenderOutcome::Retry;
             }
         };
+        self.starve_gate.clear();
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1493,13 +1587,13 @@ impl Renderer {
         // process footprint (purgeable, but it thrashes swap). Non-blocking.
         let _ = self.device.poll(wgpu::PollType::Poll);
         self.atlas.trim();
-        true
+        RenderOutcome::Presented
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TabHit, tab_col_hit};
+    use super::{Duration, Instant, StarveGate, TabHit, tab_col_hit};
 
     // 3 equal tabs over 30 columns → 10 cols each (slots 0-9, 10-19, 20-29).
     const N: usize = 3;
@@ -1532,5 +1626,38 @@ mod tests {
         assert_eq!(tab_col_hit(N, COLS, Some(1), 0), Some(TabHit::Tab(0)));
         // No hover at all → never a close.
         assert_eq!(tab_col_hit(N, COLS, None, 10), Some(TabHit::Tab(1)));
+    }
+
+    // --- StarveGate: occluded-surface render throttle -------------
+
+    #[test]
+    fn fresh_gate_always_attempts() {
+        let gate = StarveGate::new();
+        assert!(gate.should_attempt(Instant::now()));
+    }
+
+    #[test]
+    fn starved_gate_holds_off_then_reopens() {
+        let mut gate = StarveGate::new();
+        let t0 = Instant::now();
+        gate.starve(t0);
+        // Immediately after starving: blocked (this is the anti-spin property —
+        // a 700Hz retry storm collapses to ≤4 attempts/s).
+        assert!(!gate.should_attempt(t0));
+        assert!(!gate.should_attempt(t0 + Duration::from_millis(249)));
+        // After the holdoff: one attempt is allowed again (self-healing even if
+        // winit never delivers an Occluded(false) event).
+        assert!(gate.should_attempt(t0 + StarveGate::HOLDOFF));
+    }
+
+    #[test]
+    fn clear_reopens_immediately() {
+        // A successful present (or an explicit un-occlude) must never leave a
+        // revealed window waiting out the holdoff.
+        let mut gate = StarveGate::new();
+        let t0 = Instant::now();
+        gate.starve(t0);
+        gate.clear();
+        assert!(gate.should_attempt(t0));
     }
 }
