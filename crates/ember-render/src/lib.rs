@@ -5,6 +5,7 @@
 //! quad, and the egui chrome overlay land in later epics.
 
 mod background;
+pub(crate) mod boxdraw;
 pub mod grid_model;
 pub mod headless;
 mod paint;
