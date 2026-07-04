@@ -2668,11 +2668,12 @@ impl RunState {
         }
     }
 
-    /// Whether the ember sparks should be animating right now (opt-in, only while
-    /// focused and no modal overlay is covering the panes).
+    /// Whether the ember sparks should be animating right now: opt-in, whenever
+    /// the window is visible (focused or not — the campfire burns while you work
+    /// elsewhere; Brandon's call 2026-07-04) and no modal overlay covers the
+    /// panes. Occluded/asleep windows still go fully quiet.
     fn backdrop_animating(&self) -> bool {
         self.config.background.ember_sparks
-            && self.window_focused
             && !self.occluded
             && !self.help
             && !self.about
