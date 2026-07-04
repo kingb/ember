@@ -789,12 +789,41 @@ pub(crate) fn build_help(
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
 ) -> Rect {
-    // Panel sized to content: title + dismiss hint + one row per line. The amber
-    // section headers separate groups on their own (no blank line needed). Clamp to
-    // the window so a tiny (min-size) window never draws the panel off-screen.
-    let w = (logical_w * 0.7).clamp(300.0, 480.0);
-    // +1 for the title/hint line; the amber section headers need no extra spacing.
-    let h = ((lines.len() as f32 + 1.0) * LINE_HEIGHT + 2.0 * HELP_PAD).min(logical_h - 8.0);
+    // Key column: wide enough for the longest key in THIS list ( — a fixed
+    // 18-char column overflowed into the description for longer combos like
+    // "Wheel / Shift+PgUp/Dn"), plus a little breathing room.
+    let key_w = lines
+        .iter()
+        .filter(|(k, _)| !k.is_empty())
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    // A blank row before each section header (but not the first) reads far
+    // less crowded than headers packed flush against the previous group. Only
+    // add them if the panel still fits the window with the extra height —
+    // the smallest supported window is exactly tight enough for the
+    // no-spacer layout, so this must degrade gracefully, not clip.
+    let header_count = lines
+        .iter()
+        .filter(|(k, d)| k.is_empty() && !d.is_empty())
+        .count();
+    let spacers = header_count.saturating_sub(1);
+    let base_rows = lines.len() as f32 + 1.0; // +1 for the title/hint line
+    let spaced_h = (base_rows + spacers as f32) * LINE_HEIGHT + 2.0 * HELP_PAD;
+    let fits_spaced = spaced_h <= logical_h - 8.0;
+
+    // Panel sized to content. Clamp to the window so a tiny (min-size) window
+    // never draws the panel off-screen; a little wider than before to give
+    // the (now dynamic, often wider) key column room without squeezing
+    // descriptions.
+    let w = (logical_w * 0.72).clamp(320.0, 540.0);
+    let h = (if fits_spaced {
+        spaced_h
+    } else {
+        base_rows * LINE_HEIGHT + 2.0 * HELP_PAD
+    })
+    .min(logical_h - 8.0);
     let x = ((logical_w - w) * 0.5).max(0.0);
     let y = ((logical_h - h) * 0.5).max(4.0);
     let panel = Rect::new(x as f64, y as f64, w as f64, h as f64);
@@ -820,13 +849,18 @@ pub(crate) fn build_help(
     spans.push((title.to_string(), Color::rgb(0xff, 0xff, 0xff)));
     spans.push((format!("   ·  {hint}\n"), Color::rgb(0x88, 0x88, 0x88)));
     // A row with an empty key is a section header (accent-amber); the rest are
-    // `key  description`. The amber headers separate groups without blank lines.
+    // `key  description`.
+    let mut seen_header = false;
     for (key, desc) in lines {
         if key.is_empty() {
+            if fits_spaced && seen_header {
+                spans.push(("\n".to_string(), Color::rgb(FG.r, FG.g, FG.b)));
+            }
+            seen_header = true;
             spans.push((format!("{desc}\n"), Color::rgb(AMBER.r, AMBER.g, AMBER.b)));
         } else {
             spans.push((
-                format!("{key:<18}"),
+                format!("{key:<key_w$}"),
                 Color::rgb(ACCENT.r, ACCENT.g, ACCENT.b),
             ));
             spans.push((format!("{desc}\n"), Color::rgb(FG.r, FG.g, FG.b)));

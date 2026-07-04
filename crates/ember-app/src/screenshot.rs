@@ -68,6 +68,8 @@ pub struct Opts {
     pub font_size: f32,
     /// Terminal font family (None → monospace default).
     pub font: Option<String>,
+    /// Draw the keyboard-shortcuts cheat-sheet overlay (Cmd+/) over the panes.
+    pub help_overlay: bool,
 }
 
 impl Default for Opts {
@@ -97,6 +99,7 @@ impl Default for Opts {
             bell_tab: None,
             font_size: 12.0,
             font: None,
+            help_overlay: false,
         }
     }
 }
@@ -127,6 +130,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
                 opts.hover_tab = Some(next()?.parse().map_err(|e| format!("--hover-tab: {e}"))?)
             }
             "--confirm" => opts.confirm = true,
+            "--help-overlay" => opts.help_overlay = true,
             "--tab-drag" => {
                 let slot = next()?
                     .parse()
@@ -330,7 +334,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
         tabs,
         tab_drag: opts.tab_drag,
         hovered_tab: opts.hover_tab,
-        help: None,
+        help: opts.help_overlay.then(crate::help_lines),
         help_title: None,
         about: None,
         settings: None,

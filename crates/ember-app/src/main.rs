@@ -2857,7 +2857,7 @@ fn bracket_paste(text: &str, bracketed: bool) -> Vec<u8> {
 /// The keyboard cheat-sheet, grouped into sections. A row with an empty key is a
 /// **section header** (rendered as an accent heading by `build_help`); the rest are
 /// `(key, description)`. Keep in sync with [`RunState::handle_shortcut`].
-fn help_lines() -> Vec<(String, String)> {
+pub(crate) fn help_lines() -> Vec<(String, String)> {
     [
         ("", "PANES"),
         ("Cmd+D", "Split right (side by side)"),
