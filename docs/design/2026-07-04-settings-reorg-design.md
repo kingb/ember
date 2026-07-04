@@ -66,15 +66,8 @@ nested structure — this keeps `build_settings()`'s existing flat-list
 shape and only enriches each entry.
 
 **Appearance**
-- Font family (`Cycle`) — steps through: platform default (`None`),
-  Menlo, SF Mono, Monaco, JetBrains Mono, Fira Code, Cascadia Code,
-  DejaVu Sans Mono. If the current `config.font.family` isn't in this
-  list (e.g. hand-edited `config.toml`), the first step lands on index 0
-  (platform default) — a known, acceptable minor UX rough edge for a
-  rare case.
-- Font size (`Number`) — steps by 1.0pt, clamped 6.0–48.0 (matching the
-  existing `MIN_FONT_SIZE`/`MAX_FONT_SIZE` in `ember-render/renderer.rs`
-  used by the Cmd+/Cmd- zoom shortcuts).
+- Font family and font size are deferred post-0.1.0 — see
+  "Out of scope" below. Not rows in this bead.
 - Gradient backdrop (`Toggle`)
 - Ember sparks (`Toggle`)
 - Ember density (`Number`, step 0.1, clamp 0.0–2.0)
@@ -120,41 +113,33 @@ the selectable set. Every other kind renders exactly as today
    adds Enter/Space handling when it adds the first Action row.
 - Post-adjust side effects stay generic, not row-specific: after *any*
   row's `adjust` runs and the config saves, call the existing
-  `apply_appearance()` (backdrop) unconditionally, plus
-  `self.renderer.set_font_size(config.font.size)` and
-  `self.renderer.set_family(config.font.family.clone())`
-  unconditionally. All three already no-op cheaply when their target
-  value hasn't changed (matching `zoom_to`'s existing no-op-if-unchanged
-  pattern) — so the table-driven design never needs to know which row
-  fired to know which side effect to run.
-
-## Font family live-apply (`ember-render/src/renderer.rs`)
-
-New `Renderer::set_family(&mut self, family: Option<String>)`, mirroring
-the existing `set_font_size()`: updates `family_name`, re-measures cell
-width via `measure_cell_width`, triggers the same relayout path. Today,
-`family_name` is only set once at `Renderer::new()` — this is the one
-functional gap that must close for the Cycle row to actually do
-anything live (persisting to `config.toml` alone would require a
-restart to take effect, which isn't acceptable for a Settings row).
+  `apply_appearance()` (backdrop) unconditionally — it already no-ops
+  cheaply when nothing backdrop-related changed (matching `zoom_to`'s
+  existing no-op-if-unchanged pattern) — so the table-driven design
+  never needs to know which row fired to know which side effect to run.
 
 ## Testing
 
 - One test per row's `adjust` fn: verify it mutates the intended
   `Config` field and no other.
 - Navigation test: ArrowDown/ArrowUp skip over `SectionHeader` rows.
-- Font-cycle wraparound test (index 0 → last → 0, and unrecognized
-  current value → index 0).
 - Extend the existing config-roundtrip test
-  (`crates/ember-core/src/config.rs`) to cover the 3 newly-surfaced
-  fields (already serde fields, just confirming the reorg doesn't
-  change persistence).
+  (`crates/ember-core/src/config.rs`) to cover the 2 newly-surfaced
+  fields (`shell_integration`, `option_as_meta` — already serde fields,
+  just confirming the reorg doesn't change persistence).
 - Live-app verification: screenshot the categorized overlay (headers +
   all rows visible, correct highlight/skip behavior) via the control
   socket, same method used throughout this session.
 
 ## Out of scope (filed separately)
 
+- Font family + font size Settings rows — , explicitly deferred
+  post-0.1.0 (Brandon, 2026-07-04). Font size has existing live-apply
+  plumbing (`set_font_size`/`zoom_to`, clamped 6–48pt) and would be
+  near-free to include, but is deferred alongside font family (which
+  needs brand-new `Renderer::set_family` plumbing + a curated cycle
+  list) to keep the Appearance category's font UI consistent when it
+  lands as one piece, not half now / half later.
 - Updates category + `RowKind::Action`'s first real row — .
 - First-run wizard —  (depends on this landing first; shares
   this same row table + widgets, not a second UI).
