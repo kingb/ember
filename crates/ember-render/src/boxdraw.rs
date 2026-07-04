@@ -7,8 +7,23 @@
 //! rasterizer ( / 2.5) turns a [`BoxGlyph`] into an alpha mask; anything
 //! this returns `None` for falls through to the font (never a regression).
 //!
-//! Arms point from the cell center out to each edge. Cross-checked against
-//! Alacritty `builtin_font.rs` and Ghostty `draw/box.zig`.
+//! Arms point from the cell center out to each edge.
+//!
+//! **Cross-checked 2026-07-04** against Alacritty `builtin_font.rs` (master)
+//! and Ghostty `src/font/sprite/draw/box.zig` (main): all 128 codepoints agree
+//! with both references — zero spec differences, including the mixed-weight
+//! tees/crosses (U+251C–254B), the double/single junctions (U+2550–256C), and
+//! the mixed half-lines (U+257C–257F). Dash counts: Triple/Quad = Alacritty
+//! `num_gaps` 2/3 = Ghostty `count` 3/4.
+//!
+//! Reference differences that live in the RASTERIZER (/2.5), not in
+//! this table:
+//! - Vertical dash placement: Ghostty leaves a full gap at the cell bottom
+//!   (tiles better when stacked); Alacritty centers the dashes. Prefer Ghostty.
+//! - Double-line junctions carve a hollow interior (e.g. ╬'s open center):
+//!   Ghostty gaps the arms at the junction; Alacritty bounds each segment.
+//!   `BoxGlyph` is weight-only, so this is junction logic in the drawer.
+//! - Heavy stroke width: Alacritty = exactly 2× light; Ghostty uses a metric.
 
 // Checkpointed ahead of its consumer: only the test module reads the table
 // until the rasterizer wires it into glyph painting. Remove this
