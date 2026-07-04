@@ -20,17 +20,26 @@
 //! isn't a whole number of physical px — a compositing rounding artifact, not
 //! a rasterizer gap (see `boxpaint::paint`'s SEAM property doc).
 
+use ember_core::Attrs;
 use glyphon::{
     Color, CustomGlyph, CustomGlyphId, RasterizeCustomGlyphRequest, RasterizedCustomGlyph,
 };
 
 use crate::boxdraw::box_glyph;
 use crate::grid_model::GridModel;
+use crate::paint::dim_rgb;
 
-/// `CustomGlyphId` is `u16`; the whole Box Drawing block (U+2500..=U+257F)
-/// fits, so the id IS the codepoint — no separate registry to keep in sync.
-fn glyph_id(c: char) -> CustomGlyphId {
-    c as u32 as CustomGlyphId
+/// `CustomGlyphId` is `u16`; the Box Drawing block (U+2500..=U+257F) only
+/// needs its low 9 bits, so bit 15 is free to fold in SGR 1 (bold) — a bold
+/// box-drawing cell must rasterize *differently* (thicker strokes), so it
+/// needs its own glyphon cache entry, not just a different composite color.
+const BOLD_BIT: u32 = 0x8000;
+
+/// The id glyphon caches by, encoding both the codepoint and whether the
+/// cell is bold (see [`BOLD_BIT`]).
+fn glyph_id(c: char, bold: bool) -> CustomGlyphId {
+    let id = c as u32 | if bold { BOLD_BIT } else { 0 };
+    id as CustomGlyphId
 }
 
 /// Whether `c` is drawn via the sprite path rather than the font. Used both
@@ -46,13 +55,15 @@ pub fn is_sprite_glyph(c: char) -> bool {
 /// [`is_sprite_glyph`] doesn't claim — unreachable in practice, since nothing
 /// else emits a `CustomGlyph`.
 pub fn rasterize(request: RasterizeCustomGlyphRequest) -> Option<RasterizedCustomGlyph> {
-    let c = char::from_u32(request.id as u32)?;
+    let id = request.id as u32;
+    let bold = id & BOLD_BIT != 0;
+    let c = char::from_u32(id & !BOLD_BIT)?;
     let glyph = box_glyph(c)?;
     let (w, h) = (request.width, request.height);
     if w == 0 || h == 0 {
         return None;
     }
-    let canvas = crate::boxpaint::paint(&glyph, w, h);
+    let canvas = crate::boxpaint::paint(&glyph, w, h, bold);
     Some(RasterizedCustomGlyph {
         data: canvas.into_data(),
         content_type: glyphon::ContentType::Mask,
@@ -63,19 +74,29 @@ pub fn rasterize(request: RasterizeCustomGlyphRequest) -> Option<RasterizedCusto
 /// in logical px (`left`/`top` are added to the pane `TextArea`'s own
 /// `left`/`top`, then both scaled by `scale` — see glyphon's
 /// `text_render.rs`). Monospace layout means a cell's position is just
-/// `(col * cell_w, row * cell_h)`; no shaping lookup needed.
+/// `(col * cell_w, row * cell_h)`; no shaping lookup needed. Respects SGR 1
+/// (bold, via [`BOLD_BIT`] on the glyph id) and SGR 2 (dim, via [`dim_rgb`]
+/// on the color) — the same two attrs the text path (`paint::shape_grid`)
+/// respects.
 pub fn row_custom_glyphs(grid: &GridModel, row: u16, cell_w: f32, cell_h: f32) -> Vec<CustomGlyph> {
     grid.sprite_glyphs(row)
         .into_iter()
-        .map(|(col, c, fg)| CustomGlyph {
-            id: glyph_id(c),
-            left: col as f32 * cell_w,
-            top: row as f32 * cell_h,
-            width: cell_w,
-            height: cell_h,
-            color: Some(Color::rgb(fg.r, fg.g, fg.b)),
-            snap_to_physical_pixel: true,
-            metadata: 0,
+        .map(|(col, c, fg, attrs)| {
+            let fg = if attrs.contains(Attrs::DIM) {
+                dim_rgb(fg)
+            } else {
+                fg
+            };
+            CustomGlyph {
+                id: glyph_id(c, attrs.contains(Attrs::BOLD)),
+                left: col as f32 * cell_w,
+                top: row as f32 * cell_h,
+                width: cell_w,
+                height: cell_h,
+                color: Some(Color::rgb(fg.r, fg.g, fg.b)),
+                snap_to_physical_pixel: true,
+                metadata: 0,
+            }
         })
         .collect()
 }
@@ -127,7 +148,7 @@ mod tests {
     #[test]
     fn rasterize_handles_every_box_drawing_shape() {
         for c in ['─', '┏', '┄', '═', '╋', '╭', '╱', '╳'] {
-            let out = rasterize(req(glyph_id(c), 16, 24))
+            let out = rasterize(req(glyph_id(c, false), 16, 24))
                 .unwrap_or_else(|| panic!("U+{:04X} should rasterize", c as u32));
             assert_eq!(out.data.len(), 16 * 24);
             assert_eq!(out.content_type, glyphon::ContentType::Mask);
@@ -136,7 +157,19 @@ mod tests {
 
     #[test]
     fn rasterize_declines_non_box_ids() {
-        assert!(rasterize(req(glyph_id('a'), 16, 24)).is_none());
+        assert!(rasterize(req(glyph_id('a', false), 16, 24)).is_none());
+    }
+
+    #[test]
+    fn bold_bit_rasterizes_a_thicker_glyph_than_plain() {
+        let plain = rasterize(req(glyph_id('─', false), 16, 24)).unwrap();
+        let bold = rasterize(req(glyph_id('─', true), 16, 24)).unwrap();
+        // Total ink (sum of coverage, including AA fringes) rather than a
+        // count of fully-covered pixels — at some cell sizes a modest
+        // thickness bump doesn't cross another whole-pixel boundary, but the
+        // AA edges still carry strictly more coverage.
+        let total_ink = |data: &[u8]| data.iter().map(|&b| b as u64).sum::<u64>();
+        assert!(total_ink(&bold.data) > total_ink(&plain.data));
     }
 
     #[test]
@@ -153,10 +186,60 @@ mod tests {
         let glyphs = pane_custom_glyphs(&g, 10.0, 20.0);
         assert_eq!(glyphs.len(), 1);
         let glyph = glyphs[0];
-        assert_eq!(glyph.id, glyph_id('┏'));
+        assert_eq!(glyph.id, glyph_id('┏', false));
         assert_eq!((glyph.left, glyph.top), (20.0, 20.0));
         assert_eq!((glyph.width, glyph.height), (10.0, 20.0));
         assert!(glyph.snap_to_physical_pixel);
+    }
+
+    #[test]
+    fn bold_and_dim_attrs_are_respected_on_custom_glyphs() {
+        let dims = GridDims::new(5, 1);
+        let mut g = GridModel::new(dims);
+        g.apply(GridDelta {
+            epoch: 1,
+            dims,
+            reset: true,
+            cells: vec![
+                CellPatch {
+                    row: 0,
+                    col: 0,
+                    cell: NeutralCell::new(CellContent::Char('─'), StyleId(1)),
+                },
+                CellPatch {
+                    row: 0,
+                    col: 1,
+                    cell: NeutralCell::new(CellContent::Char('─'), StyleId(2)),
+                },
+            ],
+            new_styles: vec![
+                (
+                    StyleId(1),
+                    Style {
+                        fg: Rgb::new(90, 90, 90),
+                        attrs: ember_core::Attrs::BOLD,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    StyleId(2),
+                    Style {
+                        fg: Rgb::new(90, 90, 90),
+                        attrs: ember_core::Attrs::DIM,
+                        ..Default::default()
+                    },
+                ),
+            ],
+            ..Default::default()
+        });
+        let glyphs = pane_custom_glyphs(&g, 10.0, 20.0);
+        assert_eq!(glyphs.len(), 2);
+        // Bold: distinct (bit-set) id, color unchanged.
+        assert_eq!(glyphs[0].id, glyph_id('─', true));
+        assert_eq!(glyphs[0].color, Some(Color::rgb(90, 90, 90)));
+        // Dim: plain id, color scaled toward the background.
+        assert_eq!(glyphs[1].id, glyph_id('─', false));
+        assert_eq!(glyphs[1].color, Some(Color::rgb(60, 60, 60)));
     }
 
     #[test]
@@ -178,7 +261,7 @@ mod tests {
                 "U+{:04X} should emit a CustomGlyph",
                 c as u32
             );
-            assert_eq!(glyphs[0].id, glyph_id(c));
+            assert_eq!(glyphs[0].id, glyph_id(c, false));
         }
     }
 

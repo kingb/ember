@@ -207,7 +207,7 @@ pub(crate) fn lin_rgba(c: Rgb, a: f32) -> [f32; 4] {
 // quads, so the headless PNG matches what ships on screen pixel-for-pixel.
 
 /// SGR 2 (dim): scale the fg toward the background (2/3 keeps ANSI colors apart).
-fn dim_rgb(c: ember_core::Rgb) -> ember_core::Rgb {
+pub(crate) fn dim_rgb(c: ember_core::Rgb) -> ember_core::Rgb {
     ember_core::Rgb {
         r: (c.r as u16 * 2 / 3) as u8,
         g: (c.g as u16 * 2 / 3) as u8,

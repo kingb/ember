@@ -31,6 +31,12 @@ fn light_thickness(w: u16, h: u16) -> f32 {
     (w.min(h) as f32 / 8.0).max(1.0)
 }
 
+/// Emphasis multiplier applied to every stroke thickness when the cell
+/// carries SGR 1 (bold) — 's "respect attrs" requirement. Bold
+/// text reads heavier via a bolder font weight; a procedural sprite has no
+/// such variant, so it reads heavier via a thicker stroke instead.
+const BOLD_EMPHASIS: f32 = 1.4;
+
 /// Precomputed stroke thickness for a cell, bundled to keep the paint
 /// helpers' argument lists short.
 #[derive(Clone, Copy)]
@@ -40,8 +46,11 @@ struct Weights {
 }
 
 impl Weights {
-    fn for_cell(w: u16, h: u16) -> Self {
-        let light = light_thickness(w, h);
+    fn for_cell(w: u16, h: u16, bold: bool) -> Self {
+        let mut light = light_thickness(w, h);
+        if bold {
+            light *= BOLD_EMPHASIS;
+        }
         Self {
             light,
             heavy: light * 2.0,
@@ -56,7 +65,10 @@ impl Weights {
     }
 }
 
-/// Paint `glyph` into a fresh `w`x`h` alpha-coverage canvas.
+/// Paint `glyph` into a fresh `w`x`h` alpha-coverage canvas. `bold` thickens
+/// every stroke by [`BOLD_EMPHASIS`] (: SGR 1 on the cell, not to
+/// be confused with `Weight::Heavy`, which is the box-drawing character's
+/// own weight — the two compose, e.g. a bold `┃` is thicker than a plain `┃`).
 ///
 /// SEAM property: every present arm's stroke spans `[start, end]` along its
 /// axis where `end` (for `right`/`down`) is exactly `w`/`h` and `start` (for
@@ -64,10 +76,10 @@ impl Weights {
 /// vertically) adjacent cells are rasterized from the *same* geometry at the
 /// *same* physical cell size, so cell A's `right` arm and cell B's `left` arm
 /// reach the identical shared boundary with no rounding gap between them.
-pub fn paint(glyph: &BoxGlyph, w: u16, h: u16) -> Canvas {
+pub fn paint(glyph: &BoxGlyph, w: u16, h: u16, bold: bool) -> Canvas {
     let mut canvas = Canvas::new(w, h);
     let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-    let weights = Weights::for_cell(w, h);
+    let weights = Weights::for_cell(w, h, bold);
 
     if let Some(dash) = glyph.dash {
         let span = CellSpan {
@@ -304,7 +316,7 @@ mod tests {
     fn every_in_scope_codepoint_paints_some_ink() {
         for c in paintable_codepoints() {
             let glyph = box_glyph(c).unwrap();
-            let canvas = paint(&glyph, W, H);
+            let canvas = paint(&glyph, W, H, false);
             let any_ink = (0..H).any(|y| (0..W).any(|x| canvas.coverage(x, y) > 0));
             assert!(any_ink, "U+{:04X} ({c:?}) painted nothing", c as u32);
         }
@@ -320,7 +332,7 @@ mod tests {
     fn arms_reach_the_exact_cell_edge() {
         for c in paintable_codepoints().filter(|c| box_glyph(*c).unwrap().dash.is_none()) {
             let glyph = box_glyph(c).unwrap();
-            let canvas = paint(&glyph, W, H);
+            let canvas = paint(&glyph, W, H, false);
             if glyph.right.is_some() {
                 assert!(
                     (0..H).any(|y| canvas.coverage(W - 1, y) == 255),
@@ -357,15 +369,28 @@ mod tests {
     #[test]
     fn heavy_is_visibly_thicker_than_light() {
         let full_rows_at_left_edge = |c: char| {
-            let canvas = paint(&box_glyph(c).unwrap(), W, H);
+            let canvas = paint(&box_glyph(c).unwrap(), W, H, false);
             (0..H).filter(|&y| canvas.coverage(0, y) == 255).count()
         };
         assert!(full_rows_at_left_edge('━') > full_rows_at_left_edge('─'));
     }
 
     #[test]
+    fn bold_thickens_a_stroke_beyond_its_own_plain_weight() {
+        // : SGR 1 (bold) on the cell composes with the glyph's own
+        // weight — a bold light line is thicker than a plain light line,
+        // and a bold heavy line thicker still than a plain heavy line.
+        let full_rows = |c: char, bold: bool| {
+            let canvas = paint(&box_glyph(c).unwrap(), W, H, bold);
+            (0..H).filter(|&y| canvas.coverage(0, y) == 255).count()
+        };
+        assert!(full_rows('─', true) > full_rows('─', false));
+        assert!(full_rows('━', true) > full_rows('━', false));
+    }
+
+    #[test]
     fn double_weight_renders_two_separated_rails() {
-        let canvas = paint(&box_glyph('═').unwrap(), W, H);
+        let canvas = paint(&box_glyph('═').unwrap(), W, H, false);
         assert_eq!(full_coverage_runs(|y| canvas.coverage(0, y), H), 2);
     }
 
@@ -373,9 +398,9 @@ mod tests {
     fn dash_produces_the_expected_segment_count() {
         // Triple dash (3 segments) and quad dash (4 segments), both light.
         let cy = H / 2;
-        let triple = paint(&box_glyph('┄').unwrap(), W, H);
+        let triple = paint(&box_glyph('┄').unwrap(), W, H, false);
         assert_eq!(full_coverage_runs(|x| triple.coverage(x, cy), W), 3);
-        let quad = paint(&box_glyph('┈').unwrap(), W, H);
+        let quad = paint(&box_glyph('┈').unwrap(), W, H, false);
         assert_eq!(full_coverage_runs(|x| quad.coverage(x, cy), W), 4);
     }
 
@@ -386,7 +411,7 @@ mod tests {
     #[test]
     fn rounded_corner_joins_its_arms_with_no_gap() {
         // '╭' extends right+down (b(N, L, N, L)).
-        let canvas = paint(&box_glyph('╭').unwrap(), W, H);
+        let canvas = paint(&box_glyph('╭').unwrap(), W, H, false);
         let (cx, cy) = (W as f32 / 2.0, H as f32 / 2.0);
         let r = (W.min(H) as f32 / 3.0).max(light_thickness(W, H));
 
@@ -407,7 +432,7 @@ mod tests {
         for c in ['╭', '╮', '╯', '╰'] {
             let glyph = box_glyph(c).unwrap();
             assert!(glyph.rounded);
-            let canvas = paint(&glyph, W, H);
+            let canvas = paint(&glyph, W, H, false);
             if glyph.right.is_some() {
                 assert!((0..H).any(|y| canvas.coverage(W - 1, y) == 255));
             }
@@ -426,7 +451,7 @@ mod tests {
     #[test]
     fn diagonal_reaches_its_two_corners_and_is_anti_aliased() {
         // '╱' forward: bottom-left to top-right.
-        let canvas = paint(&box_glyph('╱').unwrap(), W, H);
+        let canvas = paint(&box_glyph('╱').unwrap(), W, H, false);
         assert!(canvas.coverage(0, H - 1) > 0, "should reach bottom-left");
         assert!(canvas.coverage(W - 1, 0) > 0, "should reach top-right");
         let has_partial_coverage = (0..H).any(|y| {
@@ -443,7 +468,7 @@ mod tests {
 
     #[test]
     fn cross_diagonal_reaches_all_four_corners() {
-        let canvas = paint(&box_glyph('╳').unwrap(), W, H);
+        let canvas = paint(&box_glyph('╳').unwrap(), W, H, false);
         assert!(canvas.coverage(0, 0) > 0);
         assert!(canvas.coverage(W - 1, 0) > 0);
         assert!(canvas.coverage(0, H - 1) > 0);
