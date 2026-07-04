@@ -6,10 +6,12 @@
 //!
 //!  proved the whole path end-to-end (grid cell -> `CustomGlyph`
 //! emission -> font suppression -> [`rasterize`] -> glyphon atlas -> composite
-//! at the cell) with one placeholder codepoint.  grows [`rasterize`]
-//! to the full orthogonal majority of the Box Drawing block via
-//! [`crate::boxpaint::paint`] — everything except the rounded corners and
-//! diagonals ([`is_sprite_glyph`] excludes both; 's job).
+//! at the cell) with one placeholder codepoint;  grew [`rasterize`]
+//! to the orthogonal majority;  added rounded corners + diagonals
+//! via [`crate::boxpaint::paint`] — [`is_sprite_glyph`] now covers the whole
+//! Box Drawing block (U+2500..=U+257F). Anything else (Block Elements and
+//! beyond) still isn't a box-drawing codepoint at all, so it shapes normally
+//! — never a regression.
 //!
 //! Verified headless (see `examples/sprite_smoke.rs`) and via a real `LocalPty`
 //! shell (`ember-term --screenshot --run 'printf ...'`). One known seam: each
@@ -33,12 +35,10 @@ fn glyph_id(c: char) -> CustomGlyphId {
 
 /// Whether `c` is drawn via the sprite path rather than the font. Used both
 /// to suppress it in shaped text ([`GridModel::row_runs`]) and to decide what
-/// [`row_custom_glyphs`] emits. Anything [`crate::boxdraw::box_glyph`] maps
-/// that isn't a rounded corner or a diagonal — those stay on the font path
-/// until  wires their rasterizer in (never a regression: unhandled
-/// codepoints simply don't match here, so they shape normally).
+/// [`row_custom_glyphs`] emits: every codepoint [`crate::boxdraw::box_glyph`]
+/// maps (never a regression — anything it doesn't map simply shapes as text).
 pub fn is_sprite_glyph(c: char) -> bool {
-    box_glyph(c).is_some_and(|g| !g.rounded && g.diagonal.is_none())
+    box_glyph(c).is_some()
 }
 
 /// Rasterize a sprite-path codepoint into an alpha-coverage mask, for
@@ -47,9 +47,6 @@ pub fn is_sprite_glyph(c: char) -> bool {
 /// else emits a `CustomGlyph`.
 pub fn rasterize(request: RasterizeCustomGlyphRequest) -> Option<RasterizedCustomGlyph> {
     let c = char::from_u32(request.id as u32)?;
-    if !is_sprite_glyph(c) {
-        return None;
-    }
     let glyph = box_glyph(c)?;
     let (w, h) = (request.width, request.height);
     if w == 0 || h == 0 {
@@ -128,8 +125,8 @@ mod tests {
     }
 
     #[test]
-    fn rasterize_handles_straight_corner_dash_and_double_glyphs() {
-        for c in ['─', '┏', '┄', '═', '╋'] {
+    fn rasterize_handles_every_box_drawing_shape() {
+        for c in ['─', '┏', '┄', '═', '╋', '╭', '╱', '╳'] {
             let out = rasterize(req(glyph_id(c), 16, 24))
                 .unwrap_or_else(|| panic!("U+{:04X} should rasterize", c as u32));
             assert_eq!(out.data.len(), 16 * 24);
@@ -138,14 +135,8 @@ mod tests {
     }
 
     #[test]
-    fn rasterize_declines_rounded_diagonal_and_non_box_ids() {
-        for c in ['╭', '╱', 'a'] {
-            assert!(
-                rasterize(req(glyph_id(c), 16, 24)).is_none(),
-                "U+{:04X} should not rasterize",
-                c as u32
-            );
-        }
+    fn rasterize_declines_non_box_ids() {
+        assert!(rasterize(req(glyph_id('a'), 16, 24)).is_none());
     }
 
     #[test]
@@ -169,9 +160,9 @@ mod tests {
     }
 
     #[test]
-    fn rounded_diagonal_and_plain_glyphs_are_not_emitted() {
+    fn rounded_and_diagonal_glyphs_are_emitted_too() {
         let dims = GridDims::new(5, 1);
-        for c in ['a', '╭', '╱'] {
+        for c in ['╭', '╱'] {
             let g = grid_with(
                 dims,
                 vec![CellPatch {
@@ -180,11 +171,28 @@ mod tests {
                     cell: NeutralCell::new(CellContent::Char(c), StyleId(0)),
                 }],
             );
-            assert!(
-                pane_custom_glyphs(&g, 10.0, 20.0).is_empty(),
-                "U+{:04X} should not emit a CustomGlyph",
+            let glyphs = pane_custom_glyphs(&g, 10.0, 20.0);
+            assert_eq!(
+                glyphs.len(),
+                1,
+                "U+{:04X} should emit a CustomGlyph",
                 c as u32
             );
+            assert_eq!(glyphs[0].id, glyph_id(c));
         }
+    }
+
+    #[test]
+    fn plain_text_glyphs_are_not_emitted() {
+        let dims = GridDims::new(5, 1);
+        let g = grid_with(
+            dims,
+            vec![CellPatch {
+                row: 0,
+                col: 0,
+                cell: NeutralCell::new(CellContent::Char('a'), StyleId(0)),
+            }],
+        );
+        assert!(pane_custom_glyphs(&g, 10.0, 20.0).is_empty());
     }
 }

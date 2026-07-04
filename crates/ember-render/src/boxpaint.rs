@@ -1,17 +1,17 @@
-//! Draws a [`BoxGlyph`] ('s geometry) into a [`Canvas`] alpha mask —
-//! the  rasterizer for the orthogonal majority of the Box Drawing
-//! block: straight lines, corners, tees, crosses and dashes, in
-//! light/heavy/double weights. Rounded corners (`rounded`) and diagonals
-//! (`diagonal`) are 's job; [`paint`] doesn't handle them (callers
-//! gate on `crate::sprite::is_sprite_glyph`, which excludes both).
+//! Draws a [`BoxGlyph`] ('s geometry) into a [`Canvas`] alpha mask:
+//! straight lines, corners, tees, crosses and dashes in light/heavy/double
+//! weights, plus rounded corners and diagonals —
+//! the full Box Drawing block, U+2500..=U+257F.
 //!
 //! Each present arm draws independently from the cell center to its edge
 //! (or, for a dash, the whole straight run draws as one edge-to-edge dash
 //! pattern) — see [`paint`]'s doc for why this guarantees the SEAM property:
-//! adjacent cells' touching arms meet with no gap.
+//! adjacent cells' touching arms meet with no gap. Rounded corners keep that
+//! same edge-reaching property for their straight stubs; only the
+//! center-ward end recedes to make room for the arc (see [`paint_rounded`]).
 
-use crate::boxdraw::{BoxGlyph, Dash, Weight};
-use crate::canvas::Canvas;
+use crate::boxdraw::{BoxGlyph, Dash, Diagonal, Weight};
+use crate::canvas::{Canvas, Quadrant};
 
 /// Which edge an arm reaches — perpendicular to the arm's own run, this is
 /// the coordinate the *other* arm's stroke is centered on.
@@ -75,6 +75,14 @@ pub fn paint(glyph: &BoxGlyph, w: u16, h: u16) -> Canvas {
             h: h as f32,
         };
         paint_dash(&mut canvas, glyph, dash, span, weights);
+        return canvas;
+    }
+    if let Some(diagonal) = glyph.diagonal {
+        paint_diagonal(&mut canvas, diagonal, w, h, weights.light);
+        return canvas;
+    }
+    if glyph.rounded {
+        paint_rounded(&mut canvas, glyph, cx, cy, w, h, weights.light);
         return canvas;
     }
 
@@ -144,6 +152,76 @@ fn stroke(canvas: &mut Canvas, axis: Axis, centerline: f32, start: f32, end: f32
     }
 }
 
+/// Paint a rounded corner (`╭╮╯╰`): the same two straight arms as the sharp
+/// corner it replaces, but each arm's center-ward end recedes by `radius` to
+/// make room for a quarter-circle arc that joins them with no kink. The
+/// edge-ward end is untouched, so the SEAM property (arm reaches the exact
+/// cell edge) still holds — only the corner's *interior* changes shape.
+///
+/// The arc's center sits `radius` out from the cell center, offset toward
+/// the same corner the two arms extend into (e.g. `╭` extends right+down,
+/// so the arc center is at `(cx+radius, cy+radius)`); the arc itself sweeps
+/// the *opposite* quadrant — the missing corner between the two arms.
+fn paint_rounded(
+    canvas: &mut Canvas,
+    glyph: &BoxGlyph,
+    cx: f32,
+    cy: f32,
+    w: u16,
+    h: u16,
+    light: f32,
+) {
+    let hsign = if glyph.right.is_some() { 1.0 } else { -1.0 };
+    let vsign = if glyph.down.is_some() { 1.0 } else { -1.0 };
+    // Radius: generous enough to read as a curve, capped well under half the
+    // cell so the straight stubs never vanish.
+    let radius = (w.min(h) as f32 / 3.0).max(light);
+
+    let arc_cx = cx + hsign * radius;
+    let arc_cy = cy + vsign * radius;
+    let quadrant = match (hsign > 0.0, vsign > 0.0) {
+        (true, true) => Quadrant::TopLeft,
+        (false, true) => Quadrant::TopRight,
+        (false, false) => Quadrant::BottomRight,
+        (true, false) => Quadrant::BottomLeft,
+    };
+    canvas.quarter_arc(arc_cx, arc_cy, radius, light, quadrant);
+
+    let h_edge = if hsign > 0.0 { w as f32 } else { 0.0 };
+    stroke(
+        canvas,
+        Axis::Horizontal,
+        cy,
+        cx + hsign * radius,
+        h_edge,
+        light,
+    );
+    let v_edge = if vsign > 0.0 { h as f32 } else { 0.0 };
+    stroke(
+        canvas,
+        Axis::Vertical,
+        cx,
+        cy + vsign * radius,
+        v_edge,
+        light,
+    );
+}
+
+/// Paint a diagonal (`╱╲╳`) corner-to-corner, so adjacent diagonal cells
+/// tile into continuous lines (each cell's diagonal ends exactly at the
+/// shared corner with its neighbor's).
+fn paint_diagonal(canvas: &mut Canvas, diagonal: Diagonal, w: u16, h: u16, thickness: f32) {
+    let (w, h) = (w as f32, h as f32);
+    match diagonal {
+        Diagonal::Forward => canvas.diagonal(0.0, h, w, 0.0, thickness),
+        Diagonal::Back => canvas.diagonal(0.0, 0.0, w, h, thickness),
+        Diagonal::Cross => {
+            canvas.diagonal(0.0, h, w, 0.0, thickness);
+            canvas.diagonal(0.0, 0.0, w, h, thickness);
+        }
+    }
+}
+
 /// A cell's logical width/height, bundled to keep [`paint_dash`]'s argument
 /// list short.
 #[derive(Clone, Copy)]
@@ -208,24 +286,18 @@ mod tests {
     const W: u16 = 24;
     const H: u16 = 32;
 
-    /// Every codepoint  is responsible for (i.e. not `rounded` and
-    /// not `diagonal` — 's job) — mirrors
-    /// `crate::sprite::is_sprite_glyph`'s scoping.
+    /// Every codepoint in the Box Drawing block — as of , [`paint`]
+    /// covers all 128, matching `crate::sprite::is_sprite_glyph`'s scoping.
     fn paintable_codepoints() -> impl Iterator<Item = char> {
         (0x2500u32..=0x257F).filter_map(|cp| {
             let c = char::from_u32(cp).unwrap();
-            let g = box_glyph(c)?;
-            (!g.rounded && g.diagonal.is_none()).then_some(c)
+            box_glyph(c).map(|_| c)
         })
     }
 
     #[test]
-    fn scope_excludes_rounded_and_diagonal() {
-        // Sanity on the fixture itself: 128 codepoints total, minus 4 rounded
-        // corners and 3 diagonals = 121 in scope for this rasterizer.
-        assert_eq!(paintable_codepoints().count(), 121);
-        assert!(!paintable_codepoints().any(|c| c == '╭')); // rounded
-        assert!(!paintable_codepoints().any(|c| c == '╱')); // diagonal
+    fn covers_the_whole_box_drawing_block() {
+        assert_eq!(paintable_codepoints().count(), 128);
     }
 
     #[test]
@@ -305,6 +377,77 @@ mod tests {
         assert_eq!(full_coverage_runs(|x| triple.coverage(x, cy), W), 3);
         let quad = paint(&box_glyph('┈').unwrap(), W, H);
         assert_eq!(full_coverage_runs(|x| quad.coverage(x, cy), W), 4);
+    }
+
+    /// "No kink" for a rounded corner: ink is present at both stub-arc
+    /// joints and at the arc's midpoint, so the curve connects the two
+    /// straight arms with no gap (a kink or gap would show up as a hole
+    /// between these three sample points).
+    #[test]
+    fn rounded_corner_joins_its_arms_with_no_gap() {
+        // '╭' extends right+down (b(N, L, N, L)).
+        let canvas = paint(&box_glyph('╭').unwrap(), W, H);
+        let (cx, cy) = (W as f32 / 2.0, H as f32 / 2.0);
+        let r = (W.min(H) as f32 / 3.0).max(light_thickness(W, H));
+
+        // Horizontal-stub/arc joint, directly above the arc's own center.
+        assert!(canvas.coverage((cx + r) as u16, cy as u16) > 0);
+        // Vertical-stub/arc joint, directly left of the arc's own center.
+        assert!(canvas.coverage(cx as u16, (cy + r) as u16) > 0);
+        // Arc midpoint (45° around the sweep, in the missing-corner region).
+        let (arc_cx, arc_cy) = (cx + r, cy + r);
+        let diag = r * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(canvas.coverage((arc_cx - diag) as u16, (arc_cy - diag) as u16) > 0);
+    }
+
+    #[test]
+    fn rounded_corners_still_reach_the_cell_edge() {
+        // The straight stubs' edge-ward ends are untouched by rounding —
+        // the SEAM property (arms_reach_the_exact_cell_edge) still holds.
+        for c in ['╭', '╮', '╯', '╰'] {
+            let glyph = box_glyph(c).unwrap();
+            assert!(glyph.rounded);
+            let canvas = paint(&glyph, W, H);
+            if glyph.right.is_some() {
+                assert!((0..H).any(|y| canvas.coverage(W - 1, y) == 255));
+            }
+            if glyph.left.is_some() {
+                assert!((0..H).any(|y| canvas.coverage(0, y) == 255));
+            }
+            if glyph.down.is_some() {
+                assert!((0..W).any(|x| canvas.coverage(x, H - 1) == 255));
+            }
+            if glyph.up.is_some() {
+                assert!((0..W).any(|x| canvas.coverage(x, 0) == 255));
+            }
+        }
+    }
+
+    #[test]
+    fn diagonal_reaches_its_two_corners_and_is_anti_aliased() {
+        // '╱' forward: bottom-left to top-right.
+        let canvas = paint(&box_glyph('╱').unwrap(), W, H);
+        assert!(canvas.coverage(0, H - 1) > 0, "should reach bottom-left");
+        assert!(canvas.coverage(W - 1, 0) > 0, "should reach top-right");
+        let has_partial_coverage = (0..H).any(|y| {
+            (0..W).any(|x| {
+                let c = canvas.coverage(x, y);
+                c > 0 && c < 255
+            })
+        });
+        assert!(
+            has_partial_coverage,
+            "diagonal should be anti-aliased, not just hard on/off"
+        );
+    }
+
+    #[test]
+    fn cross_diagonal_reaches_all_four_corners() {
+        let canvas = paint(&box_glyph('╳').unwrap(), W, H);
+        assert!(canvas.coverage(0, 0) > 0);
+        assert!(canvas.coverage(W - 1, 0) > 0);
+        assert!(canvas.coverage(0, H - 1) > 0);
+        assert!(canvas.coverage(W - 1, H - 1) > 0);
     }
 
     /// Count runs of consecutive fully-covered (`255`) samples along a

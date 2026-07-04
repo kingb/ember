@@ -4,12 +4,6 @@
 //! `ContentType::Mask` — via analytic anti-aliasing (per-pixel coverage from
 //! exact overlap/distance, no supersampling). No GPU; pure and unit-testable.
 
-// `quarter_arc`/`diagonal` (rounded corners + the `╱╲╳` diagonals) have no
-// caller yet —  only wires `stroke_orthogonal` through for its one
-// placeholder codepoint. /2.5 consume the rest; remove this allow
-// once they do.
-#![allow(dead_code)]
-
 /// An 8-bit alpha-coverage buffer, row-major, one byte per pixel.
 pub struct Canvas {
     width: u16,
@@ -26,21 +20,16 @@ impl Canvas {
         }
     }
 
-    pub fn width(&self) -> u16 {
-        self.width
-    }
-
-    pub fn height(&self) -> u16 {
-        self.height
-    }
-
     /// Hands the raw buffer off to glyphon as `RasterizedCustomGlyph::data`
     /// (paired with `ContentType::Mask`).
     pub fn into_data(self) -> Vec<u8> {
         self.data
     }
 
-    /// Coverage at `(x, y)` in `0..=255`, out-of-bounds reading as `0`.
+    /// Coverage at `(x, y)` in `0..=255`, out-of-bounds reading as `0`. Only
+    /// ever read back by tests (here and in `boxpaint.rs`) — production code
+    /// just hands the buffer to glyphon via `into_data`.
+    #[cfg(test)]
     pub fn coverage(&self, x: u16, y: u16) -> u8 {
         if x >= self.width || y >= self.height {
             return 0;
