@@ -206,7 +206,9 @@ impl GridModel {
     /// Columns in `row` carrying a sprite-path glyph, with the codepoint
     /// itself and each cell's foreground color — `sprite::row_custom_glyphs`
     /// turns this into `CustomGlyph`s. Mirrors `row_runs`'s per-cell style
-    /// lookup.
+    /// lookup, including its SGR 8 (conceal) handling: a hidden cell must
+    /// not reach the sprite pass either, or a concealed box-drawing char
+    /// would render its sprite instead of staying blank.
     pub fn sprite_glyphs(&self, row: u16) -> Vec<(u16, char, ember_core::Rgb)> {
         let cols = self.dims.columns as usize;
         let start = row as usize * cols;
@@ -214,11 +216,17 @@ impl GridModel {
         self.cells[start..end]
             .iter()
             .enumerate()
-            .filter_map(|(i, cell)| match &cell.content {
-                CellContent::Char(c) if crate::sprite::is_sprite_glyph(*c) => {
-                    Some((i as u16, *c, self.style_of(cell.style).fg))
+            .filter_map(|(i, cell)| {
+                let style = self.style_of(cell.style);
+                if style.attrs.contains(ember_core::Attrs::HIDDEN) {
+                    return None;
                 }
-                _ => None,
+                match &cell.content {
+                    CellContent::Char(c) if crate::sprite::is_sprite_glyph(*c) => {
+                        Some((i as u16, *c, style.fg))
+                    }
+                    _ => None,
+                }
             })
             .collect()
     }
@@ -377,6 +385,28 @@ mod tests {
             (" ", ember_core::Attrs::HIDDEN)
         );
         assert_eq!(runs[3].0, "z");
+    }
+
+    #[test]
+    fn concealed_sprite_glyph_does_not_reach_the_sprite_pass() {
+        // A box-drawing char under SGR 8 (conceal) must stay blank, same as
+        // it does on the text path (`row_runs` above) — otherwise a hidden
+        // cell would render a visible sprite instead of nothing.
+        let dims = GridDims::new(5, 1);
+        let mut g = GridModel::new(dims);
+        let hidden = Style {
+            attrs: ember_core::Attrs::HIDDEN,
+            ..Style::default()
+        };
+        let mut d = delta_with(1, dims, Vec::new(), true);
+        d.cells = vec![CellPatch {
+            row: 0,
+            col: 0,
+            cell: NeutralCell::new(CellContent::Char('\u{2500}'), StyleId(1)),
+        }];
+        d.new_styles = vec![(StyleId(0), Style::default()), (StyleId(1), hidden)];
+        g.apply(d);
+        assert!(g.sprite_glyphs(0).is_empty());
     }
 
     #[test]
