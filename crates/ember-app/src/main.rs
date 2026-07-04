@@ -27,7 +27,7 @@ use ember_core::{
     LayoutCommand, LayoutEffect, LayoutNode, OscEvent, PaneId, Rect, ScrollAmount, SessionBackend,
     SessionId, Tab, TabId, apply, layout,
 };
-use ember_platform::MenuAction;
+use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
     BackdropParams, CELL_HEIGHT, CELL_WIDTH, ConfirmView, ImageFit, Point, RenderOutcome, Renderer,
     Selection, SelectionMode, TabHit, TabLabel, VisiblePane,
@@ -264,8 +264,9 @@ struct RunState {
     last_click: Option<(Instant, SessionId, u16, u16)>,
     /// Consecutive-click count at the same cell (1 = simple, 2 = word, 3 = line).
     click_count: u32,
-    /// OS clipboard handle (lazily; `None` if the platform clipboard is unavailable).
-    clipboard: Option<arboard::Clipboard>,
+    /// The OS effect seam (design §7, ): clipboard + open-path,
+    /// `MacBackend`/`LinuxBackend` for the host OS.
+    platform: ember_platform::HostBackend,
     /// Per-session bracketed-paste (DEC 2004) mode, updated from each frame delta —
     /// so paste can wrap in `ESC[200~`…`ESC[201~` only when the app asked for it.
     bracketed: HashMap<SessionId, bool>,
@@ -449,7 +450,7 @@ impl ApplicationHandler<EmberEvent> for App {
             selecting: false,
             last_click: None,
             click_count: 0,
-            clipboard: arboard::Clipboard::new().ok(),
+            platform: ember_platform::HostBackend::default(),
             bracketed: HashMap::new(),
             tab_drag: None,
             split_preview: None,
@@ -900,11 +901,7 @@ impl ApplicationHandler<EmberEvent> for App {
             .cwd_by_session
             .retain(|id, _| state.sessions.contains_key(id));
         if let Some(text) = clipboard_set {
-            if let Some(cb) = state.clipboard.as_mut() {
-                if let Err(e) = cb.set_text(text) {
-                    eprintln!("[ember] OSC 52 clipboard copy failed: {e}");
-                }
-            }
+            state.platform.set_clipboard(&text);
         }
         if let Some(title) = new_title {
             state.renderer.window().set_title(&title);
@@ -1916,7 +1913,7 @@ impl RunState {
         if self.about {
             let (x, y) = self.cursor;
             if let Some(url) = self.renderer.about_link_at(x as f32, y as f32) {
-                ember_platform::open_url(url);
+                self.platform.open_path(url);
                 return;
             }
         }
@@ -2348,19 +2345,14 @@ impl RunState {
     /// Copy the current selection's text to the OS clipboard (Cmd+C).
     fn copy_selection(&mut self) {
         if let Some(text) = self.renderer.selected_text() {
-            if let Some(cb) = self.clipboard.as_mut() {
-                if let Err(e) = cb.set_text(text) {
-                    eprintln!("[ember] clipboard copy failed: {e}");
-                }
-            }
+            self.platform.set_clipboard(&text);
         }
     }
 
     /// Paste the OS clipboard into the focused pane's PTY (Cmd+V), bracketed when
     /// the focused app enabled bracketed-paste mode.
     fn paste_clipboard(&mut self) {
-        let text = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
-        if let Some(text) = text {
+        if let Some(text) = self.platform.clipboard() {
             self.paste_into_focused(&text);
         }
     }

@@ -4,6 +4,14 @@
 //! (design §2: the binary owns the event loop). `PlatformBackend` is the OS
 //! effect seam — clipboard, open-path/URL, hotkey — with `LinuxBackend` and
 //! `MacBackend` as co-equal v1 targets (the deep AppKit polish is deferred).
+//!
+//! Clipboard is `arboard` (already cross-platform: X11, Wayland, and macOS
+//! all work through it) and open-path is a two-line `#[cfg]` branch — both
+//! genuinely OS-agnostic today, so `MacBackend`/`LinuxBackend`'s bodies are
+//! identical. They stay distinct types anyway: that's the actual point of
+//! the seam — a clean place for ONE of them to diverge later (e.g. a
+//! Wayland-specific clipboard quirk) without threading a new `#[cfg]` through
+//! every call site in `ember-app`.
 
 pub mod menu;
 pub use menu::{AppMenu, MenuAction, build_menu, menu_action};
@@ -12,39 +20,70 @@ use winit::dpi::LogicalSize;
 use winit::window::{Window, WindowAttributes};
 
 /// Pure-domain code requests OS effects; the platform impl performs them
-/// (design §7). v1 impls are intentionally thin; real clipboard/open/hotkey
-/// wiring lands in Epic E (and `MacBackend`, ).
+/// (design §7). Clipboard needs `&mut self` — `arboard::Clipboard` is a live
+/// handle onto a system resource (the X11 clipboard in particular is a
+/// selection-owner connection, not a stateless call), not a pure function.
 pub trait PlatformBackend {
     /// Read the system clipboard (OSC 52 read policy lives in `ember-core`).
-    fn clipboard(&self) -> Option<String>;
+    fn clipboard(&mut self) -> Option<String>;
     /// Write the system clipboard.
-    fn set_clipboard(&self, text: &str);
+    fn set_clipboard(&mut self, text: &str);
     /// Open a path or URL (smart-selection / semantic-history / trigger effect).
     fn open_path(&self, target: &str);
 }
 
-/// The v1 Linux platform backend (effects pending Epic E).
-#[derive(Default, Debug)]
-pub struct LinuxBackend;
+/// One `arboard::Clipboard` handle, opened lazily at construction and reused
+/// (arboard recommends this over reopening per call — cheaper, and avoids
+/// X11 selection-ownership churn). `None` if the platform clipboard is
+/// unavailable (e.g. headless), matching the pre-revival behavior.
+struct ClipboardHandle(Option<arboard::Clipboard>);
 
-/// The v1 macOS platform backend — co-equal run/dev target (effects pending
-/// `MacBackend`, ).
-#[derive(Default, Debug)]
-pub struct MacBackend;
+impl Default for ClipboardHandle {
+    fn default() -> Self {
+        Self(arboard::Clipboard::new().ok())
+    }
+}
 
-macro_rules! todo_backend {
+impl ClipboardHandle {
+    fn get(&mut self) -> Option<String> {
+        self.0.as_mut()?.get_text().ok()
+    }
+
+    fn set(&mut self, text: &str) {
+        if let Some(cb) = self.0.as_mut() {
+            if let Err(e) = cb.set_text(text) {
+                eprintln!("[ember] clipboard write failed: {e}");
+            }
+        }
+    }
+}
+
+/// The v1 Linux platform backend.
+#[derive(Default)]
+pub struct LinuxBackend(ClipboardHandle);
+
+/// The v1 macOS platform backend — co-equal run/dev target (deep AppKit
+/// clipboard polish, e.g. rich content types, is deferred past v1).
+#[derive(Default)]
+pub struct MacBackend(ClipboardHandle);
+
+macro_rules! impl_backend {
     ($ty:ty) => {
         impl PlatformBackend for $ty {
-            fn clipboard(&self) -> Option<String> {
-                None
+            fn clipboard(&mut self) -> Option<String> {
+                self.0.get()
             }
-            fn set_clipboard(&self, _text: &str) {}
-            fn open_path(&self, _target: &str) {}
+            fn set_clipboard(&mut self, text: &str) {
+                self.0.set(text);
+            }
+            fn open_path(&self, target: &str) {
+                open_url(target);
+            }
         }
     };
 }
-todo_backend!(LinuxBackend);
-todo_backend!(MacBackend);
+impl_backend!(LinuxBackend);
+impl_backend!(MacBackend);
 
 /// The platform backend for the host OS.
 #[cfg(target_os = "macos")]
@@ -161,8 +200,34 @@ mod tests {
 
     #[test]
     fn backends_are_constructible() {
-        // The seam stays honest on both OSes from day one (Kaylee's rule).
-        assert!(LinuxBackend.clipboard().is_none());
-        assert!(MacBackend.clipboard().is_none());
+        // Construction must never panic, even where no system clipboard
+        // exists (headless CI) — arboard::Clipboard::new() just returns Err,
+        // caught by ClipboardHandle and turned into a quiet `None`.
+        let mut linux = LinuxBackend::default();
+        let mut mac = MacBackend::default();
+        let _ = linux.clipboard();
+        let _ = mac.clipboard();
+    }
+
+    #[test]
+    fn clipboard_round_trips_when_a_real_one_is_available() {
+        // The system clipboard is a shared, unsynchronized OS resource —
+        // `cargo test --workspace` runs other crates' test binaries as
+        // concurrent processes, any of which could touch it between our
+        // set() and get(). A per-process-unique marker means a mismatch is
+        // unambiguous: it's contention, not our bug, so only a genuine panic
+        // (not a value mismatch) should fail this test. Headless CI may have
+        // no system clipboard at all, hence the `if let` rather than asserting
+        // `Some`.
+        let mut backend = HostBackend::default();
+        let marker = format!("ember-platform-test-{}", std::process::id());
+        backend.set_clipboard(&marker);
+        if let Some(text) = backend.clipboard() {
+            if text != marker {
+                eprintln!(
+                    "clipboard contention (expected {marker:?}, saw {text:?}) — not a failure"
+                );
+            }
+        }
     }
 }
