@@ -560,11 +560,54 @@ fn push_pill(
     ));
 }
 
+/// Shaping cache for the tab strip. `build_tabs` runs every frame,
+/// but the cosmic-text work (`set_rich_text` → `shape_until_scroll` → font
+/// fallback) is the expensive part — re-shaping it per redraw was 66% sustained
+/// CPU under output storms (11/19 cpu_resource.diag samples). The label spans +
+/// strip geometry fully determine the shaped result, so keep the last inputs
+/// and re-shape only when they change. Quads are rebuilt each call: pure math,
+/// cheap, and they carry the per-frame state (drag lift, bell dots).
+#[derive(Default)]
+pub(crate) struct TabsCache {
+    /// Last-shaped label spans as `(text, packed rgba)`.
+    spans: Vec<(String, u32)>,
+    /// Buffer width the spans were shaped at (`f32` bits; resize/display move).
+    logical_w: u32,
+    /// Cell width behind the column math (`f32` bits; changes on zoom).
+    cw: u32,
+    /// Cell width the "✕" close glyph was last shaped at, if ever.
+    close_cw: Option<u32>,
+}
+
+impl TabsCache {
+    /// Whether `spans` shaped at `logical_w`/`cw` would differ from what the
+    /// chrome buffer currently holds. A `Default` cache is always dirty (empty
+    /// spans never match a real strip, which always has the +/?/⚙ buttons).
+    fn is_dirty(&self, spans: &[(String, Color)], lw_bits: u32, cw_bits: u32) -> bool {
+        self.logical_w != lw_bits
+            || self.cw != cw_bits
+            || self.spans.len() != spans.len()
+            || self
+                .spans
+                .iter()
+                .zip(spans)
+                .any(|((ct, cc), (t, c))| *cc != c.0 || ct != t)
+    }
+
+    /// Record what was just shaped.
+    fn store(&mut self, spans: Vec<(String, Color)>, lw_bits: u32, cw_bits: u32) {
+        self.spans = spans.into_iter().map(|(t, c)| (t, c.0)).collect();
+        self.logical_w = lw_bits;
+        self.cw = cw_bits;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_tabs(
     font_system: &mut FontSystem,
     chrome: &mut Buffer,
     close_buf: &mut Buffer,
+    cache: &mut TabsCache,
     tabs: &[TabLabel],
     drag: Option<(usize, f32)>,
     hovered: Option<usize>,
@@ -574,7 +617,6 @@ pub(crate) fn build_tabs(
     out: &mut Vec<([f32; 4], [f32; 4])>,
     rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
 ) -> Option<f32> {
-    chrome.set_size(font_system, Some(logical_w), Some(LINE_HEIGHT));
     let strip_h = CELL_HEIGHT + 2.0 * PAD;
     // Center-x of the hovered tab's "✕" (in the pill's left cap); `None` when no
     // tab is hovered. The caller positions `close_buf` there.
@@ -693,20 +735,30 @@ pub(crate) fn build_tabs(
     spans.push((center("?", help_cols), btn_fg));
     spans.push((center("⚙", gear_cols), btn_fg));
 
-    chrome.set_rich_text(
-        font_system,
-        spans
-            .iter()
-            .map(|(t, c)| (t.as_str(), Attrs::new().family(Family::Monospace).color(*c))),
-        &base,
-        Shaping::Advanced,
-        None,
-    );
-    chrome.shape_until_scroll(font_system, false);
+    // Re-shape only when the shaped inputs changed: identical spans at
+    // the same width/zoom produce byte-identical layout, so skip the shaping —
+    // the common case under an output storm, where panes churn every frame but
+    // the strip doesn't.
+    let (lw_bits, cw_bits) = (logical_w.to_bits(), cw.to_bits());
+    if cache.is_dirty(&spans, lw_bits, cw_bits) {
+        chrome.set_size(font_system, Some(logical_w), Some(LINE_HEIGHT));
+        chrome.set_rich_text(
+            font_system,
+            spans
+                .iter()
+                .map(|(t, c)| (t.as_str(), Attrs::new().family(Family::Monospace).color(*c))),
+            &base,
+            Shaping::Advanced,
+            None,
+        );
+        chrome.shape_until_scroll(font_system, false);
+        cache.store(spans, lw_bits, cw_bits);
+    }
 
     // Shape the hover "✕" into its own buffer so the caller can pixel-center it in
     // the pill cap (the column-based chrome line can't hit that spot exactly).
-    if close_cx.is_some() {
+    // The glyph is constant, so shape it once per zoom level, not per hover-frame.
+    if close_cx.is_some() && cache.close_cw != Some(cw_bits) {
         close_buf.set_size(font_system, Some(cw * 2.0), Some(LINE_HEIGHT));
         close_buf.set_text(
             font_system,
@@ -716,6 +768,7 @@ pub(crate) fn build_tabs(
             None,
         );
         close_buf.shape_until_scroll(font_system, false);
+        cache.close_cw = Some(cw_bits);
     }
     close_cx
 }
@@ -1359,5 +1412,88 @@ mod tests {
         let out = center("漢字漢字", 5);
         assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
         assert!(out.ends_with('…'));
+    }
+
+    // --- TabsCache: skip tab-strip re-shaping when nothing changed ---
+
+    use super::{Color, TabsCache};
+
+    fn spans(items: &[(&str, u32)]) -> Vec<(String, Color)> {
+        items
+            .iter()
+            .map(|(t, c)| (t.to_string(), Color(*c)))
+            .collect()
+    }
+
+    #[test]
+    fn fresh_cache_is_dirty() {
+        let cache = TabsCache::default();
+        assert!(cache.is_dirty(&spans(&[("tab 1", 1)]), 100f32.to_bits(), 8f32.to_bits()));
+    }
+
+    /// Perf evidence for , not a regression gate (hence `#[ignore]`):
+    /// run manually with
+    /// `cargo test --release -p ember-render tab_shaping_cache_speedup -- --ignored --nocapture`.
+    /// Asserts the cached path skips shaping (>5x faster over 200 frames).
+    #[test]
+    #[ignore]
+    fn tab_shaping_cache_speedup() {
+        use super::{TabsCache, build_tabs};
+        use crate::renderer::TabLabel;
+        use std::time::Instant;
+
+        let mut fs = super::new_font_system();
+        let mut chrome = glyphon::Buffer::new(
+            &mut fs,
+            glyphon::Metrics::new(crate::renderer::FONT_SIZE, crate::renderer::LINE_HEIGHT),
+        );
+        let mut close_buf = glyphon::Buffer::new(
+            &mut fs,
+            glyphon::Metrics::new(crate::renderer::FONT_SIZE, crate::renderer::LINE_HEIGHT),
+        );
+        let tabs: Vec<TabLabel> = (0..4)
+            .map(|i| TabLabel {
+                title: format!("tab {i}"),
+                active: i == 0,
+                editing: false,
+                bell: false,
+            })
+            .collect();
+        let mut run = |cache: &mut TabsCache, reset: bool| {
+            let t = Instant::now();
+            for _ in 0..200 {
+                if reset {
+                    *cache = TabsCache::default(); // force a full re-shape (old behavior)
+                }
+                let (mut out, mut rounded) = (Vec::new(), Vec::new());
+                build_tabs(
+                    &mut fs, &mut chrome, &mut close_buf, cache, &tabs, None,
+                    Some(1), 8.0, 1200.0, 2.0, &mut out, &mut rounded,
+                );
+            }
+            t.elapsed()
+        };
+        let mut cache = TabsCache::default();
+        let cold = run(&mut cache, true);
+        let warm = run(&mut cache, false);
+        println!("200 frames: uncached={cold:?} cached={warm:?} ({:.0}x)",
+            cold.as_secs_f64() / warm.as_secs_f64().max(1e-9));
+        assert!(warm < cold / 5, "cache should skip shaping: warm={warm:?} cold={cold:?}");
+    }
+
+    #[test]
+    fn stored_inputs_are_clean_until_something_changes() {
+        let mut cache = TabsCache::default();
+        let (lw, cw) = (100f32.to_bits(), 8f32.to_bits());
+        cache.store(spans(&[("tab 1", 1), ("+", 2)]), lw, cw);
+        // Same everything → clean (this is the storm fast path).
+        assert!(!cache.is_dirty(&spans(&[("tab 1", 1), ("+", 2)]), lw, cw));
+        // Rename, recolor (hover/active flip), resize, zoom → each dirties.
+        assert!(cache.is_dirty(&spans(&[("tab 2", 1), ("+", 2)]), lw, cw));
+        assert!(cache.is_dirty(&spans(&[("tab 1", 9), ("+", 2)]), lw, cw));
+        assert!(cache.is_dirty(&spans(&[("tab 1", 1), ("+", 2)]), 200f32.to_bits(), cw));
+        assert!(cache.is_dirty(&spans(&[("tab 1", 1), ("+", 2)]), lw, 9f32.to_bits()));
+        // Tab count change → dirty.
+        assert!(cache.is_dirty(&spans(&[("tab 1", 1)]), lw, cw));
     }
 }

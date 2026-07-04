@@ -380,10 +380,14 @@ pub fn capture_reusing(
                 );
             }
         }
+        // One-shot capture: a fresh cache (always shapes once) keeps the shared
+        // signature without threading state through the headless path.
+        let mut tabs_cache = crate::paint::TabsCache::default();
         close_cx = build_tabs(
             font_system,
             &mut chrome,
             &mut close_buf,
+            &mut tabs_cache,
             &shot.tabs,
             shot.tab_drag,
             shot.hovered_tab,

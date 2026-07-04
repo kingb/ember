@@ -326,6 +326,8 @@ pub struct Renderer {
     hovered_tab: Option<usize>,
     /// Glyph buffer for the tab strip.
     chrome: Buffer,
+    /// Last-shaped tab-strip inputs; skips per-frame re-shaping.
+    tabs_cache: crate::paint::TabsCache,
     /// Glyph buffer for the hovered tab's "✕", positioned in the pill's left cap.
     close_buffer: Buffer,
     /// When `Some`, the cheat-sheet overlay is shown with these `(key, desc)` rows.
@@ -519,6 +521,7 @@ impl Renderer {
             tab_drag: None,
             hovered_tab: None,
             chrome,
+            tabs_cache: crate::paint::TabsCache::default(),
             close_buffer,
             help: None,
             help_title: None,
@@ -1058,11 +1061,9 @@ impl Renderer {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
-        self.chrome.set_size(
-            &mut self.font_system,
-            Some(self.config.width as f32),
-            Some(LINE_HEIGHT),
-        );
+        // Chrome sizing is owned by `build_tabs` (keyed on logical width in its
+        // shaping cache) — sizing it here to the *physical* width was both
+        // redundant and wrong, masked only by the old per-frame re-shape.
         self.window.request_redraw();
     }
 
@@ -1271,6 +1272,7 @@ impl Renderer {
                 &mut self.font_system,
                 &mut self.chrome,
                 &mut self.close_buffer,
+                &mut self.tabs_cache,
                 &self.tabs,
                 self.tab_drag,
                 self.hovered_tab,
