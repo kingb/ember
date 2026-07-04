@@ -14,11 +14,15 @@
 //! — never a regression.
 //!
 //! Verified headless (see `examples/sprite_smoke.rs`) and via a real `LocalPty`
-//! shell (`ember-term --screenshot --run 'printf ...'`). One known seam: each
-//! cell is a separate `CustomGlyph` snapped to physical pixels independently,
-//! so a run of adjacent glyphs can show a hairline gap when `cell_w * scale`
-//! isn't a whole number of physical px — a compositing rounding artifact, not
-//! a rasterizer gap (see `boxpaint::paint`'s SEAM property doc).
+//! shell (`ember-term --screenshot --run 'printf ...'`).
+//!
+//!  seam-suite finding: glyphon positions each `CustomGlyph`
+//! independently (rounds to a whole physical pixel *per glyph*), so a naive
+//! `col * cell_w` position with a fixed `cell_w` width let adjacent cells'
+//! rounded edges drift apart by up to 1px — see [`snap_to_physical`]'s doc
+//! for the fix (independently-snapped edges, width derived as their
+//! difference, not a rasterizer gap — `boxpaint::paint`'s SEAM property
+//! still holds per-glyph).
 
 use ember_core::Attrs;
 use glyphon::{
@@ -70,15 +74,43 @@ pub fn rasterize(request: RasterizeCustomGlyphRequest) -> Option<RasterizedCusto
     })
 }
 
+/// Snap a cell-grid coordinate (`unit * cell_size`) to the nearest physical
+/// pixel at the given `scale`, in logical px — i.e. `round(unit * cell_size *
+/// scale) / scale`.
+///
+///  seam-suite finding: glyphon positions each `CustomGlyph`
+/// independently (`snap_to_physical_pixel` rounds to a whole physical pixel
+/// *per glyph*), so a naive `col as f32 * cell_w` for `left` and a fixed
+/// `cell_w` for `width` lets adjacent cells' rounded edges drift apart by up
+/// to 1px — visible at the default font size on a 2x display (12pt cell
+/// width lands ~0.45px off whole-pixel, right at the worst case). The fix:
+/// snap *both* edges of a cell to the true cumulative position (`col` and
+/// `col + 1`) and derive the width as their difference, so the rasterized
+/// glyph's size always exactly matches the gap to its snapped neighbor —
+/// zero drift (each edge tracks the true `col * cell_w`, not an accumulated
+/// per-cell delta) and zero seam gap/overlap (width is defined as the
+/// distance to the next cell's own snapped edge, not a fixed constant).
+fn snap_to_physical(unit: f32, cell_size: f32, scale: f32) -> f32 {
+    (unit * cell_size * scale).round() / scale
+}
+
 /// `CustomGlyph`s for one row's sprite-path cells, positioned pane-relative
 /// in logical px (`left`/`top` are added to the pane `TextArea`'s own
 /// `left`/`top`, then both scaled by `scale` — see glyphon's
-/// `text_render.rs`). Monospace layout means a cell's position is just
-/// `(col * cell_w, row * cell_h)`; no shaping lookup needed. Respects SGR 1
-/// (bold, via [`BOLD_BIT`] on the glyph id) and SGR 2 (dim, via [`dim_rgb`]
-/// on the color) — the same two attrs the text path (`paint::shape_grid`)
-/// respects.
-pub fn row_custom_glyphs(grid: &GridModel, row: u16, cell_w: f32, cell_h: f32) -> Vec<CustomGlyph> {
+/// `text_render.rs`); `scale` here must be that same `TextArea::scale` for
+/// [`snap_to_physical`]'s rounding to land on the same physical pixels.
+/// Respects SGR 1 (bold, via [`BOLD_BIT`] on the glyph id) and SGR 2 (dim,
+/// via [`dim_rgb`] on the color) — the same two attrs the text path
+/// (`paint::shape_grid`) respects.
+pub fn row_custom_glyphs(
+    grid: &GridModel,
+    row: u16,
+    cell_w: f32,
+    cell_h: f32,
+    scale: f32,
+) -> Vec<CustomGlyph> {
+    let top = snap_to_physical(row as f32, cell_h, scale);
+    let height = snap_to_physical(row as f32 + 1.0, cell_h, scale) - top;
     grid.sprite_glyphs(row)
         .into_iter()
         .map(|(col, c, fg, attrs)| {
@@ -87,12 +119,14 @@ pub fn row_custom_glyphs(grid: &GridModel, row: u16, cell_w: f32, cell_h: f32) -
             } else {
                 fg
             };
+            let left = snap_to_physical(col as f32, cell_w, scale);
+            let width = snap_to_physical(col as f32 + 1.0, cell_w, scale) - left;
             CustomGlyph {
                 id: glyph_id(c, attrs.contains(Attrs::BOLD)),
-                left: col as f32 * cell_w,
-                top: row as f32 * cell_h,
-                width: cell_w,
-                height: cell_h,
+                left,
+                top,
+                width,
+                height,
                 color: Some(Color::rgb(fg.r, fg.g, fg.b)),
                 snap_to_physical_pixel: true,
                 metadata: 0,
@@ -102,9 +136,14 @@ pub fn row_custom_glyphs(grid: &GridModel, row: u16, cell_w: f32, cell_h: f32) -
 }
 
 /// All sprite-path `CustomGlyph`s for a pane's visible rows.
-pub fn pane_custom_glyphs(grid: &GridModel, cell_w: f32, cell_h: f32) -> Vec<CustomGlyph> {
+pub fn pane_custom_glyphs(
+    grid: &GridModel,
+    cell_w: f32,
+    cell_h: f32,
+    scale: f32,
+) -> Vec<CustomGlyph> {
     (0..grid.dims.screen_lines)
-        .flat_map(|row| row_custom_glyphs(grid, row, cell_w, cell_h))
+        .flat_map(|row| row_custom_glyphs(grid, row, cell_w, cell_h, scale))
         .collect()
 }
 
@@ -183,13 +222,53 @@ mod tests {
                 cell: NeutralCell::new(CellContent::Char('┏'), StyleId(0)),
             }],
         );
-        let glyphs = pane_custom_glyphs(&g, 10.0, 20.0);
+        let glyphs = pane_custom_glyphs(&g, 10.0, 20.0, 1.0);
         assert_eq!(glyphs.len(), 1);
         let glyph = glyphs[0];
         assert_eq!(glyph.id, glyph_id('┏', false));
         assert_eq!((glyph.left, glyph.top), (20.0, 20.0));
         assert_eq!((glyph.width, glyph.height), (10.0, 20.0));
         assert!(glyph.snap_to_physical_pixel);
+    }
+
+    ///  seam suite: at a cell size/scale combo picked to land near
+    /// the worst-case 0.5px rounding fraction (12pt-cell-like `cw=7.2246`,
+    /// `scale=2.0` — the actual default-font-size-on-Retina numbers that
+    /// exposed this), a long run of adjacent sprite cells must tile with no
+    /// gap or overlap: each cell's `left` must equal the previous cell's
+    /// `left + width` exactly (in physical px, post-scale), all the way
+    /// across a wide row — not just the first pair.
+    #[test]
+    fn adjacent_sprite_cells_tile_with_no_gap_across_a_wide_row() {
+        let cols = 80u16;
+        let dims = GridDims::new(cols, 1);
+        let cells = (0..cols)
+            .map(|col| CellPatch {
+                row: 0,
+                col,
+                cell: NeutralCell::new(CellContent::Char('─'), StyleId(0)),
+            })
+            .collect();
+        let g = grid_with(dims, cells);
+        let cell_w = 7.224_6;
+        let scale = 2.0;
+        let glyphs = pane_custom_glyphs(&g, cell_w, 15.0, scale);
+        assert_eq!(glyphs.len(), cols as usize);
+        for pair in glyphs.windows(2) {
+            let (prev, next) = (pair[0], pair[1]);
+            let prev_right_physical = (prev.left + prev.width) * scale;
+            let next_left_physical = next.left * scale;
+            assert!(
+                (prev_right_physical - next_left_physical).abs() < 1e-3,
+                "gap/overlap between columns: prev right={prev_right_physical} next left={next_left_physical}"
+            );
+        }
+        // No drift from the true grid over the whole row: the last cell's
+        // right edge should be within half a physical pixel of `cols * cw`.
+        let last = glyphs.last().unwrap();
+        let true_right_physical = cols as f32 * cell_w * scale;
+        let actual_right_physical = (last.left + last.width) * scale;
+        assert!((actual_right_physical - true_right_physical).abs() <= 0.5 + 1e-3);
     }
 
     #[test]
@@ -232,7 +311,7 @@ mod tests {
             ],
             ..Default::default()
         });
-        let glyphs = pane_custom_glyphs(&g, 10.0, 20.0);
+        let glyphs = pane_custom_glyphs(&g, 10.0, 20.0, 1.0);
         assert_eq!(glyphs.len(), 2);
         // Bold: distinct (bit-set) id, color unchanged.
         assert_eq!(glyphs[0].id, glyph_id('─', true));
@@ -254,7 +333,7 @@ mod tests {
                     cell: NeutralCell::new(CellContent::Char(c), StyleId(0)),
                 }],
             );
-            let glyphs = pane_custom_glyphs(&g, 10.0, 20.0);
+            let glyphs = pane_custom_glyphs(&g, 10.0, 20.0, 1.0);
             assert_eq!(
                 glyphs.len(),
                 1,
@@ -276,6 +355,6 @@ mod tests {
                 cell: NeutralCell::new(CellContent::Char('a'), StyleId(0)),
             }],
         );
-        assert!(pane_custom_glyphs(&g, 10.0, 20.0).is_empty());
+        assert!(pane_custom_glyphs(&g, 10.0, 20.0, 1.0).is_empty());
     }
 }

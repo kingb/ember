@@ -1304,7 +1304,7 @@ impl Renderer {
                 .map(|vp| {
                     self.panes
                         .get(&vp.session)
-                        .map(|p| crate::sprite::pane_custom_glyphs(&p.grid, cw, ch))
+                        .map(|p| crate::sprite::pane_custom_glyphs(&p.grid, cw, ch, sf))
                         .unwrap_or_default()
                 })
                 .collect();

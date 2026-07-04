@@ -502,7 +502,7 @@ pub fn capture_reusing(
         pane_customs = shot
             .panes
             .iter()
-            .map(|pane| crate::sprite::pane_custom_glyphs(pane.grid, cw, line_height))
+            .map(|pane| crate::sprite::pane_custom_glyphs(pane.grid, cw, line_height, sf))
             .collect();
         for ((pane, buffer), customs) in shot
             .panes
