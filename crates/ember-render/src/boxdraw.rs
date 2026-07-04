@@ -10,6 +10,11 @@
 //! Arms point from the cell center out to each edge. Cross-checked against
 //! Alacritty `builtin_font.rs` and Ghostty `draw/box.zig`.
 
+// Checkpointed ahead of its consumer: only the test module reads the table
+// until the rasterizer wires it into glyph painting. Remove this
+// allow in that change — after it, dead code here IS a bug.
+#![allow(dead_code)]
+
 /// Stroke weight of one arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Weight {
