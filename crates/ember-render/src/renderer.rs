@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use ember_core::{GridDelta, GridDims, Rect, Rgb, SessionId};
 use glyphon::{
-    Buffer, Cache, Color, FontSystem, Metrics, Resolution, SwashCache, TextArea, TextAtlas,
-    TextBounds, TextRenderer, Viewport,
+    Buffer, Cache, Color, CustomGlyph, FontSystem, Metrics, Resolution, SwashCache, TextArea,
+    TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 
 use crate::quads::{QuadRenderer, srgb_to_linear};
@@ -1106,6 +1106,10 @@ impl Renderer {
         let mut areas: Vec<TextArea> = Vec::new();
         // Confirm-modal dialog text: a second pass, drawn after the panel quad.
         let mut overlay_areas: Vec<TextArea> = Vec::new();
+        // Sprite-path `CustomGlyph`s per visible pane, in `self.visible`
+        // order — declared out here (not in the `else` block below) so it outlives
+        // the `areas` that borrow from it, through the `prepare_with_custom` call.
+        let pane_customs: Vec<Vec<CustomGlyph>>;
         // Whether to draw the backdrop image this frame (pane view only — never
         // over the Settings/About/help overlays).
         let mut draw_image = false;
@@ -1291,7 +1295,20 @@ impl Renderer {
             );
 
             // Pass 3: one TextArea per visible pane (clipped to its rect) + the strip.
-            for vp in &self.visible {
+            // Sprite-path glyphs ride alongside the shaped text as
+            // `CustomGlyph`s — computed here (not cached with the buffer) so a
+            // glyph's cell position always matches this frame's `cw`/`ch`.
+            pane_customs = self
+                .visible
+                .iter()
+                .map(|vp| {
+                    self.panes
+                        .get(&vp.session)
+                        .map(|p| crate::sprite::pane_custom_glyphs(&p.grid, cw, ch))
+                        .unwrap_or_default()
+                })
+                .collect();
+            for (vp, customs) in self.visible.iter().zip(pane_customs.iter()) {
                 if let Some(p) = self.panes.get(&vp.session) {
                     areas.push(TextArea {
                         buffer: &p.buffer,
@@ -1305,7 +1322,7 @@ impl Renderer {
                             bottom: ((vp.rect.y + vp.rect.height) as f32 * sf) as i32,
                         },
                         default_color: Color::rgb(FG.r, FG.g, FG.b),
-                        custom_glyphs: &[],
+                        custom_glyphs: customs,
                     });
                 }
             }
@@ -1466,7 +1483,7 @@ impl Renderer {
             }
         }
 
-        let prepared = self.text_renderer.prepare(
+        let prepared = self.text_renderer.prepare_with_custom(
             &self.device,
             &self.queue,
             &mut self.font_system,
@@ -1474,6 +1491,7 @@ impl Renderer {
             &self.viewport,
             areas,
             &mut self.swash_cache,
+            crate::sprite::rasterize,
         );
         if let Err(e) = prepared {
             // Don't freeze on a transient atlas/prepare error: log it (always, since

@@ -10,8 +10,8 @@ use std::path::Path;
 
 use ember_core::Rect;
 use glyphon::{
-    Buffer, Cache, Color, FontSystem, Metrics, Resolution, SwashCache, TextArea, TextAtlas,
-    TextBounds, TextRenderer, Viewport,
+    Buffer, Cache, Color, CustomGlyph, FontSystem, Metrics, Resolution, SwashCache, TextArea,
+    TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use wgpu::{
     DeviceDescriptor, Instance, InstanceDescriptor, MultisampleState, RequestAdapterOptions,
@@ -453,6 +453,9 @@ pub fn capture_reusing(
     );
 
     let mut areas: Vec<TextArea> = Vec::new();
+    // Sprite-path `CustomGlyph`s per pane, in `shot.panes` order —
+    // declared out here so it outlives the `areas` that borrow from it.
+    let pane_customs: Vec<Vec<CustomGlyph>>;
     if let Some((left, top)) = settings_origin {
         areas.push(TextArea {
             buffer: &settings_buf,
@@ -493,7 +496,20 @@ pub fn capture_reusing(
             custom_glyphs: &[],
         });
     } else {
-        for (pane, buffer) in shot.panes.iter().zip(buffers.iter()) {
+        // Sprite-path glyphs ride alongside the shaped text as
+        // `CustomGlyph`s — mirrors the windowed renderer's Pass 3 exactly, so
+        // the PNG matches on-screen pixel-for-pixel.
+        pane_customs = shot
+            .panes
+            .iter()
+            .map(|pane| crate::sprite::pane_custom_glyphs(pane.grid, cw, line_height))
+            .collect();
+        for ((pane, buffer), customs) in shot
+            .panes
+            .iter()
+            .zip(buffers.iter())
+            .zip(pane_customs.iter())
+        {
             areas.push(TextArea {
                 buffer,
                 left: pane.rect.x as f32 * sf,
@@ -506,7 +522,7 @@ pub fn capture_reusing(
                     bottom: ((pane.rect.y + pane.rect.height) as f32 * sf) as i32,
                 },
                 default_color: Color::rgb(FG.r, FG.g, FG.b),
-                custom_glyphs: &[],
+                custom_glyphs: customs,
             });
         }
         // The strip (with +/?/⚙ controls) is always drawn, so always show its text.
@@ -565,7 +581,7 @@ pub fn capture_reusing(
         }
     }
     text_renderer
-        .prepare(
+        .prepare_with_custom(
             device,
             queue,
             font_system,
@@ -573,6 +589,7 @@ pub fn capture_reusing(
             &viewport,
             areas,
             &mut swash_cache,
+            crate::sprite::rasterize,
         )
         .map_err(|e| CaptureError::TextPrepare(format!("{e:?}")))?;
     overlay_text

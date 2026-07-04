@@ -178,6 +178,11 @@ impl GridModel {
                 continue;
             }
             match &cell.content {
+                // Sprite-path glyphs are drawn as a `CustomGlyph`
+                // (see `sprite::pane_custom_glyphs`), not shaped text — suppress
+                // here so the font never double-draws it, same pattern as the
+                // U+23FA monochrome remap above.
+                CellContent::Char(c) if crate::sprite::is_sprite_glyph(*c) => push(" "),
                 CellContent::Char(c) => push(&monochrome_glyph(*c).to_string()),
                 // Full cluster: combining accents / ZWJ emoji shape as one glyph.
                 CellContent::Cluster(s) => match remap_cluster(s) {
@@ -196,6 +201,25 @@ impl GridModel {
             *text = trimmed;
         }
         runs
+    }
+
+    /// Columns in `row` carrying a sprite-path glyph, with each
+    /// cell's foreground color — `sprite::row_custom_glyphs` turns this into
+    /// `CustomGlyph`s. Mirrors `row_runs`'s per-cell style lookup.
+    pub fn sprite_glyphs(&self, row: u16) -> Vec<(u16, ember_core::Rgb)> {
+        let cols = self.dims.columns as usize;
+        let start = row as usize * cols;
+        let end = (start + cols).min(self.cells.len());
+        self.cells[start..end]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, cell)| match &cell.content {
+                CellContent::Char(c) if crate::sprite::is_sprite_glyph(*c) => {
+                    Some((i as u16, self.style_of(cell.style).fg))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// The whole screen as text, rows separated by `\n` (trailing blanks trimmed

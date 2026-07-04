@@ -6,12 +6,14 @@
 
 mod background;
 pub(crate) mod boxdraw;
+mod canvas;
 pub mod grid_model;
 pub mod headless;
 mod paint;
 mod quads;
 pub mod renderer;
 pub mod selection;
+mod sprite;
 
 pub use grid_model::GridModel;
 pub use headless::CaptureError;
