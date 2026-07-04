@@ -25,11 +25,6 @@
 //!   `BoxGlyph` is weight-only, so this is junction logic in the drawer.
 //! - Heavy stroke width: Alacritty = exactly 2× light; Ghostty uses a metric.
 
-// Checkpointed ahead of its consumer: only the test module reads the table
-// until the rasterizer wires it into glyph painting. Remove this
-// allow in that change — after it, dead code here IS a bug.
-#![allow(dead_code)]
-
 /// Stroke weight of one arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Weight {
@@ -44,6 +39,18 @@ pub enum Dash {
     Double,
     Triple,
     Quad,
+}
+
+impl Dash {
+    /// Dash segments across the stroke (never paired with `Weight::Double` in
+    /// the table above — dashes only appear on plain light/heavy lines).
+    pub fn segments(self) -> u32 {
+        match self {
+            Dash::Double => 2,
+            Dash::Triple => 3,
+            Dash::Quad => 4,
+        }
+    }
 }
 
 /// A diagonal stroke (the `╱ ╲ ╳` family) — not axis-aligned, drawn corner to

@@ -203,10 +203,11 @@ impl GridModel {
         runs
     }
 
-    /// Columns in `row` carrying a sprite-path glyph, with each
-    /// cell's foreground color — `sprite::row_custom_glyphs` turns this into
-    /// `CustomGlyph`s. Mirrors `row_runs`'s per-cell style lookup.
-    pub fn sprite_glyphs(&self, row: u16) -> Vec<(u16, ember_core::Rgb)> {
+    /// Columns in `row` carrying a sprite-path glyph, with the codepoint
+    /// itself and each cell's foreground color — `sprite::row_custom_glyphs`
+    /// turns this into `CustomGlyph`s. Mirrors `row_runs`'s per-cell style
+    /// lookup.
+    pub fn sprite_glyphs(&self, row: u16) -> Vec<(u16, char, ember_core::Rgb)> {
         let cols = self.dims.columns as usize;
         let start = row as usize * cols;
         let end = (start + cols).min(self.cells.len());
@@ -215,7 +216,7 @@ impl GridModel {
             .enumerate()
             .filter_map(|(i, cell)| match &cell.content {
                 CellContent::Char(c) if crate::sprite::is_sprite_glyph(*c) => {
-                    Some((i as u16, self.style_of(cell.style).fg))
+                    Some((i as u16, *c, self.style_of(cell.style).fg))
                 }
                 _ => None,
             })
