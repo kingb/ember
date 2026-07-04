@@ -440,6 +440,13 @@ impl Renderer {
             .find(TextureFormat::is_srgb)
             .unwrap_or(caps.formats[0]);
         // Present mode is the latency lever (§6): Mailbox where honored, else Fifo.
+        // On Metal this branch never wins — macOS caps are [Fifo, Immediate]
+        // (verified via the startup debug log) — so macOS always runs Fifo and
+        // relies on drawable backpressure for pacing. The Mailbox preference is
+        // kept for the Linux/Vulkan build, where it exists and gives lower
+        // latency than Fifo without Immediate's tearing. Do NOT "fix" this by
+        // preferring Immediate on Metal: unpaced presentation is how the 
+        // class of runaway feeds itself.
         let present_mode = if caps.present_modes.contains(&PresentMode::Mailbox) {
             PresentMode::Mailbox
         } else {
