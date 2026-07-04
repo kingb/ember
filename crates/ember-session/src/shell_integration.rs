@@ -1,9 +1,11 @@
-//! Auto-injected shell integration (OSC 133) — design §8.1.
+//! Auto-injected shell integration (OSC 133 + the OSC 1337 `CurrentDir`
+//! subset) — design §8.1.
 //!
-//! Ember can make a spawned shell emit OSC 133 marks *without* the user editing
-//! their rc, so the exit-status gutter + jump-to-prompt "just work" (Ghostty's
-//! model). We write a tiny integration dir and point the shell at it via env, and
-//! that dir **chains** the user's real config first (never replaces it).
+//! Ember can make a spawned shell emit these marks *without* the user editing
+//! their rc, so the exit-status gutter, jump-to-prompt, and cwd-inheriting
+//! splits "just work" (Ghostty/iTerm2's model). We write a tiny integration
+//! dir and point the shell at it via env, and that dir **chains** the user's
+//! real config first (never replaces it).
 //!
 //! - **zsh:** set `ZDOTDIR` to our dir; our `.zshenv`/`.zshrc` restore the user's
 //!   `ZDOTDIR` and source their files, then install `precmd`/`preexec` hooks.
@@ -12,6 +14,10 @@
 //!
 //! Shells emitting OSC 133 already (many zsh setups) will simply mark twice at the
 //! same line — cosmetically one bar. Fish/others are a documented follow-up.
+//! `RemoteHost` and `SetMark` (the rest of the OSC 1337 subset — see
+//! `ember_session::osc1337`) aren't auto-emitted here: `RemoteHost` only makes
+//! sense from a script installed on the *remote* box (out of scope for this
+//! local-shell injector), and `SetMark` is user-triggered, not a prompt hook.
 
 use std::path::{Path, PathBuf};
 
@@ -38,11 +44,13 @@ pub fn prepare(program: &str, dir: &Path) -> Injection {
 }
 
 const HOOKS_ZSH: &str = r#"
-# Ember shell integration (OSC 133). Marks prompts + command exit status.
+# Ember shell integration (OSC 133 + the OSC 1337 CurrentDir subset). Marks
+# prompts + command exit status; CurrentDir lets a new split inherit the cwd.
 _ember_precmd() {
   local ret=$?
   print -n "\e]133;D;${ret}\e\\"
   print -n "\e]133;A\e\\"
+  print -n "\e]1337;CurrentDir=$PWD\e\\"
 }
 _ember_preexec() { print -n "\e]133;C\e\\" }
 autoload -Uz add-zsh-hook 2>/dev/null
@@ -112,6 +120,7 @@ _ember_precmd() {
   local ret=$?
   printf '\e]133;D;%s\e\\' "$ret"
   printf '\e]133;A\e\\'
+  printf '\e]1337;CurrentDir=%s\e\\' "$PWD"
 }
 case "$PROMPT_COMMAND" in
   *_ember_precmd*) ;;
@@ -196,6 +205,7 @@ mod tests {
         let rc = std::fs::read_to_string(dir.join(".zshrc")).unwrap();
         assert!(rc.contains("source \"$ZDOTDIR/.zshrc\"")); // chains user config
         assert!(rc.contains("133;A")); // installs the marks
+        assert!(rc.contains("1337;CurrentDir=$PWD")); // cwd-inheriting splits
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -207,6 +217,7 @@ mod tests {
         let rc = std::fs::read_to_string(dir.join("ember-bash-rc")).unwrap();
         assert!(rc.contains("source \"$HOME/.bashrc\"")); // chains user config
         assert!(rc.contains("133;A"));
+        assert!(rc.contains("1337;CurrentDir")); // cwd-inheriting splits
         let _ = std::fs::remove_dir_all(&dir);
     }
 

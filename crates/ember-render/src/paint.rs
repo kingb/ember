@@ -369,8 +369,9 @@ pub(crate) fn grid_quads(
             push_border(out, rect, ACCENT, sf);
         }
     }
-    // OSC 133 shell-integration gutter: a colored bar at each command's prompt line
-    // — green = exit 0, red = non-zero, amber = still running. Drawn in the left pad
+    // Shell-integration gutter: a colored bar at each command's prompt line —
+    // green = exit 0, red = non-zero, amber = still running, blue = a manual
+    // mark (OSC 1337 SetMark, not tied to a command). Drawn in the left pad
     // so it doesn't overlap text.
     for &(row, status) in &grid.marks {
         if row < grid.dims.screen_lines {
@@ -378,6 +379,7 @@ pub(crate) fn grid_quads(
                 MarkStatus::Ok => GUTTER_OK,
                 MarkStatus::Fail => GUTTER_FAIL,
                 MarkStatus::Running => GUTTER_RUN,
+                MarkStatus::Manual => GUTTER_MANUAL,
                 _ => GUTTER_RUN,
             };
             // Inside the pane's own left edge (not `ox - 3.5`, which reaches
@@ -391,10 +393,11 @@ pub(crate) fn grid_quads(
     }
 }
 
-/// Shell-integration gutter mark colors (exit 0 / non-zero / running).
+/// Shell-integration gutter mark colors (exit 0 / non-zero / running / manual).
 const GUTTER_OK: Rgb = Rgb::new(0x3f, 0xb9, 0x50);
 const GUTTER_FAIL: Rgb = Rgb::new(0xe5, 0x48, 0x4d);
 const GUTTER_RUN: Rgb = Rgb::new(0xd0, 0x90, 0x30);
+const GUTTER_MANUAL: Rgb = Rgb::new(0x56, 0x9c, 0xd6);
 
 /// Translucent selection-highlight color (a calm blue, drawn over the cell bg and
 /// under the glyphs so selected text stays readable).

@@ -72,23 +72,35 @@ pub struct AlacrittyProjection<L: EventListener> {
     /// Mirrors the engine's `display_offset`; read fresh each drain so it stays in
     /// sync whether it changed via a scroll command or output pushing history.
     display_offset: usize,
-    /// OSC 133 command marks, in emit order. Each is anchored to an absolute history
-    /// line (`history_size + prompt row` at emit) so it scrolls with content — valid
-    /// until scrollback saturates the history cap (a long session), then oldest
-    /// marks may drift; see the module note.
+    /// Command marks (OSC 133 prompts) and manual marks (OSC 1337 `SetMark`),
+    /// in emit order — both navigate and gutter the same way. Each is anchored
+    /// to an absolute history line (`history_size + prompt row` at emit) so it
+    /// scrolls with content — valid until scrollback saturates the history cap
+    /// (a long session), then oldest marks may drift; see the module note.
     marks: Vec<Mark>,
     /// Next drain emits a full reset + the complete style table
     /// ([`ember_core::BackendControl::RequestFull`]).
     resync: bool,
     /// Tail of the previous read that may be a split OSC 133 sequence (its
     /// bytes were already fed to the engine; kept only for the scanner).
-    scan_tail: Vec<u8>,
+    scan_tail_133: Vec<u8>,
+    /// Same, for OSC 1337.
+    scan_tail_1337: Vec<u8>,
 }
 
-/// One tracked OSC 133 command: its prompt's absolute history line + exit code.
+/// One tracked command (OSC 133) or manual (OSC 1337 `SetMark`) mark: the
+/// prompt/mark's absolute history line, and — for a command — its exit code.
 struct Mark {
     abs_line: i64,
     exit: Option<i32>,
+    manual: bool,
+}
+
+/// A mark from either scanner, tagged so the merged, buffer-ordered pass
+/// (`AlacrittyProjection::advance`) can dispatch on its origin.
+enum Scanned {
+    C133(Osc133),
+    C1337(crate::osc1337::Osc1337),
 }
 
 impl<L: EventListener> AlacrittyProjection<L> {
@@ -105,61 +117,117 @@ impl<L: EventListener> AlacrittyProjection<L> {
             display_offset: 0,
             marks: Vec::new(),
             resync: false,
-            scan_tail: Vec::new(),
+            scan_tail_133: Vec::new(),
+            scan_tail_1337: Vec::new(),
         }
     }
 
     /// Feed raw PTY bytes through the VT parser into the engine, and pre-scan them
-    /// for OSC 133 shell-integration marks (alacritty ignores OSC 133, so the bytes
-    /// still flow through unchanged). Returns the semantic marks found, in order,
-    /// and records prompt/exit state for the gutter.
+    /// for OSC 133 + OSC 1337 shell-integration sequences (alacritty ignores both,
+    /// so the bytes still flow through unchanged). Returns the semantic events
+    /// found, in order, and records prompt/exit/manual-mark state for the gutter.
     pub fn advance(&mut self, bytes: &[u8]) -> Vec<OscEvent> {
         let mut events = Vec::new();
         // Scan over (carried tail ++ new bytes): a mark split across the 8 KB
         // read boundary is statistically inevitable in long sessions and used
         // to be lost forever. The tail's bytes were already fed to the engine
-        // last read — the carry exists only for the scanner.
-        let tail_len = self.scan_tail.len();
-        let owned: Vec<u8>;
-        let scan_buf: &[u8] = if tail_len == 0 {
+        // last read — the carry exists only for the scanner. OSC 133 and OSC
+        // 1337 are scanned independently (each with its own carry), then
+        // merged back into buffer order below — carrying a wrong shared tail
+        // would either re-feed already-consumed bytes or duplicate a mark.
+        let tail_len_133 = self.scan_tail_133.len();
+        let owned_133: Vec<u8>;
+        let scan_buf_133: &[u8] = if tail_len_133 == 0 {
             bytes
         } else {
-            let mut v = std::mem::take(&mut self.scan_tail);
+            let mut v = std::mem::take(&mut self.scan_tail_133);
             v.extend_from_slice(bytes);
-            owned = v;
-            &owned
+            owned_133 = v;
+            &owned_133
         };
-        let result = crate::osc133::scan_split(scan_buf);
+        let tail_len_1337 = self.scan_tail_1337.len();
+        let owned_1337: Vec<u8>;
+        let scan_buf_1337: &[u8] = if tail_len_1337 == 0 {
+            bytes
+        } else {
+            let mut v = std::mem::take(&mut self.scan_tail_1337);
+            v.extend_from_slice(bytes);
+            owned_1337 = v;
+            &owned_1337
+        };
+        let result_133 = crate::osc133::scan_split(scan_buf_133);
+        let result_1337 = crate::osc1337::scan_split(scan_buf_1337);
+
+        // Both scans' offsets are relative to their OWN scan buffer (which may
+        // carry a different-length tail); rebase each to "offset within this
+        // read's `bytes`" before merging, so the combined list is in true
+        // buffer order regardless of which protocol's tail was longer.
+        let mut merged: Vec<(usize, Scanned)> =
+            Vec::with_capacity(result_133.marks.len() + result_1337.marks.len());
+        merged.extend(result_133.marks.into_iter().map(|(past, m)| {
+            (
+                past.saturating_sub(tail_len_133).min(bytes.len()),
+                Scanned::C133(m),
+            )
+        }));
+        merged.extend(result_1337.marks.into_iter().map(|(past, m)| {
+            (
+                past.saturating_sub(tail_len_1337).min(bytes.len()),
+                Scanned::C1337(m),
+            )
+        }));
+        merged.sort_by_key(|(off, _)| *off);
+
         let mut cut = 0usize;
-        for (past, m) in result.marks {
+        for (feed_to, m) in merged {
             // Feed the engine up to and including this (invisible) mark, so the
-            // cursor sits exactly where the mark was emitted. Positions inside
-            // the carried tail map to the start of this read (already fed).
-            let feed_to = past.saturating_sub(tail_len).min(bytes.len());
+            // cursor sits exactly where the mark was emitted. Offset 0 (a mark
+            // resolved from a carried tail) means "already fed last read" — feed
+            // nothing new for it.
             self.parser
                 .advance(&mut self.term, &bytes[cut..feed_to.max(cut)]);
             cut = feed_to.max(cut);
             match m {
-                Osc133::PromptStart => {
+                Scanned::C133(Osc133::PromptStart) => {
                     let abs = self.term.grid().history_size() as i64
                         + self.term.grid().cursor.point.line.0.max(0) as i64;
                     self.marks.push(Mark {
                         abs_line: abs,
                         exit: None,
+                        manual: false,
                     });
                     if self.marks.len() > 512 {
                         self.marks.remove(0);
                     }
                     events.push(OscEvent::PromptStart);
                 }
-                Osc133::CommandStart => events.push(OscEvent::CommandStart),
-                Osc133::OutputStart => events.push(OscEvent::OutputStart),
-                Osc133::CommandEnd(code) => {
+                Scanned::C133(Osc133::CommandStart) => events.push(OscEvent::CommandStart),
+                Scanned::C133(Osc133::OutputStart) => events.push(OscEvent::OutputStart),
+                Scanned::C133(Osc133::CommandEnd(code)) => {
                     // The exit belongs to the command whose prompt was the last mark.
                     if let Some(last) = self.marks.last_mut() {
                         last.exit = code;
                     }
                     events.push(OscEvent::CommandEnd(code));
+                }
+                Scanned::C1337(crate::osc1337::Osc1337::CurrentDir(path)) => {
+                    events.push(OscEvent::CurrentDir(path));
+                }
+                Scanned::C1337(crate::osc1337::Osc1337::RemoteHost(host)) => {
+                    events.push(OscEvent::RemoteHost(host));
+                }
+                Scanned::C1337(crate::osc1337::Osc1337::SetMark) => {
+                    let abs = self.term.grid().history_size() as i64
+                        + self.term.grid().cursor.point.line.0.max(0) as i64;
+                    self.marks.push(Mark {
+                        abs_line: abs,
+                        exit: None,
+                        manual: true,
+                    });
+                    if self.marks.len() > 512 {
+                        self.marks.remove(0);
+                    }
+                    events.push(OscEvent::SetMark);
                 }
             }
         }
@@ -167,9 +235,13 @@ impl<L: EventListener> AlacrittyProjection<L> {
         self.parser.advance(&mut self.term, &bytes[cut..]);
         // Carry a plausible split-sequence suffix into the next read (bounded —
         // scan_split already rejects oversized garbage as malformed).
-        self.scan_tail.clear();
-        if let Some(inc) = result.incomplete {
-            self.scan_tail.extend_from_slice(&scan_buf[inc..]);
+        self.scan_tail_133.clear();
+        if let Some(inc) = result_133.incomplete {
+            self.scan_tail_133.extend_from_slice(&scan_buf_133[inc..]);
+        }
+        self.scan_tail_1337.clear();
+        if let Some(inc) = result_1337.incomplete {
+            self.scan_tail_1337.extend_from_slice(&scan_buf_1337[inc..]);
         }
         events
     }
@@ -347,10 +419,14 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
                 // visible row r: abs = bottom_abs - (screen-1) + r - display_offset
                 let r = m.abs_line - bottom_abs + (screen - 1) + self.display_offset as i64;
                 if (0..screen).contains(&r) {
-                    let status = match m.exit {
-                        None => MarkStatus::Running,
-                        Some(0) => MarkStatus::Ok,
-                        Some(_) => MarkStatus::Fail,
+                    let status = if m.manual {
+                        MarkStatus::Manual
+                    } else {
+                        match m.exit {
+                            None => MarkStatus::Running,
+                            Some(0) => MarkStatus::Ok,
+                            Some(_) => MarkStatus::Fail,
+                        }
                     };
                     out.marks.push((r as u16, status));
                 }
@@ -481,6 +557,61 @@ mod tests {
         );
         // The held-back tail must not leak into later scans.
         assert_eq!(p.advance(b"plain output"), vec![]);
+    }
+
+    #[test]
+    fn osc1337_current_dir_and_remote_host_are_emitted() {
+        let mut p = proj();
+        let ev = p.advance(
+            b"\x1b]1337;CurrentDir=/home/user/projects\x07\x1b]1337;RemoteHost=user@host\x07",
+        );
+        assert_eq!(
+            ev,
+            vec![
+                OscEvent::CurrentDir("/home/user/projects".to_string()),
+                OscEvent::RemoteHost("user@host".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn osc1337_marks_survive_read_boundaries() {
+        // Mirrors `osc133_marks_survive_read_boundaries`, split mid-key.
+        let mut p = proj();
+        let mut ev = Vec::new();
+        ev.extend(p.advance(b"$ \x1b]13"));
+        ev.extend(p.advance(b"37;CurrentDir=/tm"));
+        ev.extend(p.advance(b"p\x07 tail"));
+        assert_eq!(ev, vec![OscEvent::CurrentDir("/tmp".to_string())]);
+        assert_eq!(p.advance(b"plain output"), vec![]);
+    }
+
+    #[test]
+    fn set_mark_adds_a_manual_gutter_mark() {
+        let mut p = proj();
+        p.advance(b"line one\r\n\x1b]1337;SetMark\x07line two\r\n");
+        let mut d = GridDelta::default();
+        p.drain_damage_into(&mut d);
+        assert_eq!(
+            d.marks.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+            vec![MarkStatus::Manual]
+        );
+    }
+
+    #[test]
+    fn osc133_and_osc1337_in_the_same_read_stay_in_buffer_order() {
+        // CurrentDir before the prompt, SetMark after — order must survive the
+        // merge of the two independently-scanned protocols.
+        let mut p = proj();
+        let ev = p.advance(b"\x1b]1337;CurrentDir=/tmp\x07\x1b]133;A\x07$ \x1b]1337;SetMark\x07");
+        assert_eq!(
+            ev,
+            vec![
+                OscEvent::CurrentDir("/tmp".to_string()),
+                OscEvent::PromptStart,
+                OscEvent::SetMark,
+            ]
+        );
     }
 
     #[test]

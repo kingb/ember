@@ -160,9 +160,11 @@ pub struct CellPatch {
     pub cell: NeutralCell,
 }
 
-/// Shell-integration (OSC 133) command status, shown as a colored mark in the
-/// pane's left gutter at the command's prompt line. `Running` = command in flight
-/// (no exit yet); `Ok`/`Fail` from the command's exit code.
+/// Shell-integration command status, shown as a colored mark in the pane's
+/// left gutter at the command's prompt line. `Running` = command in flight
+/// (no exit yet); `Ok`/`Fail` from the command's exit code (OSC 133);
+/// `Manual` = a user-placed mark independent of a command (iTerm2 OSC 1337
+/// `SetMark`) — same gutter + jump-navigation, distinct color.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum MarkStatus {
@@ -170,6 +172,7 @@ pub enum MarkStatus {
     Running,
     Ok,
     Fail,
+    Manual,
 }
 
 /// Which xterm mouse-reporting protocols the app enabled (terminal state,

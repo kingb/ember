@@ -24,8 +24,8 @@ use control::ControlMsg;
 
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, Direction, GridDims,
-    LayoutCommand, LayoutEffect, LayoutNode, PaneId, Rect, ScrollAmount, SessionBackend, SessionId,
-    Tab, TabId, apply, layout,
+    LayoutCommand, LayoutEffect, LayoutNode, OscEvent, PaneId, Rect, ScrollAmount, SessionBackend,
+    SessionId, Tab, TabId, apply, layout,
 };
 use ember_platform::MenuAction;
 use ember_render::{
@@ -305,6 +305,10 @@ struct RunState {
     /// Latest OSC title per session, so the window title can be re-asserted on
     /// tab/pane switch (not just when a fresh Title event happens to arrive).
     titles: std::collections::HashMap<SessionId, String>,
+    /// Latest OSC 1337 `CurrentDir` per session — a new split spawned FROM a
+    /// pane inherits its cwd (design §8.1). Not removed on exit; only read
+    /// while spawning, and a dead `SessionId` is never reused.
+    cwd_by_session: std::collections::HashMap<SessionId, String>,
     /// Wakes the event loop when a session publishes a frame; registered on
     /// every session's pixel lane so the loop can idle on `ControlFlow::Wait`.
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -462,11 +466,12 @@ impl ApplicationHandler<EmberEvent> for App {
             pending_close: None,
             confirm_focus: 0,
             titles: std::collections::HashMap::new(),
+            cwd_by_session: std::collections::HashMap::new(),
             wake: self.wake.clone(),
             occluded: false,
             render_starved: false,
         };
-        if !state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
+        if !state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS), None) {
             // No shell at startup means nothing to show; exit with the message
             // spawn_session already printed instead of presenting a dead window.
             std::process::exit(1);
@@ -856,6 +861,11 @@ impl ApplicationHandler<EmberEvent> for App {
         let mut belled: Vec<SessionId> = Vec::new();
         let mut clipboard_set: Option<String> = None;
         let mut title_updates: Vec<(SessionId, String)> = Vec::new();
+        // OSC 1337 `CurrentDir=` per session — a new split spawned from this
+        // pane inherits the latest one seen. `RemoteHost` isn't consumed yet
+        // (no UI surfaces it); tracked here anyway so the protocol is complete
+        // and a future feature (tab title, triggers) can read it.
+        let mut cwd_updates: Vec<(SessionId, String)> = Vec::new();
         for (id, handle) in &state.sessions {
             while let Ok(event) = handle.events.try_recv() {
                 match event {
@@ -871,6 +881,9 @@ impl ApplicationHandler<EmberEvent> for App {
                     BackendEvent::Clipboard(ClipboardOp::Set(text)) => {
                         clipboard_set = Some(text);
                     }
+                    BackendEvent::Osc(OscEvent::CurrentDir(path)) => {
+                        cwd_updates.push((id.clone(), path));
+                    }
                     _ => {}
                 }
             }
@@ -880,6 +893,12 @@ impl ApplicationHandler<EmberEvent> for App {
         }
         // Drop titles for sessions that no longer exist.
         state.titles.retain(|id, _| state.sessions.contains_key(id));
+        for (id, cwd) in cwd_updates {
+            state.cwd_by_session.insert(id, cwd);
+        }
+        state
+            .cwd_by_session
+            .retain(|id, _| state.sessions.contains_key(id));
         if let Some(text) = clipboard_set {
             if let Some(cb) = state.clipboard.as_mut() {
                 if let Err(e) = cb.set_text(text) {
@@ -1130,9 +1149,13 @@ impl RunState {
     /// Spawn a shell-backed session and register its grid with the renderer.
     /// On failure (stale `$SHELL`, fd exhaustion) the app must keep running:
     /// report, flash the bell, and let the caller abort its layout change.
-    fn spawn_session(&mut self, id: SessionId, dims: GridDims) -> bool {
+    /// `cwd`: the directory to start in (design §8.1 — a new split inherits
+    /// the parent pane's OSC 1337 `CurrentDir`); `None` starts at the shell's
+    /// own default (a fresh tab, or the very first pane).
+    fn spawn_session(&mut self, id: SessionId, dims: GridDims, cwd: Option<String>) -> bool {
         let mut cfg = LocalPtyConfig::new(id.clone(), dims);
         cfg.shell_integration = self.config.shell_integration;
+        cfg.cwd = cwd.map(std::path::PathBuf::from);
         let handle = match LocalPty::spawn(cfg) {
             Ok(h) => h,
             Err(e) => {
@@ -1610,6 +1633,14 @@ impl RunState {
     fn split_pane(&mut self, target: PaneId, axis: Axis, ratio: f64) {
         let new_pane = PaneId(self.next_pane);
         let new_session = SessionId::new(format!("s{}", self.next_session));
+        // Cwd-inheriting split (design §8.1): the new pane starts where the
+        // split's parent pane last reported itself (OSC 1337 `CurrentDir`).
+        let inherited_cwd = self
+            .active_tab()
+            .root
+            .session_of(target)
+            .and_then(|sid| self.cwd_by_session.get(sid))
+            .cloned();
         let vp = self.viewport();
         let min_px = self.min_px(axis);
         // Spawn only if the split is actually accepted (min-size may refuse it),
@@ -1632,7 +1663,11 @@ impl RunState {
         }
         self.next_pane += 1;
         self.next_session += 1;
-        if !self.spawn_session(new_session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
+        if !self.spawn_session(
+            new_session,
+            GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
+            inherited_cwd,
+        ) {
             // Spawn failed after the tree accepted the split: roll the pane back
             // out so we don't render a dead pane.
             let vp = self.viewport();
@@ -1732,7 +1767,13 @@ impl RunState {
         self.next_pane += 1;
         let session = SessionId::new(format!("s{}", self.next_session));
         self.next_session += 1;
-        if !self.spawn_session(session.clone(), GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
+        // Design §8.1 scopes cwd inheritance to splits, not new tabs — a new
+        // tab starts at the shell's own default, same as today.
+        if !self.spawn_session(
+            session.clone(),
+            GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
+            None,
+        ) {
             return;
         }
         let vp = self.viewport();
