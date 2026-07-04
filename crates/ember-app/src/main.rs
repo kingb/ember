@@ -46,9 +46,6 @@ const ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ass
 pub(crate) const PAD: f32 = 4.0;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
-/// How often the loop polls the pixel lanes when idle (~125 Hz). A proxy-waker on
-/// frame push is the noted refinement; this keeps CPU sane without it.
-const POLL: Duration = Duration::from_millis(8);
 
 /// The winit user-event type: a wake nudge from the PTY frame lane or the
 /// control socket, so the loop can idle on `ControlFlow::Wait` instead of
@@ -314,6 +311,12 @@ struct RunState {
     /// The window is fully hidden (another window covers it): suppress the
     /// ambient animation so an idle-but-covered window doesn't burn cycles.
     occluded: bool,
+    /// The last render attempt found no drawable (transient startup shortage,
+    /// display asleep). Drives a bounded retry cadence via the animation
+    /// machinery below — the renderer's StarveGate caps actual frame prep at
+    /// 4/s — so a missed frame repaints without the  spin. Cleared by
+    /// the first present.
+    render_starved: bool,
 }
 
 /// A close action deferred behind a running-process confirmation.
@@ -461,6 +464,7 @@ impl ApplicationHandler<EmberEvent> for App {
             titles: std::collections::HashMap::new(),
             wake: self.wake.clone(),
             occluded: false,
+            render_starved: false,
         };
         if !state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS)) {
             // No shell at startup means nothing to show; exit with the message
@@ -811,15 +815,24 @@ impl ApplicationHandler<EmberEvent> for App {
                 match state.renderer.render() {
                     // A drawable came through — the surface is ground truth, so
                     // whatever winit last said, we are visible.
-                    RenderOutcome::Presented => state.occluded = false,
+                    RenderOutcome::Presented => {
+                        state.occluded = false;
+                        state.render_starved = false;
+                    }
                     // Surface lost/outdated: it was reconfigured but this frame
                     // never presented — repaint now, not at the next input.
-                    RenderOutcome::Retry => state.renderer.window().request_redraw(),
-                    // Starved (occluded window / asleep display): mark occluded
-                    // even if winit never said so, and do NOT re-request — that
-                    // loop is the  OOM spin. Occluded(false)/Focused(true)
-                    // triggers the repaint.
-                    RenderOutcome::Starved => state.occluded = true,
+                    RenderOutcome::Retry => {
+                        state.render_starved = false;
+                        state.renderer.window().request_redraw();
+                    }
+                    // Starved (no drawable): do NOT re-request here — that loop
+                    // is the  OOM spin — and do NOT latch state.occluded: a
+                    // transient drawable shortage (startup burst) also lands
+                    // here, and latching froze a fully VISIBLE window until the
+                    // user clicked it. Durable occlusion state comes from winit's
+                    // Occluded events; this flag makes about_to_wait retry on a
+                    // bounded cadence instead.
+                    RenderOutcome::Starved => state.render_starved = true,
                 }
                 let render_ms = t.elapsed().as_secs_f32() * 1000.0;
                 state.render_ema_ms = if state.render_ema_ms == 0.0 {
@@ -957,15 +970,23 @@ impl ApplicationHandler<EmberEvent> for App {
         // sparks freeze until the mouse stops (the stutter). We only request a redraw
         // once a frame-interval has actually elapsed, so this doesn't spin either.
         let now = Instant::now();
+        // A starved (no-drawable) render retries on the animation cadence while
+        // the window isn't winit-occluded: the renderer's StarveGate turns most
+        // ticks into instant no-ops and allows a real attempt only every 250ms,
+        // so a transiently starved frame self-heals without the  spin.
+        let starve_retry = state.render_starved && !state.occluded;
         let frame = if state.about || state.fps_overlay || state.bell_flashing() {
             ANIM_FRAME
         } else if state.backdrop_animating() {
             state.ember_frame()
         } else {
-            POLL
+            ANIM_FRAME // starve retry (only reached when `animating` below)
         };
-        let animating =
-            state.about || state.fps_overlay || state.bell_flashing() || state.backdrop_animating();
+        let animating = state.about
+            || state.fps_overlay
+            || state.bell_flashing()
+            || state.backdrop_animating()
+            || starve_retry;
         if animating {
             if now.duration_since(state.last_anim) >= frame {
                 state.last_anim = now;
