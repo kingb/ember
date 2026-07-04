@@ -161,12 +161,16 @@ mod unix {
                     break; // stop() self-connected to unblock us
                 }
                 let Ok(stream) = stream else { continue };
-                if let Err(e) = serve(stream, &tx) {
+                if let Err(e) = serve(stream, &tx, &*waker) {
                     eprintln!("[ember-control] request error: {e}");
                 }
                 // The event loop sleeps on ControlFlow::Wait; wake it so the
                 // just-forwarded command is drained this cycle, not on the next
-                // unrelated event.
+                // unrelated event. (Reply-waiting commands also wake it INSIDE
+                // dispatch — this after-the-fact wake alone stranded them: on a
+                // fully quiet window — hours idle, occluded, locked display —
+                // nothing else wakes the loop within the reply timeout, which
+                // was the daily-driver "state timeout" failure.)
                 waker();
             }
         });
@@ -179,18 +183,28 @@ mod unix {
         ))
     }
 
-    fn serve(mut stream: UnixStream, tx: &Sender<ControlMsg>) -> std::io::Result<()> {
+    fn serve(
+        mut stream: UnixStream,
+        tx: &Sender<ControlMsg>,
+        waker: &(dyn Fn() + Send + Sync),
+    ) -> std::io::Result<()> {
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
             return Ok(()); // liveness probe (no payload) — just close.
         }
-        let resp = dispatch(&line, tx);
+        let resp = dispatch(&line, tx, waker);
         writeln!(stream, "{resp}")
     }
 
     /// Parse one request line and forward it; returns the JSON response line.
-    fn dispatch(line: &str, tx: &Sender<ControlMsg>) -> String {
+    ///
+    /// `waker` rouses the `ControlFlow::Wait`-parked event loop. Commands that
+    /// wait for a reply MUST call it right after their `tx.send` — the loop only
+    /// drains `control_rx` in `about_to_wait`, so without an immediate wake the
+    /// reply wait races whatever unrelated event happens to arrive next (none
+    /// ever does on an idle occluded window → guaranteed timeout).
+    fn dispatch(line: &str, tx: &Sender<ControlMsg>, waker: &(dyn Fn() + Send + Sync)) -> String {
         let v: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
             Err(e) => return format!("{{\"ok\":false,\"error\":\"bad json: {e}\"}}"),
@@ -216,6 +230,7 @@ mod unix {
                 if tx.send(ControlMsg::State(reply_tx)).is_err() {
                     return err("event loop gone");
                 }
+                waker(); // wake BEFORE waiting — see dispatch docs
                 match reply_rx.recv_timeout(Duration::from_secs(2)) {
                     Ok(state) => format!("{{\"ok\":true,\"state\":{state}}}"),
                     Err(_) => err("state timeout"),
@@ -238,6 +253,7 @@ mod unix {
                 if tx.send(ControlMsg::Screenshot(path, reply_tx)).is_err() {
                     return err("event loop gone");
                 }
+                waker(); // wake BEFORE waiting — see dispatch docs
                 match reply_rx.recv_timeout(Duration::from_secs(15)) {
                     Ok(resp) => resp, // main builds the full JSON response.
                     Err(_) => err("screenshot timeout"),
