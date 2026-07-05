@@ -4,13 +4,13 @@ cask "ember" do
   on_arm do
     sha256 "7725538b70de1333bf15f81a6b3da2c2eb553262b8300be8559bd50a4dd78ddc"
 
-    url "https://github.com/kingb/ember/releases/download/v#{version}/Ember-#{version}.zip",
+    url "https://github.com/kingb/ember/releases/download/v#{version}/Ember-#{version}-macos-arm64.zip",
         verified: "github.com/kingb/ember/"
   end
   on_intel do
     sha256 "2b3f8e9922e2fd0748e583e25bb073d97eed59c90cdec9a7399a8629291e076d"
 
-    url "https://github.com/kingb/ember/releases/download/v#{version}/Ember-#{version}-x86_64.zip",
+    url "https://github.com/kingb/ember/releases/download/v#{version}/Ember-#{version}-macos-x86_64.zip",
         verified: "github.com/kingb/ember/"
   end
 
