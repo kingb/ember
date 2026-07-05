@@ -16,16 +16,20 @@ its boundary is front-loaded.
 
 | Crate | Responsibility |
 |---|---|
-| `ember-core` | Pure domain: `SessionBackend` trait, layout tree, focus/layout, profiles, OSC/trigger matching. No IO. |
-| `ember-session` | Backend impls: `LocalPty` (v1, wraps `alacritty_terminal`'s parser and grid as the VT engine), `TmuxControlMode` (phase 2), `a future out-of-process backend` (future). |
+| `ember-core` | Pure domain: the neutral grid model (`NeutralCell`/`GridDelta`, engine-agnostic), `SessionBackend` trait, layout tree, focus/layout, profiles, OSC/trigger matching. No IO. |
+| `ember-session` | Backend impls: `LocalPty` (v1, wraps `alacritty_terminal`'s parser and grid as the VT engine, then projects it into the neutral grid), `TmuxControlMode` (phase 2), `a future out-of-process backend` (future). |
 | `ember-render` | wgpu + glyphon text, plus a hand-rolled quad pass for backgrounds, cursor, box-drawing sprites, and all chrome (tabs, Settings, About, overlays). |
 | `ember-platform` | winit + `PlatformBackend`, the clipboard/open-path seam. Real `MacBackend` and `LinuxBackend` impls, both backed by `arboard`. Global hotkey isn't implemented yet. |
 | `ember-app` | Binary: event loop, input routing, layout, config; trigger dispatch. |
 
-Two extension seams: **`SessionBackend`** (tmux / daemon / bus) and **`PlatformBackend`**
-(macOS and Linux). See the design doc for the full picture, including the
-projection-based render seam, the two-lane event sink, and the v1 → phase-2 → phase-3
-roadmap.
+The render layer only ever sees the neutral grid, never a specific VT engine's
+own types. That's what makes `SessionBackend` genuinely swappable: any backend
+(local PTY today, tmux control mode or an out-of-process bus later) just has to
+translate into `NeutralCell`/`GridDelta`, and every other crate keeps working
+unchanged. Two extension seams overall: **`SessionBackend`** (tmux / daemon /
+bus) and **`PlatformBackend`** (macOS and Linux). See the design doc for the
+full picture, including the projection-based render seam, the two-lane event
+sink, and the v1 → phase-2 → phase-3 roadmap.
 
 ## Stack
 
