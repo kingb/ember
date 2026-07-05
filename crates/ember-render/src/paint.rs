@@ -1504,8 +1504,18 @@ mod tests {
                 }
                 let (mut out, mut rounded) = (Vec::new(), Vec::new());
                 build_tabs(
-                    &mut fs, &mut chrome, &mut close_buf, cache, &tabs, None,
-                    Some(1), 8.0, 1200.0, 2.0, &mut out, &mut rounded,
+                    &mut fs,
+                    &mut chrome,
+                    &mut close_buf,
+                    cache,
+                    &tabs,
+                    None,
+                    Some(1),
+                    8.0,
+                    1200.0,
+                    2.0,
+                    &mut out,
+                    &mut rounded,
                 );
             }
             t.elapsed()
@@ -1513,9 +1523,14 @@ mod tests {
         let mut cache = TabsCache::default();
         let cold = run(&mut cache, true);
         let warm = run(&mut cache, false);
-        println!("200 frames: uncached={cold:?} cached={warm:?} ({:.0}x)",
-            cold.as_secs_f64() / warm.as_secs_f64().max(1e-9));
-        assert!(warm < cold / 5, "cache should skip shaping: warm={warm:?} cold={cold:?}");
+        println!(
+            "200 frames: uncached={cold:?} cached={warm:?} ({:.0}x)",
+            cold.as_secs_f64() / warm.as_secs_f64().max(1e-9)
+        );
+        assert!(
+            warm < cold / 5,
+            "cache should skip shaping: warm={warm:?} cold={cold:?}"
+        );
     }
 
     #[test]

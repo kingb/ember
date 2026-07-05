@@ -85,7 +85,12 @@ const H: Option<Weight> = Some(Weight::Heavy);
 const D: Option<Weight> = Some(Weight::Double);
 
 /// Build a glyph from its four arms (up, down, left, right).
-const fn b(up: Option<Weight>, down: Option<Weight>, left: Option<Weight>, right: Option<Weight>) -> BoxGlyph {
+const fn b(
+    up: Option<Weight>,
+    down: Option<Weight>,
+    left: Option<Weight>,
+    right: Option<Weight>,
+) -> BoxGlyph {
     BoxGlyph {
         up,
         down,
