@@ -8,10 +8,10 @@
 
 use std::path::Path;
 
-use ember_core::Rect;
+use ember_core::{Rect, SettingsRowView};
 use glyphon::{
-    Buffer, Cache, Color, CustomGlyph, FontSystem, Metrics, Resolution, SwashCache, TextArea,
-    TextAtlas, TextBounds, TextRenderer, Viewport,
+    Buffer, Cache, Color, CustomGlyph, Family, FontSystem, Metrics, Resolution, SwashCache,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use wgpu::{
     DeviceDescriptor, Instance, InstanceDescriptor, MultisampleState, RequestAdapterOptions,
@@ -61,8 +61,8 @@ pub struct Shot<'a> {
     pub help_title: Option<(String, String)>,
     /// When set, the About overlay is drawn, with `(info, glow, elapsed_seconds)`.
     pub about: Option<(AboutInfo, f32, f32)>,
-    /// When set, the Settings overlay is drawn: `(rows of (label, value), selected)`.
-    pub settings: Option<(Vec<(String, String)>, usize)>,
+    /// When set, the Settings overlay is drawn: `(resolved rows, selected)`.
+    pub settings: Option<(Vec<SettingsRowView>, usize)>,
     /// Campfire backdrop + ember sparks (drawn behind the panes when active).
     pub backdrop: BackdropParams,
     /// A backdrop image as `(rgba8, width, height)`; drawn behind the cells in
@@ -223,6 +223,11 @@ pub fn capture_reusing(
     let line_height = crate::paint::line_height_for(font_size);
     let font_family = crate::paint::family_of(shot.font_family.as_deref());
     let cw = measure_cell_width(font_system, font_size, font_family);
+    // The Settings panel's own text always shapes at the fixed FONT_SIZE/
+    // Monospace, never the shot's (terminal) font — reusing `cw` here made
+    // the panel's column alignment wildly wrong whenever the terminal font
+    // size differed from FONT_SIZE (see the matching fix in renderer.rs).
+    let settings_cw = measure_cell_width(font_system, FONT_SIZE, Family::Monospace);
 
     let full_bounds = TextBounds {
         left: 0,
@@ -265,7 +270,7 @@ pub fn capture_reusing(
             &mut settings_buf,
             rows,
             *sel,
-            cw,
+            settings_cw,
             shot.logical_w,
             shot.logical_h,
             sf,

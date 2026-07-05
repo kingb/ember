@@ -13,6 +13,7 @@ pub mod geom;
 pub mod grid;
 pub mod ids;
 pub mod layout;
+pub mod settings;
 
 pub use app::{AppState, ChromeRow, ChromeRowKind, ChromeState, Gate, GateId, GateRegistry};
 pub use backend::{
@@ -29,6 +30,7 @@ pub use grid::{
 };
 pub use ids::{PaneId, SessionId, TabId};
 pub use layout::{Axis, LayoutNode, Tab, WindowTree, layout};
+pub use settings::{Help, RowKind, SettingRow, SettingsRowView, resolve_rows, setting_rows};
 
 /// The crate version, surfaced for diagnostics and the `ember-term --version`
 /// banner. Acts as the workspace's first real, linkable symbol.

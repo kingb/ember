@@ -4,7 +4,7 @@
 //! identically. Stateless free functions over the renderer's colors/metrics; the
 //! `Renderer` struct + GPU plumbing live in `renderer.rs`.
 
-use ember_core::{MarkStatus, Rect, Rgb};
+use ember_core::{MarkStatus, Rect, Rgb, RowKind, SettingsRowView};
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
 
 use crate::grid_model::GridModel;
@@ -1066,7 +1066,7 @@ pub(crate) fn build_about(
 pub(crate) fn build_settings(
     font_system: &mut FontSystem,
     buf: &mut Buffer,
-    rows: &[(String, String)],
+    rows: &[SettingsRowView],
     selected: usize,
     cw: f32,
     logical_w: f32,
@@ -1095,21 +1095,33 @@ pub(crate) fn build_settings(
     push_border(out, panel, ACCENT, sf);
 
     // Highlight the selected row (row index in the body: title(0), blank(1), rows…).
+    // `selected` never lands on a SectionHeader — the interaction layer (Up/Down
+    // navigation) guarantees it always points at a selectable row.
     let row_y = y + pad + (2.0 + selected as f32) * line;
     out.push((
         scaled(x + pad * 0.5, row_y, w - pad, line, sf),
         lin_rgba(ACCENT, 0.28),
     ));
 
-    // Shape the text: title, blank, each "label …… value", blank, hint.
+    // Shape the text: title, blank, each row (a category label, or "label …… value"),
+    // blank, hint.
     buf.set_size(font_system, Some(w - 2.0 * pad), Some(h - 2.0 * pad));
     let inner_cols = ((w - 2.0 * pad) / cw).floor() as usize;
     let base = Attrs::new().family(Family::Monospace);
     let mut spans: Vec<(String, Color)> = Vec::new();
     spans.push(("Settings\n\n".to_string(), Color::rgb(0xff, 0xff, 0xff)));
-    for (i, (label, value)) in rows.iter().enumerate() {
-        let gap = inner_cols.saturating_sub(label.chars().count() + value.chars().count());
-        let text = format!("{label}{}{value}\n", " ".repeat(gap.max(1)));
+    for (i, row) in rows.iter().enumerate() {
+        if row.kind == RowKind::SectionHeader {
+            // A category divider: no value column, not highlighted, its own
+            // accent-tinted color so it reads as structure, not a settable row.
+            spans.push((
+                format!("{}\n", row.label),
+                Color::rgb(ACCENT.r, ACCENT.g, ACCENT.b),
+            ));
+            continue;
+        }
+        let gap = inner_cols.saturating_sub(row.label.chars().count() + row.value.chars().count());
+        let text = format!("{}{}{}\n", row.label, " ".repeat(gap.max(1)), row.value);
         let color = if i == selected {
             Color::rgb(0xff, 0xff, 0xff)
         } else {

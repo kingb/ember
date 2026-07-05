@@ -24,8 +24,9 @@ use control::ControlMsg;
 
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, Direction, GridDims,
-    LayoutCommand, LayoutEffect, LayoutNode, OscEvent, PaneId, Rect, ScrollAmount, SessionBackend,
-    SessionId, Tab, TabId, apply, layout,
+    LayoutCommand, LayoutEffect, LayoutNode, OscEvent, PaneId, Rect, RowKind, ScrollAmount,
+    SessionBackend, SessionId, SettingsRowView, Tab, TabId, apply, layout, resolve_rows,
+    setting_rows,
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
@@ -2522,31 +2523,11 @@ impl RunState {
         }
     }
 
-    fn settings_rows(&self) -> Vec<(String, String)> {
-        let bg = &self.config.background;
-        let on = |b: bool| if b { "on" } else { "off" }.to_string();
-        // Backdrop image is config-only (path + fit live in config.toml); shown
-        // here read-only as "<filename> (<fit>)" or "none".
-        let image = match bg.image.as_deref() {
-            Some(p) => {
-                let name = std::path::Path::new(p)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(p);
-                format!("{name} ({})", bg.image_fit)
-            }
-            None => "none".to_string(),
-        };
-        vec![
-            ("Gradient backdrop".into(), on(bg.gradient)),
-            ("Ember sparks".into(), on(bg.ember_sparks)),
-            ("Ember density".into(), format!("{:.1}", bg.ember_density)),
-            ("Ember FPS".into(), format!("{}", bg.ember_fps)),
-            ("Scrim".into(), format!("{:.2}", bg.scrim)),
-            ("Visual bell".into(), on(self.config.visual_bell)),
-            ("Developer Mode".into(), on(self.config.developer_mode)),
-            ("Backdrop image".into(), image),
-        ]
+    /// The Settings overlay's rows, resolved against the live config. The row
+    /// *table* (labels, kinds, formatters, mutators) lives in `ember-core`;
+    /// this just asks it to format itself against `self.config`.
+    fn settings_rows(&self) -> Vec<SettingsRowView> {
+        resolve_rows(&self.config)
     }
 
     /// Show the Settings overlay (closing other overlays — they're exclusive).
@@ -2555,6 +2536,7 @@ impl RunState {
         self.hide_about();
         self.settings_open = true;
         let rows = self.settings_rows();
+        self.ensure_settings_sel_selectable(&rows);
         self.renderer.set_settings(Some((rows, self.settings_sel)));
     }
 
@@ -2590,19 +2572,36 @@ impl RunState {
         self.renderer.set_settings(Some((rows, self.settings_sel)));
     }
 
+    /// If `settings_sel` doesn't point at a selectable row (a `SectionHeader`,
+    /// or out of bounds), snap it to the first selectable row. Guards the
+    /// overlay's initial open (it starts at index 0, which is always a
+    /// header) and any future row-table change.
+    fn ensure_settings_sel_selectable(&mut self, rows: &[SettingsRowView]) {
+        let invalid = match rows.get(self.settings_sel) {
+            Some(r) => r.kind == RowKind::SectionHeader,
+            None => true,
+        };
+        if invalid {
+            self.settings_sel = rows
+                .iter()
+                .position(|r| r.kind != RowKind::SectionHeader)
+                .unwrap_or(0);
+        }
+    }
+
     /// Handle a key while the Settings overlay is open: navigate + change values.
     fn settings_key(&mut self, key: &Key) {
-        let n = self.settings_rows().len();
+        let rows = self.settings_rows();
         match key {
             Key::Named(NamedKey::Escape) => {
                 self.hide_settings();
                 return;
             }
             Key::Named(NamedKey::ArrowUp) => {
-                self.settings_sel = self.settings_sel.saturating_sub(1);
+                self.settings_sel = step_selectable_row(&rows, self.settings_sel, -1);
             }
             Key::Named(NamedKey::ArrowDown) => {
-                self.settings_sel = (self.settings_sel + 1).min(n - 1);
+                self.settings_sel = step_selectable_row(&rows, self.settings_sel, 1);
             }
             Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Space) => {
                 self.adjust_setting(1.0)
@@ -2613,27 +2612,30 @@ impl RunState {
         self.refresh_settings();
     }
 
-    /// Change the selected setting by `dir` (+1 / -1): toggle bools, step numbers.
-    /// Persists the config and applies the appearance.
+    /// Change the selected setting by `dir` (+1 / -1) via its own row's
+    /// `adjust` fn — the row table *is* the dispatch, there is no positional
+    /// match here to drift out of sync with it. Persists the config, then
+    /// re-applies every live side effect unconditionally: backdrop
+    /// appearance, font size, font family, and the developer-mode control
+    /// socket. Each is already a cheap no-op when its target value hasn't
+    /// changed (matching `zoom_to`'s existing no-op-if-unchanged pattern),
+    /// so this never needs to know which row actually fired.
     fn adjust_setting(&mut self, dir: f32) {
-        let bg = &mut self.config.background;
-        match self.settings_sel {
-            0 => bg.gradient = !bg.gradient,
-            1 => bg.ember_sparks = !bg.ember_sparks,
-            2 => bg.ember_density = (bg.ember_density + 0.1 * dir).clamp(0.0, 2.0),
-            3 => bg.ember_fps = (bg.ember_fps as i32 + (5.0 * dir) as i32).clamp(10, 120) as u32,
-            4 => bg.scrim = (bg.scrim + 0.05 * dir).clamp(0.0, 1.0),
-            5 => self.config.visual_bell = !self.config.visual_bell,
-            6 => {
-                self.config.developer_mode = !self.config.developer_mode;
-                self.set_developer_mode(self.config.developer_mode);
+        if let Some(row) = setting_rows().get(self.settings_sel) {
+            if let Some(adjust) = row.adjust {
+                adjust(&mut self.config, dir);
             }
-            _ => {}
         }
         if let Err(e) = config::save(&self.config) {
             eprintln!("[ember] config save failed: {e}");
         }
         self.apply_appearance();
+        self.set_developer_mode(self.config.developer_mode);
+        let mut relayout = self.renderer.set_font_size(self.config.font.size);
+        relayout |= self.renderer.set_family(self.config.font.family.clone());
+        if relayout {
+            self.sync_layout();
+        }
     }
 
     /// The backdrop params for the current config at animation time `t` seconds.
@@ -2867,6 +2869,20 @@ fn ember_glow(t: f32) -> f32 {
     let breathe = 0.55 + 0.30 * (TAU * 0.45 * t).sin();
     let flicker = 0.10 * (TAU * 3.1 * t).sin() + 0.05 * (TAU * 6.7 * t).sin();
     (breathe + flicker).clamp(0.12, 1.0)
+}
+
+/// Move `sel` by `dir` (+1/-1) among `rows`, skipping `SectionHeader` rows —
+/// a header is never a valid selection. Clamped: if there's no selectable
+/// row further in that direction (e.g. Up from the first selectable row,
+/// just below its category header), `sel` stays put rather than landing on
+/// a header or going out of bounds.
+fn step_selectable_row(rows: &[SettingsRowView], sel: usize, dir: i32) -> usize {
+    let n = rows.len() as i32;
+    let mut i = sel as i32 + dir;
+    while i >= 0 && i < n && rows[i as usize].kind == RowKind::SectionHeader {
+        i += dir;
+    }
+    if i < 0 || i >= n { sel } else { i as usize }
 }
 
 /// The keyboard cheat-sheet shown by the Cmd+/ overlay. Keep in sync with

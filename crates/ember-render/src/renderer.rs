@@ -13,10 +13,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ember_core::{GridDelta, GridDims, Rect, Rgb, SessionId};
+use ember_core::{GridDelta, GridDims, Rect, Rgb, SessionId, SettingsRowView};
 use glyphon::{
-    Buffer, Cache, Color, CustomGlyph, FontSystem, Metrics, Resolution, SwashCache, TextArea,
-    TextAtlas, TextBounds, TextRenderer, Viewport,
+    Buffer, Cache, Color, CustomGlyph, Family, FontSystem, Metrics, Resolution, SwashCache,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 
 use crate::quads::{QuadRenderer, srgb_to_linear};
@@ -349,10 +349,19 @@ pub struct Renderer {
     /// Logical click rects + target URLs for the About overlay's link buttons
     /// (Docs, GitHub), rebuilt each About frame. Empty when About is hidden.
     about_links: Vec<([f32; 4], String)>,
-    /// When `Some`, the Settings overlay is shown: `(rows of (label, value), selected)`.
-    settings: Option<(Vec<(String, String)>, usize)>,
+    /// When `Some`, the Settings overlay is shown: `(resolved rows, selected)`.
+    settings: Option<(Vec<SettingsRowView>, usize)>,
     /// Glyph buffer for the Settings overlay.
     settings_buffer: Buffer,
+    /// Cell width for the Settings panel's OWN text, measured once at its
+    /// fixed `FONT_SIZE`/`Family::Monospace` — never the live terminal
+    /// `cell_w`. The panel's label/value column alignment used to reuse
+    /// `self.cell_w` (the *terminal's* cell width, which now changes live via
+    /// the Font size row), so zooming to an extreme size made `inner_cols`
+    /// wildly wrong for text actually shaped at the panel's own fixed size,
+    /// producing a huge padding-space run that wrapped the value onto its own
+    /// line. Fixed by giving the panel a cell width of its own.
+    settings_cw: f32,
     /// When `Some`, a blocking confirm modal is shown.
     confirm: Option<ConfirmView>,
     /// Buffers for the confirm modal's message + two button labels.
@@ -490,6 +499,10 @@ impl Renderer {
         );
         let about_body = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let settings_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        // The panel's own text always shapes at FONT_SIZE/Monospace, never the
+        // live terminal font — so its cell width is measured once here and
+        // never revisited, unlike `cell_w` below.
+        let settings_cw = measure_cell_width(&mut font_system, FONT_SIZE, Family::Monospace);
         let confirm_title = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let confirm_msg = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let confirm_cancel = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
@@ -541,6 +554,7 @@ impl Renderer {
             about_links: Vec::new(),
             settings: None,
             settings_buffer,
+            settings_cw,
             confirm: None,
             confirm_title,
             confirm_msg,
@@ -605,6 +619,31 @@ impl Renderer {
         self.cell_w = measure_cell_width(
             &mut self.font_system,
             size,
+            crate::paint::family_of(self.family_name.as_deref()),
+        );
+        let metrics = Metrics::new(self.font_size, self.line_height);
+        for p in self.panes.values_mut() {
+            p.buffer.set_metrics(&mut self.font_system, metrics);
+            p.dirty = true;
+        }
+        self.window.request_redraw();
+        true
+    }
+
+    /// Set the terminal font family (live, from the Settings Cycle row).
+    /// `None` means the platform monospace default. Mirrors `set_font_size`:
+    /// re-measures the cell advance (a different family can have a different
+    /// average glyph width at the same point size) and marks every pane
+    /// dirty so it re-shapes with the new family next frame. Returns whether
+    /// it changed — the caller must re-layout, since the cell width may have.
+    pub fn set_family(&mut self, family: Option<String>) -> bool {
+        if family == self.family_name {
+            return false;
+        }
+        self.family_name = family;
+        self.cell_w = measure_cell_width(
+            &mut self.font_system,
+            self.font_size,
             crate::paint::family_of(self.family_name.as_deref()),
         );
         let metrics = Metrics::new(self.font_size, self.line_height);
@@ -972,9 +1011,9 @@ impl Renderer {
         self.about_time = t;
     }
 
-    /// Show the Settings overlay with these `(label, value)` rows and the selected
+    /// Show the Settings overlay with these resolved rows and the selected
     /// row index, or hide it with `None`.
-    pub fn set_settings(&mut self, view: Option<(Vec<(String, String)>, usize)>) {
+    pub fn set_settings(&mut self, view: Option<(Vec<SettingsRowView>, usize)>) {
         self.settings = view;
         self.window.request_redraw();
     }
@@ -1123,7 +1162,7 @@ impl Renderer {
                 &mut self.settings_buffer,
                 &rows,
                 selected,
-                self.cell_w,
+                self.settings_cw,
                 logical_w,
                 logical_h,
                 sf,
