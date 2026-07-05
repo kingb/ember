@@ -63,4 +63,10 @@ _commit "2026-01-04T14:05:00" "Add a wgpu-backed cell renderer"
 printf '\n[profile.release]\nlto = true\n' >> Cargo.toml
 _commit "2026-01-05T16:40:00" "Enable release LTO"
 
+# Pin file mtimes so `ls -la` renders deterministically. Without this the demo
+# files carry the wall-clock time of this run, which shows up in listings and
+# makes otherwise-identical shots differ run to run (and would flag false
+# positives in the macOS/Linux parity comparison).
+find "$HOMEDIR/project/ember" -exec touch -t 202601051200 {} +
+
 echo "demo env ready: $HOMEDIR"
