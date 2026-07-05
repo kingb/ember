@@ -198,23 +198,32 @@ mod tests {
         assert!(!core_version().is_empty());
     }
 
-    /// True on a headless macOS CI runner specifically. `arboard`'s
-    /// NSPasteboard access doesn't just fail gracefully there — with no
-    /// window server session it SIGSEGVs the whole test process (confirmed
-    /// on GitHub Actions' macos-latest, 2026-07-04). `.ok()`/`Result` can't
-    /// catch a process-level crash, so the only fix is not calling into
-    /// arboard at all in that environment. Linux CI runners don't need this
-    /// guard — arboard's X11/Wayland backend already returns a plain `Err`
-    /// with no display, confirmed passing on all 4 Ubuntu CI runners. CI is
-    /// a standard-convention env var GitHub Actions (and virtually every CI
-    /// system) sets.
-    fn is_headless_mac_ci() -> bool {
-        cfg!(target_os = "macos") && std::env::var_os("CI").is_some()
+    /// Whether to skip the clipboard tests on macOS. Two distinct hard
+    /// failure modes, neither catchable from Rust:
+    ///
+    /// - Headless CI (GitHub's macos-latest): no window server session, so
+    ///   `arboard`'s NSPasteboard access SIGSEGVs the test process
+    ///   (confirmed 2026-07-04). `CI` is the standard env var every CI
+    ///   system sets.
+    /// - Local `cargo test --workspace`: test binaries run as concurrent
+    ///   processes, and parallel NSPasteboard access occasionally raises an
+    ///   Objective-C exception, which Rust aborts on ("Rust cannot catch
+    ///   foreign exceptions" — flaked twice on 2026-07-05). So on macOS the
+    ///   clipboard tests are opt-in via EMBER_CLIPBOARD_TESTS=1 (run them
+    ///   single-crate: `cargo test -p ember-platform`). The clipboard path
+    ///   itself is verified live via OSC 52 end-to-end.
+    ///
+    /// Linux needs no guard — arboard's X11/Wayland backend returns a plain
+    /// `Err` with no display, confirmed on all four Ubuntu CI runners.
+    fn skip_clipboard_tests() -> bool {
+        cfg!(target_os = "macos")
+            && (std::env::var_os("CI").is_some()
+                || std::env::var_os("EMBER_CLIPBOARD_TESTS").is_none())
     }
 
     #[test]
     fn backends_are_constructible() {
-        if is_headless_mac_ci() {
+        if skip_clipboard_tests() {
             return;
         }
         // Construction must never panic, even where no system clipboard
@@ -228,7 +237,7 @@ mod tests {
 
     #[test]
     fn clipboard_round_trips_when_a_real_one_is_available() {
-        if is_headless_mac_ci() {
+        if skip_clipboard_tests() {
             return;
         }
         // The system clipboard is a shared, unsynchronized OS resource —
