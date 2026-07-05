@@ -13,6 +13,7 @@ cask "ember" do
     url "https://github.com/kingb/ember/releases/download/v#{version}/Ember-#{version}-x86_64.zip",
         verified: "github.com/kingb/ember/"
   end
+
   name "Ember"
   desc "GPU-accelerated campfire terminal emulator"
   homepage "https://emberterm.com/"
