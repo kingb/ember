@@ -29,6 +29,22 @@ echo "→ zipping ${ZIP}…"
 rm -f "${ZIP}"
 ditto -c -k --keepParent "${APP}" "${ZIP}"
 
+# Notarize + staple if a notary keychain profile is configured (set up once via
+# `xcrun notarytool store-credentials`). The zip is submitted to Apple; on
+# success the ticket is stapled INTO the .app so it validates offline, and the
+# zip is rebuilt from the stapled bundle. Any dmg below is then built from the
+# stapled app too.
+if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+  echo "→ notarizing via profile '${NOTARY_PROFILE}' (a few minutes)…"
+  xcrun notarytool submit "${ZIP}" --keychain-profile "${NOTARY_PROFILE}" --wait
+  echo "→ stapling the ticket to ${APP}…"
+  xcrun stapler staple "${APP}"
+  xcrun stapler validate "${APP}" 2>&1 | sed 's/^/   /'
+  echo "→ re-zipping the stapled bundle…"
+  rm -f "${ZIP}"
+  ditto -c -k --keepParent "${APP}" "${ZIP}"
+fi
+
 if [[ "${MAKE_DMG}" == "1" ]]; then
   echo "→ building ${DMG} (drag-to-Applications)…"
   rm -f "${DMG}"

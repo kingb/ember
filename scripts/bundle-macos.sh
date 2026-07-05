@@ -63,10 +63,18 @@ PLIST
 
 # Sign: an explicit Developer ID if provided, else ad-hoc (`-`), which is
 # enough for local double-click launch (Gatekeeper still warns on first open
-# for un-notarized apps — right-click → Open, or notarize for distribution).
+# for un-notarized apps: right-click, Open, or notarize for distribution).
 SIGN_ID="${CODESIGN_ID:--}"
 echo "→ codesign (${SIGN_ID})…"
-codesign --force --deep --sign "${SIGN_ID}" "${APP}"
+if [[ "${SIGN_ID}" == "-" ]]; then
+  # Ad-hoc: fine for local launch, fast, no network.
+  codesign --force --sign - "${APP}"
+else
+  # Real Developer ID: hardened runtime + a secure timestamp, both of which
+  # notarization requires. Ember.app has no nested frameworks or dylibs (the
+  # Rust binary links statically), so signing the bundle covers everything.
+  codesign --force --options runtime --timestamp --sign "${SIGN_ID}" "${APP}"
+fi
 codesign --verify --verbose "${APP}" 2>&1 | sed 's/^/   /'
 
 echo "✓ built ${APP}  (v${VERSION})"
