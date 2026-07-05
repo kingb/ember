@@ -445,7 +445,7 @@ impl Renderer {
         // relies on drawable backpressure for pacing. The Mailbox preference is
         // kept for the Linux/Vulkan build, where it exists and gives lower
         // latency than Fifo without Immediate's tearing. Do NOT "fix" this by
-        // preferring Immediate on Metal: unpaced presentation is how the 
+        // preferring Immediate on Metal: unpaced presentation is how the
         // class of runaway feeds itself.
         let present_mode = if caps.present_modes.contains(&PresentMode::Mailbox) {
             PresentMode::Mailbox
