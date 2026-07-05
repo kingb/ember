@@ -73,11 +73,13 @@ timestamps, so re-packaging changes the hash). Then publish the cask through a
 cp Casks/ember.rb ../homebrew-ember/Casks/ && (cd ../homebrew-ember && git commit -am "ember 0.1.0" && git push)
 ```
 
-Users then install with:
+Once the tap is published, users will install with:
 
 ```sh
 brew install --cask kingb/ember/ember     # brew maps kingb/ember → homebrew-ember
 ```
+
+The Homebrew tap is not published yet. Until it is, build from source (above).
 
 Because the build is ad-hoc signed (not notarized), the first launch still hits
 a Gatekeeper warning — the cask's `caveats` tell users to right-click → Open or
