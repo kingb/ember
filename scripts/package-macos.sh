@@ -54,6 +54,15 @@ if [[ "${MAKE_DMG}" == "1" ]]; then
   hdiutil create -quiet -volname "Ember" -srcfolder "${STAGE}" \
     -ov -format UDZO "${DMG}"
   rm -rf "${STAGE}"
+
+  # The dmg contains the already-stapled app, but the dmg is its own quarantined
+  # container, so notarize + staple it too for a clean download-and-open.
+  if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+    echo "→ notarizing the dmg via profile '${NOTARY_PROFILE}'…"
+    xcrun notarytool submit "${DMG}" --keychain-profile "${NOTARY_PROFILE}" --wait
+    xcrun stapler staple "${DMG}"
+    xcrun stapler validate "${DMG}" 2>&1 | sed 's/^/   /'
+  fi
 fi
 
 echo
