@@ -1,8 +1,9 @@
 # Ember
 
-A native Linux terminal emulator, built from scratch in Rust, with **iTerm2 as the
-experiential spec** — a daily-driver replacement, not a port of the macOS source and
-not an extension of an existing terminal.
+Ember started with a simple question, **where's iTerm2 for Linux?**, and grew into
+its own thing: a native terminal emulator, built from scratch in Rust for macOS and
+Linux. Not a port of the macOS source, not an extension of an existing terminal, but
+a daily-driver replacement in its own right.
 
 - **Crate / binary:** `ember-term`
 - **Status:** Design approved; implementation planning underway.

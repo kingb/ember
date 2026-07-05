@@ -1,15 +1,16 @@
-# iTerm2-on-Linux — Native Reimplementation Design
+# Ember: Native Terminal Design
 
 - Date: 2026-06-27
 - Status: Design approved; ready for implementation planning
-- Scope: A native, from-scratch Linux terminal emulator that reproduces the iTerm2
-  experience as a daily-driver replacement.
+- Scope: A native, from-scratch terminal emulator, born from the question "where's
+  iTerm2 for Linux?" and grown into its own thing, a daily-driver replacement.
 
 ## 1. Overview and goals
 
-The objective is a native Linux terminal emulator built from scratch in Rust, with
-real iTerm2 as the experiential specification. This is a reimplementation, not a port
-of iTerm2's macOS/Objective-C source and not an extension of an existing terminal.
+The objective is a native terminal emulator built from scratch in Rust. Ember started
+with a simple question, where's iTerm2 for Linux?, and grew into its own thing: not a
+port of iTerm2's macOS/Objective-C source, and not an extension of an existing
+terminal.
 
 **North star:** fidelity to the iTerm2 experience, sufficient to serve as a daily-driver
 replacement on Linux. The build is multi-phase and multi-subsystem.
@@ -424,8 +425,7 @@ Each phase is independently runnable.
   performance regressions are caught structurally ("seen, not felt").
 - Golden-frame tests for the render projection.
 
-
-## 13. Open items and risks
+## 12. Open items and risks
 
 - **Swappable-engine contract:** the projection-fn signature and two-lane `BackendEvent`
   enum must be drafted and sanity-checked against `libghostty-vt` 0.2.0's real per-cell

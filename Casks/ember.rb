@@ -2,8 +2,8 @@ cask "ember" do
   version "0.1.0"
   sha256 "1943910b367153150d22dd0caaa269ac8730e186c2dec2891f20721f6b0f94f1"
 
-  url "https://github.com/kingb/ember-term/releases/download/v#{version}/Ember-#{version}.zip",
-      verified: "github.com/kingb/ember-term/"
+  url "https://github.com/kingb/ember/releases/download/v#{version}/Ember-#{version}.zip",
+      verified: "github.com/kingb/ember/"
   name "Ember"
   desc "GPU-accelerated campfire terminal emulator"
   homepage "https://emberterm.com"

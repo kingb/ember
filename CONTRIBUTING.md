@@ -1,7 +1,8 @@
 # Contributing to Ember
 
-Ember is a native Linux terminal emulator in Rust, with iTerm2 as the
-experiential spec. See [`docs/design/2026-06-27-ember-design.md`](docs/design/2026-06-27-ember-design.md)
+Ember started as an answer to "where's iTerm2 for Linux?" and grew into its own
+thing: a native terminal emulator in Rust for macOS and Linux. See
+[`docs/design/2026-06-27-ember-design.md`](docs/design/2026-06-27-ember-design.md)
 for the architecture and roadmap.
 
 ## Ground rules

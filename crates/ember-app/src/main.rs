@@ -2841,7 +2841,7 @@ fn about_info() -> ember_render::AboutInfo {
             ("Docs".to_string(), "https://emberterm.com".to_string()),
             (
                 "GitHub".to_string(),
-                "https://github.com/kingb/ember-term".to_string(),
+                "https://github.com/kingb/ember".to_string(),
             ),
         ],
     }
