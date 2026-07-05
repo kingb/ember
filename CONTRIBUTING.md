@@ -7,7 +7,7 @@ for the architecture and roadmap.
 
 ## Ground rules
 
-- **`ember-core` stays pure.** No `tokio`/IO/`winit`/`wgpu` in `ember-core` — that
+- **`ember-core` stays pure.** No `tokio`/IO/`winit`/`wgpu` in `ember-core`: that
   invariant is what makes the domain exhaustively testable.
 - **The seams stay honest.** Changes must respect the `SessionBackend` and
   `PlatformBackend` boundaries (design §4, §7).
