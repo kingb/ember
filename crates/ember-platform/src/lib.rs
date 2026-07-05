@@ -198,11 +198,28 @@ mod tests {
         assert!(!core_version().is_empty());
     }
 
+    /// True on a headless macOS CI runner specifically. `arboard`'s
+    /// NSPasteboard access doesn't just fail gracefully there — with no
+    /// window server session it SIGSEGVs the whole test process (confirmed
+    /// on GitHub Actions' macos-latest, 2026-07-04). `.ok()`/`Result` can't
+    /// catch a process-level crash, so the only fix is not calling into
+    /// arboard at all in that environment. Linux CI runners don't need this
+    /// guard — arboard's X11/Wayland backend already returns a plain `Err`
+    /// with no display, confirmed passing on all 4 Ubuntu CI runners. CI is
+    /// a standard-convention env var GitHub Actions (and virtually every CI
+    /// system) sets.
+    fn is_headless_mac_ci() -> bool {
+        cfg!(target_os = "macos") && std::env::var_os("CI").is_some()
+    }
+
     #[test]
     fn backends_are_constructible() {
+        if is_headless_mac_ci() {
+            return;
+        }
         // Construction must never panic, even where no system clipboard
-        // exists (headless CI) — arboard::Clipboard::new() just returns Err,
-        // caught by ClipboardHandle and turned into a quiet `None`.
+        // exists — arboard::Clipboard::new() just returns Err, caught by
+        // ClipboardHandle and turned into a quiet `None`.
         let mut linux = LinuxBackend::default();
         let mut mac = MacBackend::default();
         let _ = linux.clipboard();
@@ -211,6 +228,9 @@ mod tests {
 
     #[test]
     fn clipboard_round_trips_when_a_real_one_is_available() {
+        if is_headless_mac_ci() {
+            return;
+        }
         // The system clipboard is a shared, unsynchronized OS resource —
         // `cargo test --workspace` runs other crates' test binaries as
         // concurrent processes, any of which could touch it between our
