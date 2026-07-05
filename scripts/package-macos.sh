@@ -46,17 +46,33 @@ if [[ -n "${NOTARY_PROFILE:-}" ]]; then
 fi
 
 if [[ "${MAKE_DMG}" == "1" ]]; then
-  echo "→ building ${DMG} (drag-to-Applications)…"
+  echo "→ building ${DMG}…"
   rm -f "${DMG}"
+  BG="scripts/assets/dmg-background.png"
+  SIGN_ID="${CODESIGN_ID:--}"
   STAGE="$(mktemp -d)"
   cp -R "${APP}" "${STAGE}/"
-  ln -s /Applications "${STAGE}/Applications"   # drag-install target
-  hdiutil create -quiet -volname "Ember" -srcfolder "${STAGE}" \
-    -ov -format UDZO "${DMG}"
+
+  if command -v create-dmg >/dev/null 2>&1 && [[ -f "${BG}" ]]; then
+    # Styled: branded background, positioned icons, a drag arrow to Applications.
+    # create-dmg adds the Applications link and (given --codesign) signs the dmg.
+    csargs=(); [[ "${SIGN_ID}" != "-" ]] && csargs=(--codesign "${SIGN_ID}")
+    create-dmg \
+      --volname "Ember" --background "${BG}" \
+      --window-pos 200 120 --window-size 660 400 \
+      --icon-size 128 --icon "Ember.app" 175 190 --app-drop-link 485 190 \
+      --text-size 15 --no-internet-enable --hdiutil-quiet \
+      "${csargs[@]}" "${DMG}" "${STAGE}"
+  else
+    # Fallback (no create-dmg): a plain drag-install dmg.
+    ln -s /Applications "${STAGE}/Applications"
+    hdiutil create -quiet -volname "Ember" -srcfolder "${STAGE}" -ov -format UDZO "${DMG}"
+    [[ "${SIGN_ID}" != "-" ]] && codesign --force --sign "${SIGN_ID}" --timestamp "${DMG}"
+  fi
   rm -rf "${STAGE}"
 
-  # The dmg contains the already-stapled app, but the dmg is its own quarantined
-  # container, so notarize + staple it too for a clean download-and-open.
+  # The dmg is its own quarantined container: Apple expects it Developer ID
+  # signed (done above) AND notarized, or it fails Gatekeeper assessment.
   if [[ -n "${NOTARY_PROFILE:-}" ]]; then
     echo "→ notarizing the dmg via profile '${NOTARY_PROFILE}'…"
     xcrun notarytool submit "${DMG}" --keychain-profile "${NOTARY_PROFILE}" --wait
