@@ -70,6 +70,10 @@ pub struct Opts {
     pub font: Option<String>,
     /// Draw the keyboard-shortcuts cheat-sheet overlay (Cmd+/) over the panes.
     pub help_overlay: bool,
+    /// Draw the Settings overlay (Cmd+,), for documenting it. Its rows resolve
+    /// from `--font`/`--font-size` so a doc shot can show a chosen font, and
+    /// the highlight lands on the Font family row.
+    pub settings: bool,
 }
 
 impl Default for Opts {
@@ -100,6 +104,7 @@ impl Default for Opts {
             font_size: 12.0,
             font: None,
             help_overlay: false,
+            settings: false,
         }
     }
 }
@@ -131,6 +136,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             }
             "--confirm" => opts.confirm = true,
             "--help-overlay" => opts.help_overlay = true,
+            "--settings" => opts.settings = true,
             "--tab-drag" => {
                 let slot = next()?
                     .parse()
@@ -337,7 +343,20 @@ pub fn run(opts: Opts) -> Result<String, String> {
         help: opts.help_overlay.then(crate::help_lines),
         help_title: None,
         about: None,
-        settings: None,
+        settings: opts.settings.then(|| {
+            // Resolve the overlay from a config reflecting --font/--font-size,
+            // so a doc shot can showcase a specific font. Highlight the Font
+            // family row (fall back to the first selectable row otherwise).
+            let mut config = ember_core::Config::default();
+            config.font.family = opts.font.clone();
+            config.font.size = opts.font_size;
+            let rows = ember_core::resolve_rows(&config);
+            let sel = rows
+                .iter()
+                .position(|r| r.label == "Font family")
+                .unwrap_or(1);
+            (rows, sel)
+        }),
         backdrop: ember_render::BackdropParams {
             gradient: opts.backdrop,
             // An image backdrop supplies its own base; keep the scrim on so text
