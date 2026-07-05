@@ -6,7 +6,7 @@ Linux. Not a port of the macOS source, not an extension of an existing terminal,
 a daily-driver replacement in its own right.
 
 - **Crate / binary:** `ember-term`
-- **Status:** Design approved; implementation planning underway.
+- **Status:** v0.1.0 released. macOS and Linux, both daily-driver targets.
 - **Design doc:** [`docs/design/2026-06-27-ember-design.md`](docs/design/2026-06-27-ember-design.md)
 
 ## Architecture at a glance
@@ -17,19 +17,20 @@ its boundary is front-loaded.
 | Crate | Responsibility |
 |---|---|
 | `ember-core` | Pure domain: `SessionBackend` trait, layout tree, focus/layout, profiles, OSC/trigger matching. No IO. |
-| `ember-session` | Backend impls: `LocalPty` (v1), `TmuxControlMode` (phase 2), `a future out-of-process backend` (future). |
-| `ember-render` | wgpu + glyphon + custom GPU chrome + egui overlay. |
-| `ember-platform` | winit + `PlatformBackend` (clipboard, open, hotkey). macOS seam. |
+| `ember-session` | Backend impls: `LocalPty` (v1, wraps `alacritty_terminal`'s parser and grid as the VT engine), `TmuxControlMode` (phase 2), `a future out-of-process backend` (future). |
+| `ember-render` | wgpu + glyphon text, plus a hand-rolled quad pass for backgrounds, cursor, box-drawing sprites, and all chrome (tabs, Settings, About, overlays). |
+| `ember-platform` | winit + `PlatformBackend`, the clipboard/open-path seam. Real `MacBackend` and `LinuxBackend` impls, both backed by `arboard`. Global hotkey isn't implemented yet. |
 | `ember-app` | Binary: event loop, input routing, layout, config; trigger dispatch. |
 
 Two extension seams: **`SessionBackend`** (tmux / daemon / bus) and **`PlatformBackend`**
-(macOS). See the design doc for the full picture, including the projection-based render
-seam, the two-lane event sink, and the v1 → phase-2 → phase-3 roadmap.
+(macOS and Linux). See the design doc for the full picture, including the
+projection-based render seam, the two-lane event sink, and the v1 → phase-2 → phase-3
+roadmap.
 
 ## Stack
 
 `winit` · `wgpu` · `glyphon`/`cosmic-text` · `alacritty_terminal` (swappable) ·
-`portable-pty` · `egui`.
+`portable-pty`.
 
 ## Thanks
 
