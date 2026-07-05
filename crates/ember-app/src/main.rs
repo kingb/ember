@@ -62,8 +62,41 @@ const MULTI_CLICK: Duration = Duration::from_millis(400);
 /// Scrollback lines per mouse-wheel notch (Alacritty/Ghostty default).
 const WHEEL_LINES: i32 = 3;
 
+// `EMBER_FONT_DEBUG=1`: a stderr logger that surfaces cosmic-text's internal
+// font diagnostics ("font matches for … in …", "failed to find family …",
+// "failed to load font …") with since-launch millisecond timestamps. Font
+// resolution problems are invisible from the outside (wrong glyph, slow
+// frame, or nothing at all) and these logs are the only window into which
+// fonts cosmic-text actually tried — this is what root-caused the
+// font-family-switch hang. Off (and free) unless the env var is
+// set; the sibling of `EMBER_DEBUG`'s frame diagnostics.
+struct FontDebugLogger(std::time::Instant);
+impl log::Log for FontDebugLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Debug
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!(
+                "[{:>10.3}ms {} {}] {}",
+                self.0.elapsed().as_secs_f64() * 1000.0,
+                record.level(),
+                record.target(),
+                record.args()
+            );
+        }
+    }
+    fn flush(&self) {}
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if std::env::var_os("EMBER_FONT_DEBUG").is_some() {
+        let logger = Box::leak(Box::new(FontDebugLogger(std::time::Instant::now())));
+        if log::set_logger(logger).is_ok() {
+            log::set_max_level(log::LevelFilter::Debug);
+        }
+    }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         print_banner();
         return;

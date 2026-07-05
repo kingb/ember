@@ -362,6 +362,14 @@ pub struct Renderer {
     /// producing a huge padding-space run that wrapped the value onto its own
     /// line. Fixed by giving the panel a cell width of its own.
     settings_cw: f32,
+    /// What the settings buffer was last shaped for: `(rows, selected,
+    /// surface w, surface h, scale-factor bits)`. Text shaping is the
+    /// expensive part of the overlay (hundreds of runs through cosmic-text's
+    /// fallback machinery) and the modal redraws on every frame
+    /// while open — so shape only when the content or geometry actually
+    /// changed, like `TabsCache` does for the tab strip. Quads
+    /// (scrim/panel/highlight) still rebuild every frame; they're cheap.
+    settings_shaped: Option<(Vec<SettingsRowView>, usize, u32, u32, u32)>,
     /// When `Some`, a blocking confirm modal is shown.
     confirm: Option<ConfirmView>,
     /// Buffers for the confirm modal's message + two button labels.
@@ -555,6 +563,7 @@ impl Renderer {
             settings: None,
             settings_buffer,
             settings_cw,
+            settings_shaped: None,
             confirm: None,
             confirm_title,
             confirm_msg,
@@ -1154,9 +1163,19 @@ impl Renderer {
         let mut draw_image = false;
 
         if let Some((rows, selected)) = self.settings.clone() {
-            // Modal Settings overlay.
+            // Modal Settings overlay. Re-shape the text only when the rows,
+            // selection, or surface geometry changed — the modal repaints
+            // every frame, and shaping is the expensive part.
             let logical_w = self.config.width as f32 / sf;
             let logical_h = self.config.height as f32 / sf;
+            let shape_key = (
+                rows.clone(),
+                selected,
+                self.config.width,
+                self.config.height,
+                sf.to_bits(),
+            );
+            let reshape = self.settings_shaped.as_ref() != Some(&shape_key);
             let (left, top) = build_settings(
                 &mut self.font_system,
                 &mut self.settings_buffer,
@@ -1166,8 +1185,12 @@ impl Renderer {
                 logical_w,
                 logical_h,
                 sf,
+                reshape,
                 &mut rects,
             );
+            if reshape {
+                self.settings_shaped = Some(shape_key);
+            }
             areas.push(TextArea {
                 buffer: &self.settings_buffer,
                 left: left * sf,

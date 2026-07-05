@@ -133,6 +133,17 @@ pub(crate) fn spark_quads(
 /// CJK, but its metrics are degenerate (infinite advance, NaN baseline) and one
 /// such glyph corrupts the entire frame's vertex stream. Excising it makes
 /// fallback land on a real CJK face (PingFang).
+///
+/// Also repoints the generic `Family::Monospace` at a font that actually
+/// exists. cosmic-text hardcodes "Noto Sans Mono" as the monospace default,
+/// which isn't installed on stock macOS — and when the default monospace
+/// family doesn't resolve, cosmic-text's fallback iterator takes a
+/// pathological path for EVERY word shaped with `Family::Monospace`: it
+/// enumerates every face in the database, checks each for monospacedness,
+/// and coverage-tests every monospace face against the word (the
+/// font-family-switch hang was sampled almost entirely inside this
+/// enumeration). With a resolvable default, the same code path fast-returns
+/// after one coverage check.
 pub(crate) fn new_font_system() -> FontSystem {
     let mut fs = FontSystem::new();
     let bad: Vec<glyphon::fontdb::ID> = fs
@@ -143,6 +154,36 @@ pub(crate) fn new_font_system() -> FontSystem {
         .collect();
     for id in bad {
         fs.db_mut().remove_face(id);
+    }
+    let mono_resolves = fs
+        .db()
+        .query(&glyphon::fontdb::Query {
+            families: &[glyphon::fontdb::Family::Monospace],
+            ..Default::default()
+        })
+        .is_some();
+    if !mono_resolves {
+        // Ordered by platform: macOS ships Menlo; most Linux distros have one
+        // of the next three; Windows has Consolas.
+        for name in [
+            "Menlo",
+            "Noto Sans Mono",
+            "DejaVu Sans Mono",
+            "Liberation Mono",
+            "Consolas",
+        ] {
+            let found = fs
+                .db()
+                .query(&glyphon::fontdb::Query {
+                    families: &[glyphon::fontdb::Family::Name(name)],
+                    ..Default::default()
+                })
+                .is_some();
+            if found {
+                fs.db_mut().set_monospace_family(name);
+                break;
+            }
+        }
     }
     fs
 }
@@ -1062,6 +1103,12 @@ pub(crate) fn build_about(
 /// row per setting (the `selected` row highlighted in Ember-orange), and a footer
 /// hint. Quads → `out`; the row text is shaped into `buf`. Returns the logical
 /// `(left, top)` to place the text area. Shared by windowed + headless.
+///
+/// `reshape`: whether to re-shape the panel's text into `buf`. The quads
+/// (scrim/panel/selection highlight) are always rebuilt — they're cheap and
+/// positional — but shaping is hundreds of cosmic-text runs, so
+/// the windowed renderer passes `false` when rows/selection/geometry are
+/// unchanged since the last shape and `buf` still holds a valid layout.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_settings(
     font_system: &mut FontSystem,
@@ -1072,6 +1119,7 @@ pub(crate) fn build_settings(
     logical_w: f32,
     logical_h: f32,
     sf: f32,
+    reshape: bool,
     out: &mut Vec<([f32; 4], [f32; 4])>,
 ) -> (f32, f32) {
     // Scrim.
@@ -1105,6 +1153,9 @@ pub(crate) fn build_settings(
 
     // Shape the text: title, blank, each row (a category label, or "label …… value"),
     // blank, hint.
+    if !reshape {
+        return (x + pad, y + pad);
+    }
     buf.set_size(font_system, Some(w - 2.0 * pad), Some(h - 2.0 * pad));
     let inner_cols = ((w - 2.0 * pad) / cw).floor() as usize;
     let base = Attrs::new().family(Family::Monospace);

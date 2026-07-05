@@ -90,15 +90,10 @@ fn on_off(b: bool) -> String {
 }
 
 // --- Appearance: font ------------------------------------------------------
-// Not wired into a row yet (see the comment in setting_rows()) — held back
-// after cycling to certain families hung the live app, likely via
-// cosmic-text's font-fallback path. Logic is complete and unit-tested below;
-// #[allow(dead_code)] on each item until it's re-added as a row.
 
 /// The curated font-family cycle list. `None` is the platform monospace
 /// default. Deliberately small and cross-platform-friendly rather than an
 /// exhaustive system-font enumeration — see the design doc.
-#[allow(dead_code)]
 const FONT_FAMILIES: &[Option<&str>] = &[
     None,
     Some("Menlo"),
@@ -113,7 +108,6 @@ const FONT_FAMILIES: &[Option<&str>] = &[
 /// Index of `current` in `FONT_FAMILIES`, or `0` (platform default) if it
 /// isn't there — e.g. a hand-edited `config.toml` with an unlisted name. A
 /// known, acceptable minor rough edge for a rare case (see the design doc).
-#[allow(dead_code)]
 fn font_family_index(current: &Option<String>) -> usize {
     FONT_FAMILIES
         .iter()
@@ -121,7 +115,6 @@ fn font_family_index(current: &Option<String>) -> usize {
         .unwrap_or(0)
 }
 
-#[allow(dead_code)]
 fn fmt_font_family(c: &Config) -> String {
     match c.font.family.as_deref() {
         Some(name) => name.to_string(),
@@ -129,7 +122,6 @@ fn fmt_font_family(c: &Config) -> String {
     }
 }
 
-#[allow(dead_code)]
 fn adjust_font_family(c: &mut Config, dir: f32) {
     let n = FONT_FAMILIES.len();
     let idx = font_family_index(&c.font.family);
@@ -250,15 +242,16 @@ pub fn setting_rows() -> &'static [SettingRow] {
             adjust: None,
             help: Help::Inline(""),
         },
-        // "Font family" (Cycle, fmt_font_family/adjust_font_family below) is
-        // deliberately NOT a row yet: cycling to certain families can hang the
-        // live app (confirmed via process sampling stuck deep in cosmic-text's
-        // shaping code; a likely culprit is that cosmic-text's hardcoded
-        // fallback monospace, "Noto Sans Mono", isn't installed on macOS by
-        // default, so essentially every family resolution needs fallback
-        // handling, not just lookups for names outside the curated list).
-        // Held back until root-caused. The logic below is fully implemented
-        // and unit-tested, ready to re-add as a row once that's resolved.
+        SettingRow {
+            label: "Font family",
+            kind: RowKind::Cycle,
+            format: fmt_font_family,
+            adjust: Some(adjust_font_family),
+            help: Help::Inline(
+                "The terminal's monospace font. Cycles a curated cross-platform list; \
+                 System default follows the platform's own monospace font.",
+            ),
+        },
         SettingRow {
             label: "Font size",
             kind: RowKind::Number,
@@ -418,9 +411,12 @@ mod tests {
         }
     }
 
-    // "Font family" isn't a row yet (see the comment in setting_rows()), so
-    // these test the mutation logic directly rather than via the row table —
-    // still exercised, still correct, ready for when it's re-added as a row.
+    #[test]
+    fn font_family_row_is_a_cycle_with_adjust() {
+        let r = row("Font family");
+        assert_eq!(r.kind, RowKind::Cycle);
+        assert!(r.adjust.is_some());
+    }
 
     #[test]
     fn font_family_adjust_mutates_only_font_family() {

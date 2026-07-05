@@ -274,6 +274,7 @@ pub fn capture_reusing(
             shot.logical_w,
             shot.logical_h,
             sf,
+            true, // one-shot capture: always shape
             &mut rects,
         ));
     } else if let Some((info, glow, t)) = &shot.about {

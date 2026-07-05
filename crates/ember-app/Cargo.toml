@@ -17,6 +17,9 @@ ember-platform.workspace = true
 winit.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+# The EMBER_FONT_DEBUG logger: surfaces cosmic-text's internal font
+# diagnostics (see FontDebugLogger in main.rs).
+log = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
