@@ -39,6 +39,10 @@ shot shortcuts.png --help-overlay
 # Appearance: campfire backdrop + drifting embers.
 shot appearance.png --backdrop --ember --run "git log --oneline -5"
 
+# Settings overlay with the font-family picker highlighted (Menlo on macOS;
+# the font row falls back to an available family elsewhere).
+shot settings.png --settings --font "Menlo" --run "ls" --backdrop
+
 # Text selection (line mode).
 shot selection.png --run "git log --oneline -6" --select "3,0,3,44" --select-mode line
 
