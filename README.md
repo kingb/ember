@@ -87,16 +87,14 @@ timestamps, so re-packaging changes the hash). Then publish the cask through a
 cp Casks/ember.rb ../homebrew-ember/Casks/ && (cd ../homebrew-ember && git commit -am "ember 0.1.0" && git push)
 ```
 
-Once the tap is published, users will install with:
+Users install with:
 
 ```sh
 brew install --cask kingb/ember/ember     # brew maps kingb/ember → homebrew-ember
 ```
 
-The Homebrew tap is not published yet. Until it is, build from source (above).
-
-Because the build is ad-hoc signed (not notarized), the first launch still hits
-a Gatekeeper warning: the cask's `caveats` tell users to right-click → Open or
-strip the quarantine attribute. Sign with a Developer ID and notarize to remove
-that step; `scripts/bundle-macos.sh` already accepts `CODESIGN_ID`.
+The [tap](https://github.com/kingb/homebrew-ember) is published, and releases are
+signed with a Developer ID and notarized by Apple, so the app launches without a
+Gatekeeper warning. `scripts/release-macos.sh` signs and notarizes when
+`CODESIGN_ID` and `NOTARY_PROFILE` are set.
 
