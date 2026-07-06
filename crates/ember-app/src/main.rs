@@ -312,8 +312,11 @@ struct RunState {
     /// In-progress divider drag to resize a split: `(a-side pane, split axis,
     /// last cursor position along that axis in logical px)`.
     divider_drag: Option<(PaneId, Axis, f64)>,
-    /// The resize cursor currently shown (so we don't reset it every move).
-    resize_cursor: Option<Axis>,
+    /// The pointer cursor currently shown (so we don't reset it every move).
+    pointer_cursor: CursorIcon,
+    /// Left press that started on a link: `(session, link id, row, col)`.
+    /// Opens on release if the pointer is still on the same link and cell.
+    pressed_link: Option<(SessionId, u32, u16, u16)>,
     /// Live Ctrl+Opt split drop-zone preview (hover), committed on click.
     split_preview: Option<SplitPreview>,
     /// Last tab-button mouse-down (time, tab index), for double-click-to-rename.
@@ -490,7 +493,8 @@ impl ApplicationHandler<EmberEvent> for App {
             split_preview: None,
             scrollbar_drag: None,
             divider_drag: None,
-            resize_cursor: None,
+            pointer_cursor: CursorIcon::Default,
+            pressed_link: None,
             last_tab_click: None,
             editing_tab: None,
             edit_buffer: String::new(),
@@ -598,16 +602,26 @@ impl ApplicationHandler<EmberEvent> for App {
                     if state.update_tab_hover(x, y) {
                         return;
                     }
-                    // Show a resize cursor over a divider; else forward motion to
-                    // mouse-aware apps.
+                    // Show a resize cursor over a divider, a pointer over a link
+                    // (divider wins), else forward motion to mouse-aware apps.
                     let over = state.divider_at(x, y).map(|(_, a)| a);
-                    if over != state.resize_cursor {
-                        state.resize_cursor = over;
-                        state.renderer.window().set_cursor(match over {
-                            Some(Axis::Horizontal) => CursorIcon::EwResize,
-                            Some(Axis::Vertical) => CursorIcon::NsResize,
-                            None => CursorIcon::Default,
-                        });
+                    let link = if over.is_none() {
+                        state.link_under_cursor()
+                    } else {
+                        None
+                    };
+                    state
+                        .renderer
+                        .set_hovered_link(link.as_ref().map(|(sid, id, ..)| (sid.clone(), *id)));
+                    let want = match (over, &link) {
+                        (Some(Axis::Horizontal), _) => CursorIcon::EwResize,
+                        (Some(Axis::Vertical), _) => CursorIcon::NsResize,
+                        (None, Some(_)) => CursorIcon::Pointer,
+                        (None, None) => CursorIcon::Default,
+                    };
+                    if state.pointer_cursor != want {
+                        state.pointer_cursor = want;
+                        state.renderer.window().set_cursor(want);
                     }
                     if over.is_none() {
                         state.forward_mouse_motion();
@@ -618,6 +632,7 @@ impl ApplicationHandler<EmberEvent> for App {
             // don't linger.
             WindowEvent::CursorLeft { .. } => {
                 state.renderer.set_hovered_tab(None);
+                state.renderer.set_hovered_link(None);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Notch wheels scroll WHEEL_LINES per notch; trackpads report
@@ -696,6 +711,17 @@ impl ApplicationHandler<EmberEvent> for App {
                     state.selecting = false;
                     state.scrollbar_drag = None;
                     state.divider_drag = None;
+                    if let Some((psid, pid, prow, pcol)) = state.pressed_link.take() {
+                        if let Some((sid, id, url, row, col)) = state.link_under_cursor() {
+                            if sid == psid && id == pid && row == prow && col == pcol {
+                                if url_is_openable(&url) {
+                                    state.platform.open_path(&url);
+                                } else {
+                                    eprintln!("[ember] refusing to open non-http(s) url");
+                                }
+                            }
+                        }
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
@@ -1932,9 +1958,15 @@ impl RunState {
             _ => self.renderer.set_hovered_tab(None),
         }
         let on_strip = hit.is_some();
-        if on_strip && self.resize_cursor.is_some() {
-            self.resize_cursor = None;
-            self.renderer.window().set_cursor(CursorIcon::Default);
+        if on_strip {
+            // Moving onto the tab strip is chrome, not pane input, so the
+            // `CursorMoved` else-branch below never runs to refresh these —
+            // clear a stale resize/link cursor and hover highlight here.
+            self.renderer.set_hovered_link(None);
+            if self.pointer_cursor != CursorIcon::Default {
+                self.pointer_cursor = CursorIcon::Default;
+                self.renderer.window().set_cursor(CursorIcon::Default);
+            }
         }
         on_strip
     }
@@ -2011,6 +2043,18 @@ impl RunState {
             self.scrollbar_drag = Some(sid.clone());
             self.scroll_to_at(&sid, y as f32);
             return;
+        }
+        // Remember a press that lands on a link; the open decision is made on
+        // release (click = same link + same cell, so drags still select).
+        self.pressed_link = self
+            .link_under_cursor()
+            .map(|(sid, id, _, row, col)| (sid, id, row, col));
+        if let Some((sid, ..)) = &self.pressed_link {
+            // In a mouse-reporting pane this press was claimed via the open
+            // modifier — consume it so the app doesn't also react to it.
+            if self.renderer.pane_modes(sid).mouse_reporting {
+                return;
+            }
         }
         // Mouse-aware app (vim :set mouse=a, htop): forward the click instead
         // of selecting — unless Shift is held, the universal local-selection
@@ -2321,6 +2365,29 @@ impl RunState {
             }
         }
         None
+    }
+
+    /// The platform's link-open modifier: Cmd on macOS, Ctrl elsewhere. Used
+    /// only inside mouse-reporting panes, where plain clicks belong to the app.
+    fn open_modifier_held(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.modifiers.super_key()
+        } else {
+            self.modifiers.control_key()
+        }
+    }
+
+    /// The link under the pointer, when opening/hovering is eligible: always
+    /// at a plain prompt; only with the open-modifier inside mouse-reporting
+    /// panes (there, plain clicks belong to the app).
+    fn link_under_cursor(&self) -> Option<(SessionId, u32, String, u16, u16)> {
+        let (x, y) = self.cursor;
+        let (sid, row, col) = self.pixel_to_cell(x, y)?;
+        if self.renderer.pane_modes(&sid).mouse_reporting && !self.open_modifier_held() {
+            return None;
+        }
+        let (id, url) = self.renderer.link_at(&sid, row, col)?;
+        Some((sid, id, url.to_string(), row, col))
     }
 
     /// Begin a selection at a pane-body point; click count picks the mode
@@ -2918,6 +2985,13 @@ fn step_selectable_row(rows: &[SettingsRowView], sel: usize, dir: i32) -> usize 
     if i < 0 || i >= n { sel } else { i as usize }
 }
 
+/// The one gate every link-open passes: http/https only, exact prefix. The
+/// matcher only produces these, but re-check here — this is the last line
+/// between untrusted terminal output and spawning an OS opener.
+fn url_is_openable(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
 /// The keyboard cheat-sheet shown by the Cmd+/ overlay. Keep in sync with
 /// [`RunState::handle_shortcut`].
 /// Prepare paste bytes. When `bracketed`, wrap the text in the bracketed-paste
@@ -3145,7 +3219,9 @@ fn encode_key(
 
 #[cfg(test)]
 mod tests {
-    use super::{BELL_FLASH_SECS, bell_flash_intensity, bracket_paste, encode_key};
+    use super::{
+        BELL_FLASH_SECS, bell_flash_intensity, bracket_paste, encode_key, url_is_openable,
+    };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
     fn enc(key: Key, mods: ModifiersState) -> Option<Vec<u8>> {
@@ -3293,5 +3369,18 @@ mod tests {
         // ESC[201~ is removed so the payload can't escape into command position.
         let got = bracket_paste("a\x1b[201~rm -rf /\n", true);
         assert_eq!(got, b"\x1b[200~arm -rf /\n\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn only_http_and_https_pass_the_open_guard() {
+        assert!(url_is_openable("http://example.com"));
+        assert!(url_is_openable("https://example.com/a?b#c"));
+        assert!(!url_is_openable("file:///etc/passwd"));
+        assert!(!url_is_openable("javascript:alert(1)"));
+        assert!(!url_is_openable("ftp://example.com"));
+        assert!(!url_is_openable("httpss://example.com"));
+        assert!(!url_is_openable(
+            "HTTP://example.com".trim_start_matches("HTTP")
+        ));
     }
 }
