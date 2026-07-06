@@ -3002,9 +3002,11 @@ fn step_selectable_row(rows: &[SettingsRowView], sel: usize, dir: i32) -> usize 
 
 /// The one gate every link-open passes: http/https only, exact prefix. The
 /// matcher only produces these, but re-check here — this is the last line
-/// between untrusted terminal output and spawning an OS opener.
+/// between untrusted terminal output and spawning an OS opener. Scheme check
+/// is case-insensitive per RFC 3986 to match the upstream matcher.
 fn url_is_openable(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
+    let head = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    head.starts_with("http://") || head.starts_with("https://")
 }
 
 /// The keyboard cheat-sheet shown by the Cmd+/ overlay. Keep in sync with
@@ -3394,8 +3396,7 @@ mod tests {
         assert!(!url_is_openable("javascript:alert(1)"));
         assert!(!url_is_openable("ftp://example.com"));
         assert!(!url_is_openable("httpss://example.com"));
-        assert!(!url_is_openable(
-            "HTTP://example.com".trim_start_matches("HTTP")
-        ));
+        assert!(url_is_openable("HTTP://EXAMPLE.COM"));
+        assert!(url_is_openable("HtTpS://example.com"));
     }
 }
