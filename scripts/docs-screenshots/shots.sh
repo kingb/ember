@@ -15,6 +15,12 @@ OUT="${3:?}"
 mkdir -p "$OUT"
 cd "$HOMEDIR/project/ember"
 
+# The demo prompt and the cd into the project live in the shell rc files, so
+# Ember must spawn a shell that reads them. Ember runs $SHELL, falling back to
+# /bin/sh which reads neither. Prefer zsh (its .zshrc), then bash, so the demo
+# renders identically on macOS (default zsh) and inside the Linux container.
+export SHELL="$(command -v zsh || command -v bash || echo "${SHELL:-/bin/sh}")"
+
 COMMON=(--width 1000 --height 620 --scale 2 --settle 900 --font-size 13 --ember-phase 1.6)
 
 shot() {
