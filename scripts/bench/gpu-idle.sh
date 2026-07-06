@@ -20,9 +20,29 @@ SETTLE=6
 WINDOW=30
 OUTDIR="$(mktemp -d)"
 
+# Hold the display awake for the whole run. A locked/sleeping screen occludes
+# the window, and Ember intentionally stops rendering when occluded — which
+# silently turns the benchmark into a measurement of nothing (learned the
+# hard way; see README).
+caffeinate -dimsu -w $$ &
+
+screen_locked() { # -> "locked" | "awake"
+  sudo -u "$REAL_USER" python3 -c "
+import Quartz
+d = Quartz.CGSessionCopyCurrentDictionary() or {}
+print('locked' if d.get('CGSSessionScreenIsLocked', 0) else 'awake')" 2>/dev/null || echo "unknown"
+}
+
 sample() { # name -> writes $OUTDIR/$name.txt
+  local lock_before lock_after
+  lock_before="$(screen_locked)"
   powermetrics --samplers gpu_power,tasks --show-process-gpu \
     -i 1000 -n "$WINDOW" > "$OUTDIR/$1.txt" 2>/dev/null
+  lock_after="$(screen_locked)"
+  echo "SCREEN $lock_before -> $lock_after" >> "$OUTDIR/$1.txt"
+  if [ "$lock_before" != "awake" ] || [ "$lock_after" != "awake" ]; then
+    echo "  !! $1: screen not awake for the full window ($lock_before -> $lock_after) — DISCARD this scenario"
+  fi
 }
 
 report() { # name

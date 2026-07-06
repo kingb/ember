@@ -46,3 +46,11 @@ default. Sparks are CPU-negligible; their real cost is GPU/display power,
 which is what `gpu-idle.sh` exists to measure. The sparks-slightly-lower
 reading is at the edge of cputime resolution; treat differences under ~0.2%
 as noise.
+
+GPU reference numbers are pending a valid run. The first attempt was
+discarded: the screen locked partway through, and a locked screen occludes
+the window — Ember intentionally stops rendering when occluded, so the run
+measured "Ember doing nothing," not "sparks are cheap." Two lessons now baked
+into `gpu-idle.sh`: it holds the display awake with `caffeinate`, and it
+stamps every scenario with the screen-lock state so a contaminated run
+identifies itself instead of masquerading as a good one.
