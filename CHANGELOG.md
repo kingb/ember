@@ -13,6 +13,9 @@ follow [Semantic Versioning](https://semver.org).
   immediately, no restart.
 - The Settings panel is organized into Appearance, Terminal, and Developer
   sections, and now also surfaces shell integration and Option-as-Meta.
+- Clickable URLs. Web links in terminal output are subtly underlined; click
+  one at the prompt to open it in your browser. Inside mouse-driven apps like
+  vim or tmux, hold Cmd (macOS) or Ctrl (Linux) and click.
 
 ### Changed
 
