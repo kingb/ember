@@ -240,6 +240,8 @@ struct PaneRender {
     /// per-frame render skip glyphon reshaping for panes that didn't change — the
     /// big CPU win when sparks drive 60fps redraws over an idle grid.
     dirty: bool,
+    /// Clickable-link spans for the current grid, rebuilt when `dirty`.
+    links: Vec<crate::grid_model::LinkSpan>,
 }
 
 /// What [`Renderer::render`] did with the frame — tells the app whether (and
@@ -324,6 +326,8 @@ pub struct Renderer {
     /// Tab the cursor is currently over, or `None`. Drives the hover highlight +
     /// the "✕" close affordance; also gates the close zone in [`Self::tab_hit`].
     hovered_tab: Option<usize>,
+    /// The link under the pointer, for the brighter underline: `(pane, link)`.
+    hovered_link: Option<(SessionId, u32)>,
     /// Glyph buffer for the tab strip.
     chrome: Buffer,
     /// Last-shaped tab-strip inputs; skips per-frame re-shaping.
@@ -548,6 +552,7 @@ impl Renderer {
             tabs: Vec::new(),
             tab_drag: None,
             hovered_tab: None,
+            hovered_link: None,
             chrome,
             tabs_cache: crate::paint::TabsCache::default(),
             close_buffer,
@@ -687,6 +692,7 @@ impl Renderer {
                 grid: GridModel::new(dims),
                 buffer,
                 dirty: true,
+                links: Vec::new(),
             },
         );
     }
@@ -888,6 +894,24 @@ impl Renderer {
             self.hovered_tab = hovered;
             self.window.request_redraw();
         }
+    }
+
+    /// Highlight (or clear) the hovered link; redraws on change.
+    pub fn set_hovered_link(&mut self, hovered: Option<(SessionId, u32)>) {
+        if self.hovered_link != hovered {
+            self.hovered_link = hovered;
+            self.window.request_redraw();
+        }
+    }
+
+    /// The link at a pane cell, if any: `(link id, url)`.
+    pub fn link_at(&self, session: &SessionId, row: u16, col: u16) -> Option<(u32, &str)> {
+        self.panes
+            .get(session)?
+            .links
+            .iter()
+            .find(|s| s.row == row && s.cols.contains(&col))
+            .map(|s| (s.link_id, s.url.as_str()))
     }
 
     /// Set/clear the Ctrl+Opt split drop-zone preview: `(hovered session,
@@ -1303,6 +1327,7 @@ impl Renderer {
                             cw,
                             family,
                         );
+                        p.links = p.grid.link_spans();
                         p.dirty = false;
                     }
                 }
@@ -1315,6 +1340,20 @@ impl Renderer {
                 if let Some(p) = self.panes.get(&vp.session) {
                     let focused = self.focused.as_ref() == Some(&vp.session);
                     grid_quads(&p.grid, vp.rect, cw, ch, sf, focused, split, &mut rects);
+                    let hovered_link = self
+                        .hovered_link
+                        .as_ref()
+                        .filter(|(sid, _)| sid == &vp.session)
+                        .map(|(_, id)| *id);
+                    crate::paint::link_quads(
+                        &p.links,
+                        hovered_link,
+                        (vp.rect.x as f32, vp.rect.y as f32),
+                        cw,
+                        ch,
+                        sf,
+                        &mut rects,
+                    );
                     if let Some((sid, sel)) = &self.selection {
                         if *sid == vp.session {
                             selection_quads(&p.grid, sel, vp.rect, cw, ch, sf, &mut rects);

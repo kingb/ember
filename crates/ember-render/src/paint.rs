@@ -434,6 +434,32 @@ pub(crate) fn grid_quads(
     }
 }
 
+/// Underline quads for detected links: a dimmed 1px underline for every link
+/// span (always visible — the affordance is not a hidden mode), and a
+/// brighter 2px one for the hovered link. `origin` is the pane's inner
+/// top-left in logical px.
+pub(crate) fn link_quads(
+    spans: &[crate::grid_model::LinkSpan],
+    hovered: Option<u32>,
+    origin: (f32, f32),
+    cw: f32,
+    ch: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) {
+    for s in spans {
+        let hovered = hovered == Some(s.link_id);
+        let x = origin.0 + s.cols.start as f32 * cw;
+        let w = (s.cols.end - s.cols.start) as f32 * cw;
+        let (y, h, color, alpha) = if hovered {
+            (origin.1 + (s.row + 1) as f32 * ch - 2.0, 2.0, ACCENT, 0.9)
+        } else {
+            (origin.1 + (s.row + 1) as f32 * ch - 2.0, 1.0, FG, 0.35)
+        };
+        out.push((scaled(x, y, w, h, sf), lin_rgba(color, alpha)));
+    }
+}
+
 /// Shell-integration gutter mark colors (exit 0 / non-zero / running / manual).
 const GUTTER_OK: Rgb = Rgb::new(0x3f, 0xb9, 0x50);
 const GUTTER_FAIL: Rgb = Rgb::new(0xe5, 0x48, 0x4d);
@@ -1610,5 +1636,37 @@ mod tests {
         assert!(cache.is_dirty(&spans(&[("tab 1", 1), ("+", 2)]), lw, 9f32.to_bits()));
         // Tab count change → dirty.
         assert!(cache.is_dirty(&spans(&[("tab 1", 1)]), lw, cw));
+    }
+
+    use super::link_quads;
+
+    #[test]
+    fn link_quads_places_underlines_and_brightens_the_hovered_link() {
+        use crate::grid_model::{LinkSource, LinkSpan};
+        let spans = vec![
+            LinkSpan {
+                link_id: 0,
+                row: 1,
+                cols: 2..6,
+                url: "https://a.io".into(),
+                source: LinkSource::Detected,
+            },
+            LinkSpan {
+                link_id: 1,
+                row: 3,
+                cols: 0..4,
+                url: "https://b.io".into(),
+                source: LinkSource::Detected,
+            },
+        ];
+        let mut out = Vec::new();
+        link_quads(&spans, Some(1), (10.0, 20.0), 8.0, 16.0, 1.0, &mut out);
+        assert_eq!(out.len(), 2);
+        // Span 0: x = 10 + 2*8, y = 20 + (1+1)*16 - 2, w = 4*8, h = 1.
+        assert_eq!(out[0].0, [26.0, 50.0, 32.0, 1.0]);
+        // Span 1 (hovered): thicker underline, h = 2.
+        assert_eq!(out[1].0, [10.0, 82.0, 32.0, 2.0]);
+        // Hovered is more opaque than idle.
+        assert!(out[1].1[3] > out[0].1[3]);
     }
 }
