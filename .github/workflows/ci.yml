@@ -22,12 +22,17 @@ jobs:
       fail-fast: false
       matrix:
         # Explicit LTS + arch pins, not ubuntu-latest — a moving target that
-        # silently changes underlying OS version. ubuntu-26.04 is GitHub's
-        # public-preview image as of 2026-05; some software there can still
-        # be unstable, so fail-fast stays false to avoid masking real
-        # failures on the other runners if it flakes.
+        # silently changes underlying OS version. ubuntu-22.04 is the oldest
+        # supported LTS (glibc 2.35): release bottles are built against its
+        # glibc so they run on every newer release, and this pin keeps the
+        # build honest on that floor. ubuntu-26.04 is GitHub's public-preview
+        # image as of 2026-05; some software there can still be unstable, so
+        # fail-fast stays false to avoid masking real failures on the other
+        # runners if it flakes.
         os:
           [
+            ubuntu-22.04,
+            ubuntu-22.04-arm,
             ubuntu-24.04,
             ubuntu-24.04-arm,
             ubuntu-26.04,

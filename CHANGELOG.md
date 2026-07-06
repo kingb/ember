@@ -6,6 +6,17 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-06
+
+### Fixed
+
+- Ember now launches on Ubuntu 22.04. The 0.2.0 Linux builds were made
+  against a newer glibc, which made Homebrew interpose its own C library on
+  22.04 hosts; the GPU drivers then failed to load and the app never opened
+  a window. Linux builds are now made against Ubuntu 22.04's glibc, so one
+  build runs cleanly on 22.04, 24.04, and 26.04, and Ubuntu 22.04 is part
+  of continuous testing from now on.
+
 ## [0.2.0] - 2026-07-06
 
 ### Added
@@ -100,6 +111,7 @@ this first release:
   created owner-only, use no fixed or predictable paths, and return
   JSON-encoded errors rather than leaking internal state.
 
-[Unreleased]: https://github.com/kingb/ember/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kingb/ember/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/kingb/ember/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/kingb/ember/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kingb/ember/releases/tag/v0.1.0
