@@ -1,5 +1,6 @@
 # Ember
 
+[![CI](https://github.com/kingb/ember/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kingb/ember/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/kingb/ember?color=ff7a30&label=release)](https://github.com/kingb/ember/releases)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE-MIT)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux-555)](https://emberterm.com/download)
