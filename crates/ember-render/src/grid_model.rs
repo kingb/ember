@@ -245,6 +245,119 @@ impl GridModel {
     }
 }
 
+/// Where a link came from. `Explicit` (OSC 8) is added in the follow-up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LinkSource {
+    /// Matched by the plain-text URL scanner.
+    Detected,
+}
+
+/// One row's segment of a clickable link. Multi-row (soft-wrapped) URLs
+/// produce one span per touched row, sharing a `link_id`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkSpan {
+    pub link_id: u32,
+    pub row: u16,
+    pub cols: std::ops::Range<u16>,
+    pub url: String,
+    pub source: LinkSource,
+}
+
+impl GridModel {
+    /// Detect clickable URLs in the visible grid. Soft-wrapped rows (the
+    /// `wrapped` flag on a row's last cell) are joined into one logical line
+    /// before scanning, so long URLs that wrap still match; a char→(row,col)
+    /// map converts match ranges back to grid columns (wide cells make
+    /// string index ≠ column). Concealed (SGR 8) cells contribute blanks —
+    /// hidden text is not a link.
+    pub fn link_spans(&self) -> Vec<LinkSpan> {
+        let cols = self.dims.columns as usize;
+        let lines = self.dims.screen_lines;
+        let mut out = Vec::new();
+        let mut link_id = 0u32;
+        let mut row = 0u16;
+        while row < lines {
+            // Join this row with following rows while the wrapped flag is set.
+            let mut text = String::new();
+            let mut map: Vec<(u16, u16)> = Vec::new(); // char index -> (row, col)
+            let mut r = row;
+            loop {
+                let start = r as usize * cols;
+                let end = (start + cols).min(self.cells.len());
+                let mut wrapped = false;
+                for (i, cell) in self.cells[start..end].iter().enumerate() {
+                    let col = i as u16;
+                    let hidden = self
+                        .styles
+                        .get(&cell.style)
+                        .is_some_and(|s| s.attrs.contains(ember_core::Attrs::HIDDEN));
+                    match (&cell.content, hidden) {
+                        (CellContent::WideSpacer, _) => {} // leader owns the glyph
+                        (CellContent::Char(ch), false) => {
+                            text.push(*ch);
+                            map.push((r, col));
+                        }
+                        (CellContent::Cluster(s), false) => {
+                            // A cluster is one grid cell; its first char stands
+                            // in for URL scanning (URLs are ASCII anyway).
+                            text.push(s.chars().next().unwrap_or(' '));
+                            map.push((r, col));
+                        }
+                        _ => {
+                            text.push(' ');
+                            map.push((r, col));
+                        }
+                    }
+                    if i + 1 == end - start {
+                        wrapped = cell.wrapped;
+                    }
+                }
+                if wrapped && r + 1 < lines {
+                    r += 1;
+                } else {
+                    break;
+                }
+            }
+
+            for m in ember_core::links::find_urls(&text) {
+                let url = text[m.bytes.clone()].to_string();
+                // Group consecutive chars by row into per-row col ranges.
+                let mut seg: Option<(u16, u16, u16)> = None; // (row, first, last)
+                for ci in m.chars.clone() {
+                    let (cr, cc) = map[ci];
+                    match seg {
+                        Some((sr, first, _)) if sr == cr => seg = Some((sr, first, cc)),
+                        Some((sr, first, last)) => {
+                            out.push(LinkSpan {
+                                link_id,
+                                row: sr,
+                                cols: first..last + 1,
+                                url: url.clone(),
+                                source: LinkSource::Detected,
+                            });
+                            seg = Some((cr, cc, cc));
+                        }
+                        None => seg = Some((cr, cc, cc)),
+                    }
+                }
+                if let Some((sr, first, last)) = seg {
+                    out.push(LinkSpan {
+                        link_id,
+                        row: sr,
+                        cols: first..last + 1,
+                        url,
+                        source: LinkSource::Detected,
+                    });
+                }
+                link_id += 1;
+            }
+            row = r + 1;
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +547,107 @@ mod tests {
         // A reset clears prior content.
         g.apply(delta_with(2, dims, vec![patch(0, 0, 'z')], true));
         assert_eq!(g.row_text(0).trim_end(), "z");
+    }
+
+    /// Write `text` into `g` starting at (row, col), one Char cell per char.
+    fn put(g: &mut GridModel, epoch: u64, dims: GridDims, row: u16, col: u16, text: &str) {
+        let cells = text
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| patch(row, col + i as u16, ch))
+            .collect();
+        g.apply(delta_with(epoch, dims, cells, false));
+    }
+
+    #[test]
+    fn link_spans_finds_a_url_on_one_row() {
+        let dims = GridDims::new(40, 3);
+        let mut g = GridModel::new(dims);
+        g.apply(delta_with(1, dims, vec![], true));
+        put(&mut g, 2, dims, 1, 3, "see https://a.io now");
+        let spans = g.link_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].row, 1);
+        assert_eq!(spans[0].cols, 7..19); // "https://a.io" starts at col 3+4
+        assert_eq!(spans[0].url, "https://a.io");
+    }
+
+    #[test]
+    fn link_spans_joins_soft_wrapped_rows() {
+        let dims = GridDims::new(10, 3);
+        let mut g = GridModel::new(dims);
+        g.apply(delta_with(1, dims, vec![], true));
+        // Row 0: "https://ex" wrapped into row 1: "ample.com/" wrapped into row 2: "path x"
+        put(&mut g, 2, dims, 0, 0, "https://ex");
+        put(&mut g, 3, dims, 1, 0, "ample.com/");
+        put(&mut g, 4, dims, 2, 0, "path x");
+        // Set the wrapped flag on the LAST cell of rows 0 and 1.
+        let mut wrap0 = patch(0, 9, 'x');
+        wrap0.cell = NeutralCell {
+            wrapped: true,
+            ..NeutralCell::new(CellContent::Char('x'), StyleId(0))
+        };
+        let mut wrap1 = patch(1, 9, '/');
+        wrap1.cell = NeutralCell {
+            wrapped: true,
+            ..NeutralCell::new(CellContent::Char('/'), StyleId(0))
+        };
+        g.apply(delta_with(5, dims, vec![wrap0, wrap1], false));
+        let spans = g.link_spans();
+        assert_eq!(spans.len(), 3, "one segment per touched row");
+        let id = spans[0].link_id;
+        assert!(spans.iter().all(|s| s.link_id == id));
+        assert!(spans.iter().all(|s| s.url == "https://example.com/path"));
+        assert_eq!((spans[0].row, spans[0].cols.clone()), (0, 0..10));
+        assert_eq!((spans[1].row, spans[1].cols.clone()), (1, 0..10));
+        assert_eq!((spans[2].row, spans[2].cols.clone()), (2, 0..4));
+    }
+
+    #[test]
+    fn link_spans_maps_columns_past_wide_cells() {
+        let dims = GridDims::new(30, 1);
+        let mut g = GridModel::new(dims);
+        g.apply(delta_with(1, dims, vec![], true));
+        // Col 0: wide 你 (leader) + col 1: spacer; URL starts at col 3.
+        let mut wide = patch(0, 0, '你');
+        wide.cell = NeutralCell {
+            wide: true,
+            ..NeutralCell::new(CellContent::Char('你'), StyleId(0))
+        };
+        let spacer = CellPatch {
+            row: 0,
+            col: 1,
+            cell: NeutralCell::new(CellContent::WideSpacer, StyleId(0)),
+        };
+        g.apply(delta_with(2, dims, vec![wide, spacer], false));
+        put(&mut g, 3, dims, 0, 3, "https://a.io");
+        let spans = g.link_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].cols, 3..15, "columns, not char indices");
+    }
+
+    #[test]
+    fn link_spans_skips_concealed_text() {
+        use ember_core::{Attrs as CellAttrs, Style};
+        let dims = GridDims::new(30, 1);
+        let mut g = GridModel::new(dims);
+        let hidden = Style {
+            attrs: CellAttrs::HIDDEN,
+            ..Style::default()
+        };
+        let mut d = delta_with(1, dims, vec![], true);
+        d.new_styles = vec![(StyleId(7), hidden)];
+        g.apply(d);
+        let cells = "https://a.io"
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| CellPatch {
+                row: 0,
+                col: i as u16,
+                cell: NeutralCell::new(CellContent::Char(ch), StyleId(7)),
+            })
+            .collect();
+        g.apply(delta_with(2, dims, cells, false));
+        assert!(g.link_spans().is_empty(), "hidden text is not a link");
     }
 }

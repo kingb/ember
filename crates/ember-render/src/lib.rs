@@ -16,7 +16,7 @@ pub mod renderer;
 pub mod selection;
 mod sprite;
 
-pub use grid_model::GridModel;
+pub use grid_model::{GridModel, LinkSource, LinkSpan};
 pub use headless::CaptureError;
 pub use renderer::{
     AboutInfo, BackdropParams, CELL_HEIGHT, CELL_WIDTH, ConfirmView, ImageFit, PaneModes,
