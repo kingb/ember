@@ -6,6 +6,26 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Font settings, live from the Settings panel: pick the font family from a
+  curated monospace list and set the size (6 to 48pt). Both apply
+  immediately, no restart.
+- The Settings panel is organized into Appearance, Terminal, and Developer
+  sections, and now also surfaces shell integration and Option-as-Meta.
+
+### Changed
+
+- The Settings panel re-shapes its text only when something actually
+  changes, not on every frame, keeping the app responsive while it is open.
+
+### Fixed
+
+- On Linux, the keyboard shortcuts overlay now shows Super instead of Cmd,
+  matching the keys you actually press.
+- The Settings panel no longer misaligns its value column at very large or
+  very small terminal font sizes.
+
 ## [0.1.0] - 2026-07-04
 
 The first release. Ember is a GPU-accelerated terminal built around a
