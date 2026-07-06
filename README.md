@@ -1,18 +1,48 @@
 # Ember
 
+[![Release](https://img.shields.io/github/v/release/kingb/ember?color=ff7a30&label=release)](https://github.com/kingb/ember/releases)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE-MIT)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux-555)](https://emberterm.com/download)
+
 Ember started with a simple question, **where's iTerm2 for Linux?**, and grew into
 its own thing: a native terminal emulator, built from scratch in Rust for macOS and
 Linux. Not a port of the macOS source, not an extension of an existing terminal, but
 a daily-driver replacement in its own right.
 
-- **Crate / binary:** `ember-term`
-- **Status:** v0.1.0 released. macOS and Linux, both daily-driver targets.
-- **Design doc:** [`docs/design/2026-06-27-ember-design.md`](docs/design/2026-06-27-ember-design.md)
+**[Website](https://emberterm.com)** ·
+**[Docs](https://emberterm.com/docs)** ·
+**[Download](https://emberterm.com/download)** ·
+**[Changelog](CHANGELOG.md)**
+
+![Ember rendering a shell with drifting ember sparks](docs/assets/ember.gif)
+
+## Install
+
+```sh
+brew install --cask kingb/ember/ember    # macOS
+brew install kingb/ember/ember           # Linux
+```
+
+Or grab a signed, notarized build from the
+[releases page](https://github.com/kingb/ember/releases), or
+[build from source](BUILDING.md).
+
+## Highlights
+
+- **GPU-rendered**, wgpu end to end: text, chrome, and effects in one pipeline.
+- **Splits and tabs** with iTerm2-familiar keys, drop-zone splitting, and
+  drag-to-reorder tabs.
+- **Shell integration** out of the box: exit-status marks in the gutter and
+  jump-to-previous-command, no shell config required.
+- **A campfire, if you want one**: drifting ember sparks over a warm backdrop,
+  off by default, live-tunable in Settings.
+- **One codebase, two platforms**: the same terminal on macOS and Linux.
 
 ## Architecture at a glance
 
 Layered, single-process Rust workspace. The daemon/multi-process split is deferred, but
-its boundary is front-loaded.
+its boundary is front-loaded. Full picture in the
+[design doc](docs/design/2026-06-27-ember-design.md).
 
 | Crate | Responsibility |
 |---|---|
@@ -27,14 +57,18 @@ own types. That's what makes `SessionBackend` genuinely swappable: any backend
 (local PTY today, tmux control mode or an out-of-process bus later) just has to
 translate into `NeutralCell`/`GridDelta`, and every other crate keeps working
 unchanged. Two extension seams overall: **`SessionBackend`** (tmux / daemon /
-bus) and **`PlatformBackend`** (macOS and Linux). See the design doc for the
-full picture, including the projection-based render seam, the two-lane event
-sink, and the v1 → phase-2 → phase-3 roadmap.
+bus) and **`PlatformBackend`** (macOS and Linux).
 
 ## Stack
 
 `winit` · `wgpu` · `glyphon`/`cosmic-text` · `alacritty_terminal` (swappable) ·
 `portable-pty`.
+
+## Building & releasing
+
+Everyday development is `cargo build` / `cargo run -p ember-app`. Packaging,
+signing, notarization, and the Homebrew release flow live in
+[BUILDING.md](BUILDING.md).
 
 ## Thanks
 
@@ -45,56 +79,14 @@ emulators out there. Ember wouldn't exist without it. If you haven't tried
 Alacritty itself, go give it a look. It's excellent. Thank you to its
 maintainers and contributors.
 
-## Packaging (macOS)
+Beyond that dependency, Ember owes a debt of inspiration to the terminals that
+came before it. [iTerm2](https://iterm2.com) set the bar for the splits and
+shell integration Ember treats as a baseline; [Ghostty](https://ghostty.org)
+reshaped what a modern GPU terminal should feel like. Building Ember gave me
+real appreciation for how much careful work a good terminal takes, and for the
+people who did it first. If Ember isn't your fit, one of them likely is.
 
-Build a double-clickable `Ember.app`:
+## License
 
-```sh
-scripts/bundle-macos.sh              # release, ad-hoc signed → target/Ember.app
-scripts/bundle-macos.sh --debug      # debug build (faster iteration)
-CODESIGN_ID="Developer ID Application: …" scripts/bundle-macos.sh   # signed
-```
-
-Then `open target/Ember.app` to launch, or install to /Applications:
-
-```sh
-scripts/bundle-macos.sh --install   # clean replace (rm -rf + ditto)
-```
-
-Don't `cp -r` over an existing `/Applications/Ember.app`: copying *into* the
-old bundle merges files and leaves a stale code signature, which macOS refuses
-with "the application can't be opened." The `--install` flag removes the old one
-first.
-
-### Distributing via Homebrew
-
-The cask lives in [`Casks/ember.rb`](Casks/ember.rb) and installs from a GitHub
-release artifact. To cut a release:
-
-```sh
-scripts/release-macos.sh            # build + zip (+ --dmg), stamp the cask's
-                                    # version + sha256 from the built artifact
-gh release create v0.1.0 target/dist/Ember-0.1.0.zip \
-    --title "Ember 0.1.0" --generate-notes
-```
-
-Upload **the exact zip `release-macos.sh` just built** (the `ditto` zip embeds
-timestamps, so re-packaging changes the hash). Then publish the cask through a
-[tap](https://docs.brew.sh/Taps), a repo named `homebrew-ember`:
-
-```sh
-# one-time: create github.com/kingb/homebrew-ember with a Casks/ dir
-cp Casks/ember.rb ../homebrew-ember/Casks/ && (cd ../homebrew-ember && git commit -am "ember 0.1.0" && git push)
-```
-
-Users install with:
-
-```sh
-brew install --cask kingb/ember/ember     # brew maps kingb/ember → homebrew-ember
-```
-
-The [tap](https://github.com/kingb/homebrew-ember) is published, and releases are
-signed with a Developer ID and notarized by Apple, so the app launches without a
-Gatekeeper warning. `scripts/release-macos.sh` signs and notarizes when
-`CODESIGN_ID` and `NOTARY_PROFILE` are set.
-
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option.
