@@ -706,22 +706,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     _ => 0,
                 });
                 if button == MouseButton::Left {
-                    state.tab_drag = None;
-                    state.renderer.set_tab_drag(None);
-                    state.selecting = false;
-                    state.scrollbar_drag = None;
-                    state.divider_drag = None;
-                    if let Some((psid, pid, prow, pcol)) = state.pressed_link.take() {
-                        if let Some((sid, id, url, row, col)) = state.link_under_cursor() {
-                            if sid == psid && id == pid && row == prow && col == pcol {
-                                if url_is_openable(&url) {
-                                    state.platform.open_path(&url);
-                                } else {
-                                    eprintln!("[ember] refusing to open non-http(s) url");
-                                }
-                            }
-                        }
-                    }
+                    state.left_release();
                 }
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
@@ -1336,8 +1321,14 @@ impl RunState {
                 let _ = reply.send(resp);
             }
             ControlMsg::Click(x, y) => {
+                // Synthesize a full click: press half (selection/tab/scrollbar
+                // hit-testing, arms `pressed_link`) then release half (drag
+                // teardown + the link click-to-open decision) — a bare
+                // `left_click()` can never reach `open_path`, since that only
+                // fires on release.
                 self.cursor = (x, y);
                 self.left_click();
+                self.left_release();
             }
             ControlMsg::About => self.toggle_about(),
             ControlMsg::Settings => self.toggle_settings(),
@@ -1973,6 +1964,30 @@ impl RunState {
 
     /// Handle a left click at the current cursor position: dismiss an open overlay,
     /// else hit-test the tab strip (switch tab / close a tab / open a new tab).
+    /// Mouse-up half of a left click: drag/selection teardown, plus the
+    /// click-to-open decision for a link (same link + same cell as the press,
+    /// so drags still select instead of opening). Split out of the winit
+    /// `MouseInput { state: Released, .. }` handler so the control socket's
+    /// `ctl click` can synthesize a full press+release pair.
+    fn left_release(&mut self) {
+        self.tab_drag = None;
+        self.renderer.set_tab_drag(None);
+        self.selecting = false;
+        self.scrollbar_drag = None;
+        self.divider_drag = None;
+        if let Some((psid, pid, prow, pcol)) = self.pressed_link.take() {
+            if let Some((sid, id, url, row, col)) = self.link_under_cursor() {
+                if sid == psid && id == pid && row == prow && col == pcol {
+                    if url_is_openable(&url) {
+                        self.platform.open_path(&url);
+                    } else {
+                        eprintln!("[ember] refusing to open non-http(s) url");
+                    }
+                }
+            }
+        }
+    }
+
     fn left_click(&mut self) {
         // A click on an About-overlay link button (Docs/GitHub) opens the URL
         // rather than dismissing the overlay.

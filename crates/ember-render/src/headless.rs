@@ -22,8 +22,8 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help, build_settings,
-    build_tabs, grid_quads, measure_cell_width, push_backdrop, scrollbar, selection_quads,
-    shape_grid, spark_quads, split_preview,
+    build_tabs, grid_quads, link_quads, measure_cell_width, push_backdrop, scrollbar,
+    selection_quads, shape_grid, spark_quads, split_preview,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
@@ -367,6 +367,19 @@ pub fn capture_reusing(
                 sf,
                 pane.focused,
                 split,
+                &mut rects,
+            );
+            // Link underlines: headless capture has no hover state (no live cursor
+            // to hit-test), so always pass `None` — mirrors the live renderer's
+            // `link_quads` call (renderer.rs) but without a hovered link.
+            let link_spans = pane.grid.link_spans();
+            link_quads(
+                &link_spans,
+                None,
+                (pane.rect.x as f32, pane.rect.y as f32),
+                cw,
+                line_height,
+                sf,
                 &mut rects,
             );
             if let Some(sel) = &pane.selection {
