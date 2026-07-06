@@ -89,7 +89,10 @@ pub struct Background {
 impl Default for Background {
     fn default() -> Self {
         Self {
-            gradient: false,
+            // The warm gradient is Ember's signature look and draws statically
+            // (no continuous redraw), so it's on out of the box. The sparks
+            // animation stays opt-in: it forces a redraw loop and costs power.
+            gradient: true,
             scrim: 0.45,
             ember_sparks: false,
             ember_density: 1.0,
@@ -107,7 +110,9 @@ mod tests {
     #[test]
     fn defaults_are_conservative() {
         let c = Config::default();
-        assert!(!c.background.gradient);
+        // Conservative on *power*: the gradient is on (static draw, free) but
+        // anything that forces a continuous redraw loop starts off.
+        assert!(c.background.gradient);
         assert!(!c.background.ember_sparks);
         assert_eq!(c.background.ember_density, 1.0);
         assert_eq!(c.background.ember_fps, 30);
@@ -119,7 +124,7 @@ mod tests {
         // Only one key set; the rest must fall back to defaults.
         let c: Config = toml::from_str("[background]\nember_sparks = true\n").unwrap();
         assert!(c.background.ember_sparks);
-        assert!(!c.background.gradient);
+        assert!(c.background.gradient);
         assert_eq!(c.background.scrim, 0.45);
         assert_eq!(c.background.image, None);
         assert_eq!(c.background.image_fit, "cover");

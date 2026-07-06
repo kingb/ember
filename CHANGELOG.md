@@ -16,6 +16,10 @@ follow [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- The warm gradient backdrop is now on by default, so a fresh install opens
+  with Ember's signature look. It draws statically and costs nothing while
+  idle; the ember sparks animation stays opt-in. Turn the gradient off in
+  Settings if you prefer a flat background.
 - The Settings panel re-shapes its text only when something actually
   changes, not on every frame, keeping the app responsive while it is open.
 
