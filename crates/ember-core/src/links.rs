@@ -113,6 +113,20 @@ pub fn find_urls(line: &str) -> Vec<UrlMatch> {
         // 4. Trim the tail: sentence punctuation, and closing brackets that
         //    close nothing (depth rule). Never trim into the scheme.
         let body_start = start + scheme_len;
+
+        // Compute bracket/paren balances once in a forward pass.
+        let mut paren_balance = 0i32;
+        let mut bracket_balance = 0i32;
+        for &(_, c) in &chars[body_start..j] {
+            match c {
+                '(' => paren_balance += 1,
+                ')' => paren_balance -= 1,
+                '[' => bracket_balance += 1,
+                ']' => bracket_balance -= 1,
+                _ => {}
+            }
+        }
+
         loop {
             if j <= body_start {
                 break;
@@ -122,20 +136,14 @@ pub fn find_urls(line: &str) -> Vec<UrlMatch> {
                 j -= 1;
                 continue;
             }
-            if last == ')' || last == ']' {
-                let (open, close) = if last == ')' { ('(', ')') } else { ('[', ']') };
-                let mut depth = 0i32;
-                for &(_, c) in &chars[body_start..j] {
-                    if c == open {
-                        depth += 1;
-                    } else if c == close {
-                        depth -= 1;
-                    }
-                }
-                if depth < 0 {
-                    j -= 1;
-                    continue;
-                }
+            if last == ')' && paren_balance < 0 {
+                j -= 1;
+                paren_balance += 1;
+                continue;
+            } else if last == ']' && bracket_balance < 0 {
+                j -= 1;
+                bracket_balance += 1;
+                continue;
             }
             break;
         }
@@ -347,5 +355,14 @@ mod tests {
         let m = &find_urls(line)[0];
         assert_eq!(&line[m.bytes.clone()], "https://a.io");
         assert_eq!(m.chars, 3..15);
+    }
+
+    // --- performance --------------------------------------------------------
+    #[test]
+    fn adversarial_trailing_paren_run_is_fast_and_correct() {
+        // Quadratic trimming would make this take ~minutes in a debug build;
+        // the linear scanner handles it instantly.
+        let line = format!("https://a.io{}", ")".repeat(50_000));
+        assert_eq!(urls(&line), ["https://a.io"]);
     }
 }
