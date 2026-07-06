@@ -33,13 +33,22 @@ sudo scripts/bench/gpu-idle.sh
 
 ## Reference results
 
-2026-07-06, MacBook (Apple Silicon), macOS 26, idle CPU (`idle-cpu.sh`):
+**v0.2.0** (release binary, 2026-07-06, MacBook Apple Silicon, macOS 26,
+quiet machine), idle CPU (`idle-cpu.sh`) — published in the release body:
 
 | Scenario | Pass 1 | Pass 2 |
 |---|---|---|
-| flat (gradient off, sparks off) | 0.40% | 0.43% |
-| gradient (on, sparks off) | 0.40% | 0.43% |
-| sparks (gradient + sparks) | 0.27% | 0.27% |
+| flat (gradient off, sparks off) | 0.90% | 1.00% |
+| gradient (on, sparks off) | 1.03% | 1.00% |
+| sparks (gradient + sparks) | 0.60% | 0.77% |
+
+An earlier dev-build run on the same machine measured 0.27–0.43% across the
+same scenarios: absolute numbers move with machine state, which is why each
+table records both passes and its conditions. Two findings have held across
+every run so far: gradient == flat, and sparks consistently *below* the
+un-animated scenarios (the capped 30fps cadence appears to batch wakeups
+better than the idle event loop's scattered ones — unexplained, worth a
+profile someday).
 
 Gradient is identical to flat (it draws statically), which is why it's on by
 default. Sparks are CPU-negligible; their real cost is GPU/display power,
