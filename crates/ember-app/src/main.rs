@@ -2940,34 +2940,49 @@ fn bracket_paste(text: &str, bracketed: bool) -> Vec<u8> {
 /// **section header** (rendered as an accent heading by `build_help`); the rest are
 /// `(key, description)`. Keep in sync with [`RunState::handle_shortcut`].
 pub(crate) fn help_lines() -> Vec<(String, String)> {
-    [
-        ("", "PANES"),
-        ("Cmd+D", "Split right (side by side)"),
-        ("Cmd+Shift+D", "Split down (stacked)"),
-        ("Ctrl+Opt+Click", "Split by drop zone (drag to preview)"),
-        ("Cmd+W", "Close pane"),
-        ("Click pane", "Focus it"),
-        ("Cmd+Arrows", "Focus pane"),
-        ("", "TABS"),
-        ("Cmd+T", "New tab"),
-        ("Cmd+Shift+Arrows", "Switch tab"),
-        ("Cmd+1..9", "Jump to tab"),
-        ("Drag / Double-click", "Reorder / rename tab"),
-        ("", "SELECTION & CLIPBOARD"),
-        ("Drag / 2×/3× click", "Select text / word / line"),
-        ("Cmd+C / Cmd+V", "Copy / paste"),
-        ("", "SCROLLBACK"),
-        ("Wheel / Shift+PgUp/Dn", "Scroll history"),
-        ("Shift+Home/End", "Scroll to top / bottom"),
-        ("", "SHELL"),
-        ("Cmd+[ / Cmd+]", "Jump to prev / next command"),
-        ("", "APP"),
-        ("Cmd+,", "Settings"),
-        ("Cmd+/", "Show this help"),
+    // The primary modifier and the option key differ by platform. The keymap
+    // matches winit super_key()/alt_key() with no target_os gating, so on Linux
+    // the real keys are Super and Alt, not Cmd and Opt. Label them accordingly
+    // so the cheat sheet is correct on both.
+    let m = if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Super"
+    };
+    let o = if cfg!(target_os = "macos") {
+        "Opt"
+    } else {
+        "Alt"
+    };
+    let r = |k: &str, d: &str| (k.to_string(), d.to_string());
+    vec![
+        r("", "PANES"),
+        r(&format!("{m}+D"), "Split right (side by side)"),
+        r(&format!("{m}+Shift+D"), "Split down (stacked)"),
+        r(
+            &format!("Ctrl+{o}+Click"),
+            "Split by drop zone (drag to preview)",
+        ),
+        r(&format!("{m}+W"), "Close pane"),
+        r("Click pane", "Focus it"),
+        r(&format!("{m}+Arrows"), "Focus pane"),
+        r("", "TABS"),
+        r(&format!("{m}+T"), "New tab"),
+        r(&format!("{m}+Shift+Arrows"), "Switch tab"),
+        r(&format!("{m}+1..9"), "Jump to tab"),
+        r("Drag / Double-click", "Reorder / rename tab"),
+        r("", "SELECTION & CLIPBOARD"),
+        r("Drag / 2×/3× click", "Select text / word / line"),
+        r(&format!("{m}+C / {m}+V"), "Copy / paste"),
+        r("", "SCROLLBACK"),
+        r("Wheel / Shift+PgUp/Dn", "Scroll history"),
+        r("Shift+Home/End", "Scroll to top / bottom"),
+        r("", "SHELL"),
+        r(&format!("{m}+[ / {m}+]"), "Jump to prev / next command"),
+        r("", "APP"),
+        r(&format!("{m}+,"), "Settings"),
+        r(&format!("{m}+/"), "Show this help"),
     ]
-    .iter()
-    .map(|(k, d)| (k.to_string(), d.to_string()))
-    .collect()
 }
 
 /// Parse a key token (`enter`, `tab`, `arrowleft`/`left`, or a single char) into a
