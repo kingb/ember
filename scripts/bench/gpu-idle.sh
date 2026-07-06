@@ -26,11 +26,12 @@ OUTDIR="$(mktemp -d)"
 # hard way; see README).
 caffeinate -dimsu -w $$ &
 
-screen_locked() { # -> "locked" | "awake"
-  sudo -u "$REAL_USER" python3 -c "
-import Quartz
-d = Quartz.CGSessionCopyCurrentDictionary() or {}
-print('locked' if d.get('CGSSessionScreenIsLocked', 0) else 'awake')" 2>/dev/null || echo "unknown"
+screen_locked() { # -> "locked" | "awake" | "unknown"
+  case "$(ioreg -n Root -d1 -a 2>/dev/null | grep -A1 IOConsoleLocked | tail -1)" in
+    *true*)  echo "locked" ;;
+    *false*) echo "awake" ;;
+    *)       echo "unknown" ;;
+  esac
 }
 
 sample() { # name -> writes $OUTDIR/$name.txt
