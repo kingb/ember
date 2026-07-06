@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-06
+
 ### Added
 
 - Font settings, live from the Settings panel: pick the font family from a
@@ -98,5 +100,6 @@ this first release:
   created owner-only, use no fixed or predictable paths, and return
   JSON-encoded errors rather than leaking internal state.
 
-[Unreleased]: https://github.com/kingb/ember/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/kingb/ember/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kingb/ember/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kingb/ember/releases/tag/v0.1.0
