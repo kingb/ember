@@ -1487,7 +1487,12 @@ impl ApplicationHandler<EmberEvent> for App {
                     let _ = reply.send(json);
                 }
                 DeferredWindowAction::Focus(query, reply) => {
-                    let resp = focus_across_windows(&mut self.windows, shared, &query);
+                    let resp = focus_across_windows(
+                        &mut self.windows,
+                        shared,
+                        &mut self.focused_window,
+                        &query,
+                    );
                     let _ = reply.send(resp);
                 }
             }
@@ -2268,15 +2273,19 @@ fn build_state_json(
 
 /// `ctl focus <query>` across every window (Task 5): search
 /// `shared.window_order` (then tab order within each) via
-/// `match_tab_title_across`. On match: select that tab on its window and
-/// raise it (the OS `Focused` event then updates `App::focused_window`, same
-/// as any other window-focus change), reply gains 1-based `window`. On miss:
+/// `match_tab_title_across`. On match: select that tab on its window, raise
+/// it, and optimistically set `focused_window` to it (same pattern as
+/// window-creation/open/move) so subsequent `ctl` commands route correctly
+/// even before the OS `Focused` event arrives; that later event still
+/// corrects it if the user focuses elsewhere meanwhile. Reply gains 1-based
+/// `window`. On miss:
 /// the reply's `titles` is every window's titles flattened in search order —
 /// still a flat array, so existing callers that just print `titles` see no
 /// shape change, only more entries.
 fn focus_across_windows(
     windows: &mut HashMap<WindowId, WindowState>,
     shared: &Shared,
+    focused_window: &mut Option<WindowId>,
     query: &str,
 ) -> String {
     let window_titles: Vec<Vec<String>> = shared
@@ -2296,6 +2305,10 @@ fn focus_across_windows(
             if let Some(w) = windows.get_mut(&wid) {
                 w.select_tab(shared, ti + 1);
                 w.raise_window();
+                // Optimistic, mirroring window-creation/open/move: the OS
+                // Focused event corrects this if the user switches away
+                // meanwhile.
+                *focused_window = Some(wid);
             }
             serde_json::json!({
                 "ok": true, "index": ti + 1, "title": title, "window": wi + 1,
