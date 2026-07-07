@@ -2084,6 +2084,11 @@ fn update_cross_window_drag(
         Some(tid) if tid == source_id => {
             // The point is geometrically back over the source's own frame
             // (carried, but hovering itself again) — nothing else claims it.
+            // Drop any stale cross-window hover too: its preview was just
+            // cleared, and a release here must not apply an invisible target.
+            if let Some(d) = shared.drag.as_mut() {
+                d.hover = None;
+            }
             clear_incoming_drop_except(windows, Some(source_id));
         }
         Some(tid) => {
