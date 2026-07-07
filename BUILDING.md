@@ -24,10 +24,13 @@ Ember renders through wgpu, so it needs a working Vulkan driver (Mesa's
 `lavapipe` software rasterizer is enough for headless or CI use).
 
 At **runtime** the windowed app additionally needs `libxi6` (the X11 input
-extension; winit fails at event-loop creation without it) alongside the
-`libxkbcommon`/`libxcursor` runtime libraries. Desktop installs usually have
-all three; minimal containers don't — and note that headless `--screenshot`
-runs never create a window, so they won't catch a missing `libxi6`.
+extension; winit fails at event-loop creation without it) and
+`libxkbcommon-x11-0` (a separate library from `libxkbcommon`; the app panics
+at startup on X11 without it), alongside the `libxkbcommon`/`libxcursor`
+runtime libraries. Desktop installs usually have them all; minimal containers
+don't — and note that headless `--screenshot` runs never create a window, so
+they can't catch a missing windowed-only dependency. The X11 smoke test
+(windowed app under Xvfb) is what catches this class.
 
 ## Packaging (macOS)
 
