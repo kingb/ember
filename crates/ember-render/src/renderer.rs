@@ -232,6 +232,15 @@ pub struct PaneSnapshot {
 }
 
 /// Per-session render state: the neutral grid plus the glyph buffer it flows into.
+/// See [`Renderer::retained`]: the encoder inputs produced by a full scene
+/// build, reused verbatim by animation-only frames.
+#[derive(Default, Clone, Copy)]
+struct RetainedScene {
+    draw_image: bool,
+    spark_layer: usize,
+    rounded_pre_confirm: u32,
+}
+
 struct PaneRender {
     grid: GridModel,
     buffer: Buffer,
@@ -328,6 +337,16 @@ pub struct Renderer {
     hovered_tab: Option<usize>,
     /// The link under the pointer, for the brighter underline: `(pane, link)`.
     hovered_link: Option<(SessionId, u32)>,
+    /// Whether anything that affects the STATIC scene (everything except the
+    /// spark animation clock) changed since the last full build. When false
+    /// and sparks are animating, `render` takes the animation-only fast path:
+    /// it skips the whole scene rebuild + quad/text uploads and re-encodes
+    /// with fresh spark quads over the retained buffers. Every scene mutator
+    /// sets this; `set_backdrop` only when a non-`time` field changed.
+    scene_dirty: bool,
+    /// The per-frame values the encoder needs from the last full build, kept
+    /// so animation-only frames can encode without rebuilding.
+    retained: RetainedScene,
     /// Glyph buffer for the tab strip.
     chrome: Buffer,
     /// Last-shaped tab-strip inputs; skips per-frame re-shaping.
@@ -553,6 +572,8 @@ impl Renderer {
             tab_drag: None,
             hovered_tab: None,
             hovered_link: None,
+            scene_dirty: true,
+            retained: RetainedScene::default(),
             chrome,
             tabs_cache: crate::paint::TabsCache::default(),
             close_buffer,
@@ -601,6 +622,7 @@ impl Renderer {
     /// The window just became visible again (winit `Occluded(false)`): lift the
     /// starve throttle so the reveal repaint isn't delayed by the holdoff.
     pub fn surface_revealed(&mut self) {
+        self.scene_dirty = true;
         self.starve_gate.clear();
     }
 
@@ -624,6 +646,7 @@ impl Renderer {
     /// Returns whether it changed — the caller must re-layout (the cell size, and
     /// thus every pane's grid dimensions, changed). Chrome/overlays stay fixed.
     pub fn set_font_size(&mut self, size: f32) -> bool {
+        self.scene_dirty = true;
         let size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         if (size - self.font_size).abs() < f32::EPSILON {
             return false;
@@ -651,6 +674,7 @@ impl Renderer {
     /// dirty so it re-shapes with the new family next frame. Returns whether
     /// it changed — the caller must re-layout, since the cell width may have.
     pub fn set_family(&mut self, family: Option<String>) -> bool {
+        self.scene_dirty = true;
         if family == self.family_name {
             return false;
         }
@@ -678,6 +702,7 @@ impl Renderer {
 
     /// Register a session's grid so deltas can be routed to it. Idempotent.
     pub fn ensure_pane(&mut self, session: &SessionId, dims: GridDims) {
+        self.scene_dirty = true;
         if self.panes.contains_key(session) {
             return;
         }
@@ -699,6 +724,7 @@ impl Renderer {
 
     /// Drop a session's grid (its shell exited or its pane was closed).
     pub fn remove_pane(&mut self, session: &SessionId) {
+        self.scene_dirty = true;
         self.panes.remove(session);
     }
 
@@ -842,6 +868,7 @@ impl Renderer {
 
     /// Apply an owned delta to the pane backing `session`, off the pixel lane.
     pub fn apply_delta(&mut self, session: &SessionId, delta: GridDelta) {
+        self.scene_dirty = true;
         if let Some(p) = self.panes.get_mut(session) {
             // Reshape (the expensive part) only when glyph content actually
             // changed. Cursor-only, mode-only, marks-only, and scroll-offset
@@ -883,6 +910,7 @@ impl Renderer {
     /// Set/clear the in-progress tab drag: `(dragged slot, cursor x in logical px)`.
     /// Drives the lifted, cursor-following tab in the strip.
     pub fn set_tab_drag(&mut self, drag: Option<(usize, f32)>) {
+        self.scene_dirty = true;
         self.tab_drag = drag;
         self.window.request_redraw();
     }
@@ -890,6 +918,7 @@ impl Renderer {
     /// Set/clear the hovered tab. Redraws only on a real change so per-pixel
     /// cursor motion inside one tab doesn't churn frames.
     pub fn set_hovered_tab(&mut self, hovered: Option<usize>) {
+        self.scene_dirty = true;
         if self.hovered_tab != hovered {
             self.hovered_tab = hovered;
             self.window.request_redraw();
@@ -899,6 +928,7 @@ impl Renderer {
     /// Highlight (or clear) the hovered link; redraws on change.
     pub fn set_hovered_link(&mut self, hovered: Option<(SessionId, u32)>) {
         if self.hovered_link != hovered {
+            self.scene_dirty = true;
             self.hovered_link = hovered;
             self.window.request_redraw();
         }
@@ -917,6 +947,7 @@ impl Renderer {
     /// Set/clear the Ctrl+Opt split drop-zone preview: `(hovered session,
     /// horizontal = side-by-side, ratio = existing pane fraction)`.
     pub fn set_split_preview(&mut self, preview: Option<(SessionId, bool, f32)>) {
+        self.scene_dirty = true;
         self.split_preview = preview;
         self.window.request_redraw();
     }
@@ -985,10 +1016,12 @@ impl Renderer {
     /// default with `None`. Set before `set_help` when reusing the panel (e.g.
     /// a close confirmation).
     pub fn set_help_title(&mut self, title: Option<(String, String)>) {
+        self.scene_dirty = true;
         self.help_title = title;
     }
 
     pub fn set_help(&mut self, lines: Option<Vec<(String, String)>>) {
+        self.scene_dirty = true;
         self.help = lines;
         self.window.request_redraw();
     }
@@ -1001,6 +1034,7 @@ impl Renderer {
     /// Show the About overlay with this content, or hide it with `None`.
     /// Show/hide the blocking confirm modal.
     pub fn set_confirm(&mut self, view: Option<ConfirmView>) {
+        self.scene_dirty = true;
         self.confirm = view;
     }
 
@@ -1016,6 +1050,7 @@ impl Renderer {
     }
 
     pub fn set_about(&mut self, info: Option<AboutInfo>) {
+        self.scene_dirty = true;
         if info.is_none() {
             self.about_links.clear();
         }
@@ -1040,6 +1075,7 @@ impl Renderer {
     /// Update the About overlay's animation inputs each frame: glow intensity
     /// (`[0,1]`) and elapsed seconds since it opened (drives the ember sparks).
     pub fn set_about_anim(&mut self, glow: f32, t: f32) {
+        self.scene_dirty = true;
         self.about_glow = glow.clamp(0.0, 1.0);
         self.about_time = t;
     }
@@ -1047,6 +1083,7 @@ impl Renderer {
     /// Show the Settings overlay with these resolved rows and the selected
     /// row index, or hide it with `None`.
     pub fn set_settings(&mut self, view: Option<(Vec<SettingsRowView>, usize)>) {
+        self.scene_dirty = true;
         self.settings = view;
         self.window.request_redraw();
     }
@@ -1060,6 +1097,17 @@ impl Renderer {
     /// default; the app updates this each frame (and should only drive continuous
     /// redraws while `sparks` is on). Requests a redraw.
     pub fn set_backdrop(&mut self, params: BackdropParams) {
+        // `time` advances every animation tick; only the OTHER fields are
+        // scene changes. Marking dirty on time would defeat the
+        // animation-only fast path entirely.
+        let scene_changed = {
+            let a = &self.backdrop;
+            let b = &params;
+            (a.gradient, a.sparks, a.density, a.scrim) != (b.gradient, b.sparks, b.density, b.scrim)
+        };
+        if scene_changed {
+            self.scene_dirty = true;
+        }
         self.backdrop = params;
         self.window.request_redraw();
     }
@@ -1073,18 +1121,21 @@ impl Renderer {
     /// Set or clear the active text selection (and the session it belongs to).
     /// Requests a redraw so the highlight updates.
     pub fn set_selection(&mut self, selection: Option<(SessionId, Selection)>) {
+        self.scene_dirty = true;
         self.selection = selection;
         self.window.request_redraw();
     }
 
     /// Set or clear the FPS/frame-time debug readout text (bottom-right).
     pub fn set_fps_overlay(&mut self, text: Option<String>) {
+        self.scene_dirty = true;
         self.fps_overlay = text;
     }
 
     /// Set the visual-bell flash intensity (`0..1`) — a warm amber wash over the
     /// panes. The app drives this each frame, decaying it to 0 after a BEL.
     pub fn set_bell_flash(&mut self, intensity: f32) {
+        self.scene_dirty = true;
         self.bell_flash = intensity.clamp(0.0, 1.0);
         self.window.request_redraw();
     }
@@ -1102,6 +1153,7 @@ impl Renderer {
     /// the scrim still applies for legibility. The decoded RGBA is kept in RAM so
     /// on-screen captures can reproduce it headlessly. Requests a redraw.
     pub fn set_backdrop_image(&mut self, img: Option<(Vec<u8>, u32, u32)>, fit: ImageFit) {
+        self.scene_dirty = true;
         match &img {
             Some((rgba, w, h)) => self
                 .image
@@ -1137,6 +1189,7 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
+        self.scene_dirty = true;
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
@@ -1166,461 +1219,491 @@ impl Renderer {
             right: self.config.width as i32,
             bottom: self.config.height as i32,
         };
-        let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
-        // Rounded quads (tab pills) — drawn after the sharp chrome, before text.
-        let mut rounded: Vec<([f32; 4], [f32; 4], f32)> = Vec::new();
-        let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
-        // Index into `rects` where the additive spark pass is interleaved:
-        // everything before is backdrop (gradient/scrim), everything after is
-        // cells + chrome, so opaque content covers the embers. 0 = no backdrop
-        // (overlays): all quads draw after the (empty) spark pass.
-        let mut spark_layer: usize = 0;
-        let mut areas: Vec<TextArea> = Vec::new();
-        // Confirm-modal dialog text: a second pass, drawn after the panel quad.
-        let mut overlay_areas: Vec<TextArea> = Vec::new();
-        // Sprite-path `CustomGlyph`s per visible pane, in `self.visible`
-        // order — declared out here (not in the `else` block below) so it outlives
-        // the `areas` that borrow from it, through the `prepare_with_custom` call.
-        let pane_customs: Vec<Vec<CustomGlyph>>;
-        // Whether to draw the backdrop image this frame (pane view only — never
-        // over the Settings/About/help overlays).
-        let mut draw_image = false;
-
-        if let Some((rows, selected)) = self.settings.clone() {
-            // Modal Settings overlay. Re-shape the text only when the rows,
-            // selection, or surface geometry changed — the modal repaints
-            // every frame, and shaping is the expensive part.
-            let logical_w = self.config.width as f32 / sf;
-            let logical_h = self.config.height as f32 / sf;
-            let shape_key = (
-                rows.clone(),
-                selected,
-                self.config.width,
-                self.config.height,
-                sf.to_bits(),
-            );
-            let reshape = self.settings_shaped.as_ref() != Some(&shape_key);
-            let (left, top) = build_settings(
-                &mut self.font_system,
-                &mut self.settings_buffer,
-                &rows,
-                selected,
-                self.settings_cw,
-                logical_w,
-                logical_h,
-                sf,
-                reshape,
-                &mut rects,
-            );
-            if reshape {
-                self.settings_shaped = Some(shape_key);
-            }
-            areas.push(TextArea {
-                buffer: &self.settings_buffer,
-                left: left * sf,
-                top: top * sf,
-                scale: sf,
-                bounds: full_bounds,
-                default_color: Color::rgb(FG.r, FG.g, FG.b),
-                custom_glyphs: &[],
-            });
-        } else if let Some(info) = self.about.clone() {
-            // Modal About page: scrim + animated ember glow + wordmark + info.
-            let logical_w = self.config.width as f32 / sf;
-            let logical_h = self.config.height as f32 / sf;
-            let layout = build_about(
-                &mut self.font_system,
-                &mut self.about_title,
-                &mut self.about_body,
-                &info,
-                self.about_glow,
-                self.about_time,
-                self.cell_w,
-                logical_w,
-                logical_h,
-                sf,
-                &mut rects,
-            );
-            // Pair each link's click rect with its URL for hit-testing.
-            self.about_links = layout
-                .link_rects
-                .iter()
-                .zip(info.links.iter())
-                .map(|(r, (_label, url))| (*r, url.clone()))
-                .collect();
-            areas.push(TextArea {
-                buffer: &self.about_title,
-                left: layout.title_left * sf,
-                top: layout.title_top * sf,
-                scale: sf,
-                bounds: full_bounds,
-                default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
-                custom_glyphs: &[],
-            });
-            areas.push(TextArea {
-                buffer: &self.about_body,
-                left: 0.0,
-                top: layout.body_top * sf,
-                scale: sf,
-                bounds: full_bounds,
-                default_color: Color::rgb(FG.r, FG.g, FG.b),
-                custom_glyphs: &[],
-            });
-        } else if self.help.is_some() {
-            // Modal cheat-sheet: a scrim + centered panel + the key list, drawn
-            // instead of the panes (fully obscured so the text stays legible).
-            let panel = self.build_help_quads(sf, &mut rects);
-            areas.push(TextArea {
-                buffer: &self.help_buffer,
-                left: (panel.x as f32 + HELP_PAD) * sf,
-                top: (panel.y as f32 + HELP_PAD) * sf,
-                scale: sf,
-                bounds: full_bounds,
-                default_color: Color::rgb(FG.r, FG.g, FG.b),
-                custom_glyphs: &[],
-            });
-        } else {
-            // Campfire backdrop (image or gradient, + scrim) behind the cells —
-            // drawn first so empty cells (no bg quad) let it show through. A
-            // backdrop image is the base layer (drawn in the render pass below), so
-            // suppress the gradient bands when one is set; the scrim still applies.
-            let logical_w = self.config.width as f32 / sf;
-            let logical_h = self.config.height as f32 / sf;
-            draw_image = self.image.has_image();
-            let mut bp = self.backdrop;
-            if draw_image {
-                bp.gradient = false;
-            }
-            push_backdrop(&mut rects, &bp, logical_w, logical_h, sf);
-            spark_layer = rects.len();
-            if draw_image {
-                self.image.prepare(
-                    &self.device,
-                    &self.queue,
-                    (self.config.width as f32, self.config.height as f32),
-                    self.image_fit,
-                );
-            }
-            if self.backdrop.sparks {
-                spark_rects = spark_quads(
-                    self.backdrop.density,
-                    self.backdrop.time,
-                    logical_w,
-                    logical_h,
-                    sf,
-                );
-            }
-            // Pass 1: (re)shape only panes whose grid/size changed since last frame.
-            // Buffers persist in `PaneRender`, so unchanged panes reuse their shaping
-            // — the TextArea below just references the existing buffer.
-            let (size, lh, cw) = (self.font_size, self.line_height, self.cell_w);
-            let family = crate::paint::family_of(self.family_name.as_deref());
-            for vp in &self.visible {
-                if let Some(p) = self.panes.get_mut(&vp.session) {
-                    if p.dirty {
-                        shape_grid(
-                            &mut self.font_system,
-                            &mut p.buffer,
-                            &p.grid,
-                            size,
-                            lh,
-                            cw,
-                            family,
-                        );
-                        p.links = p.grid.link_spans();
-                        p.dirty = false;
-                    }
-                }
-            }
-            // Pass 2: bg fills, cursor, focus border, tab strip (logical px * sf).
-            let cw = self.cell_w;
-            let ch = self.line_height;
-            let split = self.visible.len() > 1;
-            for vp in &self.visible {
-                if let Some(p) = self.panes.get(&vp.session) {
-                    let focused = self.focused.as_ref() == Some(&vp.session);
-                    grid_quads(&p.grid, vp.rect, cw, ch, sf, focused, split, &mut rects);
-                    let hovered_link = self
-                        .hovered_link
-                        .as_ref()
-                        .filter(|(sid, _)| sid == &vp.session)
-                        .map(|(_, id)| *id);
-                    crate::paint::link_quads(
-                        &p.links,
-                        hovered_link,
-                        (vp.rect.x as f32, vp.rect.y as f32),
-                        cw,
-                        ch,
-                        sf,
-                        &mut rects,
-                    );
-                    if let Some((sid, sel)) = &self.selection {
-                        if *sid == vp.session {
-                            selection_quads(&p.grid, sel, vp.rect, cw, ch, sf, &mut rects);
-                        }
-                    }
-                    // Ctrl+Opt split drop-zone preview over the hovered pane.
-                    if let Some((psid, horizontal, ratio)) = &self.split_preview {
-                        if *psid == vp.session {
-                            split_preview(vp.rect, *horizontal, *ratio, sf, &mut rects);
-                        }
-                    }
-                    // Scrollbar (right edge): shown whenever the pane has history and
-                    // isn't on the alt screen (no scrollback there).
-                    if !p.grid.alt_screen {
-                        scrollbar(
-                            p.grid.display_offset,
-                            p.grid.history_len,
-                            p.grid.dims.screen_lines,
-                            vp.rect,
-                            sf,
-                            &mut rects,
-                        );
-                    }
-                }
-            }
-            let logical_w = self.config.width as f32 / sf;
-            let close_cx = build_tabs(
-                &mut self.font_system,
-                &mut self.chrome,
-                &mut self.close_buffer,
-                &mut self.tabs_cache,
-                &self.tabs,
-                self.tab_drag,
-                self.hovered_tab,
-                cw,
-                logical_w,
-                sf,
-                &mut rects,
-                &mut rounded,
-            );
-
-            // Pass 3: one TextArea per visible pane (clipped to its rect) + the strip.
-            // Sprite-path glyphs ride alongside the shaped text as
-            // `CustomGlyph`s — computed here (not cached with the buffer) so a
-            // glyph's cell position always matches this frame's `cw`/`ch`.
-            pane_customs = self
-                .visible
-                .iter()
-                .map(|vp| {
-                    self.panes
-                        .get(&vp.session)
-                        .map(|p| crate::sprite::pane_custom_glyphs(&p.grid, cw, ch, sf))
-                        .unwrap_or_default()
-                })
-                .collect();
-            for (vp, customs) in self.visible.iter().zip(pane_customs.iter()) {
-                if let Some(p) = self.panes.get(&vp.session) {
-                    areas.push(TextArea {
-                        buffer: &p.buffer,
-                        left: vp.rect.x as f32 * sf,
-                        top: vp.rect.y as f32 * sf,
-                        scale: sf,
-                        bounds: TextBounds {
-                            left: (vp.rect.x as f32 * sf) as i32,
-                            top: (vp.rect.y as f32 * sf) as i32,
-                            right: ((vp.rect.x + vp.rect.width) as f32 * sf) as i32,
-                            bottom: ((vp.rect.y + vp.rect.height) as f32 * sf) as i32,
-                        },
-                        default_color: Color::rgb(FG.r, FG.g, FG.b),
-                        custom_glyphs: customs,
-                    });
-                }
-            }
-            // The strip (with +/?/⚙ controls) is always drawn, so always show its text.
-            areas.push(TextArea {
-                buffer: &self.chrome,
-                left: 0.0,
-                top: PAD * sf,
-                scale: sf,
-                bounds: full_bounds,
-                default_color: Color::rgb(FG.r, FG.g, FG.b),
-                custom_glyphs: &[],
-            });
-            // The hovered tab's "✕", pixel-centered in the pill's left cap. `cw/2`
-            // recenters the 1-cell glyph on the cap center; `top: PAD` matches the
-            // chrome baseline (already vertically centered in the strip).
-            if let Some(cx) = close_cx {
-                areas.push(TextArea {
-                    buffer: &self.close_buffer,
-                    left: (cx - cw * 0.5) * sf,
-                    top: PAD * sf,
-                    scale: sf,
-                    bounds: full_bounds,
-                    default_color: Color::rgb(0xcc, 0xcc, 0xcc),
-                    custom_glyphs: &[],
-                });
-            }
-            // FPS/frame-time debug readout, on top of the panes (bottom-right).
-            if let Some(text) = self.fps_overlay.clone() {
-                let (left, top) = build_fps(
-                    &mut self.font_system,
-                    &mut self.fps_buffer,
-                    &text,
-                    cw,
-                    logical_w,
-                    logical_h,
-                    sf,
-                    &mut rects,
-                );
-                areas.push(TextArea {
-                    buffer: &self.fps_buffer,
-                    left: left * sf,
-                    top: top * sf,
-                    scale: sf,
-                    bounds: full_bounds,
-                    default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
-                    custom_glyphs: &[],
-                });
-            }
-            // Visual-bell flash: a warm amber wash over everything (under the text).
-            bell_wash(&mut rects, self.bell_flash, logical_w, logical_h, sf);
-        }
-
-        // Blocking confirm modal — drawn OVER everything (panes, tabs, overlays).
-        // Its scrim + panel + button quads are appended to `rounded` *after* this
-        // point, so this boundary splits base rounded quads (tab pills, drawn
-        // before the pane text) from the confirm quads (drawn after it).
-        let rounded_pre_confirm = rounded.len() as u32;
-        self.confirm_buttons.clear();
-        if let Some(view) = self.confirm.clone() {
+        // Animation-only fast path: nothing in the static scene changed and
+        // the only reason we're rendering is the spark clock. Skip the whole
+        // scene rebuild and the quad/text uploads; re-encode over the
+        // retained GPU buffers with fresh spark quads. This is what keeps
+        // idle-with-sparks cheap (the full rebuild costs ~4x more CPU per
+        // frame than the sparks themselves).
+        let animation_only =
+            !self.scene_dirty && self.backdrop.sparks && self.panes.values().all(|p| !p.dirty);
+        if animation_only {
             let lw = self.config.width as f32 / sf;
             let lh = self.config.height as f32 / sf;
-            let cw = self.cell_w;
-            let cl = build_confirm(
-                &mut self.font_system,
-                &mut self.confirm_title,
-                &mut self.confirm_msg,
-                &mut self.confirm_cancel,
-                &mut self.confirm_ok,
-                &view,
-                cw,
-                lw,
-                lh,
-                sf,
-                &mut rounded,
+            let spark_rects = spark_quads(self.backdrop.density, self.backdrop.time, lw, lh, sf);
+            self.sparks.prepare(
+                &self.device,
+                &self.queue,
+                (self.config.width as f32, self.config.height as f32),
+                &spark_rects,
             );
-            self.confirm_buttons = cl.buttons;
-            for (buf, (ox, oy)) in [
-                (&self.confirm_title, cl.title_origin),
-                (&self.confirm_msg, cl.msg_origin),
-                (&self.confirm_cancel, cl.cancel_origin),
-                (&self.confirm_ok, cl.ok_origin),
-            ] {
-                // Overlay pass: drawn after the opaque panel, so it can't be
-                // overpainted by pane text underneath.
-                overlay_areas.push(TextArea {
-                    buffer: buf,
-                    left: ox * sf,
-                    top: oy * sf,
+        } else {
+            let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
+            // Rounded quads (tab pills) — drawn after the sharp chrome, before text.
+            let mut rounded: Vec<([f32; 4], [f32; 4], f32)> = Vec::new();
+            let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
+            // Index into `rects` where the additive spark pass is interleaved:
+            // everything before is backdrop (gradient/scrim), everything after is
+            // cells + chrome, so opaque content covers the embers. 0 = no backdrop
+            // (overlays): all quads draw after the (empty) spark pass.
+            let mut spark_layer: usize = 0;
+            let mut areas: Vec<TextArea> = Vec::new();
+            // Confirm-modal dialog text: a second pass, drawn after the panel quad.
+            let mut overlay_areas: Vec<TextArea> = Vec::new();
+            // Sprite-path `CustomGlyph`s per visible pane, in `self.visible`
+            // order — declared out here (not in the `else` block below) so it outlives
+            // the `areas` that borrow from it, through the `prepare_with_custom` call.
+            let pane_customs: Vec<Vec<CustomGlyph>>;
+            // Whether to draw the backdrop image this frame (pane view only — never
+            // over the Settings/About/help overlays).
+            let mut draw_image = false;
+
+            if let Some((rows, selected)) = self.settings.clone() {
+                // Modal Settings overlay. Re-shape the text only when the rows,
+                // selection, or surface geometry changed — the modal repaints
+                // every frame, and shaping is the expensive part.
+                let logical_w = self.config.width as f32 / sf;
+                let logical_h = self.config.height as f32 / sf;
+                let shape_key = (
+                    rows.clone(),
+                    selected,
+                    self.config.width,
+                    self.config.height,
+                    sf.to_bits(),
+                );
+                let reshape = self.settings_shaped.as_ref() != Some(&shape_key);
+                let (left, top) = build_settings(
+                    &mut self.font_system,
+                    &mut self.settings_buffer,
+                    &rows,
+                    selected,
+                    self.settings_cw,
+                    logical_w,
+                    logical_h,
+                    sf,
+                    reshape,
+                    &mut rects,
+                );
+                if reshape {
+                    self.settings_shaped = Some(shape_key);
+                }
+                areas.push(TextArea {
+                    buffer: &self.settings_buffer,
+                    left: left * sf,
+                    top: top * sf,
                     scale: sf,
                     bounds: full_bounds,
                     default_color: Color::rgb(FG.r, FG.g, FG.b),
                     custom_glyphs: &[],
                 });
-            }
-        }
-
-        self.quads.prepare(
-            &self.device,
-            &self.queue,
-            (self.config.width as f32, self.config.height as f32),
-            &rects,
-            &rounded,
-        );
-        self.sparks.prepare(
-            &self.device,
-            &self.queue,
-            (self.config.width as f32, self.config.height as f32),
-            &spark_rects,
-        );
-        self.viewport.update(
-            &self.queue,
-            Resolution {
-                width: self.config.width,
-                height: self.config.height,
-            },
-        );
-
-        // Optional diagnostics: `EMBER_DEBUG=/tmp/e.log ember-term` (file sink) or
-        // `EMBER_DEBUG=1` (stderr). Logs scale, surface size, and each visible
-        // pane's rect/dims/cursor + cursor-row text, so a display-less reviewer can
-        // tell whether the grid has content and whether geometry is sane. Captures
-        // the first few frames (startup) plus a periodic heartbeat.
-        if std::env::var_os("EMBER_DEBUG").is_some() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static FRAME: AtomicU64 = AtomicU64::new(0);
-            let f = FRAME.fetch_add(1, Ordering::Relaxed);
-            if f < 8 || f % 60 == 0 {
-                debug_emit(&format!(
-                    "[ember-debug] frame={f} sf={sf} surface={}x{} visible={} areas={}",
-                    self.config.width,
-                    self.config.height,
-                    self.visible.len(),
-                    areas.len()
-                ));
+            } else if let Some(info) = self.about.clone() {
+                // Modal About page: scrim + animated ember glow + wordmark + info.
+                let logical_w = self.config.width as f32 / sf;
+                let logical_h = self.config.height as f32 / sf;
+                let layout = build_about(
+                    &mut self.font_system,
+                    &mut self.about_title,
+                    &mut self.about_body,
+                    &info,
+                    self.about_glow,
+                    self.about_time,
+                    self.cell_w,
+                    logical_w,
+                    logical_h,
+                    sf,
+                    &mut rects,
+                );
+                // Pair each link's click rect with its URL for hit-testing.
+                self.about_links = layout
+                    .link_rects
+                    .iter()
+                    .zip(info.links.iter())
+                    .map(|(r, (_label, url))| (*r, url.clone()))
+                    .collect();
+                areas.push(TextArea {
+                    buffer: &self.about_title,
+                    left: layout.title_left * sf,
+                    top: layout.title_top * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
+                    custom_glyphs: &[],
+                });
+                areas.push(TextArea {
+                    buffer: &self.about_body,
+                    left: 0.0,
+                    top: layout.body_top * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(FG.r, FG.g, FG.b),
+                    custom_glyphs: &[],
+                });
+            } else if self.help.is_some() {
+                // Modal cheat-sheet: a scrim + centered panel + the key list, drawn
+                // instead of the panes (fully obscured so the text stays legible).
+                let panel = self.build_help_quads(sf, &mut rects);
+                areas.push(TextArea {
+                    buffer: &self.help_buffer,
+                    left: (panel.x as f32 + HELP_PAD) * sf,
+                    top: (panel.y as f32 + HELP_PAD) * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(FG.r, FG.g, FG.b),
+                    custom_glyphs: &[],
+                });
+            } else {
+                // Campfire backdrop (image or gradient, + scrim) behind the cells —
+                // drawn first so empty cells (no bg quad) let it show through. A
+                // backdrop image is the base layer (drawn in the render pass below), so
+                // suppress the gradient bands when one is set; the scrim still applies.
+                let logical_w = self.config.width as f32 / sf;
+                let logical_h = self.config.height as f32 / sf;
+                draw_image = self.image.has_image();
+                let mut bp = self.backdrop;
+                if draw_image {
+                    bp.gradient = false;
+                }
+                push_backdrop(&mut rects, &bp, logical_w, logical_h, sf);
+                spark_layer = rects.len();
+                if draw_image {
+                    self.image.prepare(
+                        &self.device,
+                        &self.queue,
+                        (self.config.width as f32, self.config.height as f32),
+                        self.image_fit,
+                    );
+                }
+                if self.backdrop.sparks {
+                    spark_rects = spark_quads(
+                        self.backdrop.density,
+                        self.backdrop.time,
+                        logical_w,
+                        logical_h,
+                        sf,
+                    );
+                }
+                // Pass 1: (re)shape only panes whose grid/size changed since last frame.
+                // Buffers persist in `PaneRender`, so unchanged panes reuse their shaping
+                // — the TextArea below just references the existing buffer.
+                let (size, lh, cw) = (self.font_size, self.line_height, self.cell_w);
+                let family = crate::paint::family_of(self.family_name.as_deref());
+                for vp in &self.visible {
+                    if let Some(p) = self.panes.get_mut(&vp.session) {
+                        if p.dirty {
+                            shape_grid(
+                                &mut self.font_system,
+                                &mut p.buffer,
+                                &p.grid,
+                                size,
+                                lh,
+                                cw,
+                                family,
+                            );
+                            p.links = p.grid.link_spans();
+                            p.dirty = false;
+                        }
+                    }
+                }
+                // Pass 2: bg fills, cursor, focus border, tab strip (logical px * sf).
+                let cw = self.cell_w;
+                let ch = self.line_height;
+                let split = self.visible.len() > 1;
                 for vp in &self.visible {
                     if let Some(p) = self.panes.get(&vp.session) {
-                        let c = p.grid.cursor;
-                        let row = c.row.min(p.grid.dims.screen_lines.saturating_sub(1));
-                        debug_emit(&format!(
-                            "  {:?} rect=({:.0},{:.0},{:.0},{:.0}) dims={}x{} cur=({},{},vis={}) styles_known={} row[{}]={:?}",
-                            vp.session,
-                            vp.rect.x,
-                            vp.rect.y,
-                            vp.rect.width,
-                            vp.rect.height,
-                            p.grid.dims.columns,
-                            p.grid.dims.screen_lines,
-                            c.row,
-                            c.col,
-                            c.visible,
-                            p.grid.styles_len(),
-                            row,
-                            p.grid.row_text(row).trim_end()
-                        ));
+                        let focused = self.focused.as_ref() == Some(&vp.session);
+                        grid_quads(&p.grid, vp.rect, cw, ch, sf, focused, split, &mut rects);
+                        let hovered_link = self
+                            .hovered_link
+                            .as_ref()
+                            .filter(|(sid, _)| sid == &vp.session)
+                            .map(|(_, id)| *id);
+                        crate::paint::link_quads(
+                            &p.links,
+                            hovered_link,
+                            (vp.rect.x as f32, vp.rect.y as f32),
+                            cw,
+                            ch,
+                            sf,
+                            &mut rects,
+                        );
+                        if let Some((sid, sel)) = &self.selection {
+                            if *sid == vp.session {
+                                selection_quads(&p.grid, sel, vp.rect, cw, ch, sf, &mut rects);
+                            }
+                        }
+                        // Ctrl+Opt split drop-zone preview over the hovered pane.
+                        if let Some((psid, horizontal, ratio)) = &self.split_preview {
+                            if *psid == vp.session {
+                                split_preview(vp.rect, *horizontal, *ratio, sf, &mut rects);
+                            }
+                        }
+                        // Scrollbar (right edge): shown whenever the pane has history and
+                        // isn't on the alt screen (no scrollback there).
+                        if !p.grid.alt_screen {
+                            scrollbar(
+                                p.grid.display_offset,
+                                p.grid.history_len,
+                                p.grid.dims.screen_lines,
+                                vp.rect,
+                                sf,
+                                &mut rects,
+                            );
+                        }
+                    }
+                }
+                let logical_w = self.config.width as f32 / sf;
+                let close_cx = build_tabs(
+                    &mut self.font_system,
+                    &mut self.chrome,
+                    &mut self.close_buffer,
+                    &mut self.tabs_cache,
+                    &self.tabs,
+                    self.tab_drag,
+                    self.hovered_tab,
+                    cw,
+                    logical_w,
+                    sf,
+                    &mut rects,
+                    &mut rounded,
+                );
+
+                // Pass 3: one TextArea per visible pane (clipped to its rect) + the strip.
+                // Sprite-path glyphs ride alongside the shaped text as
+                // `CustomGlyph`s — computed here (not cached with the buffer) so a
+                // glyph's cell position always matches this frame's `cw`/`ch`.
+                pane_customs = self
+                    .visible
+                    .iter()
+                    .map(|vp| {
+                        self.panes
+                            .get(&vp.session)
+                            .map(|p| crate::sprite::pane_custom_glyphs(&p.grid, cw, ch, sf))
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                for (vp, customs) in self.visible.iter().zip(pane_customs.iter()) {
+                    if let Some(p) = self.panes.get(&vp.session) {
+                        areas.push(TextArea {
+                            buffer: &p.buffer,
+                            left: vp.rect.x as f32 * sf,
+                            top: vp.rect.y as f32 * sf,
+                            scale: sf,
+                            bounds: TextBounds {
+                                left: (vp.rect.x as f32 * sf) as i32,
+                                top: (vp.rect.y as f32 * sf) as i32,
+                                right: ((vp.rect.x + vp.rect.width) as f32 * sf) as i32,
+                                bottom: ((vp.rect.y + vp.rect.height) as f32 * sf) as i32,
+                            },
+                            default_color: Color::rgb(FG.r, FG.g, FG.b),
+                            custom_glyphs: customs,
+                        });
+                    }
+                }
+                // The strip (with +/?/⚙ controls) is always drawn, so always show its text.
+                areas.push(TextArea {
+                    buffer: &self.chrome,
+                    left: 0.0,
+                    top: PAD * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(FG.r, FG.g, FG.b),
+                    custom_glyphs: &[],
+                });
+                // The hovered tab's "✕", pixel-centered in the pill's left cap. `cw/2`
+                // recenters the 1-cell glyph on the cap center; `top: PAD` matches the
+                // chrome baseline (already vertically centered in the strip).
+                if let Some(cx) = close_cx {
+                    areas.push(TextArea {
+                        buffer: &self.close_buffer,
+                        left: (cx - cw * 0.5) * sf,
+                        top: PAD * sf,
+                        scale: sf,
+                        bounds: full_bounds,
+                        default_color: Color::rgb(0xcc, 0xcc, 0xcc),
+                        custom_glyphs: &[],
+                    });
+                }
+                // FPS/frame-time debug readout, on top of the panes (bottom-right).
+                if let Some(text) = self.fps_overlay.clone() {
+                    let (left, top) = build_fps(
+                        &mut self.font_system,
+                        &mut self.fps_buffer,
+                        &text,
+                        cw,
+                        logical_w,
+                        logical_h,
+                        sf,
+                        &mut rects,
+                    );
+                    areas.push(TextArea {
+                        buffer: &self.fps_buffer,
+                        left: left * sf,
+                        top: top * sf,
+                        scale: sf,
+                        bounds: full_bounds,
+                        default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
+                        custom_glyphs: &[],
+                    });
+                }
+                // Visual-bell flash: a warm amber wash over everything (under the text).
+                bell_wash(&mut rects, self.bell_flash, logical_w, logical_h, sf);
+            }
+
+            // Blocking confirm modal — drawn OVER everything (panes, tabs, overlays).
+            // Its scrim + panel + button quads are appended to `rounded` *after* this
+            // point, so this boundary splits base rounded quads (tab pills, drawn
+            // before the pane text) from the confirm quads (drawn after it).
+            let rounded_pre_confirm = rounded.len() as u32;
+            self.confirm_buttons.clear();
+            if let Some(view) = self.confirm.clone() {
+                let lw = self.config.width as f32 / sf;
+                let lh = self.config.height as f32 / sf;
+                let cw = self.cell_w;
+                let cl = build_confirm(
+                    &mut self.font_system,
+                    &mut self.confirm_title,
+                    &mut self.confirm_msg,
+                    &mut self.confirm_cancel,
+                    &mut self.confirm_ok,
+                    &view,
+                    cw,
+                    lw,
+                    lh,
+                    sf,
+                    &mut rounded,
+                );
+                self.confirm_buttons = cl.buttons;
+                for (buf, (ox, oy)) in [
+                    (&self.confirm_title, cl.title_origin),
+                    (&self.confirm_msg, cl.msg_origin),
+                    (&self.confirm_cancel, cl.cancel_origin),
+                    (&self.confirm_ok, cl.ok_origin),
+                ] {
+                    // Overlay pass: drawn after the opaque panel, so it can't be
+                    // overpainted by pane text underneath.
+                    overlay_areas.push(TextArea {
+                        buffer: buf,
+                        left: ox * sf,
+                        top: oy * sf,
+                        scale: sf,
+                        bounds: full_bounds,
+                        default_color: Color::rgb(FG.r, FG.g, FG.b),
+                        custom_glyphs: &[],
+                    });
+                }
+            }
+
+            self.quads.prepare(
+                &self.device,
+                &self.queue,
+                (self.config.width as f32, self.config.height as f32),
+                &rects,
+                &rounded,
+            );
+            self.sparks.prepare(
+                &self.device,
+                &self.queue,
+                (self.config.width as f32, self.config.height as f32),
+                &spark_rects,
+            );
+            self.viewport.update(
+                &self.queue,
+                Resolution {
+                    width: self.config.width,
+                    height: self.config.height,
+                },
+            );
+
+            // Optional diagnostics: `EMBER_DEBUG=/tmp/e.log ember-term` (file sink) or
+            // `EMBER_DEBUG=1` (stderr). Logs scale, surface size, and each visible
+            // pane's rect/dims/cursor + cursor-row text, so a display-less reviewer can
+            // tell whether the grid has content and whether geometry is sane. Captures
+            // the first few frames (startup) plus a periodic heartbeat.
+            if std::env::var_os("EMBER_DEBUG").is_some() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static FRAME: AtomicU64 = AtomicU64::new(0);
+                let f = FRAME.fetch_add(1, Ordering::Relaxed);
+                if f < 8 || f % 60 == 0 {
+                    debug_emit(&format!(
+                        "[ember-debug] frame={f} sf={sf} surface={}x{} visible={} areas={}",
+                        self.config.width,
+                        self.config.height,
+                        self.visible.len(),
+                        areas.len()
+                    ));
+                    for vp in &self.visible {
+                        if let Some(p) = self.panes.get(&vp.session) {
+                            let c = p.grid.cursor;
+                            let row = c.row.min(p.grid.dims.screen_lines.saturating_sub(1));
+                            debug_emit(&format!(
+                                "  {:?} rect=({:.0},{:.0},{:.0},{:.0}) dims={}x{} cur=({},{},vis={}) styles_known={} row[{}]={:?}",
+                                vp.session,
+                                vp.rect.x,
+                                vp.rect.y,
+                                vp.rect.width,
+                                vp.rect.height,
+                                p.grid.dims.columns,
+                                p.grid.dims.screen_lines,
+                                c.row,
+                                c.col,
+                                c.visible,
+                                p.grid.styles_len(),
+                                row,
+                                p.grid.row_text(row).trim_end()
+                            ));
+                        }
                     }
                 }
             }
-        }
 
-        let prepared = self.text_renderer.prepare_with_custom(
-            &self.device,
-            &self.queue,
-            &mut self.font_system,
-            &mut self.atlas,
-            &self.viewport,
-            areas,
-            &mut self.swash_cache,
-            crate::sprite::rasterize,
-        );
-        if let Err(e) = prepared {
-            // Don't freeze on a transient atlas/prepare error: log it (always, since
-            // it means glyphs won't paint this frame) and ask for another redraw.
-            // Poll first so the staging buffers this frame already wrote get
-            // reclaimed — early returns must never skip reclamation.
-            debug_emit(&format!("[ember] text prepare failed this frame: {e:?}"));
-            eprintln!("[ember] text prepare failed, skipping glyphs this frame: {e:?}");
-            let _ = self.device.poll(wgpu::PollType::Poll);
-            return RenderOutcome::Retry;
-        }
-        // Confirm-dialog text (empty unless the modal is up), prepared into the
-        // shared atlas for its own post-panel render pass.
-        let prepared_overlay = self.overlay_text.prepare(
-            &self.device,
-            &self.queue,
-            &mut self.font_system,
-            &mut self.atlas,
-            &self.viewport,
-            overlay_areas,
-            &mut self.swash_cache,
-        );
-        if let Err(e) = prepared_overlay {
-            debug_emit(&format!(
-                "[ember] overlay text prepare failed this frame: {e:?}"
-            ));
-            let _ = self.device.poll(wgpu::PollType::Poll);
-            return RenderOutcome::Retry;
+            let prepared = self.text_renderer.prepare_with_custom(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                areas,
+                &mut self.swash_cache,
+                crate::sprite::rasterize,
+            );
+            if let Err(e) = prepared {
+                // Don't freeze on a transient atlas/prepare error: log it (always, since
+                // it means glyphs won't paint this frame) and ask for another redraw.
+                // Poll first so the staging buffers this frame already wrote get
+                // reclaimed — early returns must never skip reclamation.
+                debug_emit(&format!("[ember] text prepare failed this frame: {e:?}"));
+                eprintln!("[ember] text prepare failed, skipping glyphs this frame: {e:?}");
+                let _ = self.device.poll(wgpu::PollType::Poll);
+                return RenderOutcome::Retry;
+            }
+            // Confirm-dialog text (empty unless the modal is up), prepared into the
+            // shared atlas for its own post-panel render pass.
+            let prepared_overlay = self.overlay_text.prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                overlay_areas,
+                &mut self.swash_cache,
+            );
+            if let Err(e) = prepared_overlay {
+                debug_emit(&format!(
+                    "[ember] overlay text prepare failed this frame: {e:?}"
+                ));
+                let _ = self.device.poll(wgpu::PollType::Poll);
+                return RenderOutcome::Retry;
+            }
+            // Everything the animation-only path will reuse is now uploaded;
+            // remember the encoder inputs and mark the scene clean. (Kept after
+            // the prepare error-returns above: a failed upload must NOT leave a
+            // half-built scene marked clean.)
+            self.retained = RetainedScene {
+                draw_image,
+                spark_layer,
+                rounded_pre_confirm,
+            };
+            self.scene_dirty = false;
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -1679,18 +1762,18 @@ impl Renderer {
             });
             // Backdrop image is the base layer: drawn before the gradient/scrim
             // quads (which alpha-darken it) and the cells.
-            if draw_image {
+            if self.retained.draw_image {
                 self.image.draw(&mut pass);
             }
             // Backdrop quads → sparks (additive) → cells + chrome → text. The
             // embers glow over the gradient but sit behind opaque cell bgs, the
             // selection, and the tab strip.
-            let split = spark_layer as u32;
+            let split = self.retained.spark_layer as u32;
             let sharp = self.quads.sharp_count();
             // Rounded quads split into base (tab pills, before pane text) and the
             // confirm modal's scrim+panel+buttons (after it, so the opaque panel
             // covers pane glyphs instead of them bleeding through).
-            let base_rounded_end = sharp + rounded_pre_confirm;
+            let base_rounded_end = sharp + self.retained.rounded_pre_confirm;
             self.quads.draw_range(&mut pass, 0..split);
             self.sparks.draw(&mut pass);
             self.quads.draw_range(&mut pass, split..sharp); // cells + chrome
