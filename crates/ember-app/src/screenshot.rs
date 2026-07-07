@@ -313,7 +313,13 @@ pub fn run(opts: Opts) -> Result<String, String> {
                 rect: *rect,
                 focused,
                 selection: if focused { selection } else { None },
-                split_preview: if focused { opts.split_preview } else { None },
+                // The CLI demo `--split` flag only ever demos the
+                // Ctrl+Opt manual-split case (new pane on the far side).
+                split_preview: if focused {
+                    opts.split_preview.map(|(h, r)| (h, r, false))
+                } else {
+                    None
+                },
             }
         })
         .collect();

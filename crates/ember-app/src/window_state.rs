@@ -109,6 +109,52 @@ pub(crate) fn revert_target_tab(n_tabs: usize, dragged: usize) -> Option<usize> 
     Some(if dragged == 0 { 1 } else { dragged - 1 })
 }
 
+/// Map a resolved [`DropZone`] hover to the [`SurfaceDest`] `resolve_drag_drop`
+/// stages, given the hovered window's INDEX (already resolved from its
+/// `WindowId` by the caller) and the hovered pane's `(tab, pane)`. Pure: no
+/// window/session state — the "drop → dest" mapping release 2 builds on,
+/// shared by same-window and cross-window pane drops alike (see
+/// `resolve_drag_drop`'s doc for why those two cases merged into one call
+/// site here).
+pub(crate) fn drop_zone_to_dest(
+    zone: DropZone,
+    window: usize,
+    tab: usize,
+    pane: PaneId,
+) -> SurfaceDest {
+    match zone {
+        DropZone::Edge { axis, before } => SurfaceDest::SplitInto {
+            window,
+            tab,
+            pane,
+            axis,
+            before,
+        },
+        DropZone::Center => SurfaceDest::NewTab { window },
+    }
+}
+
+/// The new window's SCREEN-space top-left `(x, y)`, physical px, for a
+/// desktop drag drop: the drop point (`screen`) minus the grab offset
+/// (`grab_logical`, captured at tear-off in the SOURCE window's logical px —
+/// see `DragState::grab`'s doc) converted to physical via `scale`, clamped
+/// to never go negative. A deliberately simple "stay roughly on-screen"
+/// heuristic, not full multi-monitor-aware clamping (querying real monitor
+/// geometry needs `ActiveEventLoop`, not available at this call site) —
+/// noted honestly rather than half-implemented.
+pub(crate) fn desktop_drop_position(
+    screen: (f64, f64),
+    grab_logical: (f64, f64),
+    scale: f64,
+) -> (i32, i32) {
+    let (sx, sy) = screen;
+    let (gx, gy) = grab_logical;
+    (
+        (sx - gx * scale).max(0.0).round() as i32,
+        (sy - gy * scale).max(0.0).round() as i32,
+    )
+}
+
 /// What a drag/reorder gesture resolved to on release — `ctl drag`'s
 /// `drag_ended` reply field, and the return of [`WindowState::left_release`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +290,14 @@ pub(crate) struct WindowState {
     /// (`move-tab`/`promote-pane`/`merge-tab`). `None` outside that one-tick
     /// window; nothing else should read or hold onto it.
     pub(crate) pending_move: Option<(SurfaceRef, SurfaceDest)>,
+    /// A live cross-window drag currently targeting THIS window (release 2
+    /// task 3) — set by `App::update_cross_window_drag` (`main.rs`) when
+    /// this window's frame is under the carried pointer, cleared the instant
+    /// hover moves elsewhere. Drives this window's own preview visuals
+    /// (`set_incoming_drop`); `None` on the drag's source window itself
+    /// (which shows the lifted tab chip via `update_drag_hover` instead) and
+    /// on every window outside the drag entirely.
+    pub(crate) incoming_drop: Option<DropHover>,
 }
 
 impl WindowState {
@@ -294,6 +348,7 @@ impl WindowState {
             occluded: false,
             render_starved: false,
             pending_move: None,
+            incoming_drop: None,
         }
     }
 
@@ -1130,8 +1185,10 @@ impl WindowState {
             self.clear_split_preview();
             return;
         };
+        // The manual Ctrl+Opt split always appends the new pane on the far
+        // side (`before: false`).
         self.renderer
-            .set_split_preview(Some((sid, horizontal, ratio)));
+            .set_split_preview(Some((sid, horizontal, ratio, false)));
         self.split_preview = Some(SplitPreview {
             pane,
             horizontal,
@@ -1794,6 +1851,9 @@ impl WindowState {
                     grab: (x - press_x, y - strip_bottom),
                     carried: false,
                     hover: None,
+                    last_screen: (0.0, 0.0), // set for real on this same tick's
+                                             // motion, immediately below by `update_drag_hover`'s
+                                             // caller — see `App::window_event`'s CursorMoved arm.
                 });
             } else {
                 // Still an in-strip reorder — unchanged existing behavior.
@@ -1806,13 +1866,67 @@ impl WindowState {
         }
     }
 
+    /// Classify a local point `(x, y)` — logical px, THIS window's own
+    /// coordinate space — as a drop hover target: the tab strip band (an
+    /// insertion index), else a pane hit + [`drop_zone_for`] (`Edge`/
+    /// `Center`), else `None` (nothing here — the caller decides what that
+    /// means: an in-window caller treats it as "release here cancels", a
+    /// cross-window caller treats a total miss across every tracked window
+    /// as `DropHover::Desktop`). Bounds-checks first: a point outside this
+    /// window's own logical size is never a hit, however far out it is —
+    /// without this, `tab_slot_at`'s deliberate clamping (so a live in-strip
+    /// drag never returns `None` mid-window) would otherwise misclassify a
+    /// point that's actually left the window entirely (e.g. now hovering a
+    /// DIFFERENT window's strip) as "still hovering THIS window's strip".
+    /// Pure read: no `self` mutation, no dependency on which surface (if
+    /// any) is being dragged — used both for the in-window hover
+    /// (`update_drag_hover`, called on the drag's own source) and the
+    /// cross-window target's hover (`App::update_cross_window_drag` in
+    /// `main.rs`, called on whichever OTHER window the pointer is over).
+    pub(crate) fn hover_at(&self, window_id: WindowId, x: f64, y: f64) -> Option<DropHover> {
+        let sf = self.renderer.window().scale_factor();
+        let (lw, lh) = (self.px.0 as f64 / sf, self.px.1 as f64 / sf);
+        if x < 0.0 || y < 0.0 || x >= lw || y >= lh {
+            return None;
+        }
+        let strip_bottom = Renderer::chrome_height() as f64;
+        if y <= strip_bottom {
+            return self
+                .renderer
+                .tab_slot_at(x as f32)
+                .map(|insert_at| DropHover::Strip {
+                    window: window_id,
+                    insert_at,
+                });
+        }
+        let hit = self
+            .pane_rects
+            .iter()
+            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .cloned()?;
+        let (sid, rect) = hit;
+        let pane = self
+            .active_tab()
+            .root
+            .leaves()
+            .into_iter()
+            .find(|(_, s)| *s == sid)
+            .map(|(p, _)| p)?;
+        let zone = drop_zone_for(x - rect.x, y - rect.y, rect.width, rect.height);
+        Some(DropHover::Pane {
+            window: window_id,
+            tab: self.tree.active,
+            pane,
+            zone,
+        })
+    }
+
     /// Update the live drop-hover for a torn-off drag as the pointer moves,
     /// re-deriving the preview (`set_split_preview`/the lifted tab chip)
-    /// from it. This task's only wired hover targets are inside the SAME
-    /// window as the drag's source (`drag.source_window`) — a different
-    /// window has no hover here yet (a later task's job). Anywhere else in
-    /// this window with no pane underneath hovers `None`, which
-    /// `resolve_drag_drop` treats as a cancel.
+    /// from it, ON THE DRAG'S OWN SOURCE WINDOW. `App::update_cross_window_drag`
+    /// (`main.rs`) handles the cross-window case (a different window's
+    /// `incoming_drop`) right after this returns each tick; this method only
+    /// ever sees `drag.source_window == window_id`.
     fn update_drag_hover(&mut self, shared: &mut Shared, window_id: WindowId, x: f64, y: f64) {
         let Some(drag) = shared.drag.as_ref() else {
             return;
@@ -1824,41 +1938,11 @@ impl WindowState {
         if drag.source_window != window_id {
             return;
         }
-        let strip_bottom = Renderer::chrome_height() as f64;
-        let hover = if y <= strip_bottom {
-            self.renderer
-                .tab_slot_at(x as f32)
-                .map(|insert_at| DropHover::Strip {
-                    window: window_id,
-                    insert_at,
-                })
-        } else {
-            let hit = self
-                .pane_rects
-                .iter()
-                .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-                .cloned();
-            hit.and_then(|(sid, rect)| {
-                let pane = self
-                    .active_tab()
-                    .root
-                    .leaves()
-                    .into_iter()
-                    .find(|(_, s)| *s == sid)
-                    .map(|(p, _)| p)?;
-                let zone = drop_zone_for(x - rect.x, y - rect.y, rect.width, rect.height);
-                Some(DropHover::Pane {
-                    window: window_id,
-                    tab: self.tree.active,
-                    pane,
-                    zone,
-                })
-            })
-        };
+        let hover = self.hover_at(window_id, x, y);
         match &hover {
             Some(DropHover::Pane {
                 pane,
-                zone: DropZone::Edge { axis, .. },
+                zone: DropZone::Edge { axis, before },
                 ..
             }) => {
                 if let Some(sid) = self.active_tab().root.session_of(*pane).cloned() {
@@ -1866,37 +1950,98 @@ impl WindowState {
                     // A fixed 50/50 preview — a drag-drop split is always
                     // even (`move_surface`'s own split ratio), unlike the
                     // Ctrl+Opt manual-split preview this same visual also
-                    // drives, which follows the cursor. NOTE: this preview
-                    // doesn't yet distinguish "before" (left/top) from
-                    // "after" (right/bottom) — see the task report's
-                    // concerns. The topology `resolve_drag_drop` applies is
-                    // correct either way; only the highlighted side can
-                    // read wrong for a `before: true` zone.
+                    // drives, which follows the cursor. `before` now
+                    // threads through to `set_split_preview` so the
+                    // highlighted half matches the side the moved surface
+                    // will actually land on (release 2, task 3 — was
+                    // deferred in task 2's report).
                     self.renderer
-                        .set_split_preview(Some((sid, horizontal, 0.5)));
+                        .set_split_preview(Some((sid, horizontal, 0.5, *before)));
                 }
             }
             _ => self.clear_split_preview(),
         }
         // Keep the lifted tab chip following the cursor the whole time (the
         // crude "lift" visual this task reuses — a full ghost is Task 5's).
+        // `build_tabs` clamps the visible position to the strip's own
+        // bounds, so this stays a sane (if pinned-at-the-edge) cue even once
+        // `x` has gone far outside the window during a cross-window carry.
         self.renderer.set_tab_drag(Some((dragged_tab, x as f32)));
         if let Some(drag) = shared.drag.as_mut() {
             drag.hover = hover;
         }
     }
 
-    /// Resolve a torn-off drag on release: `Strip` hover → the same reorder
-    /// a live in-strip drag commits progressively (applied here directly —
-    /// an in-strip reorder is pure `LayoutCommand` bookkeeping on THIS
-    /// window's own tree, nothing `apply_move` needs to arbitrate); `Pane`
-    /// hover → builds the `(SurfaceRef, SurfaceDest)` pair for an in-window
-    /// split and stashes it in `self.pending_move` for the caller to run
-    /// through `apply_move` (the canonical surface-mobility path every other
-    /// gesture — `move-tab`/`promote-pane`/`merge-tab` — already uses; see
+    /// Set/clear THIS window's live cross-window drop preview — called by
+    /// `App::update_cross_window_drag` when this window is (or stops being)
+    /// the current hover TARGET of some OTHER window's drag. `x` is the
+    /// local logical cursor x (only meaningful for the `Strip` case's
+    /// insertion caret). Mirrors the visual vocabulary `update_drag_hover`
+    /// drives for an in-window hover: a sided `Edge` split preview, a
+    /// near-full-pane `Center` tint (reusing the same split-preview quad
+    /// with `ratio: 0.0` rather than adding a new one — the manual-split
+    /// ratio floor caps the tinted region at 95%, not a hard 100%, but it
+    /// reads clearly as "drop here"), or a floating insertion-caret chip on
+    /// the strip (`set_tab_drag` with an out-of-range slot so no real tab of
+    /// THIS window is shown "recessed" — see `build_tabs`'s `dragging_this`
+    /// check, which only matches a real tab index).
+    pub(crate) fn set_incoming_drop(&mut self, hover: Option<DropHover>, x: f64) {
+        self.incoming_drop = hover;
+        self.clear_split_preview();
+        self.renderer.set_tab_drag(None);
+        match hover {
+            Some(DropHover::Strip { .. }) => {
+                let n = self.tree.tabs.len();
+                self.renderer.set_tab_drag(Some((n, x as f32)));
+            }
+            Some(DropHover::Pane {
+                pane,
+                zone: DropZone::Edge { axis, before },
+                ..
+            }) => {
+                if let Some(sid) = self.active_tab().root.session_of(pane).cloned() {
+                    let horizontal = matches!(axis, Axis::Horizontal);
+                    self.renderer
+                        .set_split_preview(Some((sid, horizontal, 0.5, before)));
+                }
+            }
+            Some(DropHover::Pane {
+                pane,
+                zone: DropZone::Center,
+                ..
+            }) => {
+                if let Some(sid) = self.active_tab().root.session_of(pane).cloned() {
+                    self.renderer
+                        .set_split_preview(Some((sid, true, 0.0, false)));
+                }
+            }
+            Some(DropHover::Desktop) | None => {}
+        }
+    }
+
+    /// Clear this window's own drag-related visuals: the lifted tab chip,
+    /// the split preview, and any live cross-window incoming-drop preview.
+    /// Safe to call on any window regardless of its role in a drag (source,
+    /// target, or neither) — each individual clear already no-ops cheaply
+    /// when nothing was set.
+    pub(crate) fn clear_drag_visuals(&mut self) {
+        self.renderer.set_tab_drag(None);
+        self.clear_split_preview();
+        self.incoming_drop = None;
+    }
+
+    /// Resolve a torn-off drag on release: `Strip` hover on the SOURCE's own
+    /// window → the same reorder a live in-strip drag commits progressively
+    /// (applied here directly — an in-strip reorder is pure `LayoutCommand`
+    /// bookkeeping on THIS window's own tree, nothing `apply_move` needs to
+    /// arbitrate); a `Strip` hover on any OTHER window, or a `Pane` hover on
+    /// this window OR another (release 2 task 3's cross-window addition), or
+    /// `Desktop` (ditto) → builds the `(SurfaceRef, SurfaceDest)` pair and
+    /// stashes it in `self.pending_move` for the caller to run through
+    /// `apply_move` (the canonical surface-mobility path every other gesture
+    /// — `move-tab`/`promote-pane`/`merge-tab` — already uses; see
     /// `pending_move`'s doc for why this method can't call it directly); no
-    /// hover (or a hover this task doesn't resolve, e.g. a stale window
-    /// identity) → cancel with zero mutation.
+    /// hover → cancel with zero mutation.
     fn resolve_drag_drop(
         &mut self,
         shared: &mut Shared,
@@ -1906,7 +2051,10 @@ impl WindowState {
         self.renderer.set_tab_drag(None);
         self.clear_split_preview();
         let SurfaceRef::Tab { tab: src_tab, .. } = drag.surface else {
-            return DragEnded::Cancel; // pane-only drags aren't produced by this task
+            return DragEnded::Cancel; // pane-only drags aren't produced until Task 4
+        };
+        let Some(src_w) = resolve_window_index(shared, drag.source_window) else {
+            return DragEnded::Cancel; // shouldn't happen: this IS (or was) that window
         };
         match drag.hover {
             Some(DropHover::Strip { window, insert_at }) if window == window_id => {
@@ -1926,53 +2074,68 @@ impl WindowState {
                 self.sync_layout(shared);
                 DragEnded::Reorder
             }
+            Some(DropHover::Strip { window, .. }) => {
+                // Cross-window: append as a new tab of `window` (v1: append
+                // only — `insert_at` isn't honored positionally across
+                // windows yet, noted honestly rather than half-implemented).
+                let Some(w) = resolve_window_index(shared, window) else {
+                    return DragEnded::Cancel; // target window vanished mid-drag
+                };
+                self.pending_move = Some((
+                    SurfaceRef::Tab {
+                        window: src_w,
+                        tab: src_tab,
+                    },
+                    SurfaceDest::NewTab { window: w },
+                ));
+                DragEnded::Move
+            }
             Some(DropHover::Pane {
                 window,
                 tab,
                 pane,
                 zone,
-            }) if window == window_id => {
-                let w = match resolve_window_index(shared, window_id) {
-                    Some(w) => w,
-                    None => return DragEnded::Cancel, // shouldn't happen: this IS that window
+            }) => {
+                // Same-window or cross-window pane drop: both lower onto
+                // `apply_move` identically — Task 2 special-cased `window ==
+                // window_id` here for no functional reason (`w` resolved the
+                // same either way); merged into one arm.
+                let Some(w) = resolve_window_index(shared, window) else {
+                    return DragEnded::Cancel; // target window vanished mid-drag
                 };
-                let dest = match zone {
-                    DropZone::Edge { axis, before } => SurfaceDest::SplitInto {
-                        window: w,
-                        tab,
-                        pane,
-                        axis,
-                        before,
-                    },
-                    // No in-window target yet: a same-window `NewTab` is
-                    // always rejected by `move_surface` as a no-op ("the
-                    // tab's already in that window") — `apply_move` surfaces
-                    // that as a humanized `Err`, which the caller turns into
-                    // `Cancel`.
-                    DropZone::Center => SurfaceDest::NewTab { window: w },
-                };
+                // Same-window `NewTab` is always rejected by `move_surface`
+                // as a no-op ("the tab's already in that window") —
+                // `apply_move` surfaces that as a humanized `Err`, which the
+                // caller turns into `Cancel`. A cross-window Center drop is
+                // a real append.
+                let dest = drop_zone_to_dest(zone, w, tab, pane);
                 self.pending_move = Some((
                     SurfaceRef::Tab {
-                        window: w,
+                        window: src_w,
                         tab: src_tab,
                     },
                     dest,
                 ));
                 DragEnded::Move
             }
-            _ => DragEnded::Cancel,
-        }
-    }
-
-    /// Cancel an in-progress torn-off drag (Escape / `ctl drag --cancel`):
-    /// zero tree mutation — `self.tree.active` was already reverted to the
-    /// origin tab at tear-off time and hover updates never touch the tree,
-    /// so clearing `shared.drag` and the preview visuals is enough.
-    pub(crate) fn cancel_drag(&mut self, shared: &mut Shared) {
-        if shared.drag.take().is_some() {
-            self.renderer.set_tab_drag(None);
-            self.clear_split_preview();
-            self.renderer.window().request_redraw();
+            Some(DropHover::Desktop) => {
+                // A brand-new window at (roughly) the drop point, minus the
+                // grab offset captured at tear-off — see `Shared::
+                // new_window_position_hint`'s doc for how `apply_move`
+                // threads this through to `open_window`.
+                let sf = self.renderer.window().scale_factor();
+                let (px, py) = desktop_drop_position(drag.last_screen, drag.grab, sf);
+                shared.new_window_position_hint = Some(winit::dpi::PhysicalPosition::new(px, py));
+                self.pending_move = Some((
+                    SurfaceRef::Tab {
+                        window: src_w,
+                        tab: src_tab,
+                    },
+                    SurfaceDest::NewWindow,
+                ));
+                DragEnded::Move
+            }
+            None => DragEnded::Cancel,
         }
     }
 
@@ -2676,5 +2839,87 @@ mod tests {
         assert_eq!(revert_target_tab(4, 3), Some(2));
         // Only one tab left (the dragged one itself) → nothing to revert to.
         assert_eq!(revert_target_tab(1, 0), None);
+    }
+
+    #[test]
+    fn drop_zone_to_dest_maps_edge_to_split_into_with_axis_and_side() {
+        use super::drop_zone_to_dest;
+        use ember_core::{Axis, DropZone, PaneId, SurfaceDest};
+
+        let left = drop_zone_to_dest(
+            DropZone::Edge {
+                axis: Axis::Horizontal,
+                before: true,
+            },
+            2,
+            5,
+            PaneId(9),
+        );
+        assert_eq!(
+            left,
+            SurfaceDest::SplitInto {
+                window: 2,
+                tab: 5,
+                pane: PaneId(9),
+                axis: Axis::Horizontal,
+                before: true,
+            }
+        );
+
+        let bottom = drop_zone_to_dest(
+            DropZone::Edge {
+                axis: Axis::Vertical,
+                before: false,
+            },
+            0,
+            0,
+            PaneId(1),
+        );
+        assert_eq!(
+            bottom,
+            SurfaceDest::SplitInto {
+                window: 0,
+                tab: 0,
+                pane: PaneId(1),
+                axis: Axis::Vertical,
+                before: false,
+            }
+        );
+    }
+
+    #[test]
+    fn drop_zone_to_dest_maps_center_to_new_tab_of_the_hovered_window() {
+        use super::drop_zone_to_dest;
+        use ember_core::{DropZone, PaneId, SurfaceDest};
+
+        let dest = drop_zone_to_dest(DropZone::Center, 3, 7, PaneId(4));
+        assert_eq!(dest, SurfaceDest::NewTab { window: 3 });
+    }
+
+    #[test]
+    fn desktop_drop_position_subtracts_the_scaled_grab_offset() {
+        use super::desktop_drop_position;
+        // A drop at physical (500, 400), grabbed 10 logical px right of and
+        // 4 below the tab's origin, at 2x scale → (500 - 20, 400 - 8).
+        assert_eq!(
+            desktop_drop_position((500.0, 400.0), (10.0, 4.0), 2.0),
+            (480, 392)
+        );
+    }
+
+    #[test]
+    fn desktop_drop_position_clamps_to_never_go_negative() {
+        use super::desktop_drop_position;
+        // A grab offset larger than the drop point itself would otherwise
+        // push the new window off-screen negative — clamp to (0, 0)-ish.
+        assert_eq!(
+            desktop_drop_position((10.0, 10.0), (100.0, 100.0), 1.0),
+            (0, 0)
+        );
+        // Only one axis clamps.
+        assert_eq!(
+            desktop_drop_position((10.0, 500.0), (100.0, 50.0), 1.0),
+            (0, 450)
+        );
     }
 }

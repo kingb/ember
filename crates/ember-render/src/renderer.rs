@@ -424,8 +424,12 @@ pub struct Renderer {
     image_rgba: Option<(Vec<u8>, u32, u32)>,
     /// The active text selection and the session whose pane it belongs to.
     selection: Option<(SessionId, Selection)>,
-    /// Ctrl+Opt split drop-zone preview: `(hovered session, horizontal, ratio)`.
-    split_preview: Option<(SessionId, bool, f32)>,
+    /// Split drop-zone preview: `(hovered session, horizontal, ratio, before)`.
+    /// `before` is `true` when the NEW pane lands on the left/top sibling
+    /// (surface-drag `DropZone::Edge`'s `before` bit — release 2); the
+    /// Ctrl+Opt manual split preview always passes `before: false` (that
+    /// gesture only ever appends the new pane on the far side).
+    split_preview: Option<(SessionId, bool, f32, bool)>,
     /// FPS/frame-time debug readout text (bottom-right), or `None` when hidden.
     fps_overlay: Option<String>,
     /// Glyph buffer for the FPS overlay.
@@ -752,8 +756,8 @@ impl Renderer {
                         split_preview: self
                             .split_preview
                             .as_ref()
-                            .filter(|(sid, _, _)| *sid == vp.session)
-                            .map(|(_, h, r)| (*h, *r)),
+                            .filter(|(sid, _, _, _)| *sid == vp.session)
+                            .map(|(_, h, r, before)| (*h, *r, *before)),
                     })
             })
             .collect();
@@ -953,9 +957,10 @@ impl Renderer {
             .map(|s| (s.link_id, s.url.as_str()))
     }
 
-    /// Set/clear the Ctrl+Opt split drop-zone preview: `(hovered session,
-    /// horizontal = side-by-side, ratio = existing pane fraction)`.
-    pub fn set_split_preview(&mut self, preview: Option<(SessionId, bool, f32)>) {
+    /// Set/clear the split drop-zone preview: `(hovered session, horizontal =
+    /// side-by-side, ratio = existing pane fraction, before = new pane on
+    /// the left/top sibling)`.
+    pub fn set_split_preview(&mut self, preview: Option<(SessionId, bool, f32, bool)>) {
         self.scene_dirty = true;
         self.split_preview = preview;
         self.window.request_redraw();
@@ -1440,10 +1445,18 @@ impl Renderer {
                                 selection_quads(&p.grid, sel, vp.rect, cw, ch, sf, &mut rects);
                             }
                         }
-                        // Ctrl+Opt split drop-zone preview over the hovered pane.
-                        if let Some((psid, horizontal, ratio)) = &self.split_preview {
+                        // Split drop-zone preview over the hovered pane (Ctrl+Opt
+                        // manual split, or a surface-drag Edge hover).
+                        if let Some((psid, horizontal, ratio, before)) = &self.split_preview {
                             if *psid == vp.session {
-                                split_preview(vp.rect, *horizontal, *ratio, sf, &mut rects);
+                                split_preview(
+                                    vp.rect,
+                                    *horizontal,
+                                    *before,
+                                    *ratio,
+                                    sf,
+                                    &mut rects,
+                                );
                             }
                         }
                         // Scrollbar (right edge): shown whenever the pane has history and

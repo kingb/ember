@@ -196,6 +196,7 @@ fn main() {
         shared: None,
         windows: HashMap::new(),
         focused_window: None,
+        focus_history: Vec::new(),
         control_rx,
         control_server,
         wake,
@@ -234,6 +235,15 @@ struct App {
     windows: HashMap<WindowId, WindowState>,
     /// The window that currently has focus (the sole window today).
     focused_window: Option<WindowId>,
+    /// Front-to-back focus order (index 0 = most recently focused), updated
+    /// on `WindowEvent::Focused(true)` — dedup by moving the id to the
+    /// front rather than pushing a duplicate. Drives `window_frames()`'s
+    /// z-order guess for cross-window drag hit-testing (release 2): we have
+    /// no real window-manager stacking order, so "most recently focused
+    /// first" is the best approximation available. A window that's never
+    /// been focused (just opened, still behind another) isn't in here yet —
+    /// `window_frames()` appends any missing ids from `window_order` after.
+    focus_history: Vec<WindowId>,
     /// Receiver for debug-control commands (Some while the control socket is bound).
     control_rx: Option<Receiver<ControlMsg>>,
     /// The bound control listener (from EMBER_CONTROL); moved into Shared.
@@ -311,6 +321,14 @@ pub(crate) struct Shared {
     /// `ctl drag`'s synthesized one both drive it via `WindowState::
     /// update_drag`/`update_drag_hover`/`resolve_drag_drop`.
     pub(crate) drag: Option<DragState>,
+    /// One-shot position hint for the next `open_window` call, set by
+    /// `WindowState::resolve_drag_drop`'s `Desktop` arm right before staging
+    /// a `SurfaceDest::NewWindow` `pending_move`, and consumed (taken) by
+    /// `apply_move`'s `MoveEffect::WindowOpened` handler a few lines later in
+    /// the same tick. `None` for every other window-opening path (Cmd+N,
+    /// `ctl new-window`, move-tab-to-new-window) — those place the OS window
+    /// at its default position, unchanged.
+    pub(crate) new_window_position_hint: Option<winit::dpi::PhysicalPosition<i32>>,
 }
 
 /// A drag in progress, spanning windows (hence on [`Shared`], not
@@ -325,24 +343,33 @@ pub(crate) struct DragState {
     /// The window the drag started in, by identity (not index — an index can
     /// go stale if some other action reorders `window_order` mid-drag).
     pub(crate) source_window: WindowId,
-    /// Pointer offset inside the lifted visual, logical px. This task reuses
-    /// the existing lifted-tab-chip visual (cursor-x-following) rather than a
-    /// true offset sprite, so nothing reads this yet — it's set (not just a
-    /// placeholder value) so Task 5's ghost sprite has it ready to consume.
-    #[allow(dead_code)]
+    /// Pointer offset inside the lifted visual, logical (SOURCE window)
+    /// px, captured at tear-off. Read by `resolve_drag_drop`'s `Desktop`
+    /// arm to place a brand-new window at (roughly) the drop point, minus
+    /// this offset — a real offset-from-the-grabbed-corner sprite is Task
+    /// 5's wisp; this is the closest existing artifact and reuse is
+    /// documented as the deliberate (not accidental) choice here.
     pub(crate) grab: (f64, f64),
     /// Whether the pointer has left the source window's surface (a
-    /// cross-window/desktop carry — not produced by this task, which is
-    /// in-window only; always `false` here). Read by a later task's
-    /// cross-window hover/ghost logic.
-    #[allow(dead_code)]
+    /// cross-window/desktop carry). Monotonic once a drag is torn off: flips
+    /// `true` on first exit and never flips back for this drag, even if the
+    /// pointer re-enters the source window's own bounds later. Not read by
+    /// this task's mechanics (hover/drop resolution don't need it — `hover`
+    /// alone is authoritative); kept for Task 5's wisp (visible only while
+    /// carried) and as a `ctl`-visible breadcrumb.
     pub(crate) carried: bool,
     /// The current drop target, if any, driving the live preview. `None`
     /// means "release here cancels."
     pub(crate) hover: Option<DropHover>,
+    /// Last known SCREEN-space (physical px, across every window) cursor
+    /// position, updated every motion tick once torn off by
+    /// `update_cross_window_drag`. Read by `resolve_drag_drop`'s `Desktop`
+    /// arm for the new window's position hint.
+    pub(crate) last_screen: (f64, f64),
 }
 
 /// Where a carried surface would land, driving the live drag preview.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum DropHover {
     /// Hovering a window's tab strip: dropping here reorders/re-inserts the
     /// carried tab at `insert_at`.
@@ -356,11 +383,10 @@ pub(crate) enum DropHover {
         pane: PaneId,
         zone: ember_core::DropZone,
     },
-    /// Hovering neither a tracked window's strip nor one of its panes (a
-    /// future cross-window "drop on the desktop" target). Part of the
-    /// interface this task's brief specifies (Tasks 3-6 build on it); not
-    /// produced by this task's in-window-only hover logic.
-    #[allow(dead_code)]
+    /// Hovering neither a tracked window's strip nor one of its panes: a
+    /// cross-window "drop on the desktop" target — release 2 task 3's
+    /// addition. Dropping here opens a brand-new window (`SurfaceDest::
+    /// NewWindow`) at (roughly) the drop point.
     Desktop,
 }
 
@@ -470,6 +496,7 @@ impl ApplicationHandler<EmberEvent> for App {
             cwd_by_session: std::collections::HashMap::new(),
             wake: self.wake.clone(),
             drag: None,
+            new_window_position_hint: None,
         };
         let mut win = WindowState::new(renderer, tree);
         win.px = px;
@@ -494,6 +521,7 @@ impl ApplicationHandler<EmberEvent> for App {
         win.renderer.window().request_redraw();
         self.windows.insert(window_id, win);
         self.focused_window = Some(window_id);
+        self.focus_history.push(window_id);
         self.shared = Some(shared);
     }
 
@@ -540,6 +568,8 @@ impl ApplicationHandler<EmberEvent> for App {
                     // target for keystrokes, ctl commands, and (per-window)
                     // shortcuts.
                     self.focused_window = Some(id);
+                    self.focus_history.retain(|w| *w != id);
+                    self.focus_history.insert(0, id);
                     // A focused window is never occluded. Focus events are the
                     // reliable reveal signal when an Occluded(false) got lost
                     // (e.g. around display sleep/unlock), so also clear the
@@ -569,6 +599,21 @@ impl ApplicationHandler<EmberEvent> for App {
                 let sf = win.renderer.window().scale_factor();
                 let (x, y) = (position.x / sf, position.y / sf);
                 win.on_cursor_moved(shared, id, x, y);
+                // `win`'s borrow of `self.windows` ends at the statement
+                // above (unused for the rest of this arm) — the same NLL
+                // shape `apply_move`'s callers rely on elsewhere — so this
+                // can reborrow `self.windows` as a whole for the
+                // cross-window drag tracker (release 2 task 3).
+                if shared.drag.is_some() {
+                    update_cross_window_drag(
+                        &mut self.windows,
+                        shared,
+                        &self.focus_history,
+                        id,
+                        x,
+                        y,
+                    );
+                }
             }
             // Cursor left the window — drop any tab hover so the highlight/"✕"
             // don't linger.
@@ -693,7 +738,7 @@ impl ApplicationHandler<EmberEvent> for App {
                 // (no keyboard shortcuts fire mid-drag).
                 if shared.drag.is_some() {
                     if !key.repeat && matches!(key.logical_key, Key::Named(NamedKey::Escape)) {
-                        win.cancel_drag(shared);
+                        cancel_drag_everywhere(&mut self.windows, shared);
                     }
                     return;
                 }
@@ -1601,6 +1646,7 @@ impl ApplicationHandler<EmberEvent> for App {
                         &mut self.windows,
                         shared,
                         &mut self.focused_window,
+                        &self.focus_history,
                         event_loop,
                         window,
                         x1,
@@ -1746,15 +1792,24 @@ fn queue_close_window(deferred_windows: &mut Vec<DeferredWindowAction>, id: Wind
 /// out of `self.windows`) for the rest of its enclosing function, and a
 /// `&mut self` method here would conflict with that — see `close_window` and
 /// `finish_close` below for the same reasoning. Does not spawn any shell.
+///
+/// `position`: a physical-px screen position hint (`with_position`) — `Some`
+/// only for a desktop drag drop (release 2 task 3: the new window lands at
+/// roughly the drop point); every other caller passes `None` and gets the OS
+/// default placement, unchanged.
 fn open_window(
     windows: &mut HashMap<WindowId, WindowState>,
     shared: &mut Shared,
     event_loop: &ActiveEventLoop,
     tree: ember_core::WindowTree,
+    position: Option<winit::dpi::PhysicalPosition<i32>>,
 ) -> WindowId {
     let w = DEFAULT_COLS as f32 * CELL_WIDTH + 2.0 * PAD;
     let h = DEFAULT_ROWS as f32 * CELL_HEIGHT + 2.0 * PAD;
-    let attrs = ember_platform::window_attributes("Ember", w, h);
+    let mut attrs = ember_platform::window_attributes("Ember", w, h);
+    if let Some(p) = position {
+        attrs = attrs.with_position(p);
+    }
     let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
     ember_platform::set_app_icon(&window, ICON_PNG);
     let window_id = window.id();
@@ -1816,7 +1871,7 @@ fn open_new_window(
         }],
         active: 0,
     };
-    let window_id = open_window(windows, shared, event_loop, tree);
+    let window_id = open_window(windows, shared, event_loop, tree, None);
     let win = windows.get_mut(&window_id).expect("just inserted above");
     if !win.spawn_session(
         shared,
@@ -1837,14 +1892,13 @@ fn open_new_window(
 /// closing mid-drag doesn't leave the global key-swallow (the
 /// `shared.drag.is_some()` check in the `KeyboardInput` handler above) stuck
 /// forever — nothing else ever clears `shared.drag` once the source window
-/// itself is gone, since `WindowState::cancel_drag`/`left_release` (the only
-/// other things that clear it) are methods on THAT now-removed
-/// `WindowState`. Also clears any lifted-tab-chip/split-preview visuals left
-/// behind on a DIFFERENT window the drag was hovering (not the one
-/// closing) — the same visuals `WindowState::cancel_drag` clears on the
-/// source window itself; today's in-window-only hover always has
-/// `hover.window == source_window`, so this is a no-op in practice, but a
-/// later cross-window task can make them differ.
+/// itself is gone, since `left_release`/`cancel_drag_everywhere` (the only
+/// other things that clear it) need a live `WindowState` to call into.
+/// Otherwise (release 2 task 3's addition): if `id` is instead the drag's
+/// current HOVER TARGET (a different window still owns the drag), just drop
+/// the now-stale hover — the target's `WindowState` is discarded wholesale
+/// by the caller right after this returns, so there's no visual left to
+/// clear, but a later release/motion must never dereference a dead window.
 fn clear_drag_on_window_close(
     windows: &mut HashMap<WindowId, WindowState>,
     shared: &mut Shared,
@@ -1853,7 +1907,9 @@ fn clear_drag_on_window_close(
     let Some(drag) = shared.drag.as_ref() else {
         return;
     };
-    if drag.source_window != id {
+    if drag.source_window == id {
+        shared.drag = None;
+        clear_all_drag_visuals(windows);
         return;
     }
     let hover_window = match drag.hover {
@@ -1861,12 +1917,201 @@ fn clear_drag_on_window_close(
         Some(DropHover::Pane { window, .. }) => Some(window),
         Some(DropHover::Desktop) | None => None,
     };
-    shared.drag = None;
-    if let Some(hw) = hover_window {
-        if hw != id {
-            if let Some(w) = windows.get_mut(&hw) {
-                w.renderer.set_tab_drag(None);
-                w.clear_split_preview();
+    if hover_window == Some(id) {
+        if let Some(d) = shared.drag.as_mut() {
+            d.hover = None;
+        }
+    }
+}
+
+/// Clear every window's drag-related visuals (lifted tab chip, split
+/// preview, and — release 2 task 3's addition — any live cross-window
+/// incoming-drop preview). Called whenever a drag just ended (drop, cancel,
+/// or its source window closing) so nothing lingers on a window that isn't
+/// the source, regardless of which one(s) were actually showing something —
+/// each individual clear already no-ops cheaply when nothing was set.
+fn clear_all_drag_visuals(windows: &mut HashMap<WindowId, WindowState>) {
+    for w in windows.values_mut() {
+        w.clear_drag_visuals();
+    }
+}
+
+/// Cancel a live drag with zero tree mutation (Escape, or `ctl drag
+/// --cancel`) — a free function rather than a `WindowState` method because,
+/// as of release 2 task 3, the drag's current hover can be on a DIFFERENT
+/// window than whichever one actually received the cancel input (OS
+/// keyboard focus doesn't reliably track a captured mouse-drag's source
+/// window), so clearing must reach every window, not just `self`.
+fn cancel_drag_everywhere(windows: &mut HashMap<WindowId, WindowState>, shared: &mut Shared) {
+    if shared.drag.take().is_some() {
+        clear_all_drag_visuals(windows);
+        for w in windows.values_mut() {
+            w.renderer.window().request_redraw();
+        }
+    }
+}
+
+/// Front-to-back window frames (physical px, screen space) for cross-window
+/// drag hit-testing: `focus_history` first (most-recently-focused = most
+/// "in front", our best available proxy for real window-manager stacking
+/// order — winit exposes no actual z-order query), then any window NOT in
+/// `focus_history` yet (just opened, never focused) appended via
+/// `window_order` so every live window is represented exactly once. Skips a
+/// window whose `inner_position()` fails (platforms where it can return an
+/// error; treated as "not hit-testable this frame" rather than a panic).
+fn window_frames(
+    windows: &HashMap<WindowId, WindowState>,
+    focus_history: &[WindowId],
+    window_order: &[WindowId],
+) -> Vec<(WindowId, (f64, f64, f64, f64))> {
+    let mut order: Vec<WindowId> = focus_history
+        .iter()
+        .copied()
+        .filter(|id| windows.contains_key(id))
+        .collect();
+    for wid in window_order {
+        if !order.contains(wid) {
+            order.push(*wid);
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|wid| {
+            let w = windows.get(&wid)?;
+            let win = w.renderer.window();
+            let pos = win.inner_position().ok()?;
+            let size = win.inner_size();
+            Some((
+                wid,
+                (
+                    pos.x as f64,
+                    pos.y as f64,
+                    size.width as f64,
+                    size.height as f64,
+                ),
+            ))
+        })
+        .collect()
+}
+
+/// Clear `incoming_drop` (and its visuals) on every window except `keep`
+/// (`None` clears everyone). Called on each cross-window drag motion tick so
+/// only the CURRENT target ever shows a preview — the previous target (if
+/// any) must stop showing one the instant hover moves elsewhere.
+fn clear_incoming_drop_except(
+    windows: &mut HashMap<WindowId, WindowState>,
+    keep: Option<WindowId>,
+) {
+    for (wid, w) in windows.iter_mut() {
+        if Some(*wid) != keep && w.incoming_drop.is_some() {
+            w.set_incoming_drop(None, 0.0);
+        }
+    }
+}
+
+/// Advance a live cross-window drag on a motion tick: `source_id` is the
+/// window that just received `CursorMoved`/a synthesized `ctl drag` step (the
+/// ONLY window that does, per the mini-spike — macOS keeps delivering motion
+/// to a drag's origin window even once the pointer leaves its bounds, so
+/// there is no separate "target window's own CursorMoved" to listen for).
+/// `local_x`/`local_y` are logical px in `source_id`'s own coordinate space
+/// (same units `WindowState::on_cursor_moved` takes) — which is exactly
+/// `on_cursor_moved`'s `(x, y)`; call this immediately after it, every tick,
+/// with the same values. No-ops instantly unless `shared.drag` exists and
+/// belongs to `source_id`.
+///
+/// When the point is still within `source_id`'s own bounds, this only tidies
+/// up (clears any OTHER window's stale preview) — `on_cursor_moved` already
+/// ran `WindowState::update_drag_hover` for the in-window case by the time
+/// this is called, so `drag.hover` is already correct. Once the point is
+/// outside those bounds (`carried` flips `true`, monotonically), this
+/// resolves the real screen-space target via `window_frames`/`window_under`
+/// and drives the previews: a different tracked window gets its
+/// `incoming_drop` set (Strip/Edge/Center preview), no window hit at all
+/// means `DropHover::Desktop`.
+fn update_cross_window_drag(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    focus_history: &[WindowId],
+    source_id: WindowId,
+    local_x: f64,
+    local_y: f64,
+) {
+    let Some(drag) = shared.drag.as_ref() else {
+        return;
+    };
+    if drag.source_window != source_id {
+        return;
+    }
+    let Some(src) = windows.get(&source_id) else {
+        return;
+    };
+    let sf = src.renderer.window().scale_factor();
+    let Ok(pos) = src.renderer.window().inner_position() else {
+        return;
+    };
+    let screen_x = pos.x as f64 + local_x * sf;
+    let screen_y = pos.y as f64 + local_y * sf;
+    let (sw, sh) = src.px;
+    let outside_source =
+        local_x < 0.0 || local_y < 0.0 || local_x * sf >= sw as f64 || local_y * sf >= sh as f64;
+
+    if let Some(d) = shared.drag.as_mut() {
+        d.last_screen = (screen_x, screen_y);
+        if outside_source {
+            d.carried = true;
+        }
+    }
+
+    if !outside_source {
+        // Still (or again) inside the source's own bounds: `on_cursor_moved`
+        // (called just before this, same tick) already set `drag.hover`
+        // correctly via `update_drag_hover`. Just make sure no OTHER window
+        // is left showing a stale target preview from a prior tick.
+        clear_incoming_drop_except(windows, Some(source_id));
+        return;
+    }
+
+    let frames = window_frames(windows, focus_history, &shared.window_order);
+    let hit = ember_core::window_under(
+        screen_x,
+        screen_y,
+        &frames.iter().map(|(_, f)| *f).collect::<Vec<_>>(),
+    );
+    let target = hit.and_then(|i| frames.get(i)).map(|(id, _)| *id);
+
+    match target {
+        Some(tid) if tid == source_id => {
+            // The point is geometrically back over the source's own frame
+            // (carried, but hovering itself again) — nothing else claims it.
+            clear_incoming_drop_except(windows, Some(source_id));
+        }
+        Some(tid) => {
+            clear_incoming_drop_except(windows, Some(tid));
+            let Some((tx, ty)) = windows.get(&tid).and_then(|twin| {
+                let tsf = twin.renderer.window().scale_factor();
+                let tpos = twin.renderer.window().inner_position().ok()?;
+                Some((
+                    (screen_x - tpos.x as f64) / tsf,
+                    (screen_y - tpos.y as f64) / tsf,
+                ))
+            }) else {
+                return;
+            };
+            let hover = windows
+                .get(&tid)
+                .and_then(|twin| twin.hover_at(tid, tx, ty));
+            if let Some(twin) = windows.get_mut(&tid) {
+                twin.set_incoming_drop(hover, tx);
+            }
+            if let Some(d) = shared.drag.as_mut() {
+                d.hover = hover;
+            }
+        }
+        None => {
+            clear_incoming_drop_except(windows, None);
+            if let Some(d) = shared.drag.as_mut() {
+                d.hover = Some(DropHover::Desktop);
             }
         }
     }
@@ -2061,7 +2306,13 @@ fn apply_move(
                 let Some(tree) = opened_tree.take() else {
                     continue; // shouldn't happen: move_surface mints at most one window
                 };
-                let wid = open_window(windows, shared, event_loop, tree);
+                // A desktop drag drop staged a position hint just before this
+                // `apply_move` call (`WindowState::resolve_drag_drop`'s
+                // `Desktop` arm) — consume it here; every other move that
+                // opens a window (promote-pane, move-tab-to-new-window)
+                // leaves it `None`, so the OS default placement applies.
+                let position = shared.new_window_position_hint.take();
+                let wid = open_window(windows, shared, event_loop, tree, position);
                 new_order[index] = Some(wid);
                 touched.push(wid);
             }
@@ -2302,6 +2553,7 @@ fn run_ctl_drag(
     windows: &mut HashMap<WindowId, WindowState>,
     shared: &mut Shared,
     focused_window: &mut Option<WindowId>,
+    focus_history: &[WindowId],
     event_loop: &ActiveEventLoop,
     window: WindowId,
     x1: f64,
@@ -2312,30 +2564,52 @@ fn run_ctl_drag(
     mods: &str,
     cancel: bool,
 ) -> String {
-    let Some(win) = windows.get_mut(&window) else {
+    let Some(saved_mods) = windows.get(&window).map(|w| w.modifiers) else {
         return serde_json::json!({"ok": false, "error": "window not tracked"}).to_string();
     };
     let steps = steps.max(1);
-    let saved_mods = win.modifiers;
-    win.modifiers = parse_mods_only(mods);
-    win.press_left(shared, x1, y1);
+    {
+        let win = windows.get_mut(&window).expect("checked above");
+        win.modifiers = parse_mods_only(mods);
+        win.press_left(shared, x1, y1);
+    }
+    // Each step re-fetches `win` fresh (rather than holding one borrow
+    // across the whole loop) so `update_cross_window_drag` can reborrow
+    // `windows` as a whole right after — the exact same NLL shape the real
+    // `WindowEvent::CursorMoved` handler uses, so a synthesized `ctl drag`
+    // exercises the identical cross-window path a real drag does.
     for i in 1..=steps {
         let t = i as f64 / steps as f64;
-        win.on_cursor_moved(shared, window, x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+        let (x, y) = (x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+        if let Some(win) = windows.get_mut(&window) {
+            win.on_cursor_moved(shared, window, x, y);
+        }
+        if shared.drag.is_some() {
+            update_cross_window_drag(windows, shared, focus_history, window, x, y);
+        }
     }
     // "mid" = right before release/cancel resolves it — whether a genuine
     // drag (not just a click) was actually in flight by then.
-    let drag_active_mid = shared.drag.is_some() || win.tab_drag_is_active_drag();
+    let drag_active_mid = shared.drag.is_some()
+        || windows
+            .get(&window)
+            .is_some_and(|w| w.tab_drag_is_active_drag());
     let mut ended = if cancel {
-        win.cancel_drag(shared);
+        cancel_drag_everywhere(windows, shared);
         DragEnded::Cancel
-    } else {
+    } else if let Some(win) = windows.get_mut(&window) {
         win.left_release(shared, window)
+    } else {
+        DragEnded::None
     };
-    win.modifiers = saved_mods;
-    // Ends `win`'s borrow of `windows` — nothing below reuses it, which is
-    // what lets `apply_move` reborrow `windows` as a whole a few lines down.
-    let pending = win.pending_move.take();
+    if let Some(win) = windows.get_mut(&window) {
+        win.modifiers = saved_mods;
+    }
+    // Every window's `incoming_drop`/preview is stale the instant the drag
+    // resolves one way or another — belt-and-suspenders alongside whatever
+    // `resolve_drag_drop`/`cancel_drag_everywhere` already cleared.
+    clear_all_drag_visuals(windows);
+    let pending = windows.get_mut(&window).and_then(|w| w.pending_move.take());
     let mut error = None;
     if let Some((src, dest)) = pending {
         match apply_move(windows, shared, focused_window, event_loop, src, dest) {
@@ -2542,12 +2816,29 @@ fn build_state_json(
         .enumerate()
         .filter_map(|(i, wid)| {
             windows.get(wid).map(|w| {
-                serde_json::json!({
+                // `pos`/`size` (physical px, screen space) are diagnostic —
+                // release 2's cross-window drag verification needs a way to
+                // see real window placement without an accessibility API
+                // (`inner_position()` can fail on some platforms; omitted
+                // when it does rather than reporting a bogus (0,0)).
+                let win = w.renderer.window();
+                let mut entry = serde_json::json!({
                     "id": i + 1,
                     "focused": Some(*wid) == focused_window,
                     "active_tab": w.tree.active,
                     "tabs": w.tabs_summary_json(),
-                })
+                });
+                if let Ok(pos) = win.inner_position() {
+                    let size = win.inner_size();
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("pos".to_string(), serde_json::json!([pos.x, pos.y]));
+                        obj.insert(
+                            "size".to_string(),
+                            serde_json::json!([size.width, size.height]),
+                        );
+                    }
+                }
+                entry
             })
         })
         .collect();

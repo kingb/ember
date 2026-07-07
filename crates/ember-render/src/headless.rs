@@ -39,8 +39,8 @@ pub struct PaneShot<'a> {
     pub focused: bool,
     /// Text selection to highlight in this pane, if any.
     pub selection: Option<Selection>,
-    /// Ctrl+Opt split preview `(horizontal, ratio)` for this pane, if any.
-    pub split_preview: Option<(bool, f32)>,
+    /// Split preview `(horizontal, ratio, before)` for this pane, if any.
+    pub split_preview: Option<(bool, f32, bool)>,
 }
 
 /// A full scene to capture: logical window size, HiDPI scale, the panes, and the
@@ -385,8 +385,8 @@ pub fn capture_reusing(
             if let Some(sel) = &pane.selection {
                 selection_quads(pane.grid, sel, pane.rect, cw, line_height, sf, &mut rects);
             }
-            if let Some((horizontal, ratio)) = pane.split_preview {
-                split_preview(pane.rect, horizontal, ratio, sf, &mut rects);
+            if let Some((horizontal, ratio, before)) = pane.split_preview {
+                split_preview(pane.rect, horizontal, before, ratio, sf, &mut rects);
             }
             if !pane.grid.alt_screen {
                 scrollbar(

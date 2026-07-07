@@ -494,12 +494,17 @@ pub(crate) fn selection_quads(
 }
 
 /// Draw the visual-split drop-zone preview over a pane `rect`: a translucent
-/// ember-tinted overlay on the region the NEW pane would occupy (right half if
-/// `horizontal` = side-by-side, else bottom half), with a bright divider line at
-/// `ratio` (the existing pane's fraction). Held Ctrl+Opt + hover; click commits.
+/// ember-tinted overlay on the region the NEW pane would occupy, with a bright
+/// divider line at the boundary. `horizontal` = side-by-side (else stacked).
+/// `before` = the new pane lands on the left/top sibling (else right/bottom —
+/// the Ctrl+Opt manual split's only case; a surface-drag Edge hover can be
+/// either, per its `DropZone::Edge`'s `before` bit). `ratio` is the EXISTING
+/// pane's fraction either way, so the new pane's region is always
+/// `1.0 - ratio` wide/tall, just mirrored to the named side.
 pub(crate) fn split_preview(
     rect: Rect,
     horizontal: bool,
+    before: bool,
     ratio: f32,
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
@@ -512,12 +517,20 @@ pub(crate) fn split_preview(
     );
     let r = ratio.clamp(0.05, 0.95);
     if horizontal {
-        let dx = x + w * r;
-        out.push((scaled(dx, y, w * (1.0 - r), h, sf), lin_rgba(ACCENT, 0.20)));
+        let dx = if before { x + w * (1.0 - r) } else { x + w * r };
+        let new_x = if before { x } else { dx };
+        out.push((
+            scaled(new_x, y, w * (1.0 - r), h, sf),
+            lin_rgba(ACCENT, 0.20),
+        ));
         out.push((scaled(dx - 1.0, y, 2.0, h, sf), lin_rgba(ACCENT, 0.9)));
     } else {
-        let dy = y + h * r;
-        out.push((scaled(x, dy, w, h * (1.0 - r), sf), lin_rgba(ACCENT, 0.20)));
+        let dy = if before { y + h * (1.0 - r) } else { y + h * r };
+        let new_y = if before { y } else { dy };
+        out.push((
+            scaled(x, new_y, w, h * (1.0 - r), sf),
+            lin_rgba(ACCENT, 0.20),
+        ));
         out.push((scaled(x, dy - 1.0, w, 2.0, sf), lin_rgba(ACCENT, 0.9)));
     }
 }
