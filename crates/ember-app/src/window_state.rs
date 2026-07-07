@@ -1166,20 +1166,17 @@ impl WindowState {
     /// modifier, rather than a `#[cfg(target_os = ...)]` item split).
     /// Deliberately a separate check from `split_modifier_held`, not a
     /// reuse: on macOS the two chords are physically distinct (Cmd+Opt vs.
-    /// Ctrl+Opt); on Linux they coincide (both read as Ctrl+Alt) by design
-    /// (design doc: "same modifier family as the split-preview gesture").
-    /// Where they coincide, `left_click`'s existing split-preview-commit
-    /// check (checked first, unchanged) still wins for a real click that
-    /// primed a preview via prior pointer motion — this chord only starts a
-    /// pane drag when no preview is showing, which is always true for
-    /// `ctl drag`'s synthesized press (no prior `CursorMoved`) and for any
-    /// real press where the modifier was applied without first moving the
-    /// mouse over a pane.
+    /// Ctrl+Opt). On Linux, Ctrl+Alt alone would coincide with the
+    /// split-preview gesture — and since `on_cursor_moved` arms the preview
+    /// on every motion tick while that chord is held, a real mouse could
+    /// never reach the pane-drag branch (positioning the cursor arms the
+    /// preview; the press commits a split). So Linux adds Shift:
+    /// Ctrl+Alt+Shift+drag, which shares no gate with the preview.
     pub(crate) fn pane_drag_modifier_held(&self) -> bool {
         if cfg!(target_os = "macos") {
             self.modifiers.super_key() && self.modifiers.alt_key()
         } else {
-            self.modifiers.control_key() && self.modifiers.alt_key()
+            self.modifiers.control_key() && self.modifiers.alt_key() && self.modifiers.shift_key()
         }
     }
 

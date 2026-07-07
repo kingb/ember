@@ -20,7 +20,7 @@ home and pours back.
 | Drag source | How it starts |
 |---|---|
 | Tab | the existing tab drag, once the pointer leaves the strip's band (inside the band it stays the existing reorder) |
-| Pane | `Cmd+Opt+drag` (macOS) / `Ctrl+Alt+drag` (Linux) on the pane body — chord-gated so plain drag stays text selection; same modifier family as the split-preview gesture |
+| Pane | `Cmd+Opt+drag` (macOS) / `Ctrl+Alt+Shift+drag` (Linux) on the pane body — chord-gated so plain drag stays text selection (Linux adds Shift because bare Ctrl+Alt is the split-preview gesture, which arms on pointer motion and would always win) |
 
 | Drop target | Result (all via `move_surface`) |
 |---|---|
