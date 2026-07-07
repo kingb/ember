@@ -124,6 +124,21 @@ fn tools() -> Value {
             "name": "ember_live_screenshot",
             "description": "Capture the CURRENT on-screen state of a running ember-term to a PNG (pixel-identical to the window) and return the path to read. Args: path (default /tmp/ember-live.png), plus pid/sock to target an instance.",
             "inputSchema": {"type": "object", "properties": with(target_props(), "path", json!({"type": "string"}))}
+        },
+        {
+            "name": "ember_move_tab",
+            "description": "Move the focused tab to another window: a brand-new one, an existing 1-based window number, or the window next/previous in creation order. Returns {ok:true} or {ok:false,error}.",
+            "inputSchema": {"type": "object", "properties": with(target_props(), "to", json!({"type": "string", "description": "new | next | prev | <1-based window number>"})), "required": ["to"]}
+        },
+        {
+            "name": "ember_promote_pane",
+            "description": "Promote the focused pane out of its current split: into its own new tab (same window) or its own brand-new window. Returns {ok:true} or {ok:false,error}.",
+            "inputSchema": {"type": "object", "properties": with(target_props(), "to", json!({"type": "string", "enum": ["tab", "window"]})), "required": ["to"]}
+        },
+        {
+            "name": "ember_merge_tab",
+            "description": "Merge the focused tab into the tab immediately before it, as a horizontal split of that tab's focused pane. Returns {ok:true} or {ok:false,error} (e.g. no previous tab).",
+            "inputSchema": {"type": "object", "properties": target_props()}
         }
     ])
 }
@@ -222,6 +237,21 @@ fn tools_call(params: Option<&Value>) -> Result<Value, String> {
             }
             Ok(text(send(&args, req)?))
         }
+        "ember_move_tab" => {
+            let to = args
+                .get("to")
+                .and_then(Value::as_str)
+                .ok_or("to required")?;
+            Ok(text(send(&args, json!({"cmd": "move-tab", "to": to}))?))
+        }
+        "ember_promote_pane" => {
+            let to = args
+                .get("to")
+                .and_then(Value::as_str)
+                .ok_or("to required")?;
+            Ok(text(send(&args, json!({"cmd": "promote-pane", "to": to}))?))
+        }
+        "ember_merge_tab" => Ok(text(send(&args, json!({"cmd": "merge-tab"}))?)),
         other => Err(format!("unknown tool: {other}")),
     }
 }

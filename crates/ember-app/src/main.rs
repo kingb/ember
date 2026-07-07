@@ -23,12 +23,12 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use control::ControlMsg;
+use control::{ControlMsg, MoveTabTarget, PromotePaneTarget};
 
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims, LayoutNode,
-    OscEvent, PaneId, Rect, RowKind, ScrollAmount, SessionId, SettingsRowView, Tab, TabId,
-    resolve_rows,
+    MoveEffect, OscEvent, PaneId, Rect, RowKind, ScrollAmount, SessionId, SettingsRowView,
+    SurfaceDest, SurfaceRef, Tab, TabId, resolve_rows,
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
@@ -254,6 +254,14 @@ pub(crate) struct Shared {
     /// close; Task 4's `move_surface` updates it when a session changes
     /// windows.
     pub(crate) session_window: HashMap<SessionId, WindowId>,
+    /// Stable window order (creation order): index = the 0-based window
+    /// number `ember_core::Windows`/`SurfaceRef`/`SurfaceDest` and the ctl
+    /// surface's 1-based `move-tab <N>` operate on. Maintained by
+    /// `open_window` (push on create) and `close_window`/
+    /// `close_window_shell_only` (remove on close) — never reordered
+    /// otherwise, so an index computed before a move stays valid for every
+    /// site that reads it during the same tick.
+    pub(crate) window_order: Vec<WindowId>,
     // window-scoped later? id counters are per-app today (one window).
     pub(crate) next_pane: u64,
     pub(crate) next_session: u64,
@@ -387,6 +395,7 @@ impl ApplicationHandler<EmberEvent> for App {
         let mut shared = Shared {
             sessions: HashMap::new(),
             session_window: HashMap::new(),
+            window_order: vec![window_id],
             next_pane: 2,
             next_session: 2,
             next_tab: 2,
@@ -756,6 +765,29 @@ impl ApplicationHandler<EmberEvent> for App {
                 // Super (Cmd/Win) combos are multiplexer shortcuts — consumed, never
                 // forwarded to the shell.
                 if mods.super_key() {
+                    // Cmd+Shift+N — move the focused tab to a brand-new
+                    // window. Checked BEFORE the plain Cmd+N below: a shifted
+                    // "N" still matches that character check, and Move Tab
+                    // to New Window is the more specific chord. Needs
+                    // `event_loop`/every window's state, same as Cmd+N.
+                    if mods.shift_key()
+                        && matches!(&key.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("n"))
+                    {
+                        if let Ok((src, dest)) = build_move_tab(win, shared, id, MoveTabTarget::New)
+                        {
+                            if let Err(e) = apply_move(
+                                &mut self.windows,
+                                shared,
+                                &mut self.focused_window,
+                                event_loop,
+                                src,
+                                dest,
+                            ) {
+                                eprintln!("[ember] move tab to new window: {e}");
+                            }
+                        }
+                        return;
+                    }
                     // Cmd+N — open a new window (fresh tab, cwd inherited from
                     // the focused pane). Handled here, not in `handle_shortcut`,
                     // because it needs `event_loop` (window creation) and every
@@ -773,6 +805,31 @@ impl ApplicationHandler<EmberEvent> for App {
                             event_loop,
                             cwd,
                         );
+                        return;
+                    }
+                    // Cmd+Opt+T — promote the focused pane to its own tab.
+                    // Opt(=Alt) combos don't otherwise route through
+                    // `handle_shortcut` (that method only ever sees Super-only
+                    // or Linux-translated chords), so this is checked here,
+                    // both for that reason and because it's cross-window like
+                    // Cmd+N above.
+                    if mods.alt_key()
+                        && matches!(&key.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("t"))
+                    {
+                        if let Ok((src, dest)) =
+                            build_promote_pane(win, shared, id, PromotePaneTarget::Tab)
+                        {
+                            if let Err(e) = apply_move(
+                                &mut self.windows,
+                                shared,
+                                &mut self.focused_window,
+                                event_loop,
+                                src,
+                                dest,
+                            ) {
+                                eprintln!("[ember] promote pane to tab: {e}");
+                            }
+                        }
                         return;
                     }
                     if win.handle_shortcut(shared, &key.logical_key, mods)
@@ -817,19 +874,61 @@ impl ApplicationHandler<EmberEvent> for App {
                 // translate onto the same shortcut handler Super uses.
                 #[cfg(target_os = "linux")]
                 if let Some((k, m)) = linux_chord_translate(&key.logical_key, mods) {
-                    // Ctrl+Shift+N == Cmd+N (new window) — same event_loop/
-                    // cross-window need as the macOS branch above.
+                    // Ctrl+Shift+N == Cmd+N (new window); Alt+Shift+N ==
+                    // Cmd+Shift+N (move tab to new window) — `linux_chord_translate`
+                    // tells the two apart by leaving SHIFT on the latter's
+                    // translated modifiers. Same event_loop/cross-window need
+                    // as the macOS branch above.
                     if matches!(&k, Key::Character(c) if c.eq_ignore_ascii_case("n")) {
-                        let cwd = win
-                            .focused_session_id()
-                            .and_then(|sid| shared.cwd_by_session.get(&sid).cloned());
-                        open_new_window(
-                            &mut self.windows,
-                            shared,
-                            &mut self.focused_window,
-                            event_loop,
-                            cwd,
-                        );
+                        if m.shift_key() {
+                            if let Ok((src, dest)) =
+                                build_move_tab(win, shared, id, MoveTabTarget::New)
+                            {
+                                if let Err(e) = apply_move(
+                                    &mut self.windows,
+                                    shared,
+                                    &mut self.focused_window,
+                                    event_loop,
+                                    src,
+                                    dest,
+                                ) {
+                                    eprintln!("[ember] move tab to new window: {e}");
+                                }
+                            }
+                        } else {
+                            let cwd = win
+                                .focused_session_id()
+                                .and_then(|sid| shared.cwd_by_session.get(&sid).cloned());
+                            open_new_window(
+                                &mut self.windows,
+                                shared,
+                                &mut self.focused_window,
+                                event_loop,
+                                cwd,
+                            );
+                        }
+                        return;
+                    }
+                    // Alt+Shift+T == Cmd+Opt+T (promote pane to tab) —
+                    // `linux_chord_translate` leaves ALT on the translated
+                    // modifiers for this one key precisely so it's
+                    // distinguishable from Ctrl+Shift+T's plain "new tab".
+                    if m.alt_key() && matches!(&k, Key::Character(c) if c.eq_ignore_ascii_case("t"))
+                    {
+                        if let Ok((src, dest)) =
+                            build_promote_pane(win, shared, id, PromotePaneTarget::Tab)
+                        {
+                            if let Err(e) = apply_move(
+                                &mut self.windows,
+                                shared,
+                                &mut self.focused_window,
+                                event_loop,
+                                src,
+                                dest,
+                            ) {
+                                eprintln!("[ember] promote pane to tab: {e}");
+                            }
+                        }
                         return;
                     }
                     if win.handle_shortcut(shared, &k, m) && win.tree.tabs.is_empty() {
@@ -1087,6 +1186,48 @@ impl ApplicationHandler<EmberEvent> for App {
                 deferred_windows.push(DeferredWindowAction::OpenNew(cwd));
                 continue;
             }
+            // The three surface-mobility ctl verbs: same reasoning as
+            // `NewWindow` above (`apply_move` needs `self.windows`/
+            // `event_loop`, neither reachable from `WindowState`), but these
+            // reply with a real `{ok}`/`{ok:false,error}` line, so the
+            // reply channel rides along in the deferred action and gets
+            // answered once `apply_move` actually runs at the tail.
+            if let ControlMsg::MoveTab(target, reply) = cmd {
+                match build_move_tab(win, shared, focused_id, target) {
+                    Ok((src, dest)) => {
+                        deferred_windows.push(DeferredWindowAction::Move(src, dest, Some(reply)));
+                    }
+                    Err(e) => {
+                        let _ =
+                            reply.send(serde_json::json!({"ok": false, "error": e}).to_string());
+                    }
+                }
+                continue;
+            }
+            if let ControlMsg::PromotePane(target, reply) = cmd {
+                match build_promote_pane(win, shared, focused_id, target) {
+                    Ok((src, dest)) => {
+                        deferred_windows.push(DeferredWindowAction::Move(src, dest, Some(reply)));
+                    }
+                    Err(e) => {
+                        let _ =
+                            reply.send(serde_json::json!({"ok": false, "error": e}).to_string());
+                    }
+                }
+                continue;
+            }
+            if let ControlMsg::MergeTab(reply) = cmd {
+                match build_merge_tab(win, shared, focused_id) {
+                    Ok((src, dest)) => {
+                        deferred_windows.push(DeferredWindowAction::Move(src, dest, Some(reply)));
+                    }
+                    Err(e) => {
+                        let _ =
+                            reply.send(serde_json::json!({"ok": false, "error": e}).to_string());
+                    }
+                }
+                continue;
+            }
             match win.handle_control(shared, cmd) {
                 Some(ControlClose::ExitApp) => {
                     shared.shutdown_all();
@@ -1127,6 +1268,54 @@ impl ApplicationHandler<EmberEvent> for App {
                         } else {
                             queue_close_this(&mut deferred_windows);
                         }
+                    }
+                }
+                MenuAction::MoveTabToNewWindow => {
+                    match build_move_tab(win, shared, focused_id, MoveTabTarget::New) {
+                        Ok((src, dest)) => {
+                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
+                        }
+                        Err(e) => eprintln!("[ember] move tab to new window: {e}"),
+                    }
+                }
+                MenuAction::MoveTabToNextWindow => {
+                    match build_move_tab(win, shared, focused_id, MoveTabTarget::Next) {
+                        Ok((src, dest)) => {
+                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
+                        }
+                        Err(e) => eprintln!("[ember] move tab to next window: {e}"),
+                    }
+                }
+                MenuAction::MoveTabToPrevWindow => {
+                    match build_move_tab(win, shared, focused_id, MoveTabTarget::Prev) {
+                        Ok((src, dest)) => {
+                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
+                        }
+                        Err(e) => eprintln!("[ember] move tab to previous window: {e}"),
+                    }
+                }
+                MenuAction::PromotePaneToTab => {
+                    match build_promote_pane(win, shared, focused_id, PromotePaneTarget::Tab) {
+                        Ok((src, dest)) => {
+                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
+                        }
+                        Err(e) => eprintln!("[ember] promote pane to tab: {e}"),
+                    }
+                }
+                MenuAction::PromotePaneToWindow => {
+                    match build_promote_pane(win, shared, focused_id, PromotePaneTarget::Window) {
+                        Ok((src, dest)) => {
+                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
+                        }
+                        Err(e) => eprintln!("[ember] promote pane to new window: {e}"),
+                    }
+                }
+                MenuAction::MergeTabIntoPrevious => {
+                    match build_merge_tab(win, shared, focused_id) {
+                        Ok((src, dest)) => {
+                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
+                        }
+                        Err(e) => eprintln!("[ember] merge tab: {e}"),
                     }
                 }
             }
@@ -1235,6 +1424,27 @@ impl ApplicationHandler<EmberEvent> for App {
                         focused_id,
                     );
                 }
+                DeferredWindowAction::Move(src, dest, reply) => {
+                    let result = apply_move(
+                        &mut self.windows,
+                        shared,
+                        &mut self.focused_window,
+                        event_loop,
+                        src,
+                        dest,
+                    );
+                    match (result, reply) {
+                        (Ok(()), Some(reply)) => {
+                            let _ = reply.send("{\"ok\":true}".to_string());
+                        }
+                        (Err(e), Some(reply)) => {
+                            let _ = reply
+                                .send(serde_json::json!({"ok": false, "error": e}).to_string());
+                        }
+                        (Ok(()), None) => {}
+                        (Err(e), None) => eprintln!("[ember] move failed: {e}"),
+                    }
+                }
             }
         }
     }
@@ -1250,6 +1460,17 @@ impl ApplicationHandler<EmberEvent> for App {
 enum DeferredWindowAction {
     OpenNew(Option<String>),
     CloseThis,
+    /// A surface-mobility op (`apply_move`), deferred for the same reason as
+    /// the other two variants: the sites that discover one (a ctl command, a
+    /// native menu item) still hold `win`'s borrow of `self.windows` for the
+    /// rest of the tick. `Some` reply channel is a `ctl` command awaiting its
+    /// `{ok}`/`{ok:false,error}` line; `None` is a menu item (best-effort —
+    /// an error just gets logged).
+    Move(
+        SurfaceRef,
+        SurfaceDest,
+        Option<std::sync::mpsc::Sender<String>>,
+    ),
 }
 
 /// Enqueue a `CloseThis` unless one is already queued this tick.
@@ -1328,6 +1549,7 @@ fn open_window(
     win.apply_appearance(shared);
     win.renderer.window().request_redraw();
     windows.insert(window_id, win);
+    shared.window_order.push(window_id);
     window_id
 }
 
@@ -1397,6 +1619,27 @@ fn close_window(
             shared.cwd_by_session.remove(&sid);
         }
     }
+    shared.window_order.retain(|w| *w != id);
+    if *focused_window == Some(id) {
+        *focused_window = windows.keys().next().copied();
+    }
+}
+
+/// Tear down window `id`'s OS window/`WindowState` WITHOUT touching a single
+/// session: used by [`apply_move`] to close a window that lost its last tab
+/// to a move — its sessions are still very much alive, just re-homed into
+/// another window's renderer/`session_window` entry (already done by the time
+/// this runs; effect order guarantees every `SessionsRehomed` for this window
+/// is applied before its `WindowClosed`). `close_window` would wrongly send
+/// `Shutdown` to every PTY this window's tree used to hold.
+fn close_window_shell_only(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    focused_window: &mut Option<WindowId>,
+    id: WindowId,
+) {
+    windows.remove(&id);
+    shared.window_order.retain(|w| *w != id);
     if *focused_window == Some(id) {
         *focused_window = windows.keys().next().copied();
     }
@@ -1419,6 +1662,261 @@ fn finish_close(
     } else {
         close_window(windows, shared, focused_window, id);
     }
+}
+
+/// The window index a `SurfaceRef` names (the field is the same for both
+/// variants, just not reachable through one shared pattern).
+fn surface_window_index(src: SurfaceRef) -> usize {
+    match src {
+        SurfaceRef::Pane { window, .. } | SurfaceRef::Tab { window, .. } => window,
+    }
+}
+
+/// The one function every surface-mobility gesture (menu item, keybinding,
+/// `ctl move-tab`/`promote-pane`/`merge-tab`) lowers onto: build an
+/// `ember_core::Windows` view of the live window set (ordered by
+/// `shared.window_order`), run [`move_surface`], and carry out whatever
+/// [`MoveEffect`]s it returns.
+///
+/// A moved pane/tab's session(s) must NEVER be killed by this — `move_surface`
+/// only ever *relocates* a `WindowTree`'s leaves, it never emits
+/// `LayoutEffect::KillSession`. The one danger zone is `MoveEffect::WindowClosed`
+/// (the source window ran out of tabs): that must tear down the OS
+/// window/`WindowState` only (`close_window_shell_only`), never the sessions
+/// `close_window` would kill — by the time it fires, effect order guarantees
+/// every session that window used to own has already been re-homed by an
+/// earlier `SessionsRehomed` in the same batch.
+///
+/// Free function, not an `App`/`WindowState` method, for the same reason as
+/// `open_window`/`close_window`: every call site already holds `&mut Shared`
+/// (and often a `&mut WindowState`) borrowed out of `self` for the rest of
+/// its enclosing function — see those functions' docs.
+fn apply_move(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    focused_window: &mut Option<WindowId>,
+    event_loop: &ActiveEventLoop,
+    src: SurfaceRef,
+    dest: SurfaceDest,
+) -> Result<(), String> {
+    let orig_order = shared.window_order.clone();
+    let trees: Vec<ember_core::WindowTree> = orig_order
+        .iter()
+        .map(|wid| windows[wid].tree.clone())
+        .collect();
+    let focused_idx = focused_window
+        .and_then(|fw| orig_order.iter().position(|w| *w == fw))
+        .unwrap_or(0);
+    let mut model = ember_core::Windows {
+        trees,
+        focused: focused_idx,
+    };
+    let fresh_tab_id = TabId(shared.next_tab);
+    let effects = ember_core::move_surface(&mut model, src, dest, fresh_tab_id)
+        .map_err(|e| format!("{e:?}"))?;
+    shared.next_tab += 1;
+    let final_focused = model.focused;
+
+    // At most one window can close per move (only the source can lose its
+    // last tab), so every ORIGINAL index above it simply shifts down by one
+    // in the final layout — an exact, order-independent mapping computed
+    // BEFORE any of the effects below actually mutate `windows`/`window_order`.
+    let closed_idx = effects.iter().find_map(|e| match e {
+        MoveEffect::WindowClosed { index } => Some(*index),
+        _ => None,
+    });
+    let mut new_order: Vec<Option<WindowId>> = vec![None; model.trees.len()];
+    for (i, wid) in orig_order.iter().enumerate() {
+        if Some(i) == closed_idx {
+            continue; // this window is going away this round
+        }
+        let final_idx = match closed_idx {
+            Some(c) if i > c => i - 1,
+            _ => i,
+        };
+        new_order[final_idx] = Some(*wid);
+    }
+
+    // Write every surviving window's mutated tree back; the one slot still
+    // `None` (if any) is the brand-new window `move_surface` minted — stash
+    // its tree for `MoveEffect::WindowOpened` below (`open_window` seeds it).
+    let mut opened_tree: Option<ember_core::WindowTree> = None;
+    for (i, tree) in model.trees.into_iter().enumerate() {
+        match new_order[i] {
+            Some(wid) => {
+                if let Some(w) = windows.get_mut(&wid) {
+                    w.tree = tree;
+                }
+            }
+            None => opened_tree = Some(tree),
+        }
+    }
+
+    let src_window_id = orig_order.get(surface_window_index(src)).copied();
+    let mut touched: Vec<WindowId> = src_window_id.into_iter().collect();
+
+    for effect in effects {
+        match effect {
+            MoveEffect::WindowOpened { index } => {
+                let Some(tree) = opened_tree.take() else {
+                    continue; // shouldn't happen: move_surface mints at most one window
+                };
+                let wid = open_window(windows, shared, event_loop, tree);
+                new_order[index] = Some(wid);
+                touched.push(wid);
+            }
+            MoveEffect::WindowClosed { index } => {
+                if let Some(wid) = orig_order.get(index).copied() {
+                    close_window_shell_only(windows, shared, focused_window, wid);
+                }
+            }
+            MoveEffect::SessionsRehomed {
+                sessions,
+                to_window,
+            } => {
+                let Some(dest_wid) = new_order.get(to_window).copied().flatten() else {
+                    continue;
+                };
+                for sid in sessions {
+                    shared.session_window.insert(sid.clone(), dest_wid);
+                    // A fresh (or merely session-blind) renderer starts
+                    // style-empty (the spike finding): source a full-reset
+                    // replay delta from wherever the grid currently lives —
+                    // the source window's renderer is still intact here,
+                    // `WindowClosed` (if any) always comes after every
+                    // `SessionsRehomed` in the same batch.
+                    let source = windows
+                        .values()
+                        .find_map(|w| w.renderer.grid(&sid).map(|g| (g.dims, g.snapshot_delta())));
+                    if let Some(dest_win) = windows.get_mut(&dest_wid) {
+                        let dims = source
+                            .as_ref()
+                            .map(|(d, _)| *d)
+                            .unwrap_or(GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
+                        dest_win.renderer.ensure_pane(&sid, dims);
+                        if let Some((_, delta)) = source {
+                            dest_win.renderer.apply_delta(&sid, delta);
+                        }
+                    }
+                    // It lives in the destination now — drop it from the
+                    // source window's renderer/dims cache.
+                    if let Some(src_win) = src_window_id.and_then(|id| windows.get_mut(&id)) {
+                        src_win.renderer.remove_pane(&sid);
+                        src_win.dims_cache.remove(&sid);
+                    }
+                    if !touched.contains(&dest_wid) {
+                        touched.push(dest_wid);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(wid) = new_order.get(final_focused).copied().flatten() {
+        *focused_window = Some(wid);
+    }
+    for wid in touched {
+        if let Some(w) = windows.get_mut(&wid) {
+            w.sync_layout(shared);
+            w.renderer.window().request_redraw();
+        }
+    }
+    Ok(())
+}
+
+/// The 0-based index of `id` in `shared.window_order`, if tracked.
+fn window_index_of(shared: &Shared, id: WindowId) -> Option<usize> {
+    shared.window_order.iter().position(|w| *w == id)
+}
+
+/// Build the `SurfaceRef`/`SurfaceDest` pair for a "move tab" op (keyboard,
+/// menu, or `ctl move-tab`) from the focused window's active tab.
+fn build_move_tab(
+    win: &WindowState,
+    shared: &Shared,
+    focused_id: WindowId,
+    target: MoveTabTarget,
+) -> Result<(SurfaceRef, SurfaceDest), String> {
+    let w = window_index_of(shared, focused_id).ok_or("focused window not tracked")?;
+    let src = SurfaceRef::Tab {
+        window: w,
+        tab: win.tree.active,
+    };
+    let n = shared.window_order.len();
+    let dest = match target {
+        MoveTabTarget::New => SurfaceDest::NewWindow,
+        MoveTabTarget::Window(num) => {
+            if num < 1 || num > n {
+                return Err(format!("no window {num} (there are {n})"));
+            }
+            SurfaceDest::NewTab { window: num - 1 }
+        }
+        MoveTabTarget::Next => {
+            if n < 2 {
+                return Err("only one window open".to_string());
+            }
+            SurfaceDest::NewTab {
+                window: (w + 1) % n,
+            }
+        }
+        MoveTabTarget::Prev => {
+            if n < 2 {
+                return Err("only one window open".to_string());
+            }
+            SurfaceDest::NewTab {
+                window: (w + n - 1) % n,
+            }
+        }
+    };
+    Ok((src, dest))
+}
+
+/// Build the `SurfaceRef`/`SurfaceDest` pair for a "promote pane" op
+/// (keyboard, menu, or `ctl promote-pane`) from the focused window's active
+/// tab's focused pane.
+fn build_promote_pane(
+    win: &WindowState,
+    shared: &Shared,
+    focused_id: WindowId,
+    target: PromotePaneTarget,
+) -> Result<(SurfaceRef, SurfaceDest), String> {
+    let w = window_index_of(shared, focused_id).ok_or("focused window not tracked")?;
+    let src = SurfaceRef::Pane {
+        window: w,
+        tab: win.tree.active,
+        pane: win.active_tab().focus,
+    };
+    let dest = match target {
+        PromotePaneTarget::Tab => SurfaceDest::NewTab { window: w },
+        PromotePaneTarget::Window => SurfaceDest::NewWindow,
+    };
+    Ok((src, dest))
+}
+
+/// Build the `SurfaceRef`/`SurfaceDest` pair for `merge-tab`: the focused
+/// tab, merged as a horizontal split into the tab immediately before it (that
+/// tab's own focused pane). Errors if there is no previous tab.
+fn build_merge_tab(
+    win: &WindowState,
+    shared: &Shared,
+    focused_id: WindowId,
+) -> Result<(SurfaceRef, SurfaceDest), String> {
+    let w = window_index_of(shared, focused_id).ok_or("focused window not tracked")?;
+    let t = win.tree.active;
+    if t == 0 {
+        return Err("no previous tab".to_string());
+    }
+    let prev = t - 1;
+    let pane = win.tree.tabs[prev].focus;
+    Ok((
+        SurfaceRef::Tab { window: w, tab: t },
+        SurfaceDest::SplitInto {
+            window: w,
+            tab: prev,
+            pane,
+            axis: Axis::Horizontal,
+        },
+    ))
 }
 
 impl Shared {
@@ -1653,10 +2151,17 @@ fn linux_chord_translate(key: &Key, mods: ModifiersState) -> Option<(Key, Modifi
         };
     }
     if alt && shift && !ctrl {
-        // Alt+Shift+X  ==  Cmd+Shift+X
+        // Alt+Shift+X  ==  Cmd+Shift+X for most of these ("d"/"p"/"n"), but
+        // "t" is the one exception: macOS's Promote Pane to Tab is
+        // Cmd+OPT+T (not Cmd+Shift+T — there is no such binding), so its
+        // Linux chord translates onto ALT instead of SHIFT. The caller tells
+        // the two apart on the returned modifiers.
         return match key {
             Key::Character(s) => match unshift(s)? {
-                k @ ("d" | "p") => Some((Key::Character(SmolStr::new(k)), ModifiersState::SHIFT)),
+                k @ ("d" | "p" | "n") => {
+                    Some((Key::Character(SmolStr::new(k)), ModifiersState::SHIFT))
+                }
+                "t" => Some((Key::Character(SmolStr::new("t")), ModifiersState::ALT)),
                 _ => None,
             },
             Key::Named(
@@ -1743,6 +2248,13 @@ pub(crate) fn help_lines() -> Vec<(String, String)> {
         r(k("Cmd+Shift+Arrows", "Alt+Shift+Arrows"), "Switch tab"),
         r(k("Cmd+1..9", "Alt+1..9"), "Jump to tab"),
         r("Drag / Double-click".into(), "Reorder / rename tab"),
+        r("".into(), "WINDOWS"),
+        r(k("Cmd+Shift+N", "Alt+Shift+N"), "Move tab to new window"),
+        r(k("Cmd+Opt+T", "Alt+Shift+T"), "Promote pane to tab"),
+        r(
+            "Window menu".into(),
+            "Move tab to next/previous window, promote pane to new window, merge tab",
+        ),
         r("".into(), "SELECTION & CLIPBOARD"),
         r(
             "Drag / 2\u{d7}/3\u{d7} click".into(),
@@ -2136,21 +2648,34 @@ mod tests {
             tr(&Key::Named(NamedKey::ArrowLeft), cs),
             Some((Key::Named(NamedKey::ArrowLeft), none))
         );
-        // Alt+Shift+X == Cmd+Shift+X (split down, tab cycling, fps overlay).
+        // Alt+Shift+X == Cmd+Shift+X (split down, tab cycling, fps overlay,
+        // move tab to new window).
         assert_eq!(tr(&ch("D"), als), Some((ch("d"), ModifiersState::SHIFT)));
+        assert_eq!(
+            tr(&ch("N"), als),
+            Some((ch("n"), ModifiersState::SHIFT)),
+            "move tab to new window"
+        );
         assert_eq!(
             tr(&Key::Named(NamedKey::ArrowRight), als),
             Some((Key::Named(NamedKey::ArrowRight), ModifiersState::SHIFT))
         );
+        // Alt+Shift+T is the one exception: it stands in for Cmd+OPT+T
+        // (promote pane to tab), not Cmd+Shift+T (no such binding exists) —
+        // so it carries ALT, not SHIFT, on the translated modifiers, which is
+        // exactly how the caller tells it apart from every other alt+shift chord.
+        assert_eq!(
+            tr(&ch("T"), als),
+            Some((ch("t"), ModifiersState::ALT)),
+            "promote pane to tab"
+        );
         // gnome-terminal zoom-out / reset.
         assert_eq!(tr(&ch("-"), ModifiersState::CONTROL), Some((ch("-"), none)));
         assert_eq!(tr(&ch("0"), ModifiersState::CONTROL), Some((ch("0"), none)));
-        // NOT consumed: plain Ctrl+C (SIGINT!), unknown chords, Super combos,
-        // and Alt+Shift+letters without a Cmd+Shift meaning.
+        // NOT consumed: plain Ctrl+C (SIGINT!), unknown chords, Super combos.
         assert_eq!(tr(&ch("c"), ModifiersState::CONTROL), None);
         assert_eq!(tr(&ch("r"), cs), None);
         assert_eq!(tr(&ch("t"), cs | ModifiersState::SUPER), None);
-        assert_eq!(tr(&ch("T"), als), None);
     }
 
     #[test]

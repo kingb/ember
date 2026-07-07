@@ -32,6 +32,18 @@ pub enum MenuAction {
     Copy,
     /// Edit → Paste (Cmd+V).
     Paste,
+    /// Window → Move Tab to New Window (also Cmd+Shift+N / Alt+Shift+N).
+    MoveTabToNewWindow,
+    /// Window → Move Tab to Next Window.
+    MoveTabToNextWindow,
+    /// Window → Move Tab to Previous Window.
+    MoveTabToPrevWindow,
+    /// Window → Promote Pane to Tab (also Cmd+Opt+T / Alt+Shift+T).
+    PromotePaneToTab,
+    /// Window → Promote Pane to New Window.
+    PromotePaneToWindow,
+    /// Window → Merge Tab into Previous Tab.
+    MergeTabIntoPrevious,
 }
 
 #[cfg(target_os = "macos")]
@@ -57,6 +69,12 @@ mod imp {
         close_id: MenuId,
         copy_id: MenuId,
         paste_id: MenuId,
+        move_tab_new_window_id: MenuId,
+        move_tab_next_window_id: MenuId,
+        move_tab_prev_window_id: MenuId,
+        promote_pane_tab_id: MenuId,
+        promote_pane_window_id: MenuId,
+        merge_tab_id: MenuId,
     }
 
     /// Build + install the menu bar as the NSApp main menu. Call once on the main
@@ -130,10 +148,48 @@ mod imp {
         let _ = edit.append(&paste);
         let _ = menu.append(&edit);
 
-        // Window menu — native minimize/zoom (predefined; no app routing needed).
+        // Window menu — native minimize/zoom, plus the six surface-mobility
+        // ops (move a tab/pane across the window set). Two have keybindings
+        // (mirroring the Linux Alt+Shift+N/T chords); the rest are menu+ctl
+        // only — reachable, but not important enough to spend a chord on.
         let window = Submenu::new("Window", true);
         let _ = window.append(&PredefinedMenuItem::minimize(None));
         let _ = window.append(&PredefinedMenuItem::maximize(None));
+        let _ = window.append(&PredefinedMenuItem::separator());
+        let move_tab_new_window = MenuItem::new(
+            "Move Tab to New Window",
+            true,
+            Some(Accelerator::new(
+                Some(Modifiers::SUPER | Modifiers::SHIFT),
+                Code::KeyN,
+            )),
+        );
+        let move_tab_new_window_id = move_tab_new_window.id().clone();
+        let move_tab_next_window = MenuItem::new("Move Tab to Next Window", true, None);
+        let move_tab_next_window_id = move_tab_next_window.id().clone();
+        let move_tab_prev_window = MenuItem::new("Move Tab to Previous Window", true, None);
+        let move_tab_prev_window_id = move_tab_prev_window.id().clone();
+        let _ = window.append(&move_tab_new_window);
+        let _ = window.append(&move_tab_next_window);
+        let _ = window.append(&move_tab_prev_window);
+        let _ = window.append(&PredefinedMenuItem::separator());
+        let promote_pane_tab = MenuItem::new(
+            "Promote Pane to Tab",
+            true,
+            Some(Accelerator::new(
+                Some(Modifiers::SUPER | Modifiers::ALT),
+                Code::KeyT,
+            )),
+        );
+        let promote_pane_tab_id = promote_pane_tab.id().clone();
+        let promote_pane_window = MenuItem::new("Promote Pane to New Window", true, None);
+        let promote_pane_window_id = promote_pane_window.id().clone();
+        let _ = window.append(&promote_pane_tab);
+        let _ = window.append(&promote_pane_window);
+        let _ = window.append(&PredefinedMenuItem::separator());
+        let merge_tab = MenuItem::new("Merge Tab into Previous Tab", true, None);
+        let merge_tab_id = merge_tab.id().clone();
+        let _ = window.append(&merge_tab);
         let _ = menu.append(&window);
 
         // Help menu with the cheat-sheet shortcut (Cmd+/).
@@ -159,6 +215,12 @@ mod imp {
             close_id,
             copy_id,
             paste_id,
+            move_tab_new_window_id,
+            move_tab_next_window_id,
+            move_tab_prev_window_id,
+            promote_pane_tab_id,
+            promote_pane_window_id,
+            merge_tab_id,
         }
     }
 
@@ -184,6 +246,18 @@ mod imp {
                 action = Some(MenuAction::Copy);
             } else if event.id == menu.paste_id {
                 action = Some(MenuAction::Paste);
+            } else if event.id == menu.move_tab_new_window_id {
+                action = Some(MenuAction::MoveTabToNewWindow);
+            } else if event.id == menu.move_tab_next_window_id {
+                action = Some(MenuAction::MoveTabToNextWindow);
+            } else if event.id == menu.move_tab_prev_window_id {
+                action = Some(MenuAction::MoveTabToPrevWindow);
+            } else if event.id == menu.promote_pane_tab_id {
+                action = Some(MenuAction::PromotePaneToTab);
+            } else if event.id == menu.promote_pane_window_id {
+                action = Some(MenuAction::PromotePaneToWindow);
+            } else if event.id == menu.merge_tab_id {
+                action = Some(MenuAction::MergeTabIntoPrevious);
             }
         }
         action

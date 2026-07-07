@@ -21,6 +21,25 @@ use std::sync::mpsc::Sender;
 
 use ember_core::ScrollAmount;
 
+/// `ctl move-tab <arg>`'s destination: a brand-new window, an existing
+/// 1-based window number, or the window adjacent to the focused one in
+/// `Shared::window_order`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveTabTarget {
+    New,
+    Window(usize),
+    Next,
+    Prev,
+}
+
+/// `ctl promote-pane <arg>`'s destination: the pane's own new tab (same
+/// window) or a brand-new window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromotePaneTarget {
+    Tab,
+    Window,
+}
+
 /// A command forwarded from the control socket to the event loop.
 pub enum ControlMsg {
     /// Type raw text into the focused session (newlines included).
@@ -69,6 +88,19 @@ pub enum ControlMsg {
     /// Open a new OS window with one fresh tab (mirrors Cmd+N / the File →
     /// New Window menu item), cwd inherited from the focused pane.
     NewWindow,
+    /// Move the focused tab to `target` (a brand-new window, an existing
+    /// 1-based window number, or the next/previous window). Replies with the
+    /// full JSON response line (`{"ok":true}` / `{"ok":false,"error":..}`) —
+    /// handled at the `App` level (needs the live window set + event loop),
+    /// same reasoning as `NewWindow`.
+    MoveTab(MoveTabTarget, Sender<String>),
+    /// Promote the focused pane to its own tab (same window) or its own
+    /// brand-new window. Same reply contract as `MoveTab`.
+    PromotePane(PromotePaneTarget, Sender<String>),
+    /// Merge the focused tab into the tab immediately before it, as a
+    /// horizontal split of that tab's focused pane. Same reply contract as
+    /// `MoveTab`; errors (e.g. no previous tab) surface in the reply.
+    MergeTab(Sender<String>),
 }
 
 #[cfg(unix)]
@@ -88,7 +120,7 @@ mod unix {
     use ember_core::ScrollAmount;
     use serde_json::Value;
 
-    use super::ControlMsg;
+    use super::{ControlMsg, MoveTabTarget, PromotePaneTarget};
 
     /// Directory holding per-instance sockets: `$TMPDIR/ember-ctl/`.
     pub fn socket_dir() -> PathBuf {
@@ -304,6 +336,55 @@ mod unix {
                 let _ = tx.send(ControlMsg::NewWindow);
                 ok()
             }
+            "move-tab" => {
+                let arg = v.get("to").and_then(Value::as_str).unwrap_or("");
+                let target = match arg {
+                    "new" => MoveTabTarget::New,
+                    "next" => MoveTabTarget::Next,
+                    "prev" => MoveTabTarget::Prev,
+                    n => match n.parse::<usize>() {
+                        Ok(w) if w >= 1 => MoveTabTarget::Window(w),
+                        _ => return err("move-tab: to = new|next|prev|<1-based window number>"),
+                    },
+                };
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if tx.send(ControlMsg::MoveTab(target, reply_tx)).is_err() {
+                    return err("event loop gone");
+                }
+                waker(); // wake BEFORE waiting — see dispatch docs
+                match reply_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(resp) => resp,
+                    Err(_) => err("move-tab timeout"),
+                }
+            }
+            "promote-pane" => {
+                let arg = v.get("to").and_then(Value::as_str).unwrap_or("");
+                let target = match arg {
+                    "tab" => PromotePaneTarget::Tab,
+                    "window" => PromotePaneTarget::Window,
+                    _ => return err("promote-pane: to = tab|window"),
+                };
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if tx.send(ControlMsg::PromotePane(target, reply_tx)).is_err() {
+                    return err("event loop gone");
+                }
+                waker(); // wake BEFORE waiting — see dispatch docs
+                match reply_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(resp) => resp,
+                    Err(_) => err("promote-pane timeout"),
+                }
+            }
+            "merge-tab" => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if tx.send(ControlMsg::MergeTab(reply_tx)).is_err() {
+                    return err("event loop gone");
+                }
+                waker(); // wake BEFORE waiting — see dispatch docs
+                match reply_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(resp) => resp,
+                    Err(_) => err("merge-tab timeout"),
+                }
+            }
             "settings" => {
                 let _ = tx.send(ControlMsg::Settings);
                 ok()
@@ -516,6 +597,9 @@ mod unix {
             }
             "about" => serde_json::json!({"cmd":"about"}),
             "new-window" => serde_json::json!({"cmd":"new-window"}),
+            "move-tab" => serde_json::json!({"cmd":"move-tab","to": arg}),
+            "promote-pane" => serde_json::json!({"cmd":"promote-pane","to": arg}),
+            "merge-tab" => serde_json::json!({"cmd":"merge-tab"}),
             "settings" => serde_json::json!({"cmd":"settings"}),
             "select" => {
                 let g = |i: usize| rest.get(i).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
@@ -548,7 +632,7 @@ mod unix {
             }
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window|move-tab|promote-pane|merge-tab)"
                 ));
             }
         };

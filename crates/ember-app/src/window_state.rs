@@ -587,6 +587,9 @@ impl WindowState {
             // ever invoked — it needs `self.windows`/`event_loop` to actually
             // open the window. Kept here only so the match stays exhaustive.
             ControlMsg::NewWindow => {}
+            // Same reasoning as `NewWindow`: `apply_move` needs the live
+            // window set + event loop, neither of which this method has.
+            ControlMsg::MoveTab(..) | ControlMsg::PromotePane(..) | ControlMsg::MergeTab(..) => {}
         }
         None
     }
