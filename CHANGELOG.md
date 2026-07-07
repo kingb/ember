@@ -20,6 +20,12 @@ follow [Semantic Versioning](https://semver.org).
 - In `ctl state`, the `tabs` field changed from a count to the array above.
   Callers that read it as a number should use the array's length.
 
+### Fixed
+
+- A plain click (no drag) now clears the selection, like other terminals,
+  instead of leaving a single cell selected. Drag selections and
+  double/triple-click word and line selections behave as before.
+
 ## [0.2.1] - 2026-07-06
 
 ### Fixed

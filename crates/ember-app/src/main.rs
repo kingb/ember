@@ -2014,9 +2014,15 @@ impl RunState {
     fn left_release(&mut self) {
         self.tab_drag = None;
         self.renderer.set_tab_drag(None);
+        let was_selecting = self.selecting;
         self.selecting = false;
         self.scrollbar_drag = None;
         self.divider_drag = None;
+        // A plain click (no drag) clears the selection rather than leaving a
+        // one-cell one — see click_selection_should_clear.
+        if was_selecting && click_selection_should_clear(self.sel.as_ref().map(|(_, s)| s)) {
+            self.clear_selection();
+        }
         if let Some((psid, pid, prow, pcol)) = self.pressed_link.take() {
             if let Some((sid, id, url, row, col)) = self.link_under_cursor() {
                 if sid == psid && id == pid && row == prow && col == pcol {
@@ -3079,6 +3085,16 @@ fn match_tab_title(titles: &[String], query: &str) -> Option<usize> {
     titles.iter().position(|t| t.to_lowercase().contains(&q))
 }
 
+/// Whether releasing the left button should CLEAR the selection instead of
+/// keeping it: a plain click (press+release, no drag) leaves a degenerate
+/// single-cell Simple selection, and terminals treat that as "clear what was
+/// selected", not "select this cell". A real drag (active moved off the
+/// anchor) survives, as do word/line click-selections (mode != Simple
+/// expands at copy time even while anchor == active).
+fn click_selection_should_clear(sel: Option<&Selection>) -> bool {
+    sel.is_some_and(|s| s.mode == SelectionMode::Simple && s.anchor == s.active)
+}
+
 /// The keyboard cheat-sheet shown by the Cmd+/ overlay. Keep in sync with
 /// [`RunState::handle_shortcut`].
 /// Prepare paste bytes. When `bracketed`, wrap the text in the bracketed-paste
@@ -3476,6 +3492,47 @@ mod tests {
         assert_eq!(tab_display_title("build", 0), "build");
         assert_eq!(tab_display_title("", 0), "1");
         assert_eq!(tab_display_title("", 4), "5");
+    }
+
+    #[test]
+    fn plain_click_clears_but_drag_word_and_line_selections_survive() {
+        use super::click_selection_should_clear as should_clear;
+        use ember_render::{Point, Selection, SelectionMode};
+        let sel = |anchor: (u16, u16), active: (u16, u16), mode| Selection {
+            anchor: Point::new(anchor.0, anchor.1),
+            active: Point::new(active.0, active.1),
+            mode,
+        };
+        // Plain click: collapsed simple selection -> clear.
+        assert!(should_clear(Some(&sel(
+            (2, 3),
+            (2, 3),
+            SelectionMode::Simple
+        ))));
+        // Dragged even one cell -> keep.
+        assert!(!should_clear(Some(&sel(
+            (2, 3),
+            (2, 4),
+            SelectionMode::Simple
+        ))));
+        assert!(!should_clear(Some(&sel(
+            (2, 3),
+            (5, 1),
+            SelectionMode::Simple
+        ))));
+        // Double/triple click: collapsed anchor but word/line mode -> keep.
+        assert!(!should_clear(Some(&sel(
+            (2, 3),
+            (2, 3),
+            SelectionMode::Word
+        ))));
+        assert!(!should_clear(Some(&sel(
+            (2, 3),
+            (2, 3),
+            SelectionMode::Line
+        ))));
+        // No selection at all -> nothing to clear.
+        assert!(!should_clear(None));
     }
 
     #[test]
