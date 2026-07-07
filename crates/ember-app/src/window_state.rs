@@ -23,9 +23,10 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use ember_core::{
-    Axis, BackendControl, BackendHandle, Direction, GridDims, LayoutCommand, LayoutEffect, PaneId,
-    Rect, RowKind, ScrollAmount, SessionBackend, SessionId, SettingsRowView, Tab, TabId, apply,
-    layout, setting_rows,
+    Axis, BackendControl, BackendHandle, Direction, DropZone, GridDims, LayoutCommand,
+    LayoutEffect, MoveEffect, PaneId, Rect, RowKind, ScrollAmount, SessionBackend, SessionId,
+    SettingsRowView, SurfaceDest, SurfaceRef, Tab, TabId, Windows, apply, drop_zone_for, layout,
+    move_surface, setting_rows,
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
@@ -38,10 +39,10 @@ use winit::window::{CursorIcon, WindowId};
 use crate::config;
 use crate::control::ControlMsg;
 use crate::{
-    ControlClose, DEFAULT_COLS, DEFAULT_ROWS, MULTI_CLICK, PAD, PendingClose, Shared, about_info,
-    bell_flash_intensity, bracket_paste, click_selection_should_clear, dims_for_rect, ember_glow,
-    encode_key, help_lines, inset, load_backdrop_image, named_key, parse_chord,
-    step_selectable_row, tab_display_title, url_is_openable,
+    ControlClose, DEFAULT_COLS, DEFAULT_ROWS, DragState, DropHover, MULTI_CLICK, PAD, PendingClose,
+    Shared, about_info, bell_flash_intensity, bracket_paste, click_selection_should_clear,
+    dims_for_rect, ember_glow, encode_key, help_lines, inset, load_backdrop_image, named_key,
+    parse_chord, resolve_window_index, step_selectable_row, tab_display_title, url_is_openable,
 };
 #[cfg(target_os = "linux")]
 use crate::{alt_digit_tab, linux_chord_translate};
@@ -54,11 +55,75 @@ pub(crate) struct TabDrag {
     press_x: f64,
     /// Whether the pointer has moved far enough to count as a drag (vs. a click).
     active: bool,
+    /// The `TabId` of the tab that was active immediately BEFORE this press
+    /// (before the press's own `select_tab` switched to the pressed tab).
+    /// Restored as the displayed tab the moment a drag tears off the strip
+    /// band, so an in-window pane drop (this task's only wired destination)
+    /// targets some OTHER tab's pane, not the dragged tab's own —
+    /// `move_surface` always rejects a tab dropped into itself ("no-op: tab
+    /// can't merge into itself"), and that other tab can only be
+    /// hit-testable if it's the one actually rendered underneath the lifted
+    /// tab. Deliberately an ID, not the index captured at press time: a
+    /// live in-strip reorder (this same drag, before it tears off) can
+    /// shift which tab sits at that original INDEX, so the index alone
+    /// would go stale — it's re-resolved against the current tab order at
+    /// tear-off time.
+    origin_tab: TabId,
 }
 
 /// How far (logical px) the pointer must move horizontally before a tab press
 /// becomes a drag-reorder rather than a click.
 const TAB_DRAG_THRESHOLD: f64 = 6.0;
+
+/// How far (logical px) the pointer must move BELOW the tab strip's bottom
+/// edge before an in-strip tab drag tears off into a [`crate::DragState`]
+/// (a surface drag capable of leaving the strip — a pane drop this task, a
+/// desktop/cross-window drop in later ones).
+const TEAR_OFF_THRESHOLD: f64 = 24.0;
+
+/// Pure band-exit check for tab tear-off: has the pointer moved far enough
+/// below the strip's bottom edge (`strip_bottom`, logical px) to convert an
+/// in-strip reorder into a tear-off? All three arguments are logical px;
+/// `threshold` is normally [`TEAR_OFF_THRESHOLD`] (a parameter so this is
+/// unit-testable independent of that constant, and so a caller can probe the
+/// boundary exactly). Strictly-greater: a pointer sitting exactly on the
+/// threshold is still "in the strip" (matches every other edge-band
+/// convention in this codebase — see `ember_core::drop_zone_for`'s doc).
+pub(crate) fn strip_band_exit(pointer_y: f64, strip_bottom: f64, threshold: f64) -> bool {
+    pointer_y - strip_bottom > threshold
+}
+
+/// What a drag/reorder gesture resolved to on release — `ctl drag`'s
+/// `drag_ended` reply field, and the return of [`WindowState::left_release`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DragEnded {
+    /// An in-strip tab reorder (whether it stayed in the strip the whole
+    /// time, or tore off and was dropped back on the strip).
+    Reorder,
+    /// A tear-off resolved to an in-window (or, in a later task,
+    /// cross-window) surface move.
+    Move,
+    /// A tear-off with no valid drop target, or an explicit cancel
+    /// (Escape / `--cancel`): zero mutation from the tear-off onward.
+    Cancel,
+    /// A text selection drag ended (no tab/surface drag was in progress).
+    Selection,
+    /// Nothing was in progress (a plain click, or a release with no
+    /// preceding drag/selection state at all).
+    None,
+}
+
+impl DragEnded {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DragEnded::Reorder => "reorder",
+            DragEnded::Move => "move",
+            DragEnded::Cancel => "cancel",
+            DragEnded::Selection => "selection",
+            DragEnded::None => "none",
+        }
+    }
+}
 
 /// Ctrl+Opt split drop-zone preview: the hovered pane + the split that a click
 /// would commit (new pane on the right if `horizontal`, else the bottom).
@@ -400,6 +465,7 @@ impl WindowState {
     pub(crate) fn handle_control(
         &mut self,
         shared: &mut Shared,
+        window_id: WindowId,
         msg: ControlMsg,
     ) -> Option<ControlClose> {
         // Route injected keys into the interactive Settings overlay (for tests),
@@ -509,7 +575,14 @@ impl WindowState {
                 // fires on release.
                 self.cursor = (x, y);
                 self.left_click(shared);
-                self.left_release(shared);
+                self.left_release(shared, window_id);
+            }
+            ControlMsg::Drag { .. } => {
+                // Handled by the caller (`about_to_wait`) before this method
+                // is ever invoked — press/motion/release must run as a
+                // sequence, and `run_ctl_drag` needs `self.windows` (a
+                // future cross-window drop) which isn't reachable here.
+                // Kept here only so the match stays exhaustive.
             }
             ControlMsg::About => self.toggle_about(),
             ControlMsg::Settings => self.toggle_settings(shared),
@@ -1216,20 +1289,64 @@ impl WindowState {
         on_strip
     }
 
+    /// Whether an in-strip tab drag is currently past the click-vs-drag
+    /// threshold (i.e. a genuine reorder, not just an armed press) — `ctl
+    /// drag`'s `drag_active_mid` reply field needs this, and `TabDrag::
+    /// active` is private to this module.
+    pub(crate) fn tab_drag_is_active_drag(&self) -> bool {
+        self.tab_drag.as_ref().is_some_and(|d| d.active)
+    }
+
+    /// Left-button press at logical `(x, y)`: the non-modal press path (a
+    /// divider grab, or a full `left_click`). Shared by the real
+    /// `WindowEvent::MouseInput` press handler (the pending-close modal case
+    /// stays there — it needs `event_loop`/`self.windows`, neither reachable
+    /// from here) and `ctl drag`'s synthesized press — both must hit this
+    /// exact path so a synthesized drag behaves exactly like a real mouse
+    /// press.
+    pub(crate) fn press_left(&mut self, shared: &mut Shared, x: f64, y: f64) {
+        self.cursor = (x, y);
+        if let Some((target, axis)) = self.divider_at(x, y) {
+            let pos = if matches!(axis, Axis::Horizontal) {
+                x
+            } else {
+                y
+            };
+            self.divider_drag = Some((target, axis, pos));
+        } else {
+            self.left_click(shared);
+        }
+    }
+
     /// Mouse-up half of a left click: drag/selection teardown, plus the
     /// click-to-open decision for a link (same link + same cell as the press,
-    /// so drags still select instead of opening).
-    pub(crate) fn left_release(&mut self, shared: &Shared) {
-        self.tab_drag = None;
-        self.renderer.set_tab_drag(None);
+    /// so drags still select instead of opening). Returns what (if anything)
+    /// the release resolved — the classification `ctl drag` replies with.
+    pub(crate) fn left_release(&mut self, shared: &mut Shared, window_id: WindowId) -> DragEnded {
+        let mut ended = DragEnded::None;
+        if let Some(drag) = shared.drag.take() {
+            ended = self.resolve_drag_drop(shared, window_id, drag);
+        } else if let Some(d) = self.tab_drag.take() {
+            self.renderer.set_tab_drag(None);
+            ended = if d.active {
+                DragEnded::Reorder
+            } else {
+                DragEnded::None
+            };
+        }
         let was_selecting = self.selecting;
         self.selecting = false;
         self.scrollbar_drag = None;
         self.divider_drag = None;
         // A plain click (no drag) clears the selection rather than leaving a
         // one-cell one — see click_selection_should_clear.
-        if was_selecting && click_selection_should_clear(self.sel.as_ref().map(|(_, s)| s)) {
-            self.clear_selection();
+        if was_selecting {
+            if ended == DragEnded::None {
+                ended = DragEnded::Selection;
+            }
+            if click_selection_should_clear(self.sel.as_ref().map(|(_, s)| s)) {
+                self.clear_selection();
+            }
         }
         if let Some((psid, pid, prow, pcol)) = self.pressed_link.take() {
             if let Some((sid, id, url, row, col)) = self.link_under_cursor() {
@@ -1242,6 +1359,7 @@ impl WindowState {
                 }
             }
         }
+        ended
     }
 
     pub(crate) fn left_click(&mut self, shared: &mut Shared) {
@@ -1286,11 +1404,13 @@ impl WindowState {
                     if dbl {
                         self.start_rename(shared, i);
                     } else {
+                        let origin_tab = self.tree.tabs[self.tree.active].id;
                         self.select_tab(shared, i + 1);
                         self.tab_drag = Some(TabDrag {
                             tab: i,
                             press_x: x,
                             active: false,
+                            origin_tab,
                         });
                     }
                 }
@@ -1538,6 +1658,329 @@ impl WindowState {
             .filter(|d| d.active)
             .map(|d| (d.tab, x as f32));
         self.renderer.set_tab_drag(view);
+    }
+
+    /// Handle pointer motion at logical `(x, y)`: divider resize, tab
+    /// reorder/tear-off/hover, scrollbar drag, text selection, or (when
+    /// nothing is in progress) hover/cursor-icon bookkeeping + motion
+    /// forwarding to a mouse-aware app. Shared by the real
+    /// `WindowEvent::CursorMoved` handler and `ctl drag`'s synthesized
+    /// motion steps — both must hit this exact path so a synthesized drag
+    /// behaves exactly like a real mouse move.
+    pub(crate) fn on_cursor_moved(
+        &mut self,
+        shared: &mut Shared,
+        window_id: WindowId,
+        x: f64,
+        y: f64,
+    ) {
+        self.cursor = (x, y);
+        // Ctrl+Opt held → live split drop-zone preview over the hovered pane.
+        if self.split_modifier_held() {
+            self.update_split_preview();
+            return;
+        }
+        if let Some((target, axis, last)) = self.divider_drag {
+            let pos = if matches!(axis, Axis::Horizontal) {
+                x
+            } else {
+                y
+            };
+            self.resize_pane_px(shared, target, axis, pos - last);
+            self.divider_drag = Some((target, axis, pos));
+        } else if self.tab_drag.is_some() || shared.drag.is_some() {
+            self.update_drag(shared, window_id, x, y);
+        } else if let Some(sid) = self.scrollbar_drag.clone() {
+            self.scroll_to_at(shared, &sid, y as f32);
+        } else if self.selecting {
+            self.extend_selection(x, y);
+        } else {
+            // Tab strip: track hover (highlight + "✕"); motion over the strip
+            // is chrome, not pane motion, so stop here.
+            if self.update_tab_hover(x, y) {
+                return;
+            }
+            // Show a resize cursor over a divider, a pointer over a link
+            // (divider wins), else forward motion to mouse-aware apps.
+            let over = self.divider_at(x, y).map(|(_, a)| a);
+            let link = if over.is_none() {
+                self.link_under_cursor()
+            } else {
+                None
+            };
+            self.renderer
+                .set_hovered_link(link.as_ref().map(|(sid, id, ..)| (sid.clone(), *id)));
+            let want = match (over, &link) {
+                (Some(Axis::Horizontal), _) => CursorIcon::EwResize,
+                (Some(Axis::Vertical), _) => CursorIcon::NsResize,
+                (None, Some(_)) => CursorIcon::Pointer,
+                (None, None) => CursorIcon::Default,
+            };
+            if self.pointer_cursor != want {
+                self.pointer_cursor = want;
+                self.renderer.window().set_cursor(want);
+            }
+            if over.is_none() {
+                self.forward_mouse_motion(shared);
+            }
+        }
+    }
+
+    /// Advance an in-progress tab reorder/tear-off as the pointer moves:
+    /// while still inside the strip band, this is exactly `drag_tab_to`
+    /// (unregressed — the live in-strip reorder); once the pointer crosses
+    /// [`TEAR_OFF_THRESHOLD`] below the strip, converts to `shared.drag`
+    /// (clearing `tab_drag`) and reveals the tab that was active before this
+    /// press (re-resolving `origin_tab`'s CURRENT index — a live in-strip
+    /// reorder before tear-off can have moved it) so an in-window pane drop
+    /// has something hoverable underneath that ISN'T the tab being dragged
+    /// (see [`TabDrag::origin_tab`]'s doc). Once torn off, delegates to
+    /// [`Self::update_drag_hover`] every subsequent move.
+    fn update_drag(&mut self, shared: &mut Shared, window_id: WindowId, x: f64, y: f64) {
+        if let Some(d) = &self.tab_drag {
+            let (press_x, tab, origin_tab) = (d.press_x, d.tab, d.origin_tab);
+            let mut active = d.active;
+            if !active {
+                if (x - press_x).abs() < TAB_DRAG_THRESHOLD {
+                    return;
+                }
+                active = true;
+                if let Some(d) = self.tab_drag.as_mut() {
+                    d.active = true;
+                }
+            }
+            let strip_bottom = Renderer::chrome_height() as f64;
+            if active && strip_band_exit(y, strip_bottom, TEAR_OFF_THRESHOLD) {
+                self.tab_drag = None;
+                if let Some(idx) = self.tree.tabs.iter().position(|t| t.id == origin_tab) {
+                    self.tree.active = idx;
+                }
+                self.sync_layout(shared);
+                let window = resolve_window_index(shared, window_id).unwrap_or(0);
+                shared.drag = Some(DragState {
+                    surface: SurfaceRef::Tab { window, tab },
+                    source_window: window_id,
+                    grab: (x - press_x, y - strip_bottom),
+                    carried: false,
+                    hover: None,
+                });
+            } else {
+                // Still an in-strip reorder — unchanged existing behavior.
+                self.drag_tab_to(shared, x);
+                return;
+            }
+        }
+        if shared.drag.is_some() {
+            self.update_drag_hover(shared, window_id, x, y);
+        }
+    }
+
+    /// Update the live drop-hover for a torn-off drag as the pointer moves,
+    /// re-deriving the preview (`set_split_preview`/the lifted tab chip)
+    /// from it. This task's only wired hover targets are inside the SAME
+    /// window as the drag's source (`drag.source_window`) — a different
+    /// window has no hover here yet (a later task's job). Anywhere else in
+    /// this window with no pane underneath hovers `None`, which
+    /// `resolve_drag_drop` treats as a cancel.
+    fn update_drag_hover(&mut self, shared: &mut Shared, window_id: WindowId, x: f64, y: f64) {
+        let Some(drag) = shared.drag.as_ref() else {
+            return;
+        };
+        let dragged_tab = match drag.surface {
+            SurfaceRef::Tab { tab, .. } => tab,
+            SurfaceRef::Pane { .. } => return, // pane-only drags aren't produced by this task
+        };
+        if drag.source_window != window_id {
+            return;
+        }
+        let strip_bottom = Renderer::chrome_height() as f64;
+        let hover = if y <= strip_bottom {
+            self.renderer
+                .tab_slot_at(x as f32)
+                .map(|insert_at| DropHover::Strip {
+                    window: window_id,
+                    insert_at,
+                })
+        } else {
+            let hit = self
+                .pane_rects
+                .iter()
+                .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+                .cloned();
+            hit.and_then(|(sid, rect)| {
+                let pane = self
+                    .active_tab()
+                    .root
+                    .leaves()
+                    .into_iter()
+                    .find(|(_, s)| *s == sid)
+                    .map(|(p, _)| p)?;
+                let zone = drop_zone_for(x - rect.x, y - rect.y, rect.width, rect.height);
+                Some(DropHover::Pane {
+                    window: window_id,
+                    tab: self.tree.active,
+                    pane,
+                    zone,
+                })
+            })
+        };
+        match &hover {
+            Some(DropHover::Pane {
+                pane,
+                zone: DropZone::Edge { axis, .. },
+                ..
+            }) => {
+                if let Some(sid) = self.active_tab().root.session_of(*pane).cloned() {
+                    let horizontal = matches!(axis, Axis::Horizontal);
+                    // A fixed 50/50 preview — a drag-drop split is always
+                    // even (`move_surface`'s own split ratio), unlike the
+                    // Ctrl+Opt manual-split preview this same visual also
+                    // drives, which follows the cursor. NOTE: this preview
+                    // doesn't yet distinguish "before" (left/top) from
+                    // "after" (right/bottom) — see the task report's
+                    // concerns. The topology `resolve_drag_drop` applies is
+                    // correct either way; only the highlighted side can
+                    // read wrong for a `before: true` zone.
+                    self.renderer
+                        .set_split_preview(Some((sid, horizontal, 0.5)));
+                }
+            }
+            _ => self.clear_split_preview(),
+        }
+        // Keep the lifted tab chip following the cursor the whole time (the
+        // crude "lift" visual this task reuses — a full ghost is Task 5's).
+        self.renderer.set_tab_drag(Some((dragged_tab, x as f32)));
+        if let Some(drag) = shared.drag.as_mut() {
+            drag.hover = hover;
+        }
+    }
+
+    /// Resolve a torn-off drag on release: `Strip` hover → the same reorder
+    /// a live in-strip drag commits progressively; `Pane` hover → an
+    /// in-window split; no hover (or a hover this task doesn't resolve, e.g.
+    /// a stale window identity) → cancel with zero mutation.
+    fn resolve_drag_drop(
+        &mut self,
+        shared: &mut Shared,
+        window_id: WindowId,
+        drag: DragState,
+    ) -> DragEnded {
+        self.renderer.set_tab_drag(None);
+        self.clear_split_preview();
+        let SurfaceRef::Tab { tab: src_tab, .. } = drag.surface else {
+            return DragEnded::Cancel; // pane-only drags aren't produced by this task
+        };
+        match drag.hover {
+            Some(DropHover::Strip { window, insert_at }) if window == window_id => {
+                if src_tab >= self.tree.tabs.len() {
+                    return DragEnded::Cancel;
+                }
+                let to = insert_at.min(self.tree.tabs.len() - 1);
+                if to != src_tab {
+                    let vp = self.viewport();
+                    apply(
+                        &mut self.tree,
+                        LayoutCommand::MoveTab { from: src_tab, to },
+                        vp,
+                    );
+                }
+                self.tree.active = to;
+                self.sync_layout(shared);
+                DragEnded::Reorder
+            }
+            Some(DropHover::Pane {
+                window,
+                tab,
+                pane,
+                zone,
+            }) if window == window_id => {
+                match self.apply_in_window_drop(shared, src_tab, tab, pane, zone) {
+                    Ok(()) => DragEnded::Move,
+                    Err(e) => {
+                        eprintln!("[ember] drag drop rejected: {e}");
+                        DragEnded::Cancel
+                    }
+                }
+            }
+            _ => DragEnded::Cancel,
+        }
+    }
+
+    /// Apply an in-window drop (this task's only wired destination): merge
+    /// `src_tab` (captured at drag start — indices into `self.tree`; nothing
+    /// else can have reordered it, since tear-off cleared `tab_drag` and
+    /// hover updates never mutate the tree) into `dest_tab`'s `dest_pane` as
+    /// a split, honoring `zone`'s axis + before/after side.
+    /// `DropZone::Center` has no in-window target yet: a same-window
+    /// `NewTab` is always rejected by `move_surface` as a no-op ("the tab's
+    /// already in that window"), so it surfaces as an `Err` here — the
+    /// caller turns any `Err` into `Cancel`.
+    fn apply_in_window_drop(
+        &mut self,
+        shared: &mut Shared,
+        src_tab: usize,
+        dest_tab: usize,
+        dest_pane: PaneId,
+        zone: DropZone,
+    ) -> Result<(), String> {
+        let dest = match zone {
+            DropZone::Edge { axis, before } => SurfaceDest::SplitInto {
+                window: 0,
+                tab: dest_tab,
+                pane: dest_pane,
+                axis,
+                before,
+            },
+            DropZone::Center => SurfaceDest::NewTab { window: 0 },
+        };
+        // A local, single-window `Windows` model — this task's drop target
+        // is ALWAYS the drag's own source window (checked by the caller), so
+        // there's no cross-window renderer bookkeeping to do: every session
+        // named by a `MoveEffect::SessionsRehomed` below already lives in
+        // THIS renderer and stays there; only the tree shape changes.
+        let mut model = Windows {
+            trees: vec![self.tree.clone()],
+            focused: 0,
+        };
+        let fresh_tab_id = TabId(shared.next_tab);
+        let effects = move_surface(
+            &mut model,
+            SurfaceRef::Tab {
+                window: 0,
+                tab: src_tab,
+            },
+            dest,
+            fresh_tab_id,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        shared.next_tab += 1;
+        debug_assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                MoveEffect::WindowOpened { .. } | MoveEffect::WindowClosed { .. }
+            )),
+            "an in-window merge can neither open nor close a window: {effects:?}"
+        );
+        self.tree = model
+            .trees
+            .into_iter()
+            .next()
+            .expect("single-window model always has exactly one tree");
+        self.sync_layout(shared);
+        self.renderer.window().request_redraw();
+        Ok(())
+    }
+
+    /// Cancel an in-progress torn-off drag (Escape / `ctl drag --cancel`):
+    /// zero tree mutation — `self.tree.active` was already reverted to the
+    /// origin tab at tear-off time and hover updates never touch the tree,
+    /// so clearing `shared.drag` and the preview visuals is enough.
+    pub(crate) fn cancel_drag(&mut self, shared: &mut Shared) {
+        if shared.drag.take().is_some() {
+            self.renderer.set_tab_drag(None);
+            self.clear_split_preview();
+            self.renderer.window().request_redraw();
+        }
     }
 
     /// Begin inline rename of tab `i` (double-click); seeds the buffer with its title.
@@ -2175,5 +2618,57 @@ impl WindowState {
             .min(self.tree.tabs.len() - 1);
         self.sync_layout(shared);
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TEAR_OFF_THRESHOLD, strip_band_exit};
+
+    #[test]
+    fn strip_band_exit_stays_false_inside_the_band() {
+        let strip_bottom = 32.0;
+        assert!(!strip_band_exit(
+            strip_bottom,
+            strip_bottom,
+            TEAR_OFF_THRESHOLD
+        ));
+        assert!(!strip_band_exit(
+            strip_bottom + TEAR_OFF_THRESHOLD - 1.0,
+            strip_bottom,
+            TEAR_OFF_THRESHOLD
+        ));
+        // Exactly on the threshold is still "in the strip" (strict `>`,
+        // matching every other edge-band convention in this codebase).
+        assert!(!strip_band_exit(
+            strip_bottom + TEAR_OFF_THRESHOLD,
+            strip_bottom,
+            TEAR_OFF_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn strip_band_exit_trips_just_past_the_threshold() {
+        let strip_bottom = 32.0;
+        assert!(strip_band_exit(
+            strip_bottom + TEAR_OFF_THRESHOLD + 0.01,
+            strip_bottom,
+            TEAR_OFF_THRESHOLD
+        ));
+        assert!(strip_band_exit(1000.0, strip_bottom, TEAR_OFF_THRESHOLD));
+    }
+
+    #[test]
+    fn strip_band_exit_false_above_the_strip() {
+        // A pointer still inside (or above) the strip is never "below" it,
+        // regardless of the threshold.
+        assert!(!strip_band_exit(0.0, 32.0, TEAR_OFF_THRESHOLD));
+        assert!(!strip_band_exit(-50.0, 32.0, TEAR_OFF_THRESHOLD));
+    }
+
+    #[test]
+    fn strip_band_exit_respects_a_custom_threshold() {
+        assert!(!strip_band_exit(10.0, 0.0, 12.0));
+        assert!(strip_band_exit(13.0, 0.0, 12.0));
     }
 }

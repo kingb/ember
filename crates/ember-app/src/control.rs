@@ -107,6 +107,24 @@ pub enum ControlMsg {
     /// horizontal split of that tab's focused pane. Same reply contract as
     /// `MoveTab`; errors (e.g. no previous tab) surface in the reply.
     MergeTab(Sender<String>),
+    /// Synthesize a full drag gesture on the focused window: a left press at
+    /// `(x1, y1)`, `steps` intermediate motions on the way to `(x2, y2)`,
+    /// then either a release at `(x2, y2)` or (if `cancel`) an Escape — all
+    /// through the exact same handlers a real mouse/keyboard hits. `mods` is
+    /// a `parse_chord`-style `+`-joined modifier list (e.g. `"cmd+alt"`,
+    /// possibly empty) held for the whole gesture. The testing backbone for
+    /// every surface-drag task: replies with a JSON summary
+    /// (`{"ok":true,"drag_ended":"reorder"|"move"|"cancel"|"selection"|"none","drag_active_mid":bool}`).
+    Drag {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        steps: usize,
+        mods: String,
+        cancel: bool,
+        reply: Sender<String>,
+    },
 }
 
 #[cfg(unix)]
@@ -454,6 +472,37 @@ mod unix {
                 let _ = tx.send(ControlMsg::EditTab(i));
                 ok()
             }
+            "drag" => {
+                let g = |k| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+                let steps = v.get("steps").and_then(Value::as_u64).unwrap_or(8) as usize;
+                let mods = v
+                    .get("mods")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let cancel = v.get("cancel").and_then(Value::as_bool).unwrap_or(false);
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if tx
+                    .send(ControlMsg::Drag {
+                        x1: g("x1"),
+                        y1: g("y1"),
+                        x2: g("x2"),
+                        y2: g("y2"),
+                        steps,
+                        mods,
+                        cancel,
+                        reply: reply_tx,
+                    })
+                    .is_err()
+                {
+                    return err("event loop gone");
+                }
+                waker(); // wake BEFORE waiting — see dispatch docs
+                match reply_rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(resp) => resp,
+                    Err(_) => err("drag timeout"),
+                }
+            }
             other => err(&format!("unknown cmd: {other}")),
         }
     }
@@ -636,9 +685,18 @@ mod unix {
                 let i = rest.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
                 serde_json::json!({"cmd":"edit-tab","i":i})
             }
+            "drag" => {
+                let owned: Vec<String> = rest
+                    .get(1..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|s| (*s).clone())
+                    .collect();
+                parse_drag_args(&owned)?
+            }
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window|move-tab|promote-pane|merge-tab)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window|move-tab|promote-pane|merge-tab|drag)"
                 ));
             }
         };
@@ -671,6 +729,104 @@ mod unix {
             }
         }
         out
+    }
+
+    /// Parse `ctl drag`'s args (everything after the `drag` token itself)
+    /// into the JSON request line: 4 positional logical-px coordinates
+    /// (`x1 y1 x2 y2`, in any order relative to the `--steps`/`--mods`/
+    /// `--cancel` flags) plus the optional flags. A pure function (no
+    /// socket I/O) so the parsing itself is unit-testable independent of a
+    /// running instance.
+    fn parse_drag_args(args: &[String]) -> Result<Value, String> {
+        let mut positional: Vec<f64> = Vec::new();
+        let mut steps: u64 = 8;
+        let mut mods = String::new();
+        let mut cancel = false;
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--steps" => {
+                    let n = it.next().ok_or("drag: --steps needs a number")?;
+                    steps = n
+                        .parse()
+                        .map_err(|e| format!("drag: --steps: bad number {n:?}: {e}"))?;
+                }
+                "--mods" => {
+                    mods = it.next().ok_or("drag: --mods needs a value")?.clone();
+                }
+                "--cancel" => cancel = true,
+                v => positional.push(
+                    v.parse()
+                        .map_err(|e| format!("drag: bad coordinate {v:?}: {e}"))?,
+                ),
+            }
+        }
+        if positional.len() != 4 {
+            return Err(format!(
+                "drag: need x1 y1 x2 y2 [--steps N] [--mods m] [--cancel] (got {} coordinate(s))",
+                positional.len()
+            ));
+        }
+        Ok(serde_json::json!({
+            "cmd": "drag",
+            "x1": positional[0],
+            "y1": positional[1],
+            "x2": positional[2],
+            "y2": positional[3],
+            "steps": steps,
+            "mods": mods,
+            "cancel": cancel,
+        }))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse_drag_args;
+
+        fn args(s: &str) -> Vec<String> {
+            s.split_whitespace().map(str::to_string).collect()
+        }
+
+        #[test]
+        fn drag_parses_four_coordinates_with_defaults() {
+            let v = parse_drag_args(&args("10 20 30 40")).unwrap();
+            assert_eq!(v["cmd"], "drag");
+            assert_eq!(v["x1"], 10.0);
+            assert_eq!(v["y1"], 20.0);
+            assert_eq!(v["x2"], 30.0);
+            assert_eq!(v["y2"], 40.0);
+            assert_eq!(v["steps"], 8);
+            assert_eq!(v["mods"], "");
+            assert_eq!(v["cancel"], false);
+        }
+
+        #[test]
+        fn drag_parses_steps_mods_cancel_in_any_position() {
+            let v = parse_drag_args(&args("--mods cmd+alt 1 2 3 4 --steps 3 --cancel")).unwrap();
+            assert_eq!(v["x1"], 1.0);
+            assert_eq!(v["y2"], 4.0);
+            assert_eq!(v["steps"], 3);
+            assert_eq!(v["mods"], "cmd+alt");
+            assert_eq!(v["cancel"], true);
+        }
+
+        #[test]
+        fn drag_rejects_wrong_coordinate_count() {
+            assert!(parse_drag_args(&args("1 2 3")).is_err());
+            assert!(parse_drag_args(&args("1 2 3 4 5")).is_err());
+            assert!(parse_drag_args(&args("")).is_err());
+        }
+
+        #[test]
+        fn drag_rejects_bad_coordinate() {
+            assert!(parse_drag_args(&args("x 2 3 4")).is_err());
+        }
+
+        #[test]
+        fn drag_rejects_dangling_flags() {
+            assert!(parse_drag_args(&args("1 2 3 4 --steps")).is_err());
+            assert!(parse_drag_args(&args("1 2 3 4 --mods")).is_err());
+        }
     }
 }
 

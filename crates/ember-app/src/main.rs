@@ -16,7 +16,7 @@ mod mcp;
 mod screenshot;
 mod window_state;
 
-use window_state::WindowState;
+use window_state::{DragEnded, WindowState};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{CursorIcon, WindowId};
+use winit::window::WindowId;
 
 /// The Ember app icon (embedded). Set on the window + the macOS dock at startup.
 const ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.png"));
@@ -305,6 +305,63 @@ pub(crate) struct Shared {
     /// Wakes the event loop when a session publishes a frame; registered on
     /// every session's pixel lane so the loop can idle on `ControlFlow::Wait`.
     pub(crate) wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    /// A surface drag in progress (tab tear-off, and later panes/cross-window
+    /// carries) — spans windows, hence living here rather than on
+    /// `WindowState`. `None` outside a drag; a real mouse press+motion or
+    /// `ctl drag`'s synthesized one both drive it via `WindowState::
+    /// update_drag`/`update_drag_hover`/`resolve_drag_drop`.
+    pub(crate) drag: Option<DragState>,
+}
+
+/// A drag in progress, spanning windows (hence on [`Shared`], not
+/// `WindowState`).
+pub(crate) struct DragState {
+    /// The surface being carried, captured as indices into `window_order` at
+    /// the moment the drag tore off the strip (release 1's `SurfaceRef`
+    /// indices, not raw ids — a drop re-resolves the WINDOW by `WindowId`
+    /// identity via `source_window`/a `DropHover`'s own `window`, never by
+    /// trusting these indices to still be valid at drop time).
+    pub(crate) surface: SurfaceRef,
+    /// The window the drag started in, by identity (not index — an index can
+    /// go stale if some other action reorders `window_order` mid-drag).
+    pub(crate) source_window: WindowId,
+    /// Pointer offset inside the lifted visual, logical px. This task reuses
+    /// the existing lifted-tab-chip visual (cursor-x-following) rather than a
+    /// true offset sprite, so nothing reads this yet — it's set (not just a
+    /// placeholder value) so Task 5's ghost sprite has it ready to consume.
+    #[allow(dead_code)]
+    pub(crate) grab: (f64, f64),
+    /// Whether the pointer has left the source window's surface (a
+    /// cross-window/desktop carry — not produced by this task, which is
+    /// in-window only; always `false` here). Read by a later task's
+    /// cross-window hover/ghost logic.
+    #[allow(dead_code)]
+    pub(crate) carried: bool,
+    /// The current drop target, if any, driving the live preview. `None`
+    /// means "release here cancels."
+    pub(crate) hover: Option<DropHover>,
+}
+
+/// Where a carried surface would land, driving the live drag preview.
+pub(crate) enum DropHover {
+    /// Hovering a window's tab strip: dropping here reorders/re-inserts the
+    /// carried tab at `insert_at`.
+    Strip { window: WindowId, insert_at: usize },
+    /// Hovering a pane: dropping here either splits `pane` (an `Edge` zone)
+    /// or appends as a new tab of `window` (`Center`) — see
+    /// `ember_core::DropZone`.
+    Pane {
+        window: WindowId,
+        tab: usize,
+        pane: PaneId,
+        zone: ember_core::DropZone,
+    },
+    /// Hovering neither a tracked window's strip nor one of its panes (a
+    /// future cross-window "drop on the desktop" target). Part of the
+    /// interface this task's brief specifies (Tasks 3-6 build on it); not
+    /// produced by this task's in-window-only hover logic.
+    #[allow(dead_code)]
+    Desktop,
 }
 
 /// A close action deferred behind a running-process confirmation.
@@ -412,6 +469,7 @@ impl ApplicationHandler<EmberEvent> for App {
             titles: std::collections::HashMap::new(),
             cwd_by_session: std::collections::HashMap::new(),
             wake: self.wake.clone(),
+            drag: None,
         };
         let mut win = WindowState::new(renderer, tree);
         win.px = px;
@@ -509,59 +567,8 @@ impl ApplicationHandler<EmberEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let sf = win.renderer.window().scale_factor();
-                win.cursor = (position.x / sf, position.y / sf);
-                // Ctrl+Opt held → live split drop-zone preview over the hovered pane.
-                if win.split_modifier_held() {
-                    win.update_split_preview();
-                    return;
-                }
-                if let Some((target, axis, last)) = win.divider_drag {
-                    let (x, y) = win.cursor;
-                    let pos = if matches!(axis, Axis::Horizontal) {
-                        x
-                    } else {
-                        y
-                    };
-                    win.resize_pane_px(shared, target, axis, pos - last);
-                    win.divider_drag = Some((target, axis, pos));
-                } else if win.tab_drag.is_some() {
-                    win.drag_tab_to(shared, win.cursor.0);
-                } else if let Some(sid) = win.scrollbar_drag.clone() {
-                    win.scroll_to_at(shared, &sid, win.cursor.1 as f32);
-                } else if win.selecting {
-                    let (x, y) = win.cursor;
-                    win.extend_selection(x, y);
-                } else {
-                    let (x, y) = win.cursor;
-                    // Tab strip: track hover (highlight + "✕"); motion over the
-                    // strip is chrome, not pane motion, so stop here.
-                    if win.update_tab_hover(x, y) {
-                        return;
-                    }
-                    // Show a resize cursor over a divider, a pointer over a link
-                    // (divider wins), else forward motion to mouse-aware apps.
-                    let over = win.divider_at(x, y).map(|(_, a)| a);
-                    let link = if over.is_none() {
-                        win.link_under_cursor()
-                    } else {
-                        None
-                    };
-                    win.renderer
-                        .set_hovered_link(link.as_ref().map(|(sid, id, ..)| (sid.clone(), *id)));
-                    let want = match (over, &link) {
-                        (Some(Axis::Horizontal), _) => CursorIcon::EwResize,
-                        (Some(Axis::Vertical), _) => CursorIcon::NsResize,
-                        (None, Some(_)) => CursorIcon::Pointer,
-                        (None, None) => CursorIcon::Default,
-                    };
-                    if win.pointer_cursor != want {
-                        win.pointer_cursor = want;
-                        win.renderer.window().set_cursor(want);
-                    }
-                    if over.is_none() {
-                        win.forward_mouse_motion(shared);
-                    }
-                }
+                let (x, y) = (position.x / sf, position.y / sf);
+                win.on_cursor_moved(shared, id, x, y);
             }
             // Cursor left the window — drop any tab hover so the highlight/"✕"
             // don't linger.
@@ -610,15 +617,8 @@ impl ApplicationHandler<EmberEvent> for App {
                                 }
                             }
                         }
-                    } else if let Some((target, axis)) = win.divider_at(x, y) {
-                        let pos = if matches!(axis, Axis::Horizontal) {
-                            x
-                        } else {
-                            y
-                        };
-                        win.divider_drag = Some((target, axis, pos));
                     } else {
-                        win.left_click(shared);
+                        win.press_left(shared, x, y);
                     }
                 }
                 // Middle-click on a tab closes it (standard gesture); elsewhere
@@ -661,11 +661,21 @@ impl ApplicationHandler<EmberEvent> for App {
                     },
                 );
                 if button == MouseButton::Left {
-                    win.left_release(shared);
+                    win.left_release(shared, id);
                 }
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
+                    return;
+                }
+                // A torn-off surface drag captures input: Escape cancels it
+                // (zero mutation), everything else is swallowed — mirrors
+                // the close-confirm modal below, and matches real drag UX
+                // (no keyboard shortcuts fire mid-drag).
+                if shared.drag.is_some() {
+                    if !key.repeat && matches!(key.logical_key, Key::Named(NamedKey::Escape)) {
+                        win.cancel_drag(shared);
+                    }
                     return;
                 }
                 // The Settings overlay is interactive — it handles its own keys
@@ -1261,7 +1271,39 @@ impl ApplicationHandler<EmberEvent> for App {
                 deferred_windows.push(DeferredWindowAction::Focus(query, reply));
                 continue;
             }
-            match win.handle_control(shared, cmd) {
+            // `ctl drag`: press/motion*/release must all run as one
+            // sequence (there's no real per-event `WindowEvent` to hang each
+            // step off), and — like the surface-mobility verbs above — a
+            // later task's cross-window drop will need `self.windows`, not
+            // reachable while `win` still borrows it. Deferred to the tail
+            // even though this task's own in-window resolution doesn't
+            // strictly need that access, so Tasks 3-6 don't have to move
+            // this dispatch again.
+            if let ControlMsg::Drag {
+                x1,
+                y1,
+                x2,
+                y2,
+                steps,
+                mods,
+                cancel,
+                reply,
+            } = cmd
+            {
+                deferred_windows.push(DeferredWindowAction::Drag {
+                    window: focused_id,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    steps,
+                    mods,
+                    cancel,
+                    reply,
+                });
+                continue;
+            }
+            match win.handle_control(shared, focused_id, cmd) {
                 Some(ControlClose::ExitApp) => {
                     shared.shutdown_all();
                     event_loop.exit();
@@ -1525,6 +1567,31 @@ impl ApplicationHandler<EmberEvent> for App {
                     );
                     let _ = reply.send(resp);
                 }
+                DeferredWindowAction::Drag {
+                    window,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    steps,
+                    mods,
+                    cancel,
+                    reply,
+                } => {
+                    let resp = run_ctl_drag(
+                        &mut self.windows,
+                        shared,
+                        window,
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        steps,
+                        &mods,
+                        cancel,
+                    );
+                    let _ = reply.send(resp);
+                }
             }
         }
     }
@@ -1575,6 +1642,20 @@ enum DeferredWindowAction {
     /// on) any window, not just the one `win` currently borrows. Resolved at
     /// the tail by `focus_across_windows`.
     Focus(String, std::sync::mpsc::Sender<String>),
+    /// `ctl drag`: synthesize a full press→motion*→release (or →Escape, if
+    /// `cancel`) gesture on `window`, through the exact same `WindowState`
+    /// methods a real mouse hits. Resolved at the tail by `run_ctl_drag`.
+    Drag {
+        window: WindowId,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        steps: usize,
+        mods: String,
+        cancel: bool,
+        reply: std::sync::mpsc::Sender<String>,
+    },
 }
 
 /// Which surface-mobility builder a deferred [`DeferredWindowAction::Move`]
@@ -2011,7 +2092,7 @@ fn resolve_index<T: PartialEq>(order: &[T], id: &T) -> Option<usize> {
 /// when it actually runs — to re-resolve a deferred move's captured
 /// `WindowId` against `window_order` AS IT STANDS at the moment it's finally
 /// applied, not as it stood at dispatch time.
-fn resolve_window_index(shared: &Shared, id: WindowId) -> Option<usize> {
+pub(crate) fn resolve_window_index(shared: &Shared, id: WindowId) -> Option<usize> {
     resolve_index(&shared.window_order, &id)
 }
 
@@ -2112,6 +2193,78 @@ fn build_merge_tab(
             before: false,
         },
     ))
+}
+
+/// A `+`-joined modifier list (`"cmd+alt"`, possibly empty) into a
+/// `ModifiersState` — `ctl drag --mods`'s own tiny parser. Deliberately NOT
+/// `parse_chord`: that function requires a trailing KEY token (it treats the
+/// last `+`-segment as the key, not a modifier), so it can't express
+/// "modifiers held, no key" on its own. Unknown tokens are ignored rather
+/// than erroring — a slightly typo'd `--mods` just holds fewer modifiers,
+/// which is a saner failure mode mid-drag than aborting the whole gesture.
+fn parse_mods_only(spec: &str) -> ModifiersState {
+    let mut mods = ModifiersState::empty();
+    for tok in spec.split('+').map(str::trim).filter(|s| !s.is_empty()) {
+        match tok.to_ascii_lowercase().as_str() {
+            "cmd" | "super" | "win" | "meta" => mods |= ModifiersState::SUPER,
+            "shift" => mods |= ModifiersState::SHIFT,
+            "alt" | "option" => mods |= ModifiersState::ALT,
+            "ctrl" | "control" => mods |= ModifiersState::CONTROL,
+            _ => {}
+        }
+    }
+    mods
+}
+
+/// Synthesize a full drag gesture on `window`: a left press at `(x1, y1)`,
+/// `steps` intermediate motions on the way to `(x2, y2)`, then either a
+/// release at `(x2, y2)` or (if `cancel`) an Escape — via
+/// `WindowState::press_left`/`on_cursor_moved`/`left_release`/`cancel_drag`,
+/// the EXACT same methods a real mouse/keyboard hit. `mods` (already parsed
+/// by [`parse_mods_only`]) is held for the whole gesture, then restored.
+/// Free function (not a method) for the same reason as `apply_move`/
+/// `open_window`: every call site holds `&mut Shared` (and, here, `&mut
+/// self.windows`) borrowed out of `self` for the rest of `about_to_wait`.
+#[allow(clippy::too_many_arguments)]
+fn run_ctl_drag(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    window: WindowId,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    steps: usize,
+    mods: &str,
+    cancel: bool,
+) -> String {
+    let Some(win) = windows.get_mut(&window) else {
+        return serde_json::json!({"ok": false, "error": "window not tracked"}).to_string();
+    };
+    let steps = steps.max(1);
+    let saved_mods = win.modifiers;
+    win.modifiers = parse_mods_only(mods);
+    win.press_left(shared, x1, y1);
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        win.on_cursor_moved(shared, window, x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+    }
+    // "mid" = right before release/cancel resolves it — whether a genuine
+    // drag (not just a click) was actually in flight by then.
+    let drag_active_mid = shared.drag.is_some() || win.tab_drag_is_active_drag();
+    let ended = if cancel {
+        win.cancel_drag(shared);
+        DragEnded::Cancel
+    } else {
+        win.left_release(shared, window)
+    };
+    win.modifiers = saved_mods;
+    serde_json::json!({
+        "ok": true,
+        "drag_ended": ended.as_str(),
+        "drag_active_mid": drag_active_mid,
+    })
+    .to_string()
 }
 
 impl Shared {
