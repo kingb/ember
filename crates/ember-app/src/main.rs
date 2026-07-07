@@ -1062,7 +1062,16 @@ impl ApplicationHandler<EmberEvent> for App {
         // window while `win` still points into that same map would conflict —
         // so a `new-window`/close resolution just records what to do, applied
         // once at the very end of this function (`win`'s true last use).
-        let mut deferred_window: Option<DeferredWindowAction> = None;
+        //
+        // A `Vec`, not a single `Option`: up to three sites below can each
+        // want to enqueue an action in the very same tick (the ctl-commands
+        // loop, native-menu handling, and the organic tabs-empty check
+        // further down) — a single slot let a later write silently clobber
+        // an earlier one (e.g. a batched `ctl new-window` racing a
+        // close-confirm resolution landing in the same drain), dropping the
+        // clobbered action entirely. Every queued action is processed, in
+        // write order, at the tail once `win`'s borrow ends.
+        let mut deferred_windows: Vec<DeferredWindowAction> = Vec::new();
 
         // Drain debug-control commands (EMBER_CONTROL) and act on them.
         let cmds: Vec<ControlMsg> = shared
@@ -1075,7 +1084,7 @@ impl ApplicationHandler<EmberEvent> for App {
                 let cwd = win
                     .focused_session_id()
                     .and_then(|sid| shared.cwd_by_session.get(&sid).cloned());
-                deferred_window = Some(DeferredWindowAction::OpenNew(cwd));
+                deferred_windows.push(DeferredWindowAction::OpenNew(cwd));
                 continue;
             }
             match win.handle_control(shared, cmd) {
@@ -1084,7 +1093,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     event_loop.exit();
                 }
                 Some(ControlClose::CloseWindow) => {
-                    deferred_window = Some(DeferredWindowAction::CloseThis);
+                    queue_close_this(&mut deferred_windows);
                 }
                 None => {}
             }
@@ -1100,7 +1109,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     let cwd = win
                         .focused_session_id()
                         .and_then(|sid| shared.cwd_by_session.get(&sid).cloned());
-                    deferred_window = Some(DeferredWindowAction::OpenNew(cwd));
+                    deferred_windows.push(DeferredWindowAction::OpenNew(cwd));
                 }
                 MenuAction::Copy => win.copy_selection(shared),
                 MenuAction::Paste => win.paste_clipboard(shared),
@@ -1116,21 +1125,25 @@ impl ApplicationHandler<EmberEvent> for App {
                             shared.shutdown_all();
                             event_loop.exit();
                         } else {
-                            deferred_window = Some(DeferredWindowAction::CloseThis);
+                            queue_close_this(&mut deferred_windows);
                         }
                     }
                 }
             }
         }
+        // A session can exit organically (shell `exit`, Ctrl-D, a crash) with
+        // no explicit ctl/menu close request at all — that's handled above by
+        // the `for session in exited` drain, which can leave this window with
+        // no tabs. Queue the close here rather than closing immediately and
+        // returning: an explicit close already queued above (e.g. a
+        // close-confirm resolving to `CloseWindow`) can *also* leave tabs
+        // empty — it's what emptied them — so `queue_close_this` guards
+        // against enqueuing the same window's close twice in one tick. A
+        // duplicate `finish_close` on an already-removed window would
+        // re-check `windows.len() <= 1` against post-first-close state and
+        // could tear down every remaining window instead of just this one.
         if win.tree.tabs.is_empty() {
-            finish_close(
-                &mut self.windows,
-                shared,
-                &mut self.focused_window,
-                event_loop,
-                focused_id,
-            );
-            return;
+            queue_close_this(&mut deferred_windows);
         }
         // Pace animations by WALL-CLOCK elapsed since the last frame, checked here on
         // *every* wake (timer tick OR any event). Advancing off the timer's
@@ -1138,77 +1151,127 @@ impl ApplicationHandler<EmberEvent> for App {
         // keeps resetting the `WaitUntil` deadline so the tick never fires and the
         // sparks freeze until the mouse stops (the stutter). We only request a redraw
         // once a frame-interval has actually elapsed, so this doesn't spin either.
+        //
+        // Driven for EVERY window this tick, not just the focused one:
+        // `backdrop_animating`'s contract is "the campfire burns while you
+        // work elsewhere" — any VISIBLE window, focused or not — so pacing
+        // only `self.focused_window` here would freeze an unfocused-but-
+        // visible window's ember sparks at whatever phase they were in the
+        // moment focus left it. Focus-notify and menu/ctl-command handling
+        // above stay focused-window-only (they're inherently about the
+        // focused window); only this pacing loop needs to fan out to every
+        // window (2026-07-07 fix).
         let now = Instant::now();
-        // A starved (no-drawable) render retries on the animation cadence while
-        // the window isn't winit-occluded: the renderer's StarveGate turns most
-        // ticks into instant no-ops and allows a real attempt only every 250ms,
-        // so a transiently starved frame self-heals without the  spin.
-        let starve_retry = win.render_starved && !win.occluded;
-        let frame = if win.about || win.fps_overlay || win.bell_flashing() {
-            ANIM_FRAME
-        } else if win.backdrop_animating(shared) {
-            shared.ember_frame()
-        } else {
-            ANIM_FRAME // starve retry (only reached when `animating` below)
-        };
-        let animating = win.about
-            || win.fps_overlay
-            || win.bell_flashing()
-            || win.backdrop_animating(shared)
-            || starve_retry;
-        if animating {
-            if now.duration_since(win.last_anim) >= frame {
-                win.last_anim = now;
-                win.advance_animations(shared, now);
-                // Animations advance on wall-clock regardless, but don't ask an
-                // occluded window to paint them (same  spin, slower burn).
-                if !win.occluded {
-                    win.renderer.window().request_redraw();
+        let mut next_wake: Option<Instant> = None;
+        for w in self.windows.values_mut() {
+            // A starved (no-drawable) render retries on the animation cadence while
+            // the window isn't winit-occluded: the renderer's StarveGate turns most
+            // ticks into instant no-ops and allows a real attempt only every 250ms,
+            // so a transiently starved frame self-heals without the  spin.
+            let starve_retry = w.render_starved && !w.occluded;
+            let frame = if w.about || w.fps_overlay || w.bell_flashing() {
+                ANIM_FRAME
+            } else if w.backdrop_animating(shared) {
+                shared.ember_frame()
+            } else {
+                ANIM_FRAME // starve retry (only reached when `animating` below)
+            };
+            let animating = w.about
+                || w.fps_overlay
+                || w.bell_flashing()
+                || w.backdrop_animating(shared)
+                || starve_retry;
+            if animating {
+                if now.duration_since(w.last_anim) >= frame {
+                    w.last_anim = now;
+                    w.advance_animations(shared, now);
+                    // Animations advance on wall-clock regardless, but don't ask an
+                    // occluded window to paint them (same  spin, slower burn).
+                    if !w.occluded {
+                        w.renderer.window().request_redraw();
+                    }
                 }
+                // Fixed deadline relative to each window's own last frame
+                // (not `now`), so incoming events can't push it back
+                // indefinitely; the loop wakes at the SOONEST deadline
+                // across every animating window.
+                let deadline = w.last_anim + frame;
+                next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
             }
-            // Fixed deadline relative to the last frame (not `now`), so incoming
-            // events can't push it back indefinitely.
-            event_loop.set_control_flow(ControlFlow::WaitUntil(win.last_anim + frame));
+        }
+        if let Some(deadline) = next_wake {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else {
-            // Nothing animating: sleep until an event, a frame-lane wake, or a
+            // Nothing animating anywhere: sleep until an event, a frame-lane wake, or a
             // control command wakes us — no more ~125 Hz idle polling.
             event_loop.set_control_flow(ControlFlow::Wait);
         }
 
-        // `win`'s borrow of `self.windows` ends above (last used for the
-        // animation pacing) — only now can a window actually be inserted or
-        // removed.
-        match deferred_window {
-            Some(DeferredWindowAction::OpenNew(cwd)) => {
-                open_new_window(
-                    &mut self.windows,
-                    shared,
-                    &mut self.focused_window,
-                    event_loop,
-                    cwd,
-                );
+        // Every window's borrow above (via `values_mut()`) has ended (last
+        // used for the animation pacing) — only now can a window actually be
+        // inserted or removed. Process every queued action, in write order:
+        // an explicit close queued from a control command mustn't run before
+        // an earlier-queued `OpenNew` in the same tick, or a window that was
+        // emptied-then-replaced within one batch could look, mid-processing,
+        // like "the last window standing" and trigger a full app shutdown
+        // instead of just swapping windows.
+        for action in deferred_windows {
+            match action {
+                DeferredWindowAction::OpenNew(cwd) => {
+                    open_new_window(
+                        &mut self.windows,
+                        shared,
+                        &mut self.focused_window,
+                        event_loop,
+                        cwd,
+                    );
+                }
+                DeferredWindowAction::CloseThis => {
+                    finish_close(
+                        &mut self.windows,
+                        shared,
+                        &mut self.focused_window,
+                        event_loop,
+                        focused_id,
+                    );
+                }
             }
-            Some(DeferredWindowAction::CloseThis) => {
-                finish_close(
-                    &mut self.windows,
-                    shared,
-                    &mut self.focused_window,
-                    event_loop,
-                    focused_id,
-                );
-            }
-            None => {}
         }
     }
 }
 
 /// A window-structural action (open a new window / close this one) that a
 /// control command, menu item, or a window emptying its last tab requested
-/// mid-`about_to_wait` — applied once at the very end, after the focused
-/// window's borrow ends (see the comment at its use site).
+/// mid-`about_to_wait` — applied once at the very end, after every window's
+/// borrow ends (see the comment at its use site). Collected into a `Vec`
+/// (`deferred_windows`), not a single slot: several independent sites in one
+/// `about_to_wait` tick can each want to enqueue one of these, and a single
+/// `Option` let a later write silently drop an earlier one.
 enum DeferredWindowAction {
     OpenNew(Option<String>),
     CloseThis,
+}
+
+/// Enqueue a `CloseThis` unless one is already queued this tick.
+///
+/// `CloseThis` always targets the same window (`focused_id`, captured once
+/// at the top of `about_to_wait`), and applying it twice would call
+/// `finish_close` on an already-removed window: `finish_close` re-checks
+/// `windows.len() <= 1` at the time it runs, so a second, redundant
+/// `CloseThis` right after the first one actually closed a window (out of
+/// several) would see the now-smaller window count and could tear the
+/// whole app down instead of a no-op. Several sites in `about_to_wait` can
+/// each independently conclude "this window should close" in the same
+/// tick (an explicit ctl/menu close **and** the organic tabs-emptied
+/// check, since the explicit close is often exactly what emptied the
+/// tabs) — this keeps that idempotent.
+fn queue_close_this(deferred_windows: &mut Vec<DeferredWindowAction>) {
+    if !deferred_windows
+        .iter()
+        .any(|a| matches!(a, DeferredWindowAction::CloseThis))
+    {
+        deferred_windows.push(DeferredWindowAction::CloseThis);
+    }
 }
 
 /// Create a new OS window + GPU renderer + `WindowState` seeded with `tree`,
@@ -1865,8 +1928,8 @@ fn encode_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        BELL_FLASH_SECS, bell_flash_intensity, bracket_paste, encode_key, match_tab_title,
-        tab_display_title, url_is_openable,
+        BELL_FLASH_SECS, DeferredWindowAction, bell_flash_intensity, bracket_paste, encode_key,
+        match_tab_title, queue_close_this, tab_display_title, url_is_openable,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
@@ -2145,5 +2208,43 @@ mod tests {
         assert_eq!(match_tab_title(&titles, "BETA"), Some(2));
         assert_eq!(match_tab_title(&titles, "uild"), Some(1), "substring");
         assert_eq!(match_tab_title(&titles, "gamma"), None);
+    }
+
+    /// `deferred_windows` is a `Vec`, not a single `Option`, specifically so a
+    /// same-tick `ctl new-window` + close-confirm resolution can't clobber
+    /// each other — this pins down the ordering and de-duplication contract
+    /// that guarantees, without a live window.
+    #[test]
+    fn deferred_window_actions_preserve_write_order_and_dedup_close() {
+        // Two distinct opens (e.g. two batched `ctl new-window` commands) are
+        // both real, independent windows — neither is dropped or merged.
+        let v: Vec<DeferredWindowAction> = vec![
+            DeferredWindowAction::OpenNew(Some("a".into())),
+            DeferredWindowAction::OpenNew(Some("b".into())),
+        ];
+        assert_eq!(v.len(), 2);
+
+        // An OpenNew queued before a close (e.g. a batched `ctl new-window`
+        // racing a close-confirm resolution in the same drain) keeps BOTH,
+        // in write order — this is the exact case that used to silently
+        // drop one of the two with a single `Option` slot.
+        let mut v: Vec<DeferredWindowAction> = Vec::new();
+        v.push(DeferredWindowAction::OpenNew(None));
+        queue_close_this(&mut v);
+        assert!(matches!(v[0], DeferredWindowAction::OpenNew(_)));
+        assert!(matches!(v[1], DeferredWindowAction::CloseThis));
+
+        // `CloseThis` always targets the same window (`focused_id`), so a
+        // second, independent trigger for it in the same tick (e.g. an
+        // explicit close that empties the window's last tab, which the
+        // organic tabs-empty check then also notices) must NOT enqueue a
+        // second copy — applying `finish_close` twice would re-check
+        // `windows.len()` against already-mutated state and could tear down
+        // every remaining window instead of a no-op.
+        let mut v: Vec<DeferredWindowAction> = Vec::new();
+        queue_close_this(&mut v);
+        queue_close_this(&mut v);
+        queue_close_this(&mut v);
+        assert_eq!(v.len(), 1);
     }
 }
