@@ -6,6 +6,20 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- External tools can now find and jump to tabs. `ctl state` reports every
+  tab (index, active, title, sessions), `ctl focus <query>` selects the
+  first tab whose title matches and brings the Ember window to the front,
+  and `ctl raise` raises the window on its own. All three are also exposed
+  as MCP tools. Built for hardware macro decks and agent dashboards that
+  map a name to "the tab running that thing".
+
+### Changed
+
+- In `ctl state`, the `tabs` field changed from a count to the array above.
+  Callers that read it as a number should use the array's length.
+
 ## [0.2.1] - 2026-07-06
 
 ### Fixed

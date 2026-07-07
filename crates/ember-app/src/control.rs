@@ -31,6 +31,13 @@ pub enum ControlMsg {
     Chord(String),
     /// Request a JSON state dump; the main thread replies on the channel.
     State(Sender<String>),
+    /// Focus the first tab whose displayed title contains the query
+    /// (case-insensitive), then raise the window. Reply is the full JSON
+    /// response line: `{"ok":true,"index":..,"title":..}` or a not-found
+    /// error that lists the titles seen.
+    Focus(String, Sender<String>),
+    /// Bring the window to the front and give it keyboard focus.
+    Raise,
     /// Capture the live window to a PNG at the given path; reply is the full
     /// JSON response line (`{"ok":true,"path":..}` / `{"ok":false,"error":..}`).
     Screenshot(String, Sender<String>),
@@ -259,6 +266,27 @@ mod unix {
                     Err(_) => err("screenshot timeout"),
                 }
             }
+            "focus" => {
+                let Some(query) = v.get("query").and_then(Value::as_str) else {
+                    return err("focus needs a query");
+                };
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if tx
+                    .send(ControlMsg::Focus(query.to_string(), reply_tx))
+                    .is_err()
+                {
+                    return err("event loop gone");
+                }
+                waker(); // wake BEFORE waiting — see dispatch docs
+                match reply_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(resp) => resp, // main builds the full JSON response.
+                    Err(_) => err("focus timeout"),
+                }
+            }
+            "raise" => {
+                let _ = tx.send(ControlMsg::Raise);
+                ok()
+            }
             "click" => {
                 let x = v.get("x").and_then(Value::as_f64).unwrap_or(0.0);
                 let y = v.get("y").and_then(Value::as_f64).unwrap_or(0.0);
@@ -453,6 +481,19 @@ mod unix {
             "key" => serde_json::json!({"cmd":"key","name": arg}),
             "chord" => serde_json::json!({"cmd":"chord","keys": arg}),
             "state" => serde_json::json!({"cmd":"state"}),
+            "focus" => {
+                // Join the remaining args so `ctl focus agent alpha` works
+                // without quoting.
+                let query = rest
+                    .get(1..)
+                    .map(|r| r.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                if query.is_empty() {
+                    return Err("focus needs a query (matches tab titles)".to_string());
+                }
+                serde_json::json!({"cmd":"focus","query": query})
+            }
+            "raise" => serde_json::json!({"cmd":"raise"}),
             "screenshot" => {
                 let path = if arg.is_empty() {
                     "/tmp/ember-live.png"
@@ -499,7 +540,7 @@ mod unix {
             }
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab)"
                 ));
             }
         };

@@ -1313,6 +1313,31 @@ impl RunState {
             ControlMsg::State(reply) => {
                 let _ = reply.send(self.state_json());
             }
+            ControlMsg::Focus(query, reply) => {
+                let titles: Vec<String> = self
+                    .tree
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| tab_display_title(&t.title, i))
+                    .collect();
+                let resp = match match_tab_title(&titles, &query) {
+                    Some(i) => {
+                        self.select_tab(i + 1);
+                        self.raise_window();
+                        serde_json::json!({"ok": true, "index": i + 1, "title": titles[i]})
+                            .to_string()
+                    }
+                    // Echo the titles we saw so a caller can debug its query
+                    // without a round of guesswork.
+                    None => serde_json::json!({
+                        "ok": false, "error": "no tab title matches", "titles": titles,
+                    })
+                    .to_string(),
+                };
+                let _ = reply.send(resp);
+            }
+            ControlMsg::Raise => self.raise_window(),
             ControlMsg::Screenshot(path, reply) => {
                 let resp = match self.renderer.capture_to_png(std::path::Path::new(&path)) {
                     Ok(()) => serde_json::json!({"ok": true, "path": path}).to_string(),
@@ -1417,10 +1442,29 @@ impl RunState {
             .focused_session_id()
             .and_then(|id| self.bracketed.get(&id).copied())
             .unwrap_or(false);
+        // Every tab, not just the active one — external tools map a name to a
+        // tab index with this (`index` is 1-based, matching `cmd+N` and
+        // `ctl focus`). `title` is the strip's displayed title, same rule.
+        let tabs: Vec<serde_json::Value> = self
+            .tree
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let sessions: Vec<String> =
+                    t.root.leaves().iter().map(|(_, s)| s.0.clone()).collect();
+                serde_json::json!({
+                    "index": i + 1,
+                    "active": i == self.tree.active,
+                    "title": tab_display_title(&t.title, i),
+                    "sessions": sessions,
+                })
+            })
+            .collect();
         serde_json::json!({
             "scale_factor": sf,
             "surface": [self.px.0, self.px.1],
-            "tabs": self.tree.tabs.len(),
+            "tabs": tabs,
             "active_tab": self.tree.active,
             "focus_pane": focus.0,
             "bracketed_paste": bracketed,
@@ -1498,10 +1542,8 @@ impl RunState {
                 TabLabel {
                     title: if editing {
                         self.edit_buffer.clone()
-                    } else if t.title.is_empty() {
-                        format!("{}", i + 1)
                     } else {
-                        t.title.clone()
+                        tab_display_title(&t.title, i)
                     },
                     active: i == active,
                     editing,
@@ -2881,6 +2923,15 @@ impl RunState {
         }
     }
 
+    /// Bring the window to the front and give it focus (`ctl raise`, and the
+    /// tail of `ctl focus` — a Stream Deck press should land the user IN
+    /// Ember, not silently switch a background window's tab).
+    fn raise_window(&self) {
+        let w = self.renderer.window();
+        w.set_minimized(false);
+        w.focus_window();
+    }
+
     /// Close the pane backing `session` wherever it lives (a shell exited, or a
     /// background tab's pane was closed). Switches to that tab so `ClosePane`'s
     /// active-tab semantics apply, then restores a sane active index.
@@ -3007,6 +3058,25 @@ fn step_selectable_row(rows: &[SettingsRowView], sel: usize, dir: i32) -> usize 
 fn url_is_openable(url: &str) -> bool {
     let head = url.get(..8).unwrap_or(url).to_ascii_lowercase();
     head.starts_with("http://") || head.starts_with("https://")
+}
+
+/// The tab title as displayed and as matched: the tab's own title, or its
+/// 1-based number when unset. One rule shared by the tab strip, `ctl state`,
+/// and `ctl focus`, so what an external tool matches on is exactly what the
+/// user sees in the strip.
+fn tab_display_title(title: &str, index: usize) -> String {
+    if title.is_empty() {
+        format!("{}", index + 1)
+    } else {
+        title.to_string()
+    }
+}
+
+/// First index whose title contains `query`, case-insensitively. First match
+/// wins — deterministic for callers that key off tab order.
+fn match_tab_title(titles: &[String], query: &str) -> Option<usize> {
+    let q = query.to_lowercase();
+    titles.iter().position(|t| t.to_lowercase().contains(&q))
 }
 
 /// The keyboard cheat-sheet shown by the Cmd+/ overlay. Keep in sync with
@@ -3237,7 +3307,8 @@ fn encode_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        BELL_FLASH_SECS, bell_flash_intensity, bracket_paste, encode_key, url_is_openable,
+        BELL_FLASH_SECS, bell_flash_intensity, bracket_paste, encode_key, match_tab_title,
+        tab_display_title, url_is_openable,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
@@ -3398,5 +3469,28 @@ mod tests {
         assert!(!url_is_openable("httpss://example.com"));
         assert!(url_is_openable("HTTP://EXAMPLE.COM"));
         assert!(url_is_openable("HtTpS://example.com"));
+    }
+
+    #[test]
+    fn tab_display_title_falls_back_to_the_tab_number() {
+        assert_eq!(tab_display_title("build", 0), "build");
+        assert_eq!(tab_display_title("", 0), "1");
+        assert_eq!(tab_display_title("", 4), "5");
+    }
+
+    #[test]
+    fn tab_title_matching_is_case_insensitive_substring_first_match() {
+        let titles: Vec<String> = ["Agent Alpha", "build", "agent beta"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            match_tab_title(&titles, "agent"),
+            Some(0),
+            "first match wins"
+        );
+        assert_eq!(match_tab_title(&titles, "BETA"), Some(2));
+        assert_eq!(match_tab_title(&titles, "uild"), Some(1), "substring");
+        assert_eq!(match_tab_title(&titles, "gamma"), None);
     }
 }

@@ -81,7 +81,17 @@ fn tools() -> Value {
         },
         {
             "name": "ember_state",
-            "description": "Dump the live app state as JSON: scale_factor, surface size, tabs, and each active-tab pane's dims/cursor/styles_known/screen-text. The primary way to SEE what a running ember-term is rendering.",
+            "description": "Dump the live app state as JSON: scale_factor, surface size, a tabs array (index/active/title/sessions for EVERY tab), and each active-tab pane's dims/cursor/styles_known/screen-text. The primary way to SEE what a running ember-term is rendering.",
+            "inputSchema": {"type": "object", "properties": target_props()}
+        },
+        {
+            "name": "ember_focus",
+            "description": "Focus the first tab whose title contains the query (case-insensitive) and raise the Ember window. Returns the matched index+title, or the list of titles seen when nothing matches.",
+            "inputSchema": {"type": "object", "properties": with(target_props(), "query", json!({"type": "string", "description": "Substring to match against tab titles."})), "required": ["query"]}
+        },
+        {
+            "name": "ember_raise",
+            "description": "Bring the Ember window to the front and give it keyboard focus.",
             "inputSchema": {"type": "object", "properties": target_props()}
         },
         {
@@ -148,6 +158,14 @@ fn tools_call(params: Option<&Value>) -> Result<Value, String> {
             ))
         }
         "ember_state" => Ok(text(send(&args, json!({"cmd": "state"}))?)),
+        "ember_focus" => {
+            let q = args
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or("query required")?;
+            Ok(text(send(&args, json!({"cmd": "focus", "query": q}))?))
+        }
+        "ember_raise" => Ok(text(send(&args, json!({"cmd": "raise"}))?)),
         "ember_type" => {
             let t = args
                 .get("text")
