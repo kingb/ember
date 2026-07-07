@@ -31,6 +31,8 @@ cp "$HOMEDIR/.bashrc" "$HOMEDIR/.bash_profile"
 cat > "$HOMEDIR/project/ember/README.md" <<'MD'
 # ember
 A native terminal emulator, built from scratch in Rust.
+
+Docs: https://emberterm.com/docs
 MD
 cat > "$HOMEDIR/project/ember/Cargo.toml" <<'TOML'
 [package]

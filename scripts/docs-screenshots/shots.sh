@@ -52,4 +52,8 @@ shot settings.png --settings --font "Menlo" --run "ls" --backdrop
 # Text selection (line mode).
 shot selection.png --run "git log --oneline -6" --select "3,0,3,44" --select-mode line
 
+# Clickable URLs: the demo README carries a URL, rendered with the subtle
+# always-on underline (v0.2.0+ binaries only).
+shot urls.png --run "cat README.md"
+
 echo "done -> $OUT"
