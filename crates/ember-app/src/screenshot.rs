@@ -388,6 +388,12 @@ pub fn run(opts: Opts) -> Result<String, String> {
             sparks: opts.ember,
             density: 1.0,
             time: opts.ember_phase,
+            // Experiment knob: trail sizing must match the cadence the
+            // frames will be played back at; stills default to a 30fps-equivalent.
+            frame_dt: std::env::var("EMBER_SPARK_DT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0 / 30.0),
         },
         image: opts
             .bg_image

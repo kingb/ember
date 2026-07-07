@@ -340,6 +340,7 @@ pub fn capture_reusing(
                 shot.logical_w,
                 shot.logical_h,
                 sf,
+                shot.backdrop.frame_dt,
             );
         }
         // Shape each pane into its own logical-sized buffer, then build quads.

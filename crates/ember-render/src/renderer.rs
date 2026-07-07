@@ -120,6 +120,10 @@ pub struct BackdropParams {
     pub density: f32,
     /// Elapsed seconds, driving the spark animation.
     pub time: f32,
+    /// Seconds between animation ticks (`1 / ember_fps`). Sizes the
+    /// velocity-stretched trail segments (when enabled) so consecutive
+    /// frames' streaks connect end-to-end at any configured frame rate.
+    pub frame_dt: f32,
 }
 
 impl Default for BackdropParams {
@@ -130,6 +134,7 @@ impl Default for BackdropParams {
             sparks: false,
             density: 1.0,
             time: 0.0,
+            frame_dt: 1.0 / 30.0,
         }
     }
 }
@@ -1133,7 +1138,8 @@ impl Renderer {
         let scene_changed = {
             let a = &self.backdrop;
             let b = &params;
-            (a.gradient, a.sparks, a.density, a.scrim) != (b.gradient, b.sparks, b.density, b.scrim)
+            (a.gradient, a.sparks, a.density, a.scrim, a.frame_dt)
+                != (b.gradient, b.sparks, b.density, b.scrim, b.frame_dt)
         };
         if scene_changed {
             self.scene_dirty = true;
@@ -1260,7 +1266,14 @@ impl Renderer {
         if animation_only {
             let lw = self.config.width as f32 / sf;
             let lh = self.config.height as f32 / sf;
-            let spark_rects = spark_quads(self.backdrop.density, self.backdrop.time, lw, lh, sf);
+            let spark_rects = spark_quads(
+                self.backdrop.density,
+                self.backdrop.time,
+                lw,
+                lh,
+                sf,
+                self.backdrop.frame_dt,
+            );
             self.sparks.prepare(
                 &self.device,
                 &self.queue,
@@ -1410,6 +1423,7 @@ impl Renderer {
                         logical_w,
                         logical_h,
                         sf,
+                        self.backdrop.frame_dt,
                     );
                 }
                 // Pass 1: (re)shape only panes whose grid/size changed since last frame.
