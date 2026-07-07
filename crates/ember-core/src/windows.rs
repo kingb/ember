@@ -75,15 +75,25 @@ pub enum MoveError {
 
 /// Move `src` to `dest` within `windows`, returning the effects the app layer
 /// must carry out. On error, `windows` is left completely unchanged.
+///
+/// `fresh_tab_id` is used ONLY when the move mints a brand-new tab — that is,
+/// when a `Pane` is promoted via `SurfaceDest::NewTab` or `SurfaceDest::NewWindow`.
+/// It is ignored for every other case (Tab-sourced moves carry their existing
+/// `Tab`, id included, wholesale; splits don't create a tab at all). Callers
+/// (ember-app) must allocate this from their own tab-id counter so it can
+/// never collide with an existing `TabId`.
 pub fn move_surface(
     windows: &mut Windows,
     src: SurfaceRef,
     dest: SurfaceDest,
+    fresh_tab_id: TabId,
 ) -> Result<Vec<MoveEffect>, MoveError> {
     validate(windows, src, dest)?;
     match src {
         SurfaceRef::Tab { window, tab } => move_tab(windows, window, tab, dest),
-        SurfaceRef::Pane { window, tab, pane } => move_pane(windows, window, tab, pane, dest),
+        SurfaceRef::Pane { window, tab, pane } => {
+            move_pane(windows, window, tab, pane, dest, fresh_tab_id)
+        }
     }
 }
 
@@ -293,6 +303,7 @@ fn move_pane(
     t: usize,
     p: PaneId,
     dest: SurfaceDest,
+    fresh_tab_id: TabId,
 ) -> Result<Vec<MoveEffect>, MoveError> {
     if windows.trees[w].tabs[t].root.pane_ids().len() == 1 {
         return Err(MoveError::WouldEmptyTab);
@@ -313,7 +324,7 @@ fn move_pane(
     match dest {
         SurfaceDest::NewTab { window: dw } => {
             let new_tab = Tab {
-                id: TabId(p.0),
+                id: fresh_tab_id,
                 title: String::new(),
                 root: leaf,
                 focus: p,
@@ -331,7 +342,7 @@ fn move_pane(
         }
         SurfaceDest::NewWindow => {
             let new_tab = Tab {
-                id: TabId(p.0),
+                id: fresh_tab_id,
                 title: String::new(),
                 root: leaf,
                 focus: p,
@@ -458,6 +469,7 @@ mod tests {
             &mut w,
             SurfaceRef::Tab { window: 0, tab: 0 },
             SurfaceDest::NewWindow,
+            TabId(9000),
         )
         .unwrap();
         assert_eq!(w.trees.len(), 3);
@@ -485,6 +497,7 @@ mod tests {
             &mut w,
             SurfaceRef::Tab { window: 0, tab: 0 },
             SurfaceDest::NewTab { window: 1 },
+            TabId(9001),
         )
         .unwrap();
         assert_eq!(w.trees.len(), 2);
@@ -511,6 +524,7 @@ mod tests {
             &mut w,
             SurfaceRef::Tab { window: 0, tab: 0 },
             SurfaceDest::NewTab { window: 2 },
+            TabId(9002),
         )
         .unwrap();
         assert_eq!(w.trees.len(), 2);
@@ -543,6 +557,7 @@ mod tests {
                 pane: PaneId(20),
             },
             SurfaceDest::NewTab { window: 0 },
+            TabId(9003),
         )
         .unwrap();
         assert_eq!(
@@ -552,6 +567,7 @@ mod tests {
         assert_eq!(w.trees[0].tabs[0].focus, PaneId(10)); // untouched: focus wasn't on 20
         assert_eq!(w.trees[0].tabs.len(), 2);
         assert_eq!(w.trees[0].tabs[1].root, p(20));
+        assert_eq!(w.trees[0].tabs[1].id, TabId(9003));
         assert_eq!(w.trees[0].active, 1);
         assert!(effects.is_empty()); // same window: nothing rehomed
     }
@@ -573,11 +589,13 @@ mod tests {
                 pane: PaneId(20),
             },
             SurfaceDest::NewWindow,
+            TabId(9004),
         )
         .unwrap();
         assert_eq!(w.trees.len(), 2);
         assert_eq!(w.trees[0].tabs[0].root, p(10));
         assert_eq!(w.trees[1].tabs[0].root, p(20));
+        assert_eq!(w.trees[1].tabs[0].id, TabId(9004));
         assert_eq!(w.focused, 1);
         assert_eq!(
             effects,
@@ -589,6 +607,72 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Regression for the `TabId(pane.0)` collision bug: a promoted pane's new
+    /// tab must get the id the caller passed in, not one derived from the
+    /// pane's own id (which desyncs from ember-app's independent tab counter
+    /// and can collide with an existing `TabId`). A Tab-sourced move must
+    /// ignore `fresh_tab_id` entirely and keep the tab's own id.
+    #[test]
+    fn promoted_pane_gets_the_caller_supplied_tab_id() {
+        // Pane -> NewTab: the newly minted tab gets `fresh_tab_id`.
+        let mut w = Windows {
+            trees: vec![WindowTree {
+                tabs: vec![tab(1, &[10, 20])],
+                active: 0,
+            }],
+            focused: 0,
+        };
+        move_surface(
+            &mut w,
+            SurfaceRef::Pane {
+                window: 0,
+                tab: 0,
+                pane: PaneId(20),
+            },
+            SurfaceDest::NewTab { window: 0 },
+            TabId(12345),
+        )
+        .unwrap();
+        assert_eq!(w.trees[0].tabs[1].id, TabId(12345));
+        assert_ne!(w.trees[0].tabs[1].id, TabId(20)); // NOT derived from PaneId(20)
+
+        // Pane -> NewWindow: same contract.
+        let mut w = Windows {
+            trees: vec![WindowTree {
+                tabs: vec![tab(1, &[10, 20])],
+                active: 0,
+            }],
+            focused: 0,
+        };
+        move_surface(
+            &mut w,
+            SurfaceRef::Pane {
+                window: 0,
+                tab: 0,
+                pane: PaneId(20),
+            },
+            SurfaceDest::NewWindow,
+            TabId(54321),
+        )
+        .unwrap();
+        assert_eq!(w.trees[1].tabs[0].id, TabId(54321));
+        assert_ne!(w.trees[1].tabs[0].id, TabId(20));
+
+        // Tab-sourced move: `fresh_tab_id` is ignored, the moved tab keeps
+        // its own id. `windows(&[&[1, 2], &[3]])` makes 2 windows, so the new
+        // window promoted tab 0 (id 1) out of window 0 lands at index 2.
+        let mut w = windows(&[&[1, 2], &[3]]);
+        move_surface(
+            &mut w,
+            SurfaceRef::Tab { window: 0, tab: 0 },
+            SurfaceDest::NewWindow,
+            TabId(99999),
+        )
+        .unwrap();
+        assert_eq!(w.trees[2].tabs[0].id, TabId(1));
+        assert_ne!(w.trees[2].tabs[0].id, TabId(99999));
     }
 
     #[test]
@@ -619,6 +703,7 @@ mod tests {
                 pane: PaneId(30),
                 axis: Axis::Vertical,
             },
+            TabId(9005),
         )
         .unwrap();
         assert_eq!(w.trees[0].tabs[0].root, p(20));
@@ -661,6 +746,7 @@ mod tests {
                 pane: PaneId(30),
                 axis: Axis::Horizontal,
             },
+            TabId(9006),
         )
         .unwrap();
         assert_eq!(w.trees[0].tabs.len(), 1);
@@ -695,6 +781,7 @@ mod tests {
                 pane: PaneId(1),
             },
             SurfaceDest::NewTab { window: 0 },
+            TabId(9007),
         );
         assert_eq!(result, Err(MoveError::WouldEmptyTab));
     }
@@ -708,7 +795,8 @@ mod tests {
             move_surface(
                 &mut w,
                 SurfaceRef::Tab { window: 9, tab: 0 },
-                SurfaceDest::NewWindow
+                SurfaceDest::NewWindow,
+                TabId(9100)
             ),
             Err(MoveError::Invalid(_))
         ));
@@ -716,7 +804,8 @@ mod tests {
             move_surface(
                 &mut w,
                 SurfaceRef::Tab { window: 0, tab: 9 },
-                SurfaceDest::NewWindow
+                SurfaceDest::NewWindow,
+                TabId(9101)
             ),
             Err(MoveError::Invalid(_))
         ));
@@ -728,7 +817,8 @@ mod tests {
                     tab: 0,
                     pane: PaneId(999)
                 },
-                SurfaceDest::NewWindow
+                SurfaceDest::NewWindow,
+                TabId(9102)
             ),
             Err(MoveError::Invalid(_))
         ));
@@ -736,7 +826,8 @@ mod tests {
             move_surface(
                 &mut w,
                 SurfaceRef::Tab { window: 0, tab: 0 },
-                SurfaceDest::NewTab { window: 9 }
+                SurfaceDest::NewTab { window: 9 },
+                TabId(9103)
             ),
             Err(MoveError::Invalid(_))
         ));
@@ -749,7 +840,8 @@ mod tests {
                     tab: 9,
                     pane: PaneId(3),
                     axis: Axis::Horizontal
-                }
+                },
+                TabId(9104)
             ),
             Err(MoveError::Invalid(_))
         ));
@@ -762,7 +854,8 @@ mod tests {
                     tab: 0,
                     pane: PaneId(999),
                     axis: Axis::Horizontal
-                }
+                },
+                TabId(9105)
             ),
             Err(MoveError::Invalid(_))
         ));
@@ -770,7 +863,8 @@ mod tests {
             move_surface(
                 &mut w,
                 SurfaceRef::Tab { window: 0, tab: 0 },
-                SurfaceDest::NewTab { window: 0 }
+                SurfaceDest::NewTab { window: 0 },
+                TabId(9106)
             ),
             Err(MoveError::Invalid(_))
         ));
@@ -787,7 +881,8 @@ mod tests {
                     tab: 0,
                     pane: PaneId(1),
                     axis: Axis::Horizontal
-                }
+                },
+                TabId(9107)
             ),
             Err(MoveError::Invalid(_))
         ));
@@ -800,7 +895,8 @@ mod tests {
                     tab: 0,
                     pane: PaneId(1),
                     axis: Axis::Horizontal
-                }
+                },
+                TabId(9108)
             ),
             Err(MoveError::Invalid(_))
         ));
@@ -830,6 +926,7 @@ mod tests {
                 pane: PaneId(20),
             },
             SurfaceDest::NewWindow,
+            TabId(9200),
         )
         .unwrap();
         let remaining_focus = w.trees[0].tabs[0].focus;
@@ -915,10 +1012,16 @@ mod tests {
         let srcs = all_srcs(&base);
         let dests = all_dests(&base);
 
+        // Every id here must be distinct from every other id used across the
+        // whole loop AND from every id already present in `fixture()`
+        // (1..=4, 99) — offset well clear of both so a colliding TabId can
+        // never mask a real bug in the assertions below.
+        let mut next_id: u64 = 90_000;
         for src in &srcs {
             for dest in &dests {
                 let mut w = base.clone();
-                match move_surface(&mut w, *src, *dest) {
+                next_id += 1;
+                match move_surface(&mut w, *src, *dest, TabId(next_id)) {
                     Ok(_) => {
                         assert_eq!(
                             sorted(all_session_ids(&base)),
@@ -940,10 +1043,12 @@ mod tests {
         let srcs = all_srcs(&base);
         let dests = all_dests(&base);
 
+        let mut next_id: u64 = 90_000;
         for src in &srcs {
             for dest in &dests {
                 let mut w = base.clone();
-                if move_surface(&mut w, *src, *dest).is_ok() {
+                next_id += 1;
+                if move_surface(&mut w, *src, *dest, TabId(next_id)).is_ok() {
                     for win in &w.trees {
                         assert!(!win.tabs.is_empty(), "window left with zero tabs");
                         for t in &win.tabs {
