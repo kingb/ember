@@ -19,7 +19,12 @@ serde_json.workspace = true
 toml.workspace = true
 # The EMBER_FONT_DEBUG logger: surfaces cosmic-text's internal font
 # diagnostics (see FontDebugLogger in main.rs).
-log = "0.4"
+# Statically compile out trace-level logging in release builds: wgpu's hot
+# paths are dense with log::trace! calls whose disabled-check still costs real
+# CPU per frame (Bevy measured ~15% from compiled-in-but-off tracing). Debug
+# level stays: EMBER_FONT_DEBUG diagnostics are untouched. Experiment for the
+# animation-cost work; measure before/after on the idle benchmark.
+log = { version = "0.4", features = ["release_max_level_debug"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
