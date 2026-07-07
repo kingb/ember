@@ -69,10 +69,18 @@ run_scenario() { # name gradient sparks   (omit gradient -> no ember launched)
   local name="$1" gradient="${2:-}" sparks="${3:-}"
   local pid=""
   if [ -n "$gradient" ]; then
-    local cfg; cfg="$(mktemp -d)"; mkdir -p "$cfg/ember"
+    # Under /tmp, NOT mktemp's default: as root that lands in root's private
+    # temp tree, whose parent dirs the real user cannot traverse - the app
+    # then silently falls back to default config and every scenario renders
+    # identically (learned the hard way; see README).
+    local cfg; cfg="$(mktemp -d /tmp/ember-gpu-cfg.XXXXXX)"; mkdir -p "$cfg/ember"
     printf '[background]\ngradient = %s\nember_sparks = %s\n' "$gradient" "$sparks" \
       > "$cfg/ember/config.toml"
     chown -R "$REAL_USER" "$cfg"
+    # Fail loudly if the scenario config is unreadable as the real user -
+    # a silent fallback poisons every scenario identically.
+    sudo -u "$REAL_USER" test -r "$cfg/ember/config.toml" \
+      || { echo "!! $name: config unreadable by $REAL_USER - aborting"; exit 1; }
     # launch as the logged-in user so the window lands in their GUI session
     sudo -u "$REAL_USER" env XDG_CONFIG_HOME="$cfg" "$BIN" >/dev/null 2>&1 &
     pid=$!
@@ -80,6 +88,7 @@ run_scenario() { # name gradient sparks   (omit gradient -> no ember launched)
   fi
   sample "$name"
   [ -n "$pid" ] && { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }
+  [ -n "${cfg:-}" ] && rm -rf "$cfg"
   report "$name"
 }
 
