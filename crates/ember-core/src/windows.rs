@@ -43,6 +43,9 @@ pub enum SurfaceDest {
         tab: usize,
         pane: PaneId,
         axis: Axis,
+        /// `true`: the moved surface becomes the left/top sibling (tree
+        /// child `a`). `false`: right/bottom (tree child `b`).
+        before: bool,
     },
 }
 
@@ -259,6 +262,7 @@ fn move_tab(
             tab: dt,
             pane: dp,
             axis,
+            before,
         } => {
             let moved = windows.trees[w].tabs.remove(t);
             clamp_active(&mut windows.trees[w], t);
@@ -273,12 +277,12 @@ fn move_tab(
                 .session_of(dp)
                 .cloned()
                 .expect("dest pane validated");
-            let merged = LayoutNode::split(
-                axis,
-                0.5,
-                LayoutNode::pane(dp, existing_session),
-                moved.root,
-            );
+            let existing = LayoutNode::pane(dp, existing_session);
+            let merged = if before {
+                LayoutNode::split(axis, 0.5, moved.root, existing)
+            } else {
+                LayoutNode::split(axis, 0.5, existing, moved.root)
+            };
             dest_tab
                 .root
                 .replace_pane(dp, merged)
@@ -366,6 +370,7 @@ fn move_pane(
             tab: dt,
             pane: dp,
             axis,
+            before,
         } => {
             let dest_tab = &mut windows.trees[dw].tabs[dt];
             let existing_session = dest_tab
@@ -373,7 +378,12 @@ fn move_pane(
                 .session_of(dp)
                 .cloned()
                 .expect("dest pane validated");
-            let merged = LayoutNode::split(axis, 0.5, LayoutNode::pane(dp, existing_session), leaf);
+            let existing = LayoutNode::pane(dp, existing_session);
+            let merged = if before {
+                LayoutNode::split(axis, 0.5, leaf, existing)
+            } else {
+                LayoutNode::split(axis, 0.5, existing, leaf)
+            };
             dest_tab
                 .root
                 .replace_pane(dp, merged)
@@ -431,7 +441,16 @@ pub enum DropZone {
 /// A point can fall in two bands at once (a corner): the NEARER edge wins,
 /// i.e. the smaller of the two edge distances. An exact tie resolves
 /// horizontal-first (West/East beats North/South).
+///
+/// Degenerate panes (`w` or `h` zero, negative, or NaN) resolve to `Center`:
+/// the band math (`x < w * BAND`, etc.) produces geometrically meaningless
+/// results on such dimensions — e.g. a 0-width pane still satisfies `x <
+/// w * BAND` for negative `x` — so this is guarded explicitly rather than
+/// left to fall out of the general case.
 pub fn drop_zone_for(x: f64, y: f64, w: f64, h: f64) -> DropZone {
+    if w <= 0.0 || w.is_nan() || h <= 0.0 || h.is_nan() {
+        return DropZone::Center;
+    }
     const BAND: f64 = 0.3;
     let west = x < w * BAND;
     let east = x > w * (1.0 - BAND);
@@ -810,6 +829,7 @@ mod tests {
                 tab: 0,
                 pane: PaneId(30),
                 axis: Axis::Vertical,
+                before: false,
             },
             TabId(9005),
         )
@@ -853,6 +873,7 @@ mod tests {
                 tab: 0,
                 pane: PaneId(30),
                 axis: Axis::Horizontal,
+                before: false,
             },
             TabId(9006),
         )
@@ -876,6 +897,92 @@ mod tests {
                 to_window: 1,
             }]
         );
+    }
+
+    /// `before` steers which tree child the moved surface lands as: `true` ->
+    /// left/top (child `a`), `false` -> right/bottom (child `b`, the existing
+    /// behavior already exercised above). Covers both `SurfaceRef` shapes:
+    /// a lone pane (`move_pane`) and a whole tab merging in (`move_tab`).
+    #[test]
+    fn split_into_before_places_moved_surface_left_or_top() {
+        // Pane case: PaneId(10) moves, `before: true` -> it becomes child `a`.
+        let mut w = Windows {
+            trees: vec![
+                WindowTree {
+                    tabs: vec![tab(1, &[10, 20])],
+                    active: 0,
+                },
+                WindowTree {
+                    tabs: vec![tab(2, &[30])],
+                    active: 0,
+                },
+            ],
+            focused: 0,
+        };
+        move_surface(
+            &mut w,
+            SurfaceRef::Pane {
+                window: 0,
+                tab: 0,
+                pane: PaneId(10),
+            },
+            SurfaceDest::SplitInto {
+                window: 1,
+                tab: 0,
+                pane: PaneId(30),
+                axis: Axis::Vertical,
+                before: true,
+            },
+            TabId(9500),
+        )
+        .unwrap();
+        // Moved pane (10) is child `a`; existing pane (30) is child `b` — the
+        // mirror image of `pane_split_into_other_windows_pane`'s `before: false`.
+        assert_eq!(
+            w.trees[1].tabs[0].root,
+            LayoutNode::split(Axis::Vertical, 0.5, p(10), p(30))
+        );
+
+        // Tab-merge case: the whole tab (10, 20) moves in `before: true`, so
+        // it becomes child `a` and the existing pane (30) becomes child `b`.
+        let mut w = Windows {
+            trees: vec![
+                WindowTree {
+                    tabs: vec![tab(1, &[10, 20]), tab(99, &[99])],
+                    active: 0,
+                },
+                WindowTree {
+                    tabs: vec![tab(2, &[30])],
+                    active: 0,
+                },
+            ],
+            focused: 0,
+        };
+        move_surface(
+            &mut w,
+            SurfaceRef::Tab { window: 0, tab: 0 },
+            SurfaceDest::SplitInto {
+                window: 1,
+                tab: 0,
+                pane: PaneId(30),
+                axis: Axis::Horizontal,
+                before: true,
+            },
+            TabId(9501),
+        )
+        .unwrap();
+        assert_eq!(
+            w.trees[1].tabs[0].root,
+            LayoutNode::split(
+                Axis::Horizontal,
+                0.5,
+                LayoutNode::split(Axis::Horizontal, 0.5, p(10), p(20)),
+                p(30)
+            )
+        );
+        // Focus-after-merge is order-independent: it's set directly to the
+        // moved tab's own focus pane id, not derived from tree position.
+        assert_eq!(w.trees[1].tabs[0].focus, PaneId(10));
     }
 
     #[test]
@@ -947,7 +1054,8 @@ mod tests {
                     window: 1,
                     tab: 9,
                     pane: PaneId(3),
-                    axis: Axis::Horizontal
+                    axis: Axis::Horizontal,
+                    before: false
                 },
                 TabId(9104)
             ),
@@ -961,7 +1069,8 @@ mod tests {
                     window: 1,
                     tab: 0,
                     pane: PaneId(999),
-                    axis: Axis::Horizontal
+                    axis: Axis::Horizontal,
+                    before: false
                 },
                 TabId(9105)
             ),
@@ -988,7 +1097,8 @@ mod tests {
                     window: 0,
                     tab: 0,
                     pane: PaneId(1),
-                    axis: Axis::Horizontal
+                    axis: Axis::Horizontal,
+                    before: false
                 },
                 TabId(9107)
             ),
@@ -1002,7 +1112,8 @@ mod tests {
                     window: 0,
                     tab: 0,
                     pane: PaneId(1),
-                    axis: Axis::Horizontal
+                    axis: Axis::Horizontal,
+                    before: false
                 },
                 TabId(9108)
             ),
@@ -1101,12 +1212,14 @@ mod tests {
                         tab: ti,
                         pane,
                         axis: Axis::Horizontal,
+                        before: false,
                     });
                     out.push(SurfaceDest::SplitInto {
                         window: wi,
                         tab: ti,
                         pane,
                         axis: Axis::Vertical,
+                        before: false,
                     });
                 }
             }
@@ -1250,6 +1363,18 @@ mod tests {
                 "boundary probe ({x},{y})"
             );
         }
+    }
+
+    /// Degenerate pane dimensions (zero, negative, NaN) must resolve to
+    /// `Center` rather than falling through to whatever the band math
+    /// produces, which is geometrically meaningless on such sizes (e.g. a
+    /// point outside a 0-width pane can still satisfy `x < w * BAND`).
+    #[test]
+    fn degenerate_pane_sizes_resolve_to_center() {
+        assert_eq!(drop_zone_for(5.0, 5.0, 0.0, 0.0), DropZone::Center);
+        assert_eq!(drop_zone_for(5.0, 5.0, -10.0, -10.0), DropZone::Center);
+        assert_eq!(drop_zone_for(5.0, 5.0, f64::NAN, 100.0), DropZone::Center);
+        assert_eq!(drop_zone_for(5.0, 5.0, 100.0, f64::NAN), DropZone::Center);
     }
 
     #[test]

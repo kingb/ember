@@ -2109,6 +2109,7 @@ fn build_merge_tab(
             tab: prev,
             pane,
             axis: Axis::Horizontal,
+            before: false,
         },
     ))
 }
