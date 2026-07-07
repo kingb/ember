@@ -115,6 +115,15 @@ pub enum ControlMsg {
     /// possibly empty) held for the whole gesture. The testing backbone for
     /// every surface-drag task: replies with a JSON summary
     /// (`{"ok":true,"drag_ended":"reorder"|"move"|"cancel"|"selection"|"none","drag_active_mid":bool}`).
+    ///
+    /// `paced_ms`, if set (`--paced <ms>`), spreads the `steps` motions
+    /// across real event-loop ticks — one waypoint every `paced_ms`
+    /// milliseconds, via `Shared::paced_drag` — instead of running the
+    /// whole gesture synchronously inside one `about_to_wait` pass. That
+    /// synchronous-by-default behavior starves anything paced by real
+    /// frames (the wisp included) of any actual ticks to render on; a
+    /// blocking sleep here would be worse still, freezing the whole event
+    /// loop. `None` keeps the original synchronous-in-one-pass behavior.
     Drag {
         x1: f64,
         y1: f64,
@@ -123,6 +132,7 @@ pub enum ControlMsg {
         steps: usize,
         mods: String,
         cancel: bool,
+        paced_ms: Option<u64>,
         reply: Sender<String>,
     },
 }
@@ -481,6 +491,7 @@ mod unix {
                     .unwrap_or_default()
                     .to_string();
                 let cancel = v.get("cancel").and_then(Value::as_bool).unwrap_or(false);
+                let paced_ms = v.get("paced_ms").and_then(Value::as_u64);
                 let (reply_tx, reply_rx) = mpsc::channel();
                 if tx
                     .send(ControlMsg::Drag {
@@ -491,6 +502,7 @@ mod unix {
                         steps,
                         mods,
                         cancel,
+                        paced_ms,
                         reply: reply_tx,
                     })
                     .is_err()
@@ -498,7 +510,17 @@ mod unix {
                     return err("event loop gone");
                 }
                 waker(); // wake BEFORE waiting — see dispatch docs
-                match reply_rx.recv_timeout(Duration::from_secs(5)) {
+                // A paced drag can legitimately take `steps * paced_ms` to
+                // resolve (Task 6: up to ~20 waypoints at whatever interval
+                // the caller chose) — the fixed 5s budget below is tuned for
+                // the synchronous-by-default gesture, so scale it up when
+                // paced rather than timing out a perfectly healthy drag.
+                let budget = match paced_ms {
+                    Some(ms) => Duration::from_secs(5)
+                        .max(Duration::from_millis(ms.saturating_mul(steps as u64 + 2))),
+                    None => Duration::from_secs(5),
+                };
+                match reply_rx.recv_timeout(budget) {
                     Ok(resp) => resp,
                     Err(_) => err("drag timeout"),
                 }
@@ -734,14 +756,15 @@ mod unix {
     /// Parse `ctl drag`'s args (everything after the `drag` token itself)
     /// into the JSON request line: 4 positional logical-px coordinates
     /// (`x1 y1 x2 y2`, in any order relative to the `--steps`/`--mods`/
-    /// `--cancel` flags) plus the optional flags. A pure function (no
-    /// socket I/O) so the parsing itself is unit-testable independent of a
-    /// running instance.
+    /// `--cancel`/`--paced` flags) plus the optional flags. A pure function
+    /// (no socket I/O) so the parsing itself is unit-testable independent of
+    /// a running instance.
     fn parse_drag_args(args: &[String]) -> Result<Value, String> {
         let mut positional: Vec<f64> = Vec::new();
         let mut steps: u64 = 8;
         let mut mods = String::new();
         let mut cancel = false;
+        let mut paced_ms: Option<u64> = None;
         let mut it = args.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
@@ -755,6 +778,13 @@ mod unix {
                     mods = it.next().ok_or("drag: --mods needs a value")?.clone();
                 }
                 "--cancel" => cancel = true,
+                "--paced" => {
+                    let n = it.next().ok_or("drag: --paced needs a millisecond value")?;
+                    paced_ms = Some(
+                        n.parse()
+                            .map_err(|e| format!("drag: --paced: bad number {n:?}: {e}"))?,
+                    );
+                }
                 v => positional.push(
                     v.parse()
                         .map_err(|e| format!("drag: bad coordinate {v:?}: {e}"))?,
@@ -763,11 +793,11 @@ mod unix {
         }
         if positional.len() != 4 {
             return Err(format!(
-                "drag: need x1 y1 x2 y2 [--steps N] [--mods m] [--cancel] (got {} coordinate(s))",
+                "drag: need x1 y1 x2 y2 [--steps N] [--mods m] [--cancel] [--paced ms] (got {} coordinate(s))",
                 positional.len()
             ));
         }
-        Ok(serde_json::json!({
+        let mut req = serde_json::json!({
             "cmd": "drag",
             "x1": positional[0],
             "y1": positional[1],
@@ -776,7 +806,11 @@ mod unix {
             "steps": steps,
             "mods": mods,
             "cancel": cancel,
-        }))
+        });
+        if let Some(ms) = paced_ms {
+            req["paced_ms"] = serde_json::json!(ms);
+        }
+        Ok(req)
     }
 
     #[cfg(test)]
@@ -826,6 +860,25 @@ mod unix {
         fn drag_rejects_dangling_flags() {
             assert!(parse_drag_args(&args("1 2 3 4 --steps")).is_err());
             assert!(parse_drag_args(&args("1 2 3 4 --mods")).is_err());
+            assert!(parse_drag_args(&args("1 2 3 4 --paced")).is_err());
+        }
+
+        #[test]
+        fn drag_omits_paced_ms_by_default() {
+            let v = parse_drag_args(&args("1 2 3 4")).unwrap();
+            assert!(v.get("paced_ms").is_none());
+        }
+
+        #[test]
+        fn drag_parses_paced_flag() {
+            let v = parse_drag_args(&args("10 20 30 40 --paced 50 --steps 20")).unwrap();
+            assert_eq!(v["paced_ms"], 50);
+            assert_eq!(v["steps"], 20);
+        }
+
+        #[test]
+        fn drag_rejects_bad_paced_value() {
+            assert!(parse_drag_args(&args("1 2 3 4 --paced nope")).is_err());
         }
     }
 }

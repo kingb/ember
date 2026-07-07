@@ -116,10 +116,19 @@ impl SparkRenderer {
                 dst_factor: wgpu::BlendFactor::One,
                 operation: wgpu::BlendOperation::Add,
             },
+            // Alpha channel uses Max, not Add: overlapping sparks (the
+            // opaque-backdrop campfire case AND the wisp's tightly-clustered
+            // ring/trail) would otherwise sum past 1.0. Under
+            // `CompositeAlphaMode::PreMultiplied` the compositor blends with
+            // `(1 - src_a)`, which goes negative once src_a > 1 and produces
+            // visible dark halos at spark overlaps. Max is a no-op for the
+            // single-spark / opaque-backdrop case (nothing to saturate
+            // against) and only changes behavior where quads overlap, so the
+            // pipeline stays shared between the backdrop and wisp uses.
             alpha: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
                 dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
+                operation: wgpu::BlendOperation::Max,
             },
         };
 

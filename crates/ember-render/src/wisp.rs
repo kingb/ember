@@ -156,6 +156,28 @@ impl WispRenderer {
     /// `Renderer` but with nothing to report back — the wisp is decorative,
     /// never load-bearing for drag mechanics.
     pub fn render(&mut self, t: f32, intensity: f32, velocity: (f32, f32)) {
+        // The wisp window is deliberately excluded from `ember-app`'s
+        // `windows` map (it's not a pane surface), so its Resized/
+        // ScaleFactorChanged events never reach us — the only way this
+        // renderer learns its window changed size is by asking directly,
+        // here, every frame. Without this check, dragging across a
+        // mixed-DPI monitor boundary leaves `self.config` holding the old
+        // (stale) physical size; the Outdated/Lost branch below would then
+        // reconfigure the surface with those stale dims instead of the
+        // window's actual current size, and on some backends that wedges
+        // the surface into a permanently blank state for the rest of the
+        // drag. Compare against the window's live size and reconfigure
+        // proactively, before acquiring, whenever it disagrees.
+        let live = self.window.inner_size();
+        if live.width > 0
+            && live.height > 0
+            && (live.width != self.config.width || live.height != self.config.height)
+        {
+            self.config.width = live.width;
+            self.config.height = live.height;
+            self.surface.configure(&self.device, &self.config);
+        }
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
             wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,

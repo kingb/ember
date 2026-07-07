@@ -18,9 +18,9 @@ mod window_state;
 
 use window_state::{DragEnded, WindowState};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use control::{ControlMsg, MoveTabTarget, PromotePaneTarget};
@@ -339,6 +339,44 @@ pub(crate) struct Shared {
     /// without a second parameter — those same call sites already have an
     /// `&ActiveEventLoop` in scope for the one-time lazy creation.
     pub(crate) wisp: WispSlot,
+    /// A `ctl drag --paced <ms>` gesture whose waypoints are being advanced
+    /// one per `about_to_wait` tick rather than all at once (Task 6's test
+    /// machinery). `None` outside a paced drag; at most one at a time — see
+    /// `run_ctl_drag`'s "already running" guard. Lives on `Shared` for the
+    /// same reason `drag` does: it must survive across many `about_to_wait`
+    /// calls, not just the one that received the `ControlMsg::Drag`.
+    pub(crate) paced_drag: Option<PacedDrag>,
+}
+
+/// State for an in-flight paced `ctl drag`. Never advanced by a blocking
+/// sleep — that would freeze the whole event loop (the wisp's own redraws
+/// included), which is exactly the problem `--paced` exists to avoid.
+/// Advanced instead from `about_to_wait`, at most one waypoint per tick,
+/// once `interval` has elapsed since `last_step`.
+pub(crate) struct PacedDrag {
+    /// Motion waypoints not yet visited, in order; the LAST one is `(x2,
+    /// y2)` from the original request. Never includes the press point
+    /// `(x1, y1)` — that already ran synchronously in `run_ctl_drag` before
+    /// this was stashed. Popping the final waypoint (leaving this empty)
+    /// is what triggers the release-or-cancel tail.
+    pub(crate) waypoints: VecDeque<(f64, f64)>,
+    /// Wall-clock spacing between waypoints (`--paced <ms>`).
+    pub(crate) interval: Duration,
+    /// When the last waypoint (or the press, for the first tick) ran.
+    pub(crate) last_step: Instant,
+    /// The window the whole gesture (press through release) runs on.
+    pub(crate) window: WindowId,
+    /// Whether the tail, once waypoints are exhausted, is a release or an
+    /// Escape-cancel — same meaning as `ControlMsg::Drag`'s `cancel`.
+    pub(crate) cancel: bool,
+    /// The window's modifiers from before the drag overwrote them with
+    /// `--mods`, restored by the tail — same bookkeeping `run_ctl_drag`
+    /// does locally for the unpaced case, just kept alive across ticks.
+    pub(crate) saved_mods: ModifiersState,
+    /// The `ctl drag` client's reply channel — held, unfired, until the
+    /// tail runs (the whole point of pacing: the client's `recv` blocks for
+    /// the full gesture, same reply shape as the unpaced case).
+    pub(crate) reply: Sender<String>,
 }
 
 /// The wisp's lazy-creation/degradation state (Task 5). Not `Option<WispWindow>`
@@ -724,6 +762,7 @@ impl ApplicationHandler<EmberEvent> for App {
             drag: None,
             new_window_position_hint: None,
             wisp: WispSlot::Uninit,
+            paced_drag: None,
         };
         let mut win = WindowState::new(renderer, tree);
         win.px = px;
@@ -1579,6 +1618,7 @@ impl ApplicationHandler<EmberEvent> for App {
                 steps,
                 mods,
                 cancel,
+                paced_ms,
                 reply,
             } = cmd
             {
@@ -1591,6 +1631,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     steps,
                     mods,
                     cancel,
+                    paced_ms,
                     reply,
                 });
                 continue;
@@ -1770,6 +1811,83 @@ impl ApplicationHandler<EmberEvent> for App {
                 next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
             }
         }
+        // A paced `ctl drag --paced <ms>` (Task 6's test machinery):
+        // advance at most ONE waypoint this tick, through the exact same
+        // `on_cursor_moved`/`update_cross_window_drag` pair a real mouse
+        // step (or an unpaced `ctl drag`) drives — never a blocking sleep,
+        // which would freeze this whole loop (the wisp's own pacing above
+        // included) for the gesture's whole duration. `take()` up front so
+        // there's no simultaneous `&mut shared.paced_drag` / `&mut shared`
+        // borrow below (both `on_cursor_moved` and `update_cross_window_drag`
+        // need the latter).
+        if let Some(mut paced) = shared.paced_drag.take() {
+            if !self.windows.contains_key(&paced.window) {
+                // The window closed mid-drag. `clear_drag_on_window_close`
+                // (called from `finish_close`) already cleared `shared.drag`
+                // if this was its source, but mop up defensively — cheap,
+                // and correct even if this window was only the CTL DRAG's
+                // window without (yet) becoming the cross-window drag's
+                // recorded source.
+                shared.drag = None;
+                clear_all_drag_visuals(&mut self.windows);
+                let _ = paced.reply.send(
+                    serde_json::json!({"ok": false, "error": "window closed mid-drag"}).to_string(),
+                );
+                // Leave `shared.paced_drag` as `None` — already taken.
+            } else if now.duration_since(paced.last_step) < paced.interval {
+                // Not due yet this tick — fold its deadline into `next_wake`
+                // and put it back for the next tick to find.
+                let deadline = paced.last_step + paced.interval;
+                next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
+                shared.paced_drag = Some(paced);
+            } else {
+                paced.last_step = now;
+                match paced.waypoints.pop_front() {
+                    Some((x, y)) => {
+                        if let Some(win) = self.windows.get_mut(&paced.window) {
+                            win.on_cursor_moved(shared, paced.window, x, y);
+                        }
+                        if shared.drag.is_some() {
+                            update_cross_window_drag(
+                                &mut self.windows,
+                                shared,
+                                &self.focus_history,
+                                paced.window,
+                                x,
+                                y,
+                                event_loop,
+                            );
+                        }
+                        let deadline = paced.last_step + paced.interval;
+                        next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
+                        shared.paced_drag = Some(paced);
+                    }
+                    None => {
+                        // Waypoints exhausted: run the exact same
+                        // release-or-cancel tail an unpaced drag runs, then
+                        // finally send the reply the client's been blocked
+                        // on since the original `ctl drag --paced` request.
+                        let drag_active_mid = shared.drag.is_some()
+                            || self
+                                .windows
+                                .get(&paced.window)
+                                .is_some_and(|w| w.tab_drag_is_active_drag());
+                        let resp = finish_ctl_drag_tail(
+                            &mut self.windows,
+                            shared,
+                            &mut self.focused_window,
+                            event_loop,
+                            paced.window,
+                            paced.cancel,
+                            paced.saved_mods,
+                            drag_active_mid,
+                        );
+                        let _ = paced.reply.send(resp);
+                        // Leave `shared.paced_drag` as `None` — already taken.
+                    }
+                }
+            }
+        }
         if let Some(deadline) = next_wake {
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else {
@@ -1883,9 +2001,14 @@ impl ApplicationHandler<EmberEvent> for App {
                     steps,
                     mods,
                     cancel,
+                    paced_ms,
                     reply,
                 } => {
-                    let resp = run_ctl_drag(
+                    // Unpaced: replies synchronously, right here. Paced:
+                    // stashes into `shared.paced_drag` and sends its own
+                    // reply later, once `about_to_wait`'s paced tick runs
+                    // the tail — nothing to send here in that case.
+                    run_ctl_drag(
                         &mut self.windows,
                         shared,
                         &mut self.focused_window,
@@ -1899,8 +2022,9 @@ impl ApplicationHandler<EmberEvent> for App {
                         steps,
                         &mods,
                         cancel,
+                        paced_ms,
+                        reply,
                     );
-                    let _ = reply.send(resp);
                 }
             }
         }
@@ -1964,6 +2088,7 @@ enum DeferredWindowAction {
         steps: usize,
         mods: String,
         cancel: bool,
+        paced_ms: Option<u64>,
         reply: std::sync::mpsc::Sender<String>,
     },
 }
@@ -2844,20 +2969,27 @@ fn parse_mods_only(spec: &str) -> ModifiersState {
 }
 
 /// Synthesize a full drag gesture on `window`: a left press at `(x1, y1)`,
-/// `steps` intermediate motions on the way to `(x2, y2)`, then either a
-/// release at `(x2, y2)` or (if `cancel`) an Escape — via
+/// then either all `steps` intermediate motions on the way to `(x2, y2)`
+/// synchronously (the default) or, if `paced_ms` is set, one motion per
+/// `about_to_wait` tick spaced `paced_ms` apart (`--paced`) — either way
+/// finishing with a release at `(x2, y2)` or (if `cancel`) an Escape — via
 /// `WindowState::press_left`/`on_cursor_moved`/`left_release`/`cancel_drag`,
 /// the EXACT same methods a real mouse/keyboard hit. `mods` (already parsed
 /// by [`parse_mods_only`]) is held for the whole gesture, then restored.
 ///
+/// Unpaced, this sends `reply` itself before returning. Paced, it stashes
+/// `reply` into `shared.paced_drag` and returns without sending — the
+/// paced tick in `about_to_wait` sends it once the gesture's tail actually
+/// runs (see [`PacedDrag`]).
+///
 /// A pane drop `left_release` resolves is only STAGED (`WindowState::
-/// pending_move`), not applied — this runs it through `apply_move` inline,
-/// right here, rather than re-queueing another `DeferredWindowAction`: this
-/// function already runs at the `about_to_wait` TAIL (see the call site),
-/// where `deferred_windows` has already been drained by-value into a `for`
-/// loop; pushing a new entry into it here would just sit unprocessed until
-/// next tick, and this reply would report an outcome ("move"/"cancel") that
-/// hadn't actually happened yet.
+/// pending_move`), not applied — [`finish_ctl_drag_tail`] runs it through
+/// `apply_move` inline, right there, rather than re-queueing another
+/// `DeferredWindowAction`: both the unpaced tail (called from here) and the
+/// paced tail (called from `about_to_wait`'s own TAIL, after
+/// `deferred_windows` has already been drained by-value) would otherwise
+/// have to wait a further tick to see an outcome that's already happened by
+/// the time the reply is built.
 ///
 /// Free function (not a method) for the same reason as `apply_move`/
 /// `open_window`: every call site holds `&mut Shared` (and, here, `&mut
@@ -2877,24 +3009,54 @@ fn run_ctl_drag(
     steps: usize,
     mods: &str,
     cancel: bool,
-) -> String {
+    paced_ms: Option<u64>,
+    reply: Sender<String>,
+) {
     let Some(saved_mods) = windows.get(&window).map(|w| w.modifiers) else {
-        return serde_json::json!({"ok": false, "error": "window not tracked"}).to_string();
+        let _ =
+            reply.send(serde_json::json!({"ok": false, "error": "window not tracked"}).to_string());
+        return;
     };
+    if shared.paced_drag.is_some() {
+        let _ = reply.send(
+            serde_json::json!({"ok": false, "error": "a paced drag is already running"})
+                .to_string(),
+        );
+        return;
+    }
     let steps = steps.max(1);
     {
         let win = windows.get_mut(&window).expect("checked above");
         win.modifiers = parse_mods_only(mods);
         win.press_left(shared, x1, y1);
     }
-    // Each step re-fetches `win` fresh (rather than holding one borrow
-    // across the whole loop) so `update_cross_window_drag` can reborrow
-    // `windows` as a whole right after — the exact same NLL shape the real
+    let waypoints: VecDeque<(f64, f64)> = (1..=steps)
+        .map(|i| {
+            let t = i as f64 / steps as f64;
+            (x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)
+        })
+        .collect();
+
+    if let Some(ms) = paced_ms {
+        shared.paced_drag = Some(PacedDrag {
+            waypoints,
+            interval: Duration::from_millis(ms.max(1)),
+            last_step: Instant::now(),
+            window,
+            cancel,
+            saved_mods,
+            reply,
+        });
+        return; // The paced tick in `about_to_wait` sends the reply later.
+    }
+
+    // Unpaced: drive every waypoint synchronously, right now. Each step
+    // re-fetches `win` fresh (rather than holding one borrow across the
+    // whole loop) so `update_cross_window_drag` can reborrow `windows` as a
+    // whole right after — the exact same NLL shape the real
     // `WindowEvent::CursorMoved` handler uses, so a synthesized `ctl drag`
     // exercises the identical cross-window path a real drag does.
-    for i in 1..=steps {
-        let t = i as f64 / steps as f64;
-        let (x, y) = (x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+    for (x, y) in waypoints {
         if let Some(win) = windows.get_mut(&window) {
             win.on_cursor_moved(shared, window, x, y);
         }
@@ -2908,6 +3070,37 @@ fn run_ctl_drag(
         || windows
             .get(&window)
             .is_some_and(|w| w.tab_drag_is_active_drag());
+    let resp = finish_ctl_drag_tail(
+        windows,
+        shared,
+        focused_window,
+        event_loop,
+        window,
+        cancel,
+        saved_mods,
+        drag_active_mid,
+    );
+    let _ = reply.send(resp);
+}
+
+/// The release-or-cancel tail shared by an unpaced `ctl drag` (run inline,
+/// synchronously, from [`run_ctl_drag`]) and a paced one (run once its
+/// waypoints are exhausted, from `about_to_wait`'s paced tick): resolve the
+/// gesture, restore modifiers, clear every window's drag visuals, apply any
+/// staged move, and build the JSON reply. `drag_active_mid` must be
+/// captured by the caller BEFORE calling this — release/cancel clears the
+/// state it reads.
+#[allow(clippy::too_many_arguments)]
+fn finish_ctl_drag_tail(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    focused_window: &mut Option<WindowId>,
+    event_loop: &ActiveEventLoop,
+    window: WindowId,
+    cancel: bool,
+    saved_mods: ModifiersState,
+    drag_active_mid: bool,
+) -> String {
     let mut ended = if cancel {
         cancel_drag_everywhere(windows, shared);
         DragEnded::Cancel
