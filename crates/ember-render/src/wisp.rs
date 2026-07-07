@@ -271,11 +271,16 @@ pub(crate) fn wisp_quads(
     }
     let cx = w * 0.5;
     let cy = h * 0.5;
+    // All cluster geometry is expressed as a fraction of the surface's min
+    // dimension, so the whole wisp scales with `WISP_SIZE` (the app-side
+    // window size) and is resolution-independent. Retune the fractions to
+    // change the *look*; retune `WISP_SIZE` to change the *scale*.
+    let s = w.min(h);
     let mut out = Vec::with_capacity(16);
 
     // Glowing core: one bright, slowly pulsing quad at the center.
     let pulse = 0.85 + 0.15 * (t * 6.0).sin();
-    let core_size = 26.0 * pulse;
+    let core_size = s * 0.20 * pulse;
     let core_color = lerp_rgb(AMBER, ACCENT, 0.35 + 0.15 * (t * 3.0).sin());
     out.push((
         [
@@ -298,7 +303,7 @@ pub(crate) fn wisp_quads(
         };
         let seed = hash(12.9898, 4.1);
         let angle = (fi / N as f32) * std::f32::consts::TAU + t * (0.6 + seed * 0.5);
-        let orbit_r = 10.0 + seed * 26.0;
+        let orbit_r = s * (0.11 + seed * 0.23);
         let x = cx + angle.cos() * orbit_r;
         let y = cy + angle.sin() * orbit_r;
         let phase = ((t * (0.5 + seed * 0.4)) + fi / N as f32).fract();
@@ -308,10 +313,10 @@ pub(crate) fn wisp_quads(
             lerp_rgb(ACCENT, AMBER, (phase - 0.5) * 2.0)
         };
         let flicker = 0.75 + 0.25 * (t * (7.0 + seed * 5.0) + fi).sin();
-        let size = 3.0 + seed * 3.0;
+        let size = s * (0.024 + seed * 0.026);
         out.push((
             [x - size * 0.5, y - size * 0.5, size, size],
-            lin_rgba(color, 0.7 * intensity * flicker.max(0.0)),
+            lin_rgba(color, 0.8 * intensity * flicker.max(0.0)),
         ));
     }
 
@@ -325,10 +330,10 @@ pub(crate) fn wisp_quads(
         const TRAIL: usize = 4;
         for i in 1..=TRAIL {
             let f = i as f32 / TRAIL as f32;
-            let dist = f * (8.0 + speed.min(600.0) * 0.05);
+            let dist = f * (s * 0.06 + speed.min(600.0) * 0.05);
             let x = cx + dx * dist;
             let y = cy + dy * dist;
-            let size = (6.0 - f * 3.5).max(1.5);
+            let size = (s * 0.05 - f * s * 0.029).max(s * 0.012);
             let a = (1.0 - f) * 0.5 * intensity;
             out.push((
                 [x - size * 0.5, y - size * 0.5, size, size],

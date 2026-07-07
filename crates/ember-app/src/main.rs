@@ -449,8 +449,10 @@ const WISP_FRAME: Duration = Duration::from_millis(16);
 const WISP_FADE_IN: Duration = Duration::from_millis(150);
 /// Fade-out duration at drop/cancel (Task 5 §2).
 const WISP_FADE_OUT: Duration = Duration::from_millis(200);
-/// Logical px side length of the wisp window (Task 5: "~140x140 logical").
-const WISP_SIZE: f32 = 140.0;
+/// Logical px side length of the wisp window. Started at ~140 (Task 5); bumped
+/// to 230 after the first live look read as "barely visible" — the cluster
+/// geometry in `wisp_quads` is a fraction of this, so it scales as one knob.
+const WISP_SIZE: f32 = 230.0;
 
 impl WispWindow {
     /// Build (and show) a brand-new wisp window + renderer. `Err` on any
@@ -973,6 +975,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     },
                 );
                 if button == MouseButton::Left {
+                    let was_dragging = shared.drag.is_some() || win.tab_drag.is_some();
                     win.left_release(shared, id);
                     // A pane drop only STAGES its move (`WindowState::
                     // pending_move`) — run it through the same canonical
@@ -981,7 +984,18 @@ impl ApplicationHandler<EmberEvent> for App {
                     // isn't touched again in this arm, so its borrow of
                     // `self.windows` ends at the `take()` below, freeing
                     // `self.windows` for `apply_move` to reborrow whole.
-                    if let Some((src, dest)) = win.pending_move.take() {
+                    let pending = win.pending_move.take();
+                    if was_dragging {
+                        // Every window's incoming-drop/preview visual is
+                        // stale the instant the drag resolves. The ctl-drag
+                        // tail (`finish_ctl_drag_tail`) has always swept
+                        // here; the real-mouse path missing the same sweep
+                        // left stuck split-preview bands on the target
+                        // window after a successful drop — the first bug a
+                        // human hand found that no scripted drive could.
+                        clear_all_drag_visuals(&mut self.windows);
+                    }
+                    if let Some((src, dest)) = pending {
                         if let Err(e) = apply_move(
                             &mut self.windows,
                             shared,
