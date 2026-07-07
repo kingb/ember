@@ -23,6 +23,12 @@ sudo apt install build-essential pkg-config libwayland-dev libxkbcommon-dev \
 Ember renders through wgpu, so it needs a working Vulkan driver (Mesa's
 `lavapipe` software rasterizer is enough for headless or CI use).
 
+At **runtime** the windowed app additionally needs `libxi6` (the X11 input
+extension; winit fails at event-loop creation without it) alongside the
+`libxkbcommon`/`libxcursor` runtime libraries. Desktop installs usually have
+all three; minimal containers don't — and note that headless `--screenshot`
+runs never create a window, so they won't catch a missing `libxi6`.
+
 ## Packaging (macOS)
 
 Build a double-clickable `Ember.app`:
