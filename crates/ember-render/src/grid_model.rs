@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 
-use ember_core::{CellContent, CursorState, GridDelta, GridDims, NeutralCell, Style, StyleId};
+use ember_core::{
+    CellContent, CellPatch, CursorState, GridDelta, GridDims, NeutralCell, Style, StyleId,
+};
 
 /// The current screen state, reconstructed from coalesced deltas.
 #[derive(Debug)]
@@ -242,6 +244,57 @@ impl GridModel {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Build a full-reset delta that reproduces this exact grid when applied to a
+    /// **fresh** `GridModel`: `reset: true`, every non-default cell as a
+    /// `CellPatch` (a default-empty cell needs no patch — the reset already
+    /// rebuilds an all-default grid), every learned style (not just the ones a
+    /// damaged cell references), and every piece of carried terminal state
+    /// (dims/cursor/scrollback view/modes/marks).
+    ///
+    /// This is the multi-window replay seam (design's spike finding): a brand
+    /// new renderer starts style-empty, so handing a moved/shared session's pane
+    /// to it with only the session's own incremental deltas would render
+    /// black-on-black until the next real PTY delta happened to touch every
+    /// cell. Sourcing a `snapshot_delta()` from the OLD renderer's `GridModel`
+    /// and applying it to the new one first avoids that entirely.
+    pub fn snapshot_delta(&self) -> GridDelta {
+        let cols = self.dims.columns as usize;
+        let cells: Vec<CellPatch> = self
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| **cell != NeutralCell::default())
+            .map(|(idx, cell)| CellPatch {
+                row: (idx / cols) as u16,
+                col: (idx % cols) as u16,
+                cell: cell.clone(),
+            })
+            .collect();
+        let new_styles: Vec<(StyleId, Style)> = self
+            .styles
+            .iter()
+            .map(|(id, style)| (*id, *style))
+            .collect();
+        GridDelta {
+            epoch: self.epoch,
+            dims: self.dims,
+            reset: true,
+            cells,
+            new_styles,
+            cursor: self.cursor,
+            // Bracketed-paste is session (Shared) state, not part of the grid —
+            // the owning session's own tracking is untouched by a window move.
+            bracketed_paste: false,
+            display_offset: self.display_offset,
+            history_len: self.history_len,
+            alt_screen: self.alt_screen,
+            mouse_reporting: self.mouse_reporting,
+            app_cursor: self.app_cursor,
+            mouse: self.mouse,
+            marks: self.marks.clone(),
+        }
     }
 }
 
@@ -536,6 +589,61 @@ mod tests {
         assert_eq!(g.row_runs(0)[0].0, "\u{25CF}");
         // ...but the text path (copy/paste, selection) keeps the real char.
         assert_eq!(g.row_text(0).trim_end(), "\u{23FA}");
+    }
+
+    #[test]
+    fn snapshot_delta_reproduces_source_grid_in_a_fresh_model() {
+        // Build a grid with styled text via ordinary deltas (as a live session
+        // would), snapshot it, and apply that snapshot to a brand-new model
+        // seeded with DIFFERENT dims — the reset must overwrite them.
+        use ember_core::{Rgb, Style};
+        let dims = GridDims::new(10, 2);
+        let mut g = GridModel::new(dims);
+        let red = Style {
+            fg: Rgb::new(200, 30, 30),
+            ..Default::default()
+        };
+        let mut d = GridDelta {
+            epoch: 7,
+            dims,
+            reset: true,
+            cells: vec![
+                CellPatch {
+                    row: 0,
+                    col: 0,
+                    cell: NeutralCell::new(CellContent::Char('h'), StyleId(1)),
+                },
+                CellPatch {
+                    row: 0,
+                    col: 1,
+                    cell: NeutralCell::new(CellContent::Char('i'), StyleId(1)),
+                },
+                CellPatch {
+                    row: 1,
+                    col: 0,
+                    cell: NeutralCell::new(CellContent::Char('y'), StyleId(0)),
+                },
+            ],
+            ..Default::default()
+        };
+        d.new_styles = vec![(StyleId(0), Style::default()), (StyleId(1), red)];
+        g.apply(d);
+
+        let snap = g.snapshot_delta();
+        assert!(snap.reset, "a snapshot must fully reset the target");
+
+        let mut fresh = GridModel::new(GridDims::new(1, 1)); // deliberately wrong dims
+        fresh.apply(snap);
+
+        assert_eq!(fresh.dims, g.dims, "dims carried across");
+        assert_eq!(fresh.screen_text(), g.screen_text(), "text reproduced");
+        assert_eq!(
+            fresh.styles_len(),
+            g.styles_len(),
+            "every learned style carried, not just damaged ones"
+        );
+        assert_eq!(fresh.style_of(StyleId(1)), g.style_of(StyleId(1)));
+        assert_eq!(fresh.cursor, g.cursor);
     }
 
     #[test]

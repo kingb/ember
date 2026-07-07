@@ -247,6 +247,13 @@ struct App {
 pub(crate) struct Shared {
     /// One running session per pane leaf, keyed by its `SessionId`.
     pub(crate) sessions: HashMap<SessionId, BackendHandle>,
+    /// Which window owns each session, so PTY pixel-lane deltas (drained in
+    /// `about_to_wait`) land in the renderer that actually registered that
+    /// pane, not "whichever window happens to be focused." Populated by
+    /// `WindowState::spawn_session` and cleared by `kill_session`/window
+    /// close; Task 4's `move_surface` updates it when a session changes
+    /// windows.
+    pub(crate) session_window: HashMap<SessionId, WindowId>,
     // window-scoped later? id counters are per-app today (one window).
     pub(crate) next_pane: u64,
     pub(crate) next_session: u64,
@@ -299,8 +306,23 @@ pub(crate) enum PendingClose {
     Pane,
     /// Close a whole tab by id (middle-click).
     Tab(TabId),
-    /// Quit the whole app (Cmd+Q / window close).
+    /// Quit the whole app (Cmd+Q / the OS close button on the LAST window).
     Quit,
+    /// Close just this one window (the OS close button on a non-last window).
+    /// Other windows' sessions are untouched.
+    CloseWindow,
+}
+
+/// What the caller must do after a debug-control command resolved a pending
+/// close confirmation (`WindowState::handle_control` can't decide this itself —
+/// it has no view of how many windows exist).
+pub(crate) enum ControlClose {
+    /// Quit the whole app (all windows, all sessions) — the confirmed kind was
+    /// [`PendingClose::Quit`].
+    ExitApp,
+    /// Close just this window, unless it turns out to be the last one (then
+    /// quit) — see [`finish_close`].
+    CloseWindow,
 }
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
@@ -364,6 +386,7 @@ impl ApplicationHandler<EmberEvent> for App {
 
         let mut shared = Shared {
             sessions: HashMap::new(),
+            session_window: HashMap::new(),
             next_pane: 2,
             next_session: 2,
             next_tab: 2,
@@ -381,47 +404,8 @@ impl ApplicationHandler<EmberEvent> for App {
             cwd_by_session: std::collections::HashMap::new(),
             wake: self.wake.clone(),
         };
-        let mut win = WindowState {
-            renderer,
-            tree,
-            dims_cache: HashMap::new(),
-            modifiers: ModifiersState::empty(),
-            px,
-            help: false,
-            about: false,
-            about_since: Instant::now(),
-            settings_open: false,
-            settings_sel: 0,
-            image_loaded: None,
-            window_focused: true,
-            fps_overlay: false,
-            last_frame: None,
-            fps_ema_ms: 0.0,
-            render_ema_ms: 0.0,
-            last_anim: Instant::now(),
-            bell_flash_since: None,
-            belled_tabs: std::collections::HashSet::new(),
-            cursor: (0.0, 0.0),
-            pane_rects: Vec::new(),
-            sel: None,
-            selecting: false,
-            last_click: None,
-            click_count: 0,
-            tab_drag: None,
-            split_preview: None,
-            scrollbar_drag: None,
-            divider_drag: None,
-            pointer_cursor: CursorIcon::Default,
-            pressed_link: None,
-            last_tab_click: None,
-            editing_tab: None,
-            edit_buffer: String::new(),
-            pending_close: None,
-            confirm_focus: 0,
-            wheel_accum: 0.0,
-            occluded: false,
-            render_starved: false,
-        };
+        let mut win = WindowState::new(renderer, tree);
+        win.px = px;
         if !win.spawn_session(
             &mut shared,
             session,
@@ -447,6 +431,10 @@ impl ApplicationHandler<EmberEvent> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Read before `win` borrows `self.windows` mutably below — used only
+        // by `CloseRequested` to decide "quit the app" vs. "close just this
+        // window".
+        let is_last_window = self.windows.len() <= 1;
         let Some(shared) = self.shared.as_mut() else {
             return;
         };
@@ -455,9 +443,22 @@ impl ApplicationHandler<EmberEvent> for App {
         };
         match event {
             WindowEvent::CloseRequested => {
-                if win.request_close(shared, PendingClose::Quit) {
-                    shared.shutdown_all();
-                    event_loop.exit();
+                // The OS close button on the LAST window keeps today's quit
+                // behavior (checks every session app-wide); on any other
+                // window it closes just that one (checks only ITS sessions).
+                let kind = if is_last_window {
+                    PendingClose::Quit
+                } else {
+                    PendingClose::CloseWindow
+                };
+                if win.request_close(shared, kind) {
+                    finish_close(
+                        &mut self.windows,
+                        shared,
+                        &mut self.focused_window,
+                        event_loop,
+                        id,
+                    );
                 }
             }
             WindowEvent::Resized(size) => {
@@ -468,6 +469,10 @@ impl ApplicationHandler<EmberEvent> for App {
             WindowEvent::Focused(focused) => {
                 win.window_focused = focused;
                 if focused {
+                    // The window the OS gave keyboard focus to becomes the
+                    // target for keystrokes, ctl commands, and (per-window)
+                    // shortcuts.
+                    self.focused_window = Some(id);
                     // A focused window is never occluded. Focus events are the
                     // reliable reveal signal when an Occluded(false) got lost
                     // (e.g. around display sleep/unlock), so also clear the
@@ -579,9 +584,21 @@ impl ApplicationHandler<EmberEvent> for App {
                     // resolves it, elsewhere is a no-op (stays modal).
                     if win.pending_close.is_some() {
                         if let Some(idx) = win.renderer.confirm_button_at(x as f32, y as f32) {
+                            let kind = win.pending_close;
                             if win.resolve_confirm(shared, idx == 1) {
-                                shared.shutdown_all();
-                                event_loop.exit();
+                                match kind {
+                                    Some(PendingClose::Quit) => {
+                                        shared.shutdown_all();
+                                        event_loop.exit();
+                                    }
+                                    _ => finish_close(
+                                        &mut self.windows,
+                                        shared,
+                                        &mut self.focused_window,
+                                        event_loop,
+                                        id,
+                                    ),
+                                }
                             }
                         }
                     } else if let Some((target, axis)) = win.divider_at(x, y) {
@@ -600,10 +617,15 @@ impl ApplicationHandler<EmberEvent> for App {
                 MouseButton::Middle => {
                     let (x, y) = win.cursor;
                     if let Some(TabHit::Tab(i)) = win.renderer.tab_hit(x as f32, y as f32) {
-                        if let Some(id) = win.tree.tabs.get(i).map(|t| t.id) {
-                            if win.request_close(shared, PendingClose::Tab(id)) {
-                                shared.shutdown_all();
-                                event_loop.exit();
+                        if let Some(tab_id) = win.tree.tabs.get(i).map(|t| t.id) {
+                            if win.request_close(shared, PendingClose::Tab(tab_id)) {
+                                finish_close(
+                                    &mut self.windows,
+                                    shared,
+                                    &mut self.focused_window,
+                                    event_loop,
+                                    id,
+                                );
                             }
                         }
                     } else {
@@ -661,9 +683,21 @@ impl ApplicationHandler<EmberEvent> for App {
                             }
                             Key::Named(NamedKey::Enter) => {
                                 let ok = win.confirm_focus == 1;
+                                let kind = win.pending_close;
                                 if win.resolve_confirm(shared, ok) {
-                                    shared.shutdown_all();
-                                    event_loop.exit();
+                                    match kind {
+                                        Some(PendingClose::Quit) => {
+                                            shared.shutdown_all();
+                                            event_loop.exit();
+                                        }
+                                        _ => finish_close(
+                                            &mut self.windows,
+                                            shared,
+                                            &mut self.focused_window,
+                                            event_loop,
+                                            id,
+                                        ),
+                                    }
                                 }
                             }
                             Key::Named(
@@ -722,11 +756,35 @@ impl ApplicationHandler<EmberEvent> for App {
                 // Super (Cmd/Win) combos are multiplexer shortcuts — consumed, never
                 // forwarded to the shell.
                 if mods.super_key() {
+                    // Cmd+N — open a new window (fresh tab, cwd inherited from
+                    // the focused pane). Handled here, not in `handle_shortcut`,
+                    // because it needs `event_loop` (window creation) and every
+                    // other window's state — neither is available to a
+                    // `WindowState` method.
+                    if matches!(&key.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("n"))
+                    {
+                        let cwd = win
+                            .focused_session_id()
+                            .and_then(|sid| shared.cwd_by_session.get(&sid).cloned());
+                        open_new_window(
+                            &mut self.windows,
+                            shared,
+                            &mut self.focused_window,
+                            event_loop,
+                            cwd,
+                        );
+                        return;
+                    }
                     if win.handle_shortcut(shared, &key.logical_key, mods)
                         && win.tree.tabs.is_empty()
                     {
-                        shared.shutdown_all();
-                        event_loop.exit();
+                        finish_close(
+                            &mut self.windows,
+                            shared,
+                            &mut self.focused_window,
+                            event_loop,
+                            id,
+                        );
                     }
                     return;
                 }
@@ -759,9 +817,29 @@ impl ApplicationHandler<EmberEvent> for App {
                 // translate onto the same shortcut handler Super uses.
                 #[cfg(target_os = "linux")]
                 if let Some((k, m)) = linux_chord_translate(&key.logical_key, mods) {
+                    // Ctrl+Shift+N == Cmd+N (new window) — same event_loop/
+                    // cross-window need as the macOS branch above.
+                    if matches!(&k, Key::Character(c) if c.eq_ignore_ascii_case("n")) {
+                        let cwd = win
+                            .focused_session_id()
+                            .and_then(|sid| shared.cwd_by_session.get(&sid).cloned());
+                        open_new_window(
+                            &mut self.windows,
+                            shared,
+                            &mut self.focused_window,
+                            event_loop,
+                            cwd,
+                        );
+                        return;
+                    }
                     if win.handle_shortcut(shared, &k, m) && win.tree.tabs.is_empty() {
-                        shared.shutdown_all();
-                        event_loop.exit();
+                        finish_close(
+                            &mut self.windows,
+                            shared,
+                            &mut self.focused_window,
+                            event_loop,
+                            id,
+                        );
                     }
                     return;
                 }
@@ -784,7 +862,7 @@ impl ApplicationHandler<EmberEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                win.drain_frames(shared);
+                win.drain_own_frames(shared, id);
                 // Frame-timing for the FPS overlay: cadence (interval between
                 // redraws) + the render() call's own duration (the per-frame cost).
                 let now = Instant::now();
@@ -846,11 +924,31 @@ impl ApplicationHandler<EmberEvent> for App {
         let Some(shared) = self.shared.as_mut() else {
             return;
         };
-        let win = match self.focused_window {
-            Some(id) => self.windows.get_mut(&id),
-            None => None,
+
+        // Poll every session's pixel lane, routing each one's deltas to the
+        // window that actually owns it (`session_window`) — "drain only the
+        // focused window" (the pre-multi-window shape of this function) would
+        // silently drop a background window's frames: that renderer never
+        // called `ensure_pane` for a session it doesn't own, so `apply_delta`
+        // would find nothing to patch. A background window still gets its
+        // grid updated even while occluded/unfocused; it just isn't asked to
+        // repaint (Task 6 soak-tests that idle-but-visible windows don't spin).
+        let mut redraw_windows: Vec<WindowId> = Vec::new();
+        for (wid, w) in self.windows.iter_mut() {
+            if w.drain_own_frames(shared, *wid) && !w.occluded {
+                redraw_windows.push(*wid);
+            }
+        }
+        for wid in redraw_windows {
+            if let Some(w) = self.windows.get(&wid) {
+                w.renderer.window().request_redraw();
+            }
+        }
+
+        let Some(focused_id) = self.focused_window else {
+            return;
         };
-        let Some(win) = win else {
+        let Some(win) = self.windows.get_mut(&focused_id) else {
             return;
         };
         // Drain the semantic lanes: focused-pane title, and any exited shells.
@@ -906,12 +1004,35 @@ impl ApplicationHandler<EmberEvent> for App {
         if let Some(title) = new_title {
             win.renderer.window().set_title(&title);
         }
+        // Route each exited/belled session to the window that actually owns
+        // it (it may not be the focused one), falling back to the focused
+        // window for a session `session_window` never learned about (a spawn
+        // racing this drain).
         for session in exited {
-            win.close_session(shared, &session);
+            let wid = shared
+                .session_window
+                .get(&session)
+                .copied()
+                .unwrap_or(focused_id);
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.close_session(shared, &session);
+            }
         }
         for session in belled {
-            win.on_bell(shared, &session);
+            let wid = shared
+                .session_window
+                .get(&session)
+                .copied()
+                .unwrap_or(focused_id);
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.on_bell(shared, &session);
+            }
         }
+        // Neither loop above touches the focused window through `win` (each
+        // routes to the owning window fresh), so re-borrow it once here for
+        // everything below — closing a background window's last pane/session
+        // never removes the focused window itself.
+        let win = self.windows.get_mut(&focused_id).expect("still open");
         // Focus reporting (DEC 1004): tell sessions when their pane gains or
         // loses focus (pane switch, tab switch, window focus/blur).
         let focus_now = if win.window_focused { focused } else { None };
@@ -936,6 +1057,13 @@ impl ApplicationHandler<EmberEvent> for App {
             win.renderer.window().set_title(&title);
             shared.focus_notified = focus_now;
         }
+        // Window-structural actions (open/close a whole window) can't run
+        // until `win`'s borrow of `self.windows` ends — inserting/removing a
+        // window while `win` still points into that same map would conflict —
+        // so a `new-window`/close resolution just records what to do, applied
+        // once at the very end of this function (`win`'s true last use).
+        let mut deferred_window: Option<DeferredWindowAction> = None;
+
         // Drain debug-control commands (EMBER_CONTROL) and act on them.
         let cmds: Vec<ControlMsg> = shared
             .control_rx
@@ -943,7 +1071,23 @@ impl ApplicationHandler<EmberEvent> for App {
             .map(|rx| rx.try_iter().collect())
             .unwrap_or_default();
         for cmd in cmds {
-            win.handle_control(shared, cmd, event_loop);
+            if matches!(cmd, ControlMsg::NewWindow) {
+                let cwd = win
+                    .focused_session_id()
+                    .and_then(|sid| shared.cwd_by_session.get(&sid).cloned());
+                deferred_window = Some(DeferredWindowAction::OpenNew(cwd));
+                continue;
+            }
+            match win.handle_control(shared, cmd) {
+                Some(ControlClose::ExitApp) => {
+                    shared.shutdown_all();
+                    event_loop.exit();
+                }
+                Some(ControlClose::CloseWindow) => {
+                    deferred_window = Some(DeferredWindowAction::CloseThis);
+                }
+                None => {}
+            }
         }
         // Native menu items (macOS) → semantic actions.
         if let Some(action) = ember_platform::menu_action(&shared.menu) {
@@ -952,32 +1096,41 @@ impl ApplicationHandler<EmberEvent> for App {
                 MenuAction::About => win.toggle_about(),
                 MenuAction::Settings => win.toggle_settings(shared),
                 MenuAction::NewTab => win.new_tab(shared),
+                MenuAction::NewWindow => {
+                    let cwd = win
+                        .focused_session_id()
+                        .and_then(|sid| shared.cwd_by_session.get(&sid).cloned());
+                    deferred_window = Some(DeferredWindowAction::OpenNew(cwd));
+                }
                 MenuAction::Copy => win.copy_selection(shared),
                 MenuAction::Paste => win.paste_clipboard(shared),
                 MenuAction::Close | MenuAction::Quit => {
-                    let kind = if matches!(action, MenuAction::Quit) {
+                    let is_quit = matches!(action, MenuAction::Quit);
+                    let kind = if is_quit {
                         PendingClose::Quit
                     } else {
                         PendingClose::Pane
                     };
                     if win.request_close(shared, kind) {
-                        shared.shutdown_all();
-                        event_loop.exit();
+                        if is_quit {
+                            shared.shutdown_all();
+                            event_loop.exit();
+                        } else {
+                            deferred_window = Some(DeferredWindowAction::CloseThis);
+                        }
                     }
                 }
             }
         }
         if win.tree.tabs.is_empty() {
-            shared.shutdown_all();
-            event_loop.exit();
+            finish_close(
+                &mut self.windows,
+                shared,
+                &mut self.focused_window,
+                event_loop,
+                focused_id,
+            );
             return;
-        }
-        // Poll the pixel lanes; redraw only when something changed — and only
-        // when someone can see it. While occluded, content-driven redraws would
-        // re-enter frame prep at PTY rate for frames that can never present
-        //; the grids still update here, and Occluded(false) repaints.
-        if win.drain_frames(shared) && !win.occluded {
-            win.renderer.window().request_redraw();
         }
         // Pace animations by WALL-CLOCK elapsed since the last frame, checked here on
         // *every* wake (timer tick OR any event). Advancing off the timer's
@@ -1021,6 +1174,187 @@ impl ApplicationHandler<EmberEvent> for App {
             // control command wakes us — no more ~125 Hz idle polling.
             event_loop.set_control_flow(ControlFlow::Wait);
         }
+
+        // `win`'s borrow of `self.windows` ends above (last used for the
+        // animation pacing) — only now can a window actually be inserted or
+        // removed.
+        match deferred_window {
+            Some(DeferredWindowAction::OpenNew(cwd)) => {
+                open_new_window(
+                    &mut self.windows,
+                    shared,
+                    &mut self.focused_window,
+                    event_loop,
+                    cwd,
+                );
+            }
+            Some(DeferredWindowAction::CloseThis) => {
+                finish_close(
+                    &mut self.windows,
+                    shared,
+                    &mut self.focused_window,
+                    event_loop,
+                    focused_id,
+                );
+            }
+            None => {}
+        }
+    }
+}
+
+/// A window-structural action (open a new window / close this one) that a
+/// control command, menu item, or a window emptying its last tab requested
+/// mid-`about_to_wait` — applied once at the very end, after the focused
+/// window's borrow ends (see the comment at its use site).
+enum DeferredWindowAction {
+    OpenNew(Option<String>),
+    CloseThis,
+}
+
+/// Create a new OS window + GPU renderer + `WindowState` seeded with `tree`,
+/// replaying every contained session's content into the new renderer (the
+/// spike finding, binding): a fresh `Renderer` starts style-empty, so any
+/// session already running elsewhere (a future moved/shared pane — Task 4)
+/// would render black-on-black until its next real PTY delta if we didn't
+/// seed it with a full-reset [`ember_render::GridModel::snapshot_delta`]
+/// sourced from whichever existing window currently owns its grid. A session
+/// with no existing grid anywhere (a brand-new one the caller is about to
+/// spawn) just gets an empty pane registered.
+///
+/// Free function rather than an `App` method: every call site already holds a
+/// `&mut Shared` borrowed out of `self.shared` (and often a `&mut WindowState`
+/// out of `self.windows`) for the rest of its enclosing function, and a
+/// `&mut self` method here would conflict with that — see `close_window` and
+/// `finish_close` below for the same reasoning. Does not spawn any shell.
+fn open_window(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    event_loop: &ActiveEventLoop,
+    tree: ember_core::WindowTree,
+) -> WindowId {
+    let w = DEFAULT_COLS as f32 * CELL_WIDTH + 2.0 * PAD;
+    let h = DEFAULT_ROWS as f32 * CELL_HEIGHT + 2.0 * PAD;
+    let attrs = ember_platform::window_attributes("Ember", w, h);
+    let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+    ember_platform::set_app_icon(&window, ICON_PNG);
+    let window_id = window.id();
+    let size = window.inner_size();
+    let px = (size.width.max(1), size.height.max(1));
+    let mut renderer = Renderer::new(Arc::clone(&window), &shared.config.font);
+
+    for (_, sid) in tree.tabs.iter().flat_map(|t| t.root.leaves()) {
+        // Source a replay delta from whatever window currently has this
+        // session's grid (none, for a session about to be freshly spawned).
+        let source = windows
+            .values()
+            .find_map(|w| w.renderer.grid(&sid).map(|g| (g.dims, g.snapshot_delta())));
+        let dims = source
+            .as_ref()
+            .map(|(d, _)| *d)
+            .unwrap_or(GridDims::new(DEFAULT_COLS, DEFAULT_ROWS));
+        renderer.ensure_pane(&sid, dims);
+        if let Some((_, delta)) = source {
+            renderer.apply_delta(&sid, delta);
+        }
+        shared.session_window.insert(sid, window_id);
+    }
+
+    let mut win = WindowState::new(renderer, tree);
+    win.px = px;
+    win.sync_layout(shared);
+    win.apply_appearance(shared);
+    win.renderer.window().request_redraw();
+    windows.insert(window_id, win);
+    window_id
+}
+
+/// Open a new window with one fresh tab: a new shell spawned with `cwd` (the
+/// focused pane's OSC 1337 dir — the same cwd-inheritance rule the split-spawn
+/// path uses). The shared path behind Cmd+N, the File → New Window menu item,
+/// and `ctl new-window`. On spawn failure the empty window is closed
+/// immediately rather than left on screen with a dead pane.
+fn open_new_window(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    focused_window: &mut Option<WindowId>,
+    event_loop: &ActiveEventLoop,
+    cwd: Option<String>,
+) -> WindowId {
+    let pane = PaneId(shared.next_pane);
+    shared.next_pane += 1;
+    let session = SessionId::new(format!("s{}", shared.next_session));
+    shared.next_session += 1;
+    let tab_id = TabId(shared.next_tab);
+    shared.next_tab += 1;
+    let tree = ember_core::WindowTree {
+        tabs: vec![Tab {
+            id: tab_id,
+            title: String::new(),
+            root: LayoutNode::pane(pane, session.clone()),
+            focus: pane,
+        }],
+        active: 0,
+    };
+    let window_id = open_window(windows, shared, event_loop, tree);
+    let win = windows.get_mut(&window_id).expect("just inserted above");
+    if !win.spawn_session(
+        shared,
+        session,
+        GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
+        cwd,
+    ) {
+        close_window(windows, shared, focused_window, window_id);
+        return window_id;
+    }
+    win.sync_layout(shared);
+    *focused_window = Some(window_id);
+    win.renderer.window().request_redraw();
+    window_id
+}
+
+/// Tear down window `id` immediately: shut down every session it owns (send
+/// `Shutdown`, forget it in `shared.sessions`/`session_window`, and drop its
+/// per-session bookkeeping), then drop the `WindowState` itself — the last
+/// reference to its winit `Window`/GPU surface, which closes the OS window.
+/// Re-targets `focused_window` at any remaining window if it pointed here.
+fn close_window(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    focused_window: &mut Option<WindowId>,
+    id: WindowId,
+) {
+    if let Some(win) = windows.remove(&id) {
+        for sid in win.window_session_ids() {
+            if let Some(h) = shared.sessions.remove(&sid) {
+                let _ = h.control.send(BackendControl::Shutdown);
+            }
+            shared.session_window.remove(&sid);
+            shared.bracketed.remove(&sid);
+            shared.titles.remove(&sid);
+            shared.cwd_by_session.remove(&sid);
+        }
+    }
+    if *focused_window == Some(id) {
+        *focused_window = windows.keys().next().copied();
+    }
+}
+
+/// The shared tail of every "this close/quit was confirmed (or needed no
+/// confirmation)" path: if `id` is the only window left, closing it is
+/// indistinguishable from quitting the app, so do the full app-wide shutdown;
+/// otherwise close just that one window and keep running.
+fn finish_close(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    focused_window: &mut Option<WindowId>,
+    event_loop: &ActiveEventLoop,
+    id: WindowId,
+) {
+    if windows.len() <= 1 {
+        shared.shutdown_all();
+        event_loop.exit();
+    } else {
+        close_window(windows, shared, focused_window, id);
     }
 }
 
@@ -1226,6 +1560,7 @@ fn linux_chord_translate(key: &Key, mods: ModifiersState) -> Option<(Key, Modifi
             "c" | "C" => "c",
             "v" | "V" => "v",
             "t" | "T" => "t",
+            "n" | "N" => "n",
             "w" | "W" => "w",
             "d" | "D" => "d",
             "p" | "P" => "p",
@@ -1341,6 +1676,7 @@ pub(crate) fn help_lines() -> Vec<(String, String)> {
         r(k("Cmd+Arrows", "Ctrl+Shift+Arrows"), "Focus pane"),
         r("".into(), "TABS"),
         r(k("Cmd+T", "Ctrl+Shift+T"), "New tab"),
+        r(k("Cmd+N", "Ctrl+Shift+N"), "New window"),
         r(k("Cmd+Shift+Arrows", "Alt+Shift+Arrows"), "Switch tab"),
         r(k("Cmd+1..9", "Alt+1..9"), "Jump to tab"),
         r("Drag / Double-click".into(), "Reorder / rename tab"),
@@ -1727,6 +2063,7 @@ mod tests {
         let none = ModifiersState::empty();
         // Ctrl+Shift+X == Cmd+X, shifted characters folded back.
         assert_eq!(tr(&ch("T"), cs), Some((ch("t"), none)));
+        assert_eq!(tr(&ch("N"), cs), Some((ch("n"), none)), "new window");
         assert_eq!(tr(&ch("c"), cs), Some((ch("c"), none)));
         assert_eq!(tr(&ch("?"), cs), Some((ch("/"), none)));
         assert_eq!(tr(&ch("<"), cs), Some((ch(","), none)));

@@ -852,6 +852,15 @@ impl Renderer {
         Some(((1.0 - top_frac) * p.grid.history_len as f32).round() as u16)
     }
 
+    /// The live `GridModel` behind a session's pane, if registered — the read
+    /// half of `apply_delta`. Multi-window replay (opening/moving a pane into a
+    /// new window) sources a `GridModel::snapshot_delta()` from here rather than
+    /// re-deriving one from `pane_snapshot`'s flattened text, so styles/cursor/
+    /// scrollback-view/marks all carry over exactly, not just the glyphs.
+    pub fn grid(&self, session: &SessionId) -> Option<&GridModel> {
+        self.panes.get(session).map(|p| &p.grid)
+    }
+
     /// A read-only snapshot of a pane's grid — for the debug control surface. The
     /// `text` is the whole screen as text (trailing blanks trimmed per row).
     pub fn pane_snapshot(&self, session: &SessionId) -> Option<PaneSnapshot> {

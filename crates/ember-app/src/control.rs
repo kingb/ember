@@ -66,6 +66,9 @@ pub enum ControlMsg {
     EditTab(usize),
     /// Scroll the focused pane's scrollback (for tests / accessibility).
     Scroll(ScrollAmount),
+    /// Open a new OS window with one fresh tab (mirrors Cmd+N / the File →
+    /// New Window menu item), cwd inherited from the focused pane.
+    NewWindow,
 }
 
 #[cfg(unix)]
@@ -297,6 +300,10 @@ mod unix {
                 let _ = tx.send(ControlMsg::About);
                 ok()
             }
+            "new-window" => {
+                let _ = tx.send(ControlMsg::NewWindow);
+                ok()
+            }
             "settings" => {
                 let _ = tx.send(ControlMsg::Settings);
                 ok()
@@ -508,6 +515,7 @@ mod unix {
                 serde_json::json!({"cmd":"click","x": x, "y": y})
             }
             "about" => serde_json::json!({"cmd":"about"}),
+            "new-window" => serde_json::json!({"cmd":"new-window"}),
             "settings" => serde_json::json!({"cmd":"settings"}),
             "select" => {
                 let g = |i: usize| rest.get(i).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
@@ -540,7 +548,7 @@ mod unix {
             }
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window)"
                 ));
             }
         };

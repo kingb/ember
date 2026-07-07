@@ -32,14 +32,13 @@ use ember_render::{
     ConfirmView, ImageFit, Point, Renderer, Selection, SelectionMode, TabHit, TabLabel, VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
-use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::CursorIcon;
+use winit::window::{CursorIcon, WindowId};
 
 use crate::config;
 use crate::control::ControlMsg;
 use crate::{
-    DEFAULT_COLS, DEFAULT_ROWS, MULTI_CLICK, PAD, PendingClose, Shared, about_info,
+    ControlClose, DEFAULT_COLS, DEFAULT_ROWS, MULTI_CLICK, PAD, PendingClose, Shared, about_info,
     bell_flash_intensity, bracket_paste, click_selection_should_clear, dims_for_rect, ember_glow,
     encode_key, help_lines, inset, load_backdrop_image, match_tab_title, named_key, parse_chord,
     step_selectable_row, tab_display_title, url_is_openable,
@@ -156,6 +155,55 @@ pub(crate) struct WindowState {
 }
 
 impl WindowState {
+    /// Build a fresh per-window state around an already-created `renderer` +
+    /// seeded `tree`; every other field starts at its "nothing in progress"
+    /// default. Shared by the very first window (`resumed`) and every window
+    /// opened afterward (`open_window`) — the caller sets `px` to the real
+    /// surface size right after construction.
+    pub(crate) fn new(renderer: Renderer, tree: ember_core::WindowTree) -> Self {
+        Self {
+            renderer,
+            tree,
+            dims_cache: HashMap::new(),
+            modifiers: ModifiersState::empty(),
+            px: (1, 1),
+            help: false,
+            about: false,
+            about_since: Instant::now(),
+            settings_open: false,
+            settings_sel: 0,
+            image_loaded: None,
+            window_focused: true,
+            fps_overlay: false,
+            last_frame: None,
+            fps_ema_ms: 0.0,
+            render_ema_ms: 0.0,
+            last_anim: Instant::now(),
+            bell_flash_since: None,
+            belled_tabs: std::collections::HashSet::new(),
+            cursor: (0.0, 0.0),
+            pane_rects: Vec::new(),
+            sel: None,
+            selecting: false,
+            last_click: None,
+            click_count: 0,
+            tab_drag: None,
+            split_preview: None,
+            scrollbar_drag: None,
+            divider_drag: None,
+            pointer_cursor: CursorIcon::Default,
+            pressed_link: None,
+            last_tab_click: None,
+            editing_tab: None,
+            edit_buffer: String::new(),
+            pending_close: None,
+            confirm_focus: 0,
+            wheel_accum: 0.0,
+            occluded: false,
+            render_starved: false,
+        }
+    }
+
     /// The **logical**-pixel rect available to the layout (full surface minus the
     /// tab strip). `px` is physical; the renderer draws in logical units and scales
     /// to physical by the HiDPI factor, so layout/dims must be logical too — else a
@@ -302,6 +350,11 @@ impl WindowState {
         handle.frames.set_waker(shared.wake.clone());
         self.renderer.ensure_pane(&id, dims);
         self.dims_cache.insert(id.clone(), dims);
+        // Register ownership BEFORE the session goes live, so the very first
+        // PTY delta already has a window to route to (see `drain_own_frames`).
+        shared
+            .session_window
+            .insert(id.clone(), self.renderer.window().id());
         shared.sessions.insert(id, handle);
         true
     }
@@ -311,8 +364,20 @@ impl WindowState {
         if let Some(h) = shared.sessions.remove(id) {
             let _ = h.control.send(BackendControl::Shutdown);
         }
+        shared.session_window.remove(id);
         self.renderer.remove_pane(id);
         self.dims_cache.remove(id);
+    }
+
+    /// Every session in this window's layout tree (every tab) — used to tear
+    /// the whole window down (closing a non-last window) rather than one
+    /// pane/tab at a time.
+    pub(crate) fn window_session_ids(&self) -> Vec<SessionId> {
+        self.tree
+            .tabs
+            .iter()
+            .flat_map(|t| t.root.leaves().into_iter().map(|(_, s)| s))
+            .collect()
     }
 
     /// Send raw bytes to the focused session's PTY (used by control + key paths).
@@ -326,12 +391,17 @@ impl WindowState {
 
     /// Act on a debug-control command (see `control`): inject text/keys, run a
     /// chord, or reply with a JSON state dump.
+    ///
+    /// Returns what the caller must do about this window's OS lifecycle, if
+    /// anything: this method has no view of how many windows exist or of
+    /// `self.windows`/an `ActiveEventLoop`, so it can't itself decide "quit the
+    /// app" vs. "just close this window" — the caller (`about_to_wait`) does,
+    /// via [`crate::finish_close`].
     pub(crate) fn handle_control(
         &mut self,
         shared: &mut Shared,
         msg: ControlMsg,
-        event_loop: &ActiveEventLoop,
-    ) {
+    ) -> Option<ControlClose> {
         // Route injected keys into the interactive Settings overlay (for tests),
         // mirroring the real keyboard path.
         if self.settings_open {
@@ -339,7 +409,7 @@ impl WindowState {
                 if let Some(k) = named_key(name) {
                     self.settings_key(shared, &k);
                 }
-                return;
+                return None;
             }
         }
         // Mirror the keyboard: the close-confirm modal captures input (arrows/Tab
@@ -351,10 +421,13 @@ impl WindowState {
                         self.resolve_confirm(shared, false);
                     }
                     "Enter" | "Return" => {
+                        let kind = self.pending_close;
                         let ok = self.confirm_focus == 1;
                         if self.resolve_confirm(shared, ok) {
-                            shared.shutdown_all();
-                            event_loop.exit();
+                            return Some(match kind {
+                                Some(PendingClose::Quit) => ControlClose::ExitApp,
+                                _ => ControlClose::CloseWindow,
+                            });
                         }
                     }
                     "ArrowLeft" | "ArrowRight" | "Tab" => {
@@ -365,14 +438,14 @@ impl WindowState {
                     _ => {}
                 }
             }
-            return;
+            return None;
         }
         // Mirror the keyboard: while a modal overlay is up, any input dismisses it
         // (but state/screenshot still work, so the overlay can be inspected).
         if self.help || self.about {
             if let ControlMsg::Type(_) | ControlMsg::Key(_) | ControlMsg::Chord(_) = &msg {
                 self.dismiss_overlay();
-                return;
+                return None;
             }
         }
         match msg {
@@ -392,20 +465,18 @@ impl WindowState {
                     #[cfg(target_os = "linux")]
                     if let Some(n) = alt_digit_tab(&key, mods) {
                         self.select_tab(shared, n);
-                        return;
+                        return None;
                     }
                     #[cfg(target_os = "linux")]
                     if let Some((k, m)) = linux_chord_translate(&key, mods) {
                         if self.handle_shortcut(shared, &k, m) && self.tree.tabs.is_empty() {
-                            shared.shutdown_all();
-                            event_loop.exit();
+                            return Some(ControlClose::CloseWindow);
                         }
-                        return;
+                        return None;
                     }
                     if mods.super_key() {
                         if self.handle_shortcut(shared, &key, mods) && self.tree.tabs.is_empty() {
-                            shared.shutdown_all();
-                            event_loop.exit();
+                            return Some(ControlClose::CloseWindow);
                         }
                     } else if let Some(bytes) =
                         encode_key(&key, mods, self.focused_app_cursor(), false)
@@ -462,9 +533,7 @@ impl WindowState {
             ControlMsg::About => self.toggle_about(),
             ControlMsg::Settings => self.toggle_settings(shared),
             ControlMsg::Select(r1, c1, r2, c2, mode) => {
-                let Some(sid) = self.focused_session_id() else {
-                    return;
-                };
+                let sid = self.focused_session_id()?;
                 let mode = match mode.as_str() {
                     "word" => SelectionMode::Word,
                     "line" => SelectionMode::Line,
@@ -514,7 +583,12 @@ impl WindowState {
                 }
             }
             ControlMsg::EditTab(i) => self.start_rename(shared, i),
+            // Handled by the caller (`about_to_wait`) before this method is
+            // ever invoked — it needs `self.windows`/`event_loop` to actually
+            // open the window. Kept here only so the match stays exhaustive.
+            ControlMsg::NewWindow => {}
         }
+        None
     }
 
     /// A JSON snapshot of the live app for the debug control surface: scale,
@@ -665,11 +739,19 @@ impl WindowState {
         self.renderer.window().request_redraw();
     }
 
-    /// Poll every session's pixel lane into its grid. Returns whether anything
-    /// changed (background tabs stay current so they're right when re-shown).
-    pub(crate) fn drain_frames(&mut self, shared: &mut Shared) -> bool {
+    /// Poll the pixel lane of every session **this window owns** (per
+    /// `shared.session_window`) into its grid. Returns whether anything
+    /// changed (background tabs stay current so they're right when
+    /// re-shown). Scoped to `window_id` rather than iterating every session
+    /// in `shared.sessions` — with N windows, an unscoped drain would also
+    /// pull a DIFFERENT window's frames and silently drop them (`apply_delta`
+    /// finds no matching pane in `self.renderer` and no-ops).
+    pub(crate) fn drain_own_frames(&mut self, shared: &mut Shared, window_id: WindowId) -> bool {
         let mut dirty = false;
         for (id, handle) in &shared.sessions {
+            if shared.session_window.get(id) != Some(&window_id) {
+                continue;
+            }
             while let Some(delta) = handle.frames.take() {
                 shared.bracketed.insert(id.clone(), delta.bracketed_paste);
                 self.renderer.apply_delta(id, delta);
@@ -1703,6 +1785,12 @@ impl WindowState {
                 .iter()
                 .find(|t| t.id == tab)
                 .is_some_and(|t| t.root.leaves().iter().any(|(_, s)| shared.session_busy(s))),
+            // Scoped to THIS window's own sessions, unlike `Quit` — closing one
+            // window must not be blocked by a busy pane in a DIFFERENT window.
+            PendingClose::CloseWindow => self
+                .window_session_ids()
+                .iter()
+                .any(|s| shared.session_busy(s)),
         }
     }
 
@@ -1725,6 +1813,11 @@ impl WindowState {
             }
             PendingClose::Tab(tab) => self.do_close_tab(shared, tab),
             PendingClose::Quit => true,
+            // The actual teardown (killing this window's sessions, dropping
+            // its `WindowState`/OS window) needs `App`-level access this
+            // method doesn't have — the caller does it via `close_window`/
+            // `finish_close` once this returns true.
+            PendingClose::CloseWindow => true,
         }
     }
 
@@ -1747,6 +1840,7 @@ impl WindowState {
             PendingClose::Pane => ("Close this pane?", "Close"),
             PendingClose::Tab(_) => ("Close this tab?", "Close"),
             PendingClose::Quit => ("Quit Ember?", "Quit"),
+            PendingClose::CloseWindow => ("Close this window?", "Close"),
         };
         self.renderer.set_confirm(Some(ConfirmView {
             title: title.to_string(),
@@ -2046,14 +2140,19 @@ impl WindowState {
         self.sync_layout(shared);
     }
 
-    /// Perform a tab close (after any confirmation). Returns true to exit.
+    /// Perform a tab close (after any confirmation). Returns true when this
+    /// window's tree is now empty — the caller (`finish_close`) decides
+    /// whether that means quitting the whole app (last window) or just
+    /// closing this one. Doesn't itself call `shutdown_all`: `apply_effects`
+    /// above already killed every session THIS tab held via `KillSession`
+    /// effects, and a global `shutdown_all` here would also kill every OTHER
+    /// window's still-running sessions.
     pub(crate) fn do_close_tab(&mut self, shared: &mut Shared, tab: TabId) -> bool {
         let user_tab = self.tree.tabs.get(self.tree.active).map(|t| t.id);
         let vp = self.viewport();
         let effects = apply(&mut self.tree, LayoutCommand::CloseTab { tab }, vp);
         self.apply_effects(shared, effects);
         if self.tree.tabs.is_empty() {
-            shared.shutdown_all();
             return true;
         }
         self.tree.active = user_tab

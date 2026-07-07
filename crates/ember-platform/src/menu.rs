@@ -24,6 +24,8 @@ pub enum MenuAction {
     Quit,
     /// File → New Tab (Cmd+T).
     NewTab,
+    /// File → New Window (Cmd+N).
+    NewWindow,
     /// File → Close Tab / pane (Cmd+W).
     Close,
     /// Edit → Copy (Cmd+C). Also lets macOS route to Services/dictation.
@@ -51,6 +53,7 @@ mod imp {
         shortcuts_id: MenuId,
         quit_id: MenuId,
         new_tab_id: MenuId,
+        new_window_id: MenuId,
         close_id: MenuId,
         copy_id: MenuId,
         paste_id: MenuId,
@@ -92,6 +95,12 @@ mod imp {
             Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyT)),
         );
         let new_tab_id = new_tab.id().clone();
+        let new_window = MenuItem::new(
+            "New Window",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyN)),
+        );
+        let new_window_id = new_window.id().clone();
         let close = MenuItem::new(
             "Close",
             true,
@@ -99,6 +108,7 @@ mod imp {
         );
         let close_id = close.id().clone();
         let _ = file.append(&new_tab);
+        let _ = file.append(&new_window);
         let _ = file.append(&close);
         let _ = menu.append(&file);
 
@@ -145,6 +155,7 @@ mod imp {
             shortcuts_id,
             quit_id,
             new_tab_id,
+            new_window_id,
             close_id,
             copy_id,
             paste_id,
@@ -165,6 +176,8 @@ mod imp {
                 action = Some(MenuAction::Quit);
             } else if event.id == menu.new_tab_id {
                 action = Some(MenuAction::NewTab);
+            } else if event.id == menu.new_window_id {
+                action = Some(MenuAction::NewWindow);
             } else if event.id == menu.close_id {
                 action = Some(MenuAction::Close);
             } else if event.id == menu.copy_id {
