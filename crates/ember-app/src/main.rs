@@ -14,6 +14,9 @@ mod control;
 #[cfg(unix)]
 mod mcp;
 mod screenshot;
+mod window_state;
+
+use window_state::WindowState;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,17 +26,15 @@ use std::time::{Duration, Instant};
 use control::ControlMsg;
 
 use ember_core::{
-    Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, Direction, GridDims,
-    LayoutCommand, LayoutEffect, LayoutNode, OscEvent, PaneId, Rect, RowKind, ScrollAmount,
-    SessionBackend, SessionId, SettingsRowView, Tab, TabId, apply, layout, resolve_rows,
-    setting_rows,
+    Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims, LayoutNode,
+    OscEvent, PaneId, Rect, RowKind, ScrollAmount, SessionId, SettingsRowView, Tab, TabId,
+    resolve_rows,
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
-    BackdropParams, CELL_HEIGHT, CELL_WIDTH, ConfirmView, ImageFit, Point, RenderOutcome, Renderer,
-    Selection, SelectionMode, TabHit, TabLabel, VisiblePane,
+    BackdropParams, CELL_HEIGHT, CELL_WIDTH, RenderOutcome, Renderer, Selection, SelectionMode,
+    TabHit,
 };
-use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -45,8 +46,8 @@ use winit::window::{CursorIcon, WindowId};
 const ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.png"));
 
 pub(crate) const PAD: f32 = 4.0;
-const DEFAULT_COLS: u16 = 80;
-const DEFAULT_ROWS: u16 = 24;
+pub(crate) const DEFAULT_COLS: u16 = 80;
+pub(crate) const DEFAULT_ROWS: u16 = 24;
 
 /// The winit user-event type: a wake nudge from the PTY frame lane or the
 /// control socket, so the loop can idle on `ControlFlow::Wait` instead of
@@ -58,7 +59,7 @@ enum EmberEvent {
 /// Redraw cadence (~60fps) while an animation (e.g. the About glow) is active.
 const ANIM_FRAME: Duration = Duration::from_millis(16);
 /// Max gap between clicks at the same cell to count as a double/triple click.
-const MULTI_CLICK: Duration = Duration::from_millis(400);
+pub(crate) const MULTI_CLICK: Duration = Duration::from_millis(400);
 /// Scrollback lines per mouse-wheel notch (Alacritty/Ghostty default).
 const WHEEL_LINES: i32 = 3;
 
@@ -192,7 +193,9 @@ fn main() {
     };
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
-        state: None,
+        shared: None,
+        windows: HashMap::new(),
+        focused_window: None,
         control_rx,
         control_server,
         wake,
@@ -225,173 +228,79 @@ fn print_usage() {
 }
 
 struct App {
-    state: Option<RunState>,
+    /// Process-wide state shared across every window (one window today).
+    shared: Option<Shared>,
+    /// Per-window state, keyed by winit `WindowId` (exactly one entry today).
+    windows: HashMap<WindowId, WindowState>,
+    /// The window that currently has focus (the sole window today).
+    focused_window: Option<WindowId>,
     /// Receiver for debug-control commands (Some while the control socket is bound).
     control_rx: Option<Receiver<ControlMsg>>,
-    /// The bound control listener (from EMBER_CONTROL); moved into RunState.
+    /// The bound control listener (from EMBER_CONTROL); moved into Shared.
     control_server: Option<control::ControlServer>,
     /// Wakes the event loop from the PTY frame lane; handed to each session.
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
 }
 
-struct RunState {
-    renderer: Renderer,
-    /// The multiplexer model (one tab list, one binary split tree per tab).
-    tree: ember_core::WindowTree,
+/// Process-wide state that is not tied to any one window: the running sessions,
+/// user config, OS effect seam, control socket, and per-session bookkeeping.
+pub(crate) struct Shared {
     /// One running session per pane leaf, keyed by its `SessionId`.
-    sessions: HashMap<SessionId, BackendHandle>,
-    /// Last grid dims pushed to each session — so resizes are only sent on change.
-    dims_cache: HashMap<SessionId, GridDims>,
-    modifiers: ModifiersState,
-    /// Physical surface size in px.
-    px: (u32, u32),
-    next_pane: u64,
-    next_session: u64,
-    next_tab: u64,
+    pub(crate) sessions: HashMap<SessionId, BackendHandle>,
+    // window-scoped later? id counters are per-app today (one window).
+    pub(crate) next_pane: u64,
+    pub(crate) next_session: u64,
+    pub(crate) next_tab: u64,
     /// Debug-control command receiver (drained each poll tick).
-    control_rx: Option<Receiver<ControlMsg>>,
+    pub(crate) control_rx: Option<Receiver<ControlMsg>>,
     /// The bound control listener, if the socket is currently open (Settings
     /// toggle / EMBER_CONTROL). Dropping/stopping it closes the socket.
-    control_server: Option<control::ControlServer>,
-    /// Whether the keyboard cheat-sheet overlay is showing.
-    help: bool,
-    /// Whether the About overlay is showing, and when it opened (for the glow clock).
-    about: bool,
-    about_since: Instant,
-    /// User config + the Settings overlay state (open + selected row).
-    config: Config,
-    settings_open: bool,
-    settings_sel: usize,
-    /// The backdrop-image path currently uploaded to the renderer, so
-    /// `apply_appearance` re-decodes only when the configured path changes.
-    image_loaded: Option<String>,
-    /// Backdrop animation clock + whether the window is focused (sparks pause when
-    /// unfocused, per the perf stance).
-    backdrop_since: Instant,
-    window_focused: bool,
-    /// FPS/frame-time debug overlay (toggle: Cmd+Shift+P / `ctl fps`). EMAs of the
-    /// redraw interval (cadence) and the render() call duration (per-frame cost).
-    fps_overlay: bool,
-    last_frame: Option<Instant>,
-    fps_ema_ms: f32,
-    render_ema_ms: f32,
-    /// When the last animation frame was advanced+redrawn. Animation is paced by
-    /// wall-clock elapsed since this (checked on every wake), NOT by the timer's
-    /// `ResumeTimeReached` — a flood of mouse-move events would otherwise keep
-    /// resetting the `WaitUntil` deadline and starve the animation (visible stutter).
-    last_anim: Instant,
-    /// Visual bell: when the current ember flash started (None = no flash), and the
-    /// set of tabs with an unseen bell (a background tab belled).
-    bell_flash_since: Option<Instant>,
-    belled_tabs: std::collections::HashSet<TabId>,
+    pub(crate) control_server: Option<control::ControlServer>,
+    /// User config (the Settings overlay reads + mutates it).
+    pub(crate) config: Config,
+    /// Backdrop animation clock.
+    pub(crate) backdrop_since: Instant,
     /// Native menu bar (macOS); inert elsewhere. Kept alive for the app's life.
-    menu: ember_platform::AppMenu,
-    /// Last cursor position in **logical** px.
-    cursor: (f64, f64),
-    /// Visible panes' inner rects (logical px), for mouse→cell hit-testing.
-    pane_rects: Vec<(SessionId, Rect)>,
-    /// Active text selection + the session (pane) it belongs to.
-    sel: Option<(SessionId, Selection)>,
-    /// Whether a mouse drag is currently extending the selection.
-    selecting: bool,
-    /// Last mouse-down (time, pane, cell), for double/triple-click detection.
-    last_click: Option<(Instant, SessionId, u16, u16)>,
-    /// Consecutive-click count at the same cell (1 = simple, 2 = word, 3 = line).
-    click_count: u32,
+    pub(crate) menu: ember_platform::AppMenu,
     /// The OS effect seam (design §7, ): clipboard + open-path,
     /// `MacBackend`/`LinuxBackend` for the host OS.
-    platform: ember_platform::HostBackend,
+    pub(crate) platform: ember_platform::HostBackend,
     /// Per-session bracketed-paste (DEC 2004) mode, updated from each frame delta —
     /// so paste can wrap in `ESC[200~`…`ESC[201~` only when the app asked for it.
-    bracketed: HashMap<SessionId, bool>,
-    /// In-progress tab drag-reorder: the tab being dragged, the press x (logical),
-    /// and whether the drag threshold has been crossed (below it, it's a click).
-    tab_drag: Option<TabDrag>,
-    /// In-progress scrollbar-thumb drag: the session whose scrollbar is grabbed.
-    scrollbar_drag: Option<SessionId>,
-    /// In-progress divider drag to resize a split: `(a-side pane, split axis,
-    /// last cursor position along that axis in logical px)`.
-    divider_drag: Option<(PaneId, Axis, f64)>,
-    /// The pointer cursor currently shown (so we don't reset it every move).
-    pointer_cursor: CursorIcon,
-    /// Left press that started on a link: `(session, link id, row, col)`.
-    /// Opens on release if the pointer is still on the same link and cell.
-    pressed_link: Option<(SessionId, u32, u16, u16)>,
-    /// Live Ctrl+Opt split drop-zone preview (hover), committed on click.
-    split_preview: Option<SplitPreview>,
-    /// Last tab-button mouse-down (time, tab index), for double-click-to-rename.
-    last_tab_click: Option<(Instant, usize)>,
-    /// Inline tab rename in progress: the tab index + the live edit buffer.
-    editing_tab: Option<usize>,
-    edit_buffer: String,
+    pub(crate) bracketed: HashMap<SessionId, bool>,
+    // window-scoped later? focus reporting is per-window.
     /// The session last told it has focus (DEC 1004 focus reporting) — the
     /// backend only writes `CSI I`/`CSI O` when the app enabled mode 1004.
-    focus_notified: Option<SessionId>,
-    /// Fractional wheel-scroll carry (trackpad pixel deltas < one cell).
-    wheel_accum: f32,
+    pub(crate) focus_notified: Option<SessionId>,
+    // window-scoped later? mouse forwarding follows a window's pointer.
     /// A mouse press being forwarded to an app (session + button code) — its
     /// drag/release go to the same session even if the pointer leaves the pane.
-    mouse_press: Option<(SessionId, u8)>,
+    pub(crate) mouse_press: Option<(SessionId, u8)>,
+    // window-scoped later? per-window pointer dedup.
     /// Last (col, row) a motion report was sent for (dedup per cell).
-    last_mouse_cell: Option<(u16, u16)>,
-    /// Sessions with an OSC 133 command in flight (Command/OutputStart seen, no
-    /// CommandEnd) — used to confirm before destroying a busy pane.
-    /// A destructive close awaiting confirmation (a busy pane).
-    pending_close: Option<PendingClose>,
-    /// The focused confirm button: 0 = Cancel (safe default), 1 = Close/Quit.
-    confirm_focus: usize,
+    pub(crate) last_mouse_cell: Option<(u16, u16)>,
+    // window-scoped later? titles are per-session, surfaced per-window.
     /// Latest OSC title per session, so the window title can be re-asserted on
     /// tab/pane switch (not just when a fresh Title event happens to arrive).
-    titles: std::collections::HashMap<SessionId, String>,
+    pub(crate) titles: std::collections::HashMap<SessionId, String>,
     /// Latest OSC 1337 `CurrentDir` per session — a new split spawned FROM a
     /// pane inherits its cwd (design §8.1). Not removed on exit; only read
     /// while spawning, and a dead `SessionId` is never reused.
-    cwd_by_session: std::collections::HashMap<SessionId, String>,
+    pub(crate) cwd_by_session: std::collections::HashMap<SessionId, String>,
     /// Wakes the event loop when a session publishes a frame; registered on
     /// every session's pixel lane so the loop can idle on `ControlFlow::Wait`.
-    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
-    /// The window is fully hidden (another window covers it): suppress the
-    /// ambient animation so an idle-but-covered window doesn't burn cycles.
-    occluded: bool,
-    /// The last render attempt found no drawable (transient startup shortage,
-    /// display asleep). Drives a bounded retry cadence via the animation
-    /// machinery below — the renderer's StarveGate caps actual frame prep at
-    /// 4/s — so a missed frame repaints without the  spin. Cleared by
-    /// the first present.
-    render_starved: bool,
+    pub(crate) wake: std::sync::Arc<dyn Fn() + Send + Sync>,
 }
 
 /// A close action deferred behind a running-process confirmation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PendingClose {
+pub(crate) enum PendingClose {
     /// Close the focused pane (Cmd+W).
     Pane,
     /// Close a whole tab by id (middle-click).
     Tab(TabId),
     /// Quit the whole app (Cmd+Q / window close).
     Quit,
-}
-
-/// State for an in-progress tab drag-reorder.
-struct TabDrag {
-    /// Index of the tab currently being dragged (updated as it live-reorders).
-    tab: usize,
-    /// Logical-x of the initial press (to measure the drag threshold).
-    press_x: f64,
-    /// Whether the pointer has moved far enough to count as a drag (vs. a click).
-    active: bool,
-}
-
-/// How far (logical px) the pointer must move horizontally before a tab press
-/// becomes a drag-reorder rather than a click.
-const TAB_DRAG_THRESHOLD: f64 = 6.0;
-
-/// Ctrl+Opt split drop-zone preview: the hovered pane + the split that a click
-/// would commit (new pane on the right if `horizontal`, else the bottom).
-struct SplitPreview {
-    pane: PaneId,
-    horizontal: bool,
-    ratio: f32,
 }
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
@@ -425,7 +334,7 @@ impl ApplicationHandler<EmberEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: EmberEvent) {}
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
+        if self.shared.is_some() {
             return;
         }
         let w = DEFAULT_COLS as f32 * CELL_WIDTH + 2.0 * PAD;
@@ -433,6 +342,7 @@ impl ApplicationHandler<EmberEvent> for App {
         let attrs = ember_platform::window_attributes("Ember", w, h);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         ember_platform::set_app_icon(&window, ICON_PNG);
+        let window_id = window.id();
 
         let size = window.inner_size();
         let px = (size.width.max(1), size.height.max(1));
@@ -452,26 +362,37 @@ impl ApplicationHandler<EmberEvent> for App {
             active: 0,
         };
 
-        let mut state = RunState {
-            renderer,
-            tree,
+        let mut shared = Shared {
             sessions: HashMap::new(),
-            dims_cache: HashMap::new(),
-            modifiers: ModifiersState::empty(),
-            px,
             next_pane: 2,
             next_session: 2,
             next_tab: 2,
             control_rx: self.control_rx.take(),
             control_server: self.control_server.take(),
+            config,
+            backdrop_since: Instant::now(),
+            menu: ember_platform::build_menu(),
+            platform: ember_platform::HostBackend::default(),
+            bracketed: HashMap::new(),
+            focus_notified: None,
+            mouse_press: None,
+            last_mouse_cell: None,
+            titles: std::collections::HashMap::new(),
+            cwd_by_session: std::collections::HashMap::new(),
+            wake: self.wake.clone(),
+        };
+        let mut win = WindowState {
+            renderer,
+            tree,
+            dims_cache: HashMap::new(),
+            modifiers: ModifiersState::empty(),
+            px,
             help: false,
             about: false,
             about_since: Instant::now(),
-            config,
             settings_open: false,
             settings_sel: 0,
             image_loaded: None,
-            backdrop_since: Instant::now(),
             window_focused: true,
             fps_overlay: false,
             last_frame: None,
@@ -480,15 +401,12 @@ impl ApplicationHandler<EmberEvent> for App {
             last_anim: Instant::now(),
             bell_flash_since: None,
             belled_tabs: std::collections::HashSet::new(),
-            menu: ember_platform::build_menu(),
             cursor: (0.0, 0.0),
             pane_rects: Vec::new(),
             sel: None,
             selecting: false,
             last_click: None,
             click_count: 0,
-            platform: ember_platform::HostBackend::default(),
-            bracketed: HashMap::new(),
             tab_drag: None,
             split_preview: None,
             scrollbar_drag: None,
@@ -498,120 +416,123 @@ impl ApplicationHandler<EmberEvent> for App {
             last_tab_click: None,
             editing_tab: None,
             edit_buffer: String::new(),
-            focus_notified: None,
-            wheel_accum: 0.0,
-            mouse_press: None,
-            last_mouse_cell: None,
             pending_close: None,
             confirm_focus: 0,
-            titles: std::collections::HashMap::new(),
-            cwd_by_session: std::collections::HashMap::new(),
-            wake: self.wake.clone(),
+            wheel_accum: 0.0,
             occluded: false,
             render_starved: false,
         };
-        if !state.spawn_session(session, GridDims::new(DEFAULT_COLS, DEFAULT_ROWS), None) {
+        if !win.spawn_session(
+            &mut shared,
+            session,
+            GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
+            None,
+        ) {
             // No shell at startup means nothing to show; exit with the message
             // spawn_session already printed instead of presenting a dead window.
             std::process::exit(1);
         }
-        state.sync_layout();
-        state.apply_appearance();
-        if state.config.developer_mode && state.control_server.is_none() {
-            state.set_developer_mode(true);
+        win.sync_layout(&shared);
+        win.apply_appearance(&shared);
+        if shared.config.developer_mode && shared.control_server.is_none() {
+            shared.set_developer_mode(true);
         }
         // Paint once now: with ControlFlow::Wait the loop won't run again until
         // an event or a frame-lane wake, and the very first frame may have been
         // published before the waker was registered.
-        state.renderer.window().request_redraw();
-        self.state = Some(state);
+        win.renderer.window().request_redraw();
+        self.windows.insert(window_id, win);
+        self.focused_window = Some(window_id);
+        self.shared = Some(shared);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(state) = self.state.as_mut() else {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let Some(shared) = self.shared.as_mut() else {
+            return;
+        };
+        let Some(win) = self.windows.get_mut(&id) else {
             return;
         };
         match event {
             WindowEvent::CloseRequested => {
-                if state.request_close(PendingClose::Quit) {
-                    state.shutdown_all();
+                if win.request_close(shared, PendingClose::Quit) {
+                    shared.shutdown_all();
                     event_loop.exit();
                 }
             }
             WindowEvent::Resized(size) => {
-                state.px = (size.width.max(1), size.height.max(1));
-                state.renderer.resize(state.px.0, state.px.1);
-                state.sync_layout();
+                win.px = (size.width.max(1), size.height.max(1));
+                win.renderer.resize(win.px.0, win.px.1);
+                win.sync_layout(shared);
             }
             WindowEvent::Focused(focused) => {
-                state.window_focused = focused;
+                win.window_focused = focused;
                 if focused {
                     // A focused window is never occluded. Focus events are the
                     // reliable reveal signal when an Occluded(false) got lost
                     // (e.g. around display sleep/unlock), so also clear the
                     // renderer's starve throttle before the repaint.
-                    state.occluded = false;
-                    state.renderer.surface_revealed();
-                    state.renderer.window().request_redraw();
+                    win.occluded = false;
+                    win.renderer.surface_revealed();
+                    win.renderer.window().request_redraw();
                 }
             }
             WindowEvent::Occluded(occluded) => {
-                state.occluded = occluded;
+                win.occluded = occluded;
                 if !occluded {
                     // Lift the renderer's starve throttle BEFORE requesting the
                     // reveal repaint, so it isn't swallowed by the holdoff.
-                    state.renderer.surface_revealed();
-                    state.renderer.window().request_redraw();
+                    win.renderer.surface_revealed();
+                    win.renderer.window().request_redraw();
                 }
             }
             WindowEvent::ModifiersChanged(mods) => {
-                state.modifiers = mods.state();
+                win.modifiers = mods.state();
                 // Releasing Ctrl+Opt hides the split drop-zone preview.
-                if !state.split_modifier_held() {
-                    state.clear_split_preview();
+                if !win.split_modifier_held() {
+                    win.clear_split_preview();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let sf = state.renderer.window().scale_factor();
-                state.cursor = (position.x / sf, position.y / sf);
+                let sf = win.renderer.window().scale_factor();
+                win.cursor = (position.x / sf, position.y / sf);
                 // Ctrl+Opt held → live split drop-zone preview over the hovered pane.
-                if state.split_modifier_held() {
-                    state.update_split_preview();
+                if win.split_modifier_held() {
+                    win.update_split_preview();
                     return;
                 }
-                if let Some((target, axis, last)) = state.divider_drag {
-                    let (x, y) = state.cursor;
+                if let Some((target, axis, last)) = win.divider_drag {
+                    let (x, y) = win.cursor;
                     let pos = if matches!(axis, Axis::Horizontal) {
                         x
                     } else {
                         y
                     };
-                    state.resize_pane_px(target, axis, pos - last);
-                    state.divider_drag = Some((target, axis, pos));
-                } else if state.tab_drag.is_some() {
-                    state.drag_tab_to(state.cursor.0);
-                } else if let Some(sid) = state.scrollbar_drag.clone() {
-                    state.scroll_to_at(&sid, state.cursor.1 as f32);
-                } else if state.selecting {
-                    let (x, y) = state.cursor;
-                    state.extend_selection(x, y);
+                    win.resize_pane_px(shared, target, axis, pos - last);
+                    win.divider_drag = Some((target, axis, pos));
+                } else if win.tab_drag.is_some() {
+                    win.drag_tab_to(shared, win.cursor.0);
+                } else if let Some(sid) = win.scrollbar_drag.clone() {
+                    win.scroll_to_at(shared, &sid, win.cursor.1 as f32);
+                } else if win.selecting {
+                    let (x, y) = win.cursor;
+                    win.extend_selection(x, y);
                 } else {
-                    let (x, y) = state.cursor;
+                    let (x, y) = win.cursor;
                     // Tab strip: track hover (highlight + "✕"); motion over the
                     // strip is chrome, not pane motion, so stop here.
-                    if state.update_tab_hover(x, y) {
+                    if win.update_tab_hover(x, y) {
                         return;
                     }
                     // Show a resize cursor over a divider, a pointer over a link
                     // (divider wins), else forward motion to mouse-aware apps.
-                    let over = state.divider_at(x, y).map(|(_, a)| a);
+                    let over = win.divider_at(x, y).map(|(_, a)| a);
                     let link = if over.is_none() {
-                        state.link_under_cursor()
+                        win.link_under_cursor()
                     } else {
                         None
                     };
-                    state
-                        .renderer
+                    win.renderer
                         .set_hovered_link(link.as_ref().map(|(sid, id, ..)| (sid.clone(), *id)));
                     let want = match (over, &link) {
                         (Some(Axis::Horizontal), _) => CursorIcon::EwResize,
@@ -619,20 +540,20 @@ impl ApplicationHandler<EmberEvent> for App {
                         (None, Some(_)) => CursorIcon::Pointer,
                         (None, None) => CursorIcon::Default,
                     };
-                    if state.pointer_cursor != want {
-                        state.pointer_cursor = want;
-                        state.renderer.window().set_cursor(want);
+                    if win.pointer_cursor != want {
+                        win.pointer_cursor = want;
+                        win.renderer.window().set_cursor(want);
                     }
                     if over.is_none() {
-                        state.forward_mouse_motion();
+                        win.forward_mouse_motion(shared);
                     }
                 }
             }
             // Cursor left the window — drop any tab hover so the highlight/"✕"
             // don't linger.
             WindowEvent::CursorLeft { .. } => {
-                state.renderer.set_hovered_tab(None);
-                state.renderer.set_hovered_link(None);
+                win.renderer.set_hovered_tab(None);
+                win.renderer.set_hovered_link(None);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Notch wheels scroll WHEEL_LINES per notch; trackpads report
@@ -642,10 +563,10 @@ impl ApplicationHandler<EmberEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => y * WHEEL_LINES as f32,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / CELL_HEIGHT,
                 };
-                state.wheel_accum += cells;
-                let lines = state.wheel_accum.trunc() as i32;
-                state.wheel_accum -= lines as f32;
-                state.wheel_scroll(lines);
+                win.wheel_accum += cells;
+                let lines = win.wheel_accum.trunc() as i32;
+                win.wheel_accum -= lines as f32;
+                win.wheel_scroll(shared, lines);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -653,44 +574,44 @@ impl ApplicationHandler<EmberEvent> for App {
                 ..
             } => match button {
                 MouseButton::Left => {
-                    let (x, y) = state.cursor;
+                    let (x, y) = win.cursor;
                     // A blocking confirm modal captures the click: a button
                     // resolves it, elsewhere is a no-op (stays modal).
-                    if state.pending_close.is_some() {
-                        if let Some(idx) = state.renderer.confirm_button_at(x as f32, y as f32) {
-                            if state.resolve_confirm(idx == 1) {
-                                state.shutdown_all();
+                    if win.pending_close.is_some() {
+                        if let Some(idx) = win.renderer.confirm_button_at(x as f32, y as f32) {
+                            if win.resolve_confirm(shared, idx == 1) {
+                                shared.shutdown_all();
                                 event_loop.exit();
                             }
                         }
-                    } else if let Some((target, axis)) = state.divider_at(x, y) {
+                    } else if let Some((target, axis)) = win.divider_at(x, y) {
                         let pos = if matches!(axis, Axis::Horizontal) {
                             x
                         } else {
                             y
                         };
-                        state.divider_drag = Some((target, axis, pos));
+                        win.divider_drag = Some((target, axis, pos));
                     } else {
-                        state.left_click();
+                        win.left_click(shared);
                     }
                 }
                 // Middle-click on a tab closes it (standard gesture); elsewhere
                 // it forwards to a mouse-aware app.
                 MouseButton::Middle => {
-                    let (x, y) = state.cursor;
-                    if let Some(TabHit::Tab(i)) = state.renderer.tab_hit(x as f32, y as f32) {
-                        if let Some(id) = state.tree.tabs.get(i).map(|t| t.id) {
-                            if state.request_close(PendingClose::Tab(id)) {
-                                state.shutdown_all();
+                    let (x, y) = win.cursor;
+                    if let Some(TabHit::Tab(i)) = win.renderer.tab_hit(x as f32, y as f32) {
+                        if let Some(id) = win.tree.tabs.get(i).map(|t| t.id) {
+                            if win.request_close(shared, PendingClose::Tab(id)) {
+                                shared.shutdown_all();
                                 event_loop.exit();
                             }
                         }
                     } else {
-                        state.forward_mouse_press(1);
+                        win.forward_mouse_press(shared, 1);
                     }
                 }
                 MouseButton::Right => {
-                    state.forward_mouse_press(2);
+                    win.forward_mouse_press(shared, 2);
                 }
                 _ => {}
             },
@@ -699,14 +620,17 @@ impl ApplicationHandler<EmberEvent> for App {
                 button,
                 ..
             } => {
-                state.forward_mouse_release(match button {
-                    MouseButton::Left => 0,
-                    MouseButton::Middle => 1,
-                    MouseButton::Right => 2,
-                    _ => 0,
-                });
+                win.forward_mouse_release(
+                    shared,
+                    match button {
+                        MouseButton::Left => 0,
+                        MouseButton::Middle => 1,
+                        MouseButton::Right => 2,
+                        _ => 0,
+                    },
+                );
                 if button == MouseButton::Left {
-                    state.left_release();
+                    win.left_release(shared);
                 }
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
@@ -715,39 +639,39 @@ impl ApplicationHandler<EmberEvent> for App {
                 }
                 // The Settings overlay is interactive — it handles its own keys
                 // (arrows / space / esc) rather than dismissing on any key.
-                if state.settings_open {
-                    state.settings_key(&key.logical_key);
+                if win.settings_open {
+                    win.settings_key(shared, &key.logical_key);
                     return;
                 }
                 // Inline tab rename captures typing, but NOT Cmd combos — those
                 // stay app shortcuts (Cmd+W must not insert "w"), so fall through
                 // to the Super branch below when Cmd is held.
-                if state.editing_tab.is_some() && !state.modifiers.super_key() {
-                    state.rename_key(&key.logical_key);
+                if win.editing_tab.is_some() && !win.modifiers.super_key() {
+                    win.rename_key(shared, &key.logical_key);
                     return;
                 }
                 // A running-process close confirmation (modal): Left/Right/Tab
                 // move focus, Enter activates it, Esc cancels. Auto-repeat is
                 // ignored so a held key can't confirm.
-                if state.pending_close.is_some() {
+                if win.pending_close.is_some() {
                     if !key.repeat {
                         match &key.logical_key {
                             Key::Named(NamedKey::Escape) => {
-                                state.resolve_confirm(false);
+                                win.resolve_confirm(shared, false);
                             }
                             Key::Named(NamedKey::Enter) => {
-                                let ok = state.confirm_focus == 1;
-                                if state.resolve_confirm(ok) {
-                                    state.shutdown_all();
+                                let ok = win.confirm_focus == 1;
+                                if win.resolve_confirm(shared, ok) {
+                                    shared.shutdown_all();
                                     event_loop.exit();
                                 }
                             }
                             Key::Named(
                                 NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::Tab,
                             ) => {
-                                state.confirm_focus ^= 1;
-                                state.update_confirm_view();
-                                state.renderer.window().request_redraw();
+                                win.confirm_focus ^= 1;
+                                win.update_confirm_view();
+                                win.renderer.window().request_redraw();
                             }
                             _ => {}
                         }
@@ -756,11 +680,11 @@ impl ApplicationHandler<EmberEvent> for App {
                 }
                 // Cmd+Q — quit (with confirmation if a command is running). Handled
                 // here so it exits regardless of tab count, unlike pane shortcuts.
-                if state.modifiers.super_key()
+                if win.modifiers.super_key()
                     && matches!(&key.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
                 {
-                    if state.request_close(PendingClose::Quit) {
-                        state.shutdown_all();
+                    if win.request_close(shared, PendingClose::Quit) {
+                        shared.shutdown_all();
                         event_loop.exit();
                     }
                     return;
@@ -770,21 +694,21 @@ impl ApplicationHandler<EmberEvent> for App {
                 // dismisses AND falls through so the keystroke still reaches the
                 // shell (typing `ls` at the help screen shouldn't eat the `l`).
                 // Auto-repeat is ignored so holding Cmd+/ can't close on open.
-                if state.help || state.about {
+                if win.help || win.about {
                     if key.repeat {
                         return;
                     }
-                    state.dismiss_overlay();
+                    win.dismiss_overlay();
                     let swallow = matches!(
                         &key.logical_key,
                         Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)
-                    ) || state.modifiers.super_key();
+                    ) || win.modifiers.super_key();
                     if swallow {
                         return;
                     }
                     // else: fall through and process this key normally.
                 }
-                let mods = state.modifiers;
+                let mods = win.modifiers;
                 if std::env::var_os("EMBER_DEBUG").is_some() {
                     eprintln!(
                         "[ember-key] {:?} super={} shift={} alt={} ctrl={}",
@@ -798,8 +722,10 @@ impl ApplicationHandler<EmberEvent> for App {
                 // Super (Cmd/Win) combos are multiplexer shortcuts — consumed, never
                 // forwarded to the shell.
                 if mods.super_key() {
-                    if state.handle_shortcut(&key.logical_key, mods) && state.tree.tabs.is_empty() {
-                        state.shutdown_all();
+                    if win.handle_shortcut(shared, &key.logical_key, mods)
+                        && win.tree.tabs.is_empty()
+                    {
+                        shared.shutdown_all();
                         event_loop.exit();
                     }
                     return;
@@ -815,7 +741,7 @@ impl ApplicationHandler<EmberEvent> for App {
                         _ => None,
                     };
                     if let Some(a) = amt {
-                        state.scroll_focused(a);
+                        win.scroll_focused(shared, a);
                         return;
                     }
                 }
@@ -826,15 +752,15 @@ impl ApplicationHandler<EmberEvent> for App {
                 // gnome-terminal's default.
                 #[cfg(target_os = "linux")]
                 if let Some(n) = alt_digit_tab(&key.logical_key, mods) {
-                    state.select_tab(n);
+                    win.select_tab(shared, n);
                     return;
                 }
                 // The GNOME-safe conventional chords (Ctrl+Shift+X, Alt+Shift+X)
                 // translate onto the same shortcut handler Super uses.
                 #[cfg(target_os = "linux")]
                 if let Some((k, m)) = linux_chord_translate(&key.logical_key, mods) {
-                    if state.handle_shortcut(&k, m) && state.tree.tabs.is_empty() {
-                        state.shutdown_all();
+                    if win.handle_shortcut(shared, &k, m) && win.tree.tabs.is_empty() {
+                        shared.shutdown_all();
                         event_loop.exit();
                     }
                     return;
@@ -842,15 +768,15 @@ impl ApplicationHandler<EmberEvent> for App {
                 // DECCKM from the focused pane; Option-as-Meta strips the
                 // macOS compose (Opt+b = "∫") back to the plain key for the
                 // ESC prefix. With the option off, composing wins (é, ñ).
-                let app_cursor = state.focused_app_cursor();
-                let alt_meta = mods.alt_key() && state.config.option_as_meta;
+                let app_cursor = win.focused_app_cursor();
+                let alt_meta = mods.alt_key() && shared.config.option_as_meta;
                 let logical = if alt_meta {
                     key.key_without_modifiers()
                 } else {
                     key.logical_key.clone()
                 };
                 if let Some(bytes) = encode_key(&logical, mods, app_cursor, alt_meta) {
-                    if let Some(h) = state.focused_session() {
+                    if let Some(h) = win.focused_session(shared) {
                         let _ = h
                             .control
                             .send(BackendControl::Input(bytes.into_boxed_slice()));
@@ -858,43 +784,43 @@ impl ApplicationHandler<EmberEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                state.drain_frames();
+                win.drain_frames(shared);
                 // Frame-timing for the FPS overlay: cadence (interval between
                 // redraws) + the render() call's own duration (the per-frame cost).
                 let now = Instant::now();
-                if let Some(last) = state.last_frame {
+                if let Some(last) = win.last_frame {
                     let dt = now.duration_since(last).as_secs_f32() * 1000.0;
-                    state.fps_ema_ms = if state.fps_ema_ms == 0.0 {
+                    win.fps_ema_ms = if win.fps_ema_ms == 0.0 {
                         dt
                     } else {
-                        state.fps_ema_ms * 0.9 + dt * 0.1
+                        win.fps_ema_ms * 0.9 + dt * 0.1
                     };
                 }
-                state.last_frame = Some(now);
-                if state.fps_overlay {
-                    let fps = if state.fps_ema_ms > 0.0 {
-                        1000.0 / state.fps_ema_ms
+                win.last_frame = Some(now);
+                if win.fps_overlay {
+                    let fps = if win.fps_ema_ms > 0.0 {
+                        1000.0 / win.fps_ema_ms
                     } else {
                         0.0
                     };
-                    state.renderer.set_fps_overlay(Some(format!(
+                    win.renderer.set_fps_overlay(Some(format!(
                         "{fps:.0} fps · {:.1} ms",
-                        state.render_ema_ms
+                        win.render_ema_ms
                     )));
                 }
                 let t = Instant::now();
-                match state.renderer.render() {
+                match win.renderer.render() {
                     // A drawable came through — the surface is ground truth, so
                     // whatever winit last said, we are visible.
                     RenderOutcome::Presented => {
-                        state.occluded = false;
-                        state.render_starved = false;
+                        win.occluded = false;
+                        win.render_starved = false;
                     }
                     // Surface lost/outdated: it was reconfigured but this frame
                     // never presented — repaint now, not at the next input.
                     RenderOutcome::Retry => {
-                        state.render_starved = false;
-                        state.renderer.window().request_redraw();
+                        win.render_starved = false;
+                        win.renderer.window().request_redraw();
                     }
                     // Starved (no drawable): do NOT re-request here — that loop
                     // is the  OOM spin — and do NOT latch state.occluded: a
@@ -903,13 +829,13 @@ impl ApplicationHandler<EmberEvent> for App {
                     // user clicked it. Durable occlusion state comes from winit's
                     // Occluded events; this flag makes about_to_wait retry on a
                     // bounded cadence instead.
-                    RenderOutcome::Starved => state.render_starved = true,
+                    RenderOutcome::Starved => win.render_starved = true,
                 }
                 let render_ms = t.elapsed().as_secs_f32() * 1000.0;
-                state.render_ema_ms = if state.render_ema_ms == 0.0 {
+                win.render_ema_ms = if win.render_ema_ms == 0.0 {
                     render_ms
                 } else {
-                    state.render_ema_ms * 0.9 + render_ms * 0.1
+                    win.render_ema_ms * 0.9 + render_ms * 0.1
                 };
             }
             _ => {}
@@ -917,11 +843,18 @@ impl ApplicationHandler<EmberEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(state) = self.state.as_mut() else {
+        let Some(shared) = self.shared.as_mut() else {
+            return;
+        };
+        let win = match self.focused_window {
+            Some(id) => self.windows.get_mut(&id),
+            None => None,
+        };
+        let Some(win) = win else {
             return;
         };
         // Drain the semantic lanes: focused-pane title, and any exited shells.
-        let focused = state.focused_session_id();
+        let focused = win.focused_session_id();
         let mut new_title: Option<String> = None;
         let mut exited: Vec<SessionId> = Vec::new();
         let mut belled: Vec<SessionId> = Vec::new();
@@ -932,7 +865,7 @@ impl ApplicationHandler<EmberEvent> for App {
         // (no UI surfaces it); tracked here anyway so the protocol is complete
         // and a future feature (tab title, triggers) can read it.
         let mut cwd_updates: Vec<(SessionId, String)> = Vec::new();
-        for (id, handle) in &state.sessions {
+        for (id, handle) in &shared.sessions {
             while let Ok(event) = handle.events.try_recv() {
                 match event {
                     BackendEvent::Title(t) => {
@@ -955,39 +888,41 @@ impl ApplicationHandler<EmberEvent> for App {
             }
         }
         for (id, title) in title_updates {
-            state.titles.insert(id, title);
+            shared.titles.insert(id, title);
         }
         // Drop titles for sessions that no longer exist.
-        state.titles.retain(|id, _| state.sessions.contains_key(id));
+        shared
+            .titles
+            .retain(|id, _| shared.sessions.contains_key(id));
         for (id, cwd) in cwd_updates {
-            state.cwd_by_session.insert(id, cwd);
+            shared.cwd_by_session.insert(id, cwd);
         }
-        state
+        shared
             .cwd_by_session
-            .retain(|id, _| state.sessions.contains_key(id));
+            .retain(|id, _| shared.sessions.contains_key(id));
         if let Some(text) = clipboard_set {
-            state.platform.set_clipboard(&text);
+            shared.platform.set_clipboard(&text);
         }
         if let Some(title) = new_title {
-            state.renderer.window().set_title(&title);
+            win.renderer.window().set_title(&title);
         }
         for session in exited {
-            state.close_session(&session);
+            win.close_session(shared, &session);
         }
         for session in belled {
-            state.on_bell(&session);
+            win.on_bell(shared, &session);
         }
         // Focus reporting (DEC 1004): tell sessions when their pane gains or
         // loses focus (pane switch, tab switch, window focus/blur).
-        let focus_now = if state.window_focused { focused } else { None };
-        if focus_now != state.focus_notified {
-            if let Some(old) = state.focus_notified.take() {
-                if let Some(h) = state.sessions.get(&old) {
+        let focus_now = if win.window_focused { focused } else { None };
+        if focus_now != shared.focus_notified {
+            if let Some(old) = shared.focus_notified.take() {
+                if let Some(h) = shared.sessions.get(&old) {
                     let _ = h.control.send(BackendControl::Focus(false));
                 }
             }
             if let Some(new) = &focus_now {
-                if let Some(h) = state.sessions.get(new) {
+                if let Some(h) = shared.sessions.get(new) {
                     let _ = h.control.send(BackendControl::Focus(true));
                 }
             }
@@ -995,45 +930,45 @@ impl ApplicationHandler<EmberEvent> for App {
             // hasn't set one) so a tab/pane switch never leaves a stale title.
             let title = focus_now
                 .as_ref()
-                .and_then(|id| state.titles.get(id).cloned())
+                .and_then(|id| shared.titles.get(id).cloned())
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| "Ember".to_string());
-            state.renderer.window().set_title(&title);
-            state.focus_notified = focus_now;
+            win.renderer.window().set_title(&title);
+            shared.focus_notified = focus_now;
         }
         // Drain debug-control commands (EMBER_CONTROL) and act on them.
-        let cmds: Vec<ControlMsg> = state
+        let cmds: Vec<ControlMsg> = shared
             .control_rx
             .as_ref()
             .map(|rx| rx.try_iter().collect())
             .unwrap_or_default();
         for cmd in cmds {
-            state.handle_control(cmd, event_loop);
+            win.handle_control(shared, cmd, event_loop);
         }
         // Native menu items (macOS) → semantic actions.
-        if let Some(action) = ember_platform::menu_action(&state.menu) {
+        if let Some(action) = ember_platform::menu_action(&shared.menu) {
             match action {
-                MenuAction::ShowShortcuts => state.toggle_help(),
-                MenuAction::About => state.toggle_about(),
-                MenuAction::Settings => state.toggle_settings(),
-                MenuAction::NewTab => state.new_tab(),
-                MenuAction::Copy => state.copy_selection(),
-                MenuAction::Paste => state.paste_clipboard(),
+                MenuAction::ShowShortcuts => win.toggle_help(),
+                MenuAction::About => win.toggle_about(),
+                MenuAction::Settings => win.toggle_settings(shared),
+                MenuAction::NewTab => win.new_tab(shared),
+                MenuAction::Copy => win.copy_selection(shared),
+                MenuAction::Paste => win.paste_clipboard(shared),
                 MenuAction::Close | MenuAction::Quit => {
                     let kind = if matches!(action, MenuAction::Quit) {
                         PendingClose::Quit
                     } else {
                         PendingClose::Pane
                     };
-                    if state.request_close(kind) {
-                        state.shutdown_all();
+                    if win.request_close(shared, kind) {
+                        shared.shutdown_all();
                         event_loop.exit();
                     }
                 }
             }
         }
-        if state.tree.tabs.is_empty() {
-            state.shutdown_all();
+        if win.tree.tabs.is_empty() {
+            shared.shutdown_all();
             event_loop.exit();
             return;
         }
@@ -1041,8 +976,8 @@ impl ApplicationHandler<EmberEvent> for App {
         // when someone can see it. While occluded, content-driven redraws would
         // re-enter frame prep at PTY rate for frames that can never present
         //; the grids still update here, and Occluded(false) repaints.
-        if state.drain_frames() && !state.occluded {
-            state.renderer.window().request_redraw();
+        if win.drain_frames(shared) && !win.occluded {
+            win.renderer.window().request_redraw();
         }
         // Pace animations by WALL-CLOCK elapsed since the last frame, checked here on
         // *every* wake (timer tick OR any event). Advancing off the timer's
@@ -1055,32 +990,32 @@ impl ApplicationHandler<EmberEvent> for App {
         // the window isn't winit-occluded: the renderer's StarveGate turns most
         // ticks into instant no-ops and allows a real attempt only every 250ms,
         // so a transiently starved frame self-heals without the  spin.
-        let starve_retry = state.render_starved && !state.occluded;
-        let frame = if state.about || state.fps_overlay || state.bell_flashing() {
+        let starve_retry = win.render_starved && !win.occluded;
+        let frame = if win.about || win.fps_overlay || win.bell_flashing() {
             ANIM_FRAME
-        } else if state.backdrop_animating() {
-            state.ember_frame()
+        } else if win.backdrop_animating(shared) {
+            shared.ember_frame()
         } else {
             ANIM_FRAME // starve retry (only reached when `animating` below)
         };
-        let animating = state.about
-            || state.fps_overlay
-            || state.bell_flashing()
-            || state.backdrop_animating()
+        let animating = win.about
+            || win.fps_overlay
+            || win.bell_flashing()
+            || win.backdrop_animating(shared)
             || starve_retry;
         if animating {
-            if now.duration_since(state.last_anim) >= frame {
-                state.last_anim = now;
-                state.advance_animations(now);
+            if now.duration_since(win.last_anim) >= frame {
+                win.last_anim = now;
+                win.advance_animations(shared, now);
                 // Animations advance on wall-clock regardless, but don't ask an
                 // occluded window to paint them (same  spin, slower burn).
-                if !state.occluded {
-                    state.renderer.window().request_redraw();
+                if !win.occluded {
+                    win.renderer.window().request_redraw();
                 }
             }
             // Fixed deadline relative to the last frame (not `now`), so incoming
             // events can't push it back indefinitely.
-            event_loop.set_control_flow(ControlFlow::WaitUntil(state.last_anim + frame));
+            event_loop.set_control_flow(ControlFlow::WaitUntil(win.last_anim + frame));
         } else {
             // Nothing animating: sleep until an event, a frame-lane wake, or a
             // control command wakes us — no more ~125 Hz idle polling.
@@ -1089,1613 +1024,21 @@ impl ApplicationHandler<EmberEvent> for App {
     }
 }
 
-impl RunState {
-    /// The **logical**-pixel rect available to the layout (full surface minus the
-    /// tab strip). `px` is physical; the renderer draws in logical units and scales
-    /// to physical by the HiDPI factor, so layout/dims must be logical too — else a
-    /// Retina shell gets 2× the columns it can show.
-    fn viewport(&self) -> Rect {
-        let sf = self.renderer.window().scale_factor();
-        let chrome = Renderer::chrome_height() as f64;
-        let w = self.px.0 as f64 / sf;
-        let h = self.px.1 as f64 / sf;
-        Rect::new(0.0, chrome, w.max(1.0), (h - chrome).max(1.0))
-    }
-
-    fn active_tab(&self) -> &Tab {
-        &self.tree.tabs[self.tree.active]
-    }
-
-    fn focused_session_id(&self) -> Option<SessionId> {
-        if self.tree.tabs.is_empty() {
-            return None;
-        }
-        let tab = self.active_tab();
-        tab.root.session_of(tab.focus).cloned()
-    }
-
-    fn focused_session(&self) -> Option<&BackendHandle> {
-        self.focused_session_id()
-            .and_then(|id| self.sessions.get(&id))
-    }
-
-    /// Scroll the focused pane's scrollback by `amount`. No-op on the alternate
-    /// screen (the projection gates it).
-    fn scroll_focused(&self, amount: ScrollAmount) {
-        if let Some(h) = self.focused_session() {
-            let _ = h.control.send(BackendControl::Scroll(amount));
-        }
-    }
-
-    /// Jump the focused pane to the previous (`-1`) / next (`+1`) OSC 133 prompt.
-    fn jump_prompt(&self, dir: i8) {
-        if let Some(h) = self.focused_session() {
-            let _ = h.control.send(BackendControl::JumpMark(dir));
-        }
-    }
-
-    /// Handle a mouse-wheel notch worth `lines` (positive = up, into history). On
-    /// the primary screen this scrolls history; in a full-screen app (alt screen)
-    /// with no mouse reporting it translates to arrow keys so `less`/`man`/`vim`
-    /// still page; with mouse reporting on we leave it alone (that path is a future
-    /// mouse-forwarding feature).
-    fn wheel_scroll(&self, lines: i32) {
-        if lines == 0 {
-            return;
-        }
-        // Scroll the pane under the pointer (every mainstream terminal), not
-        // the focused one; fall back to focused when hovering the chrome.
-        let Some(id) = self
-            .session_under_cursor()
-            .or_else(|| self.focused_session_id())
-        else {
-            return;
-        };
-        let m = self.renderer.pane_modes(&id);
-        let (alt, mouse) = (m.alt_screen, m.mouse_reporting);
-        // Mouse-aware app: the wheel is button 64 (up) / 65 (down), one report
-        // per line. Shift keeps the wheel local (scrollback), same as clicks.
-        if mouse && !self.modifiers.shift_key() {
-            let (x, y) = self.cursor;
-            if let Some((_, rect)) = self
-                .pane_rects
-                .iter()
-                .find(|(s, r)| {
-                    *s == id && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
-                })
-                .cloned()
-            {
-                let (cw, ch) = self.renderer.cell_size();
-                let col = ((x - rect.x) / cw as f64).max(0.0) as u16;
-                let row = ((y - rect.y) / ch as f64).max(0.0) as u16;
-                let btn = if lines > 0 { 64 } else { 65 } + self.mouse_mod_bits();
-                let mut bytes = Vec::new();
-                for _ in 0..lines.abs() {
-                    bytes.extend(Self::mouse_report_bytes(m.mouse.sgr, btn, col, row, true));
-                }
-                if let Some(h) = self.sessions.get(&id) {
-                    let _ = h
-                        .control
-                        .send(BackendControl::Input(bytes.into_boxed_slice()));
-                }
-                return;
-            }
-        }
-        let Some(h) = self.sessions.get(&id) else {
-            return;
-        };
-        if alt {
-            if mouse {
-                return;
-            }
-            // Alternate-scroll: wheel → Up/Down arrows (CSI form).
-            let (seq, count): (&[u8], i32) = if lines > 0 {
-                (b"\x1b[A", lines)
-            } else {
-                (b"\x1b[B", -lines)
-            };
-            let mut bytes = Vec::with_capacity(seq.len() * count as usize);
-            for _ in 0..count {
-                bytes.extend_from_slice(seq);
-            }
-            let _ = h
-                .control
-                .send(BackendControl::Input(bytes.into_boxed_slice()));
-        } else {
-            let _ = h
-                .control
-                .send(BackendControl::Scroll(ScrollAmount::Lines(lines)));
-        }
-    }
-
-    /// Spawn a shell-backed session and register its grid with the renderer.
-    /// On failure (stale `$SHELL`, fd exhaustion) the app must keep running:
-    /// report, flash the bell, and let the caller abort its layout change.
-    /// `cwd`: the directory to start in (design §8.1 — a new split inherits
-    /// the parent pane's OSC 1337 `CurrentDir`); `None` starts at the shell's
-    /// own default (a fresh tab, or the very first pane).
-    fn spawn_session(&mut self, id: SessionId, dims: GridDims, cwd: Option<String>) -> bool {
-        let mut cfg = LocalPtyConfig::new(id.clone(), dims);
-        cfg.shell_integration = self.config.shell_integration;
-        cfg.cwd = cwd.map(std::path::PathBuf::from);
-        let handle = match LocalPty::spawn(cfg) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("ember: failed to spawn shell: {e}");
-                self.bell_flash_since = Some(Instant::now());
-                self.renderer.set_bell_flash(bell_flash_intensity(0.0));
-                return false;
-            }
-        };
-        handle.frames.set_waker(self.wake.clone());
-        self.renderer.ensure_pane(&id, dims);
-        self.dims_cache.insert(id.clone(), dims);
-        self.sessions.insert(id, handle);
-        true
-    }
-
-    /// Tear down a session backend and forget its render/cache state.
-    fn kill_session(&mut self, id: &SessionId) {
-        if let Some(h) = self.sessions.remove(id) {
-            let _ = h.control.send(BackendControl::Shutdown);
-        }
-        self.renderer.remove_pane(id);
-        self.dims_cache.remove(id);
-    }
-
-    fn shutdown_all(&mut self) {
+impl Shared {
+    pub(crate) fn shutdown_all(&mut self) {
         for (_, h) in self.sessions.drain() {
             let _ = h.control.send(BackendControl::Shutdown);
         }
     }
 
-    /// Send raw bytes to the focused session's PTY (used by control + key paths).
-    fn send_to_focused(&self, bytes: Vec<u8>) {
-        if let Some(h) = self.focused_session() {
-            let _ = h
-                .control
-                .send(BackendControl::Input(bytes.into_boxed_slice()));
-        }
-    }
-
-    /// Act on a debug-control command (see `control`): inject text/keys, run a
-    /// chord, or reply with a JSON state dump.
-    fn handle_control(&mut self, msg: ControlMsg, event_loop: &ActiveEventLoop) {
-        // Route injected keys into the interactive Settings overlay (for tests),
-        // mirroring the real keyboard path.
-        if self.settings_open {
-            if let ControlMsg::Key(name) = &msg {
-                if let Some(k) = named_key(name) {
-                    self.settings_key(&k);
-                }
-                return;
-            }
-        }
-        // Mirror the keyboard: the close-confirm modal captures input (arrows/Tab
-        // move focus, Enter activates, Esc cancels).
-        if self.pending_close.is_some() {
-            if let ControlMsg::Key(name) = &msg {
-                match name.as_str() {
-                    "Escape" => {
-                        self.resolve_confirm(false);
-                    }
-                    "Enter" | "Return" => {
-                        let ok = self.confirm_focus == 1;
-                        if self.resolve_confirm(ok) {
-                            self.shutdown_all();
-                            event_loop.exit();
-                        }
-                    }
-                    "ArrowLeft" | "ArrowRight" | "Tab" => {
-                        self.confirm_focus ^= 1;
-                        self.update_confirm_view();
-                        self.renderer.window().request_redraw();
-                    }
-                    _ => {}
-                }
-            }
-            return;
-        }
-        // Mirror the keyboard: while a modal overlay is up, any input dismisses it
-        // (but state/screenshot still work, so the overlay can be inspected).
-        if self.help || self.about {
-            if let ControlMsg::Type(_) | ControlMsg::Key(_) | ControlMsg::Chord(_) = &msg {
-                self.dismiss_overlay();
-                return;
-            }
-        }
-        match msg {
-            ControlMsg::Type(text) => self.send_to_focused(text.into_bytes()),
-            ControlMsg::Key(name) => {
-                if let Some(key) = named_key(&name) {
-                    let app_cursor = self.focused_app_cursor();
-                    if let Some(bytes) =
-                        encode_key(&key, ModifiersState::empty(), app_cursor, false)
-                    {
-                        self.send_to_focused(bytes);
-                    }
-                }
-            }
-            ControlMsg::Chord(combo) => {
-                if let Some((key, mods)) = parse_chord(&combo) {
-                    #[cfg(target_os = "linux")]
-                    if let Some(n) = alt_digit_tab(&key, mods) {
-                        self.select_tab(n);
-                        return;
-                    }
-                    #[cfg(target_os = "linux")]
-                    if let Some((k, m)) = linux_chord_translate(&key, mods) {
-                        if self.handle_shortcut(&k, m) && self.tree.tabs.is_empty() {
-                            self.shutdown_all();
-                            event_loop.exit();
-                        }
-                        return;
-                    }
-                    if mods.super_key() {
-                        if self.handle_shortcut(&key, mods) && self.tree.tabs.is_empty() {
-                            self.shutdown_all();
-                            event_loop.exit();
-                        }
-                    } else if let Some(bytes) =
-                        encode_key(&key, mods, self.focused_app_cursor(), false)
-                    {
-                        self.send_to_focused(bytes);
-                    }
-                }
-            }
-            ControlMsg::State(reply) => {
-                let _ = reply.send(self.state_json());
-            }
-            ControlMsg::Focus(query, reply) => {
-                let titles: Vec<String> = self
-                    .tree
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| tab_display_title(&t.title, i))
-                    .collect();
-                let resp = match match_tab_title(&titles, &query) {
-                    Some(i) => {
-                        self.select_tab(i + 1);
-                        self.raise_window();
-                        serde_json::json!({"ok": true, "index": i + 1, "title": titles[i]})
-                            .to_string()
-                    }
-                    // Echo the titles we saw so a caller can debug its query
-                    // without a round of guesswork.
-                    None => serde_json::json!({
-                        "ok": false, "error": "no tab title matches", "titles": titles,
-                    })
-                    .to_string(),
-                };
-                let _ = reply.send(resp);
-            }
-            ControlMsg::Raise => self.raise_window(),
-            ControlMsg::Screenshot(path, reply) => {
-                let resp = match self.renderer.capture_to_png(std::path::Path::new(&path)) {
-                    Ok(()) => serde_json::json!({"ok": true, "path": path}).to_string(),
-                    Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
-                };
-                let _ = reply.send(resp);
-            }
-            ControlMsg::Click(x, y) => {
-                // Synthesize a full click: press half (selection/tab/scrollbar
-                // hit-testing, arms `pressed_link`) then release half (drag
-                // teardown + the link click-to-open decision) — a bare
-                // `left_click()` can never reach `open_path`, since that only
-                // fires on release.
-                self.cursor = (x, y);
-                self.left_click();
-                self.left_release();
-            }
-            ControlMsg::About => self.toggle_about(),
-            ControlMsg::Settings => self.toggle_settings(),
-            ControlMsg::Select(r1, c1, r2, c2, mode) => {
-                let Some(sid) = self.focused_session_id() else {
-                    return;
-                };
-                let mode = match mode.as_str() {
-                    "word" => SelectionMode::Word,
-                    "line" => SelectionMode::Line,
-                    _ => SelectionMode::Simple,
-                };
-                let mut s = Selection::new(Point::new(r1, c1), mode);
-                s.update(Point::new(r2, c2));
-                self.sel = Some((sid, s));
-                self.renderer.set_selection(self.sel.clone());
-            }
-            ControlMsg::Copy => self.copy_selection(),
-            ControlMsg::Paste(text) => self.paste_into_focused(&text),
-            ControlMsg::Fps => self.toggle_fps(),
-            ControlMsg::Scroll(amount) => self.scroll_focused(amount),
-            ControlMsg::Bell(tab) => {
-                // `Some(i)` = a specific tab's first session; `None` = focused pane.
-                let session = match tab {
-                    Some(i) => self
-                        .tree
-                        .tabs
-                        .get(i)
-                        .and_then(|t| t.root.leaves().into_iter().next().map(|(_, s)| s)),
-                    None => self.focused_session_id(),
-                };
-                if let Some(s) = session {
-                    self.on_bell(&s);
-                }
-            }
-            ControlMsg::ReorderTab(from, to) => {
-                let vp = self.viewport();
-                apply(&mut self.tree, LayoutCommand::MoveTab { from, to }, vp);
-                self.sync_layout();
-            }
-            ControlMsg::RenameTab(i, name) => {
-                if let Some(t) = self.tree.tabs.get(i) {
-                    let id = t.id;
-                    let vp = self.viewport();
-                    apply(
-                        &mut self.tree,
-                        LayoutCommand::RenameTab {
-                            tab: id,
-                            title: name,
-                        },
-                        vp,
-                    );
-                    self.sync_layout();
-                }
-            }
-            ControlMsg::EditTab(i) => self.start_rename(i),
-        }
-    }
-
-    /// A JSON snapshot of the live app for the debug control surface: scale,
-    /// surface size, tabs, and the active tab's panes (dims/cursor/styles/text).
-    fn state_json(&self) -> String {
-        let sf = self.renderer.window().scale_factor();
-        let tab = self.active_tab();
-        let focus = tab.focus;
-        let panes: Vec<serde_json::Value> = tab
-            .root
-            .leaves()
-            .iter()
-            .map(|(pane, sess)| {
-                let snap = self.renderer.pane_snapshot(sess);
-                serde_json::json!({
-                    "session": sess.0,
-                    "pane": pane.0,
-                    "focused": *pane == focus,
-                    "dims": snap.as_ref().map(|s| serde_json::json!([s.cols, s.rows])),
-                    "cursor": snap.as_ref().map(|s| serde_json::json!({
-                        "row": s.cursor_row, "col": s.cursor_col, "visible": s.cursor_visible,
-                    })),
-                    "styles_known": snap.as_ref().map(|s| s.styles_known),
-                    "text": snap.as_ref().map(|s| s.text.clone()),
-                })
-            })
-            .collect();
-        let bracketed = self
-            .focused_session_id()
-            .and_then(|id| self.bracketed.get(&id).copied())
-            .unwrap_or(false);
-        // Every tab, not just the active one — external tools map a name to a
-        // tab index with this (`index` is 1-based, matching `cmd+N` and
-        // `ctl focus`). `title` is the strip's displayed title, same rule.
-        let tabs: Vec<serde_json::Value> = self
-            .tree
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let sessions: Vec<String> =
-                    t.root.leaves().iter().map(|(_, s)| s.0.clone()).collect();
-                serde_json::json!({
-                    "index": i + 1,
-                    "active": i == self.tree.active,
-                    "title": tab_display_title(&t.title, i),
-                    "sessions": sessions,
-                })
-            })
-            .collect();
-        serde_json::json!({
-            "scale_factor": sf,
-            "surface": [self.px.0, self.px.1],
-            "tabs": tabs,
-            "active_tab": self.tree.active,
-            "focus_pane": focus.0,
-            "bracketed_paste": bracketed,
-            "panes": panes,
-        })
-        .to_string()
-    }
-
-    /// Run the `KillSession` side effects of an applied command (the layout tree is
-    /// already mutated; spawns/resizes are handled by the caller + `sync_layout`).
-    fn apply_effects(&mut self, effects: Vec<LayoutEffect>) {
-        for effect in effects {
-            if let LayoutEffect::KillSession(id) = effect {
-                self.kill_session(&id);
-            }
-        }
-    }
-
-    /// Recompute the active tab's tiling, hand it to the renderer, and resize each
-    /// session's PTY whose grid dims changed. Idempotent; the single source of
-    /// truth for "what's on screen and how big each shell is."
-    fn sync_layout(&mut self) {
-        if self.tree.tabs.is_empty() {
-            return;
-        }
-        let vp = self.viewport();
-        let (cw, ch) = self.renderer.cell_size();
-        let tab = self.active_tab();
-        let focus_pane = tab.focus;
-        let sessions: HashMap<PaneId, SessionId> = tab.root.leaves().into_iter().collect();
-        let rects = layout(&tab.root, vp);
-
-        let mut visible = Vec::with_capacity(rects.len());
-        let mut focused_session: Option<SessionId> = None;
-        let mut resizes: Vec<(SessionId, GridDims)> = Vec::new();
-        for (pane, outer) in rects {
-            let Some(session) = sessions.get(&pane).cloned() else {
-                continue;
-            };
-            let inner = inset(outer, PAD as f64);
-            let dims = dims_for_rect(inner, cw, ch);
-            resizes.push((session.clone(), dims));
-            if pane == focus_pane {
-                focused_session = Some(session.clone());
-            }
-            visible.push(VisiblePane {
-                session,
-                rect: inner,
-            });
-        }
-
-        for (session, dims) in resizes {
-            if self.dims_cache.get(&session) != Some(&dims) {
-                if let Some(h) = self.sessions.get(&session) {
-                    let _ = h.control.send(BackendControl::Resize(dims));
-                }
-                self.dims_cache.insert(session, dims);
-            }
-        }
-
-        let active = self.tree.active;
-        let editing_tab = self.editing_tab;
-        // Becoming the active tab clears its unseen-bell indicator.
-        if let Some(id) = self.tree.tabs.get(active).map(|t| t.id) {
-            self.belled_tabs.remove(&id);
-        }
-        let belled = &self.belled_tabs;
-        let tabs: Vec<TabLabel> = self
-            .tree
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let editing = editing_tab == Some(i);
-                TabLabel {
-                    title: if editing {
-                        self.edit_buffer.clone()
-                    } else {
-                        tab_display_title(&t.title, i)
-                    },
-                    active: i == active,
-                    editing,
-                    bell: belled.contains(&t.id),
-                }
-            })
-            .collect();
-
-        let focused = focused_session.unwrap_or_else(|| visible[0].session.clone());
-        self.pane_rects = visible
-            .iter()
-            .map(|vp| (vp.session.clone(), vp.rect))
-            .collect();
-        self.renderer.set_visible(visible, focused, tabs);
-        self.renderer.window().request_redraw();
-    }
-
-    /// Poll every session's pixel lane into its grid. Returns whether anything
-    /// changed (background tabs stay current so they're right when re-shown).
-    fn drain_frames(&mut self) -> bool {
-        let mut dirty = false;
-        for (id, handle) in &self.sessions {
-            while let Some(delta) = handle.frames.take() {
-                self.bracketed.insert(id.clone(), delta.bracketed_paste);
-                self.renderer.apply_delta(id, delta);
-                dirty = true;
-            }
-        }
-        dirty
-    }
-
-    /// Send `text` to the focused pane as a paste: when that session enabled
-    /// bracketed paste, wrap it in `ESC[200~`…`ESC[201~` (stripping any embedded
-    /// markers first — see [`bracket_paste`]); otherwise send it raw.
-    fn paste_into_focused(&self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let bracketed = self
-            .focused_session_id()
-            .and_then(|id| self.bracketed.get(&id).copied())
-            .unwrap_or(false);
-        self.send_to_focused(bracket_paste(text, bracketed));
-    }
-
-    /// Handle a Super-modified key as a multiplexer command. Returns whether it was
-    /// a recognized shortcut (so the caller can check for an emptied tree → quit).
-    fn handle_shortcut(&mut self, key: &Key, mods: ModifiersState) -> bool {
-        match key {
-            // Cmd+/ — show the cheat-sheet overlay (any key dismisses). macOS
-            // reserves Cmd+? (Cmd+Shift+/) for the system Help menu and never
-            // delivers it, so Cmd+/ is the real binding; "?" is accepted too in
-            // case a layout delivers it.
-            Key::Character(s) if s.as_str() == "/" || s.as_str() == "?" => {
-                self.toggle_help();
-                true
-            }
-            // Cmd+, — Settings (the macOS Preferences convention; also a menu item).
-            Key::Character(s) if s.as_str() == "," => {
-                self.toggle_settings();
-                true
-            }
-            // Cmd+[ / Cmd+] — jump to previous / next command prompt (OSC 133).
-            Key::Character(s) if s.as_str() == "[" => {
-                self.jump_prompt(-1);
-                true
-            }
-            Key::Character(s) if s.as_str() == "]" => {
-                self.jump_prompt(1);
-                true
-            }
-            // Cmd+Shift+P — toggle the FPS / frame-time debug overlay.
-            Key::Character(s) if s.eq_ignore_ascii_case("p") && mods.shift_key() => {
-                self.toggle_fps();
-                true
-            }
-            // Cmd+C — copy the current selection (macOS clipboard convention;
-            // Ctrl+C remains SIGINT to the shell). Cmd+V — paste.
-            Key::Character(s) if s.eq_ignore_ascii_case("c") => {
-                self.copy_selection();
-                true
-            }
-            Key::Character(s) if s.eq_ignore_ascii_case("v") => {
-                self.paste_clipboard();
-                true
-            }
-            // Cmd+D / Cmd+Shift+D — split the focused pane side-by-side / stacked.
-            Key::Character(s) if s.eq_ignore_ascii_case("d") => {
-                let axis = if mods.shift_key() {
-                    Axis::Vertical
-                } else {
-                    Axis::Horizontal
-                };
-                self.split_focused(axis);
-                true
-            }
-            // Cmd+W — close the focused pane (and its tab if it was the last),
-            // confirming first if it's running a command. The caller's
-            // tabs-empty check still handles quit-on-last-pane for the
-            // no-confirm path; a deferred confirm leaves tabs intact.
-            Key::Character(s) if s.eq_ignore_ascii_case("w") => {
-                self.request_close(PendingClose::Pane);
-                true
-            }
-            // Cmd+T — open a new tab with a fresh shell.
-            Key::Character(s) if s.eq_ignore_ascii_case("t") => {
-                self.new_tab();
-                true
-            }
-            // Cmd+0 — reset the font size to the config baseline.
-            Key::Character(s) if s.as_str() == "0" => {
-                self.zoom_to(self.config.font.size);
-                true
-            }
-            // Cmd+= / Cmd++ — zoom in; Cmd+- / Cmd+_ — zoom out (1pt steps).
-            Key::Character(s) if s.as_str() == "=" || s.as_str() == "+" => {
-                self.zoom_by(1.0);
-                true
-            }
-            Key::Character(s) if s.as_str() == "-" || s.as_str() == "_" => {
-                self.zoom_by(-1.0);
-                true
-            }
-            // Cmd+1..9 — jump straight to a tab (Option/Alt is awkward on macOS, so
-            // tab + pane navigation avoid it entirely).
-            Key::Character(s) if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() => {
-                if let Some(n) = s.chars().next().and_then(|c| c.to_digit(10)) {
-                    self.select_tab(n as usize);
-                }
-                true
-            }
-            // Cmd+Shift+Arrows — cycle the active tab. (Checked before the plain
-            // arrows so Shift wins.)
-            Key::Named(NamedKey::ArrowRight) if mods.shift_key() => self.cycle_tab(1),
-            Key::Named(NamedKey::ArrowLeft) if mods.shift_key() => self.cycle_tab(-1),
-            // Cmd+Ctrl+Arrows — resize the focused pane (grow toward the arrow).
-            Key::Named(NamedKey::ArrowRight) if mods.control_key() => {
-                self.resize_focused(Axis::Horizontal, 1.0)
-            }
-            Key::Named(NamedKey::ArrowLeft) if mods.control_key() => {
-                self.resize_focused(Axis::Horizontal, -1.0)
-            }
-            Key::Named(NamedKey::ArrowDown) if mods.control_key() => {
-                self.resize_focused(Axis::Vertical, 1.0)
-            }
-            Key::Named(NamedKey::ArrowUp) if mods.control_key() => {
-                self.resize_focused(Axis::Vertical, -1.0)
-            }
-            // Cmd+Arrows — move focus geometrically between panes.
-            Key::Named(NamedKey::ArrowLeft) => self.focus_dir(Direction::Left),
-            Key::Named(NamedKey::ArrowRight) => self.focus_dir(Direction::Right),
-            Key::Named(NamedKey::ArrowUp) => self.focus_dir(Direction::Up),
-            Key::Named(NamedKey::ArrowDown) => self.focus_dir(Direction::Down),
-            _ => false,
-        }
-    }
-
-    fn split_focused(&mut self, axis: Axis) {
-        self.split_pane(self.active_tab().focus, axis, 0.5);
-    }
-
-    /// Split `target` on `axis` at `ratio` (existing pane's fraction), spawning a
-    /// fresh shell in the new pane (right/bottom). Shared by Cmd+D + the visual split.
-    /// Minimum pane extent (px) along `axis`, from a floor of cells + padding —
-    /// the value core clamps splits/resizes against (metrics live app-side).
-    fn min_px(&self, axis: Axis) -> f64 {
-        const MIN_COLS: f32 = 8.0;
-        const MIN_ROWS: f32 = 3.0;
-        let (cw, ch) = self.renderer.cell_size();
-        let px = match axis {
-            Axis::Horizontal => MIN_COLS * cw + 2.0 * PAD,
-            Axis::Vertical => MIN_ROWS * ch + 2.0 * PAD,
-        };
-        px as f64
-    }
-
-    fn split_pane(&mut self, target: PaneId, axis: Axis, ratio: f64) {
-        let new_pane = PaneId(self.next_pane);
-        let new_session = SessionId::new(format!("s{}", self.next_session));
-        // Cwd-inheriting split (design §8.1): the new pane starts where the
-        // split's parent pane last reported itself (OSC 1337 `CurrentDir`).
-        let inherited_cwd = self
-            .active_tab()
-            .root
-            .session_of(target)
-            .and_then(|sid| self.cwd_by_session.get(sid))
-            .cloned();
-        let vp = self.viewport();
-        let min_px = self.min_px(axis);
-        // Spawn only if the split is actually accepted (min-size may refuse it),
-        // so a refused split never leaks a shell. Probe by applying first, then
-        // spawn on success — apply is pure and the session isn't wired yet.
-        let effects = apply(
-            &mut self.tree,
-            LayoutCommand::SplitPane {
-                target,
-                axis,
-                ratio,
-                new_pane,
-                new_session: new_session.clone(),
-                min_px,
-            },
-            vp,
-        );
-        if effects.is_empty() {
-            return; // refused (pane too small) — nothing spawned, nothing to undo
-        }
-        self.next_pane += 1;
-        self.next_session += 1;
-        if !self.spawn_session(
-            new_session,
-            GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
-            inherited_cwd,
-        ) {
-            // Spawn failed after the tree accepted the split: roll the pane back
-            // out so we don't render a dead pane.
-            let vp = self.viewport();
-            let rollback = apply(
-                &mut self.tree,
-                LayoutCommand::ClosePane { target: new_pane },
-                vp,
-            );
-            self.apply_effects(rollback);
-            self.sync_layout();
-            return;
-        }
-        self.apply_effects(effects);
-        self.sync_layout();
-    }
-
-    /// Whether Ctrl+Opt is currently held (the visual-split modifier).
-    fn split_modifier_held(&self) -> bool {
-        self.modifiers.control_key() && self.modifiers.alt_key()
-    }
-
-    /// DECCKM state of the focused pane (drives arrow/Home/End encoding).
-    fn focused_app_cursor(&self) -> bool {
-        self.focused_session_id()
-            .map(|id| self.renderer.pane_modes(&id).app_cursor)
-            .unwrap_or(false)
-    }
-
-    /// The pane under the mouse cursor, if any.
-    fn session_under_cursor(&self) -> Option<SessionId> {
-        let (x, y) = self.cursor;
-        self.pane_rects
-            .iter()
-            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-            .map(|(s, _)| s.clone())
-    }
-
-    /// Recompute the Ctrl+Opt split drop-zone preview from the cursor over a pane:
-    /// nearer the right edge → side-by-side (new pane right), nearer the bottom →
-    /// stacked (new pane below); the divider follows the cursor for the ratio.
-    fn update_split_preview(&mut self) {
-        let (x, y) = self.cursor;
-        let hit = self
-            .pane_rects
-            .iter()
-            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-            .map(|(s, r)| (s.clone(), *r));
-        let Some((sid, rect)) = hit else {
-            self.clear_split_preview();
-            return;
-        };
-        let fx = ((x - rect.x) / rect.width).clamp(0.0, 1.0) as f32;
-        let fy = ((y - rect.y) / rect.height).clamp(0.0, 1.0) as f32;
-        let horizontal = fx >= fy; // closer to the right edge than the bottom
-        let ratio = if horizontal { fx } else { fy }.clamp(0.1, 0.9);
-        let pane = self
-            .active_tab()
-            .root
-            .leaves()
-            .into_iter()
-            .find(|(_, s)| *s == sid)
-            .map(|(p, _)| p);
-        let Some(pane) = pane else {
-            self.clear_split_preview();
-            return;
-        };
-        self.renderer
-            .set_split_preview(Some((sid, horizontal, ratio)));
-        self.split_preview = Some(SplitPreview {
-            pane,
-            horizontal,
-            ratio,
-        });
-    }
-
-    /// Clear the split preview (modifier released / cursor left the panes).
-    fn clear_split_preview(&mut self) {
-        if self.split_preview.take().is_some() {
-            self.renderer.set_split_preview(None);
-        }
-    }
-
-    fn close_focused(&mut self) {
-        let target = self.active_tab().focus;
-        let vp = self.viewport();
-        let effects = apply(&mut self.tree, LayoutCommand::ClosePane { target }, vp);
-        self.apply_effects(effects);
-        if !self.tree.tabs.is_empty() {
-            self.sync_layout();
-        }
-    }
-
-    fn new_tab(&mut self) {
-        let id = TabId(self.next_tab);
-        self.next_tab += 1;
-        let pane = PaneId(self.next_pane);
-        self.next_pane += 1;
-        let session = SessionId::new(format!("s{}", self.next_session));
-        self.next_session += 1;
-        // Design §8.1 scopes cwd inheritance to splits, not new tabs — a new
-        // tab starts at the shell's own default, same as today.
-        if !self.spawn_session(
-            session.clone(),
-            GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
-            None,
-        ) {
-            return;
-        }
-        let vp = self.viewport();
-        let effects = apply(
-            &mut self.tree,
-            LayoutCommand::NewTab { id, session, pane },
-            vp,
-        );
-        self.apply_effects(effects);
-        self.sync_layout();
-    }
-
-    /// Keyboard resize of the focused pane: `dir` (±1) grows/shrinks it by a few
-    /// cells along `axis` (key-repeat makes it fast). Core takes a px delta.
-    fn resize_focused(&mut self, axis: Axis, dir: f64) -> bool {
-        let (cw, ch) = self.renderer.cell_size();
-        let step = 3.0
-            * if matches!(axis, Axis::Horizontal) {
-                cw
-            } else {
-                ch
-            } as f64;
-        let target = self.active_tab().focus;
-        self.resize_pane_px(target, axis, dir * step);
-        true
-    }
-
-    /// Resize the split enclosing `target` along `axis` by `delta` px. Shared by
-    /// keyboard resize and mouse divider drag. Core clamps against `min_px`.
-    fn resize_pane_px(&mut self, target: PaneId, axis: Axis, delta: f64) {
-        let vp = self.viewport();
-        let min_px = self.min_px(axis);
-        apply(
-            &mut self.tree,
-            LayoutCommand::ResizePane {
-                target,
-                axis,
-                delta,
-                min_px,
-            },
-            vp,
-        );
-        self.sync_layout();
-    }
-
-    /// The split divider under logical `(x, y)`, as `(a-side pane, axis)`, when
-    /// the cursor is in the gap between two adjacent panes. `None` otherwise.
-    fn divider_at(&self, x: f64, y: f64) -> Option<(PaneId, Axis)> {
-        let leaves: HashMap<SessionId, PaneId> = self
-            .active_tab()
-            .root
-            .leaves()
-            .into_iter()
-            .map(|(p, s)| (s, p))
-            .collect();
-        let grab = PAD as f64 + 3.0; // gap half-width + a little slop
-        let gap = 2.0 * PAD as f64; // inner-rect gap between adjacent panes
-        for (sid, r) in &self.pane_rects {
-            let right = r.x + r.width;
-            let bottom = r.y + r.height;
-            // Vertical divider on this pane's right edge (a neighbor abuts it).
-            if (x - right).abs() <= grab
-                && y >= r.y
-                && y < r.y + r.height
-                && self.pane_rects.iter().any(|(_, o)| {
-                    (o.x - (right + gap)).abs() <= grab && y >= o.y && y < o.y + o.height
-                })
-            {
-                if let Some(&p) = leaves.get(sid) {
-                    return Some((p, Axis::Horizontal));
-                }
-            }
-            // Horizontal divider on this pane's bottom edge.
-            if (y - bottom).abs() <= grab
-                && x >= r.x
-                && x < r.x + r.width
-                && self.pane_rects.iter().any(|(_, o)| {
-                    (o.y - (bottom + gap)).abs() <= grab && x >= o.x && x < o.x + o.width
-                })
-            {
-                if let Some(&p) = leaves.get(sid) {
-                    return Some((p, Axis::Vertical));
-                }
-            }
-        }
-        None
-    }
-
-    fn focus_dir(&mut self, dir: Direction) -> bool {
-        let vp = self.viewport();
-        let effects = apply(&mut self.tree, LayoutCommand::FocusDir { dir }, vp);
-        self.apply_effects(effects);
-        self.sync_layout();
-        true
-    }
-
-    fn cycle_tab(&mut self, delta: isize) -> bool {
-        let n = self.tree.tabs.len();
-        if n > 1 {
-            let cur = self.tree.active as isize;
-            self.tree.active = (cur + delta).rem_euclid(n as isize) as usize;
-            self.sync_layout();
-        }
-        true
-    }
-
-    /// Show the keyboard cheat-sheet overlay (closing other overlays — exclusive).
-    fn show_help(&mut self) {
-        self.hide_about();
-        self.hide_settings();
-        self.help = true;
-        self.renderer.set_help(Some(help_lines()));
-    }
-
-    /// Track which tab the cursor is over, driving the hover highlight + "✕"
-    /// close affordance. Returns `true` when the cursor is over the tab strip, so
-    /// the caller treats the motion as chrome (not pane) input. Also clears a
-    /// stale resize cursor when moving off a divider onto the strip.
-    fn update_tab_hover(&mut self, x: f64, y: f64) -> bool {
-        let hit = self.renderer.tab_hit(x as f32, y as f32);
-        match hit {
-            Some(TabHit::Tab(i)) | Some(TabHit::CloseTab(i)) => {
-                self.renderer.set_hovered_tab(Some(i))
-            }
-            _ => self.renderer.set_hovered_tab(None),
-        }
-        let on_strip = hit.is_some();
-        if on_strip {
-            // Moving onto the tab strip is chrome, not pane input, so the
-            // `CursorMoved` else-branch below never runs to refresh these —
-            // clear a stale resize/link cursor and hover highlight here.
-            self.renderer.set_hovered_link(None);
-            if self.pointer_cursor != CursorIcon::Default {
-                self.pointer_cursor = CursorIcon::Default;
-                self.renderer.window().set_cursor(CursorIcon::Default);
-            }
-        }
-        on_strip
-    }
-
-    /// Handle a left click at the current cursor position: dismiss an open overlay,
-    /// else hit-test the tab strip (switch tab / close a tab / open a new tab).
-    /// Mouse-up half of a left click: drag/selection teardown, plus the
-    /// click-to-open decision for a link (same link + same cell as the press,
-    /// so drags still select instead of opening). Split out of the winit
-    /// `MouseInput { state: Released, .. }` handler so the control socket's
-    /// `ctl click` can synthesize a full press+release pair.
-    fn left_release(&mut self) {
-        self.tab_drag = None;
-        self.renderer.set_tab_drag(None);
-        let was_selecting = self.selecting;
-        self.selecting = false;
-        self.scrollbar_drag = None;
-        self.divider_drag = None;
-        // A plain click (no drag) clears the selection rather than leaving a
-        // one-cell one — see click_selection_should_clear.
-        if was_selecting && click_selection_should_clear(self.sel.as_ref().map(|(_, s)| s)) {
-            self.clear_selection();
-        }
-        if let Some((psid, pid, prow, pcol)) = self.pressed_link.take() {
-            if let Some((sid, id, url, row, col)) = self.link_under_cursor() {
-                if sid == psid && id == pid && row == prow && col == pcol {
-                    if url_is_openable(&url) {
-                        self.platform.open_path(&url);
-                    } else {
-                        eprintln!("[ember] refusing to open non-http(s) url");
-                    }
-                }
-            }
-        }
-    }
-
-    fn left_click(&mut self) {
-        // A click on an About-overlay link button (Docs/GitHub) opens the URL
-        // rather than dismissing the overlay.
-        if self.about {
-            let (x, y) = self.cursor;
-            if let Some(url) = self.renderer.about_link_at(x as f32, y as f32) {
-                self.platform.open_path(url);
-                return;
-            }
-        }
-        if self.dismiss_overlay() {
-            return;
-        }
-        // A click while the Ctrl+Opt split preview is up commits that split.
-        if let Some(p) = self.split_preview.take() {
-            self.renderer.set_split_preview(None);
-            let axis = if p.horizontal {
-                Axis::Horizontal
-            } else {
-                Axis::Vertical
-            };
-            self.split_pane(p.pane, axis, p.ratio as f64);
-            return;
-        }
-        // Any click commits an in-progress tab rename first.
-        let was_editing = self.editing_tab.is_some();
-        self.commit_rename();
-        let (x, y) = self.cursor;
-        if let Some(hit) = self.renderer.tab_hit(x as f32, y as f32) {
-            match hit {
-                TabHit::Tab(i) => {
-                    // Second click on the same tab (and we weren't just committing a
-                    // rename) → inline rename; otherwise select it + arm a drag.
-                    let now = Instant::now();
-                    let dbl = !was_editing
-                        && self
-                            .last_tab_click
-                            .is_some_and(|(t, ti)| ti == i && now.duration_since(t) < MULTI_CLICK);
-                    self.last_tab_click = Some((now, i));
-                    if dbl {
-                        self.start_rename(i);
-                    } else {
-                        self.select_tab(i + 1);
-                        self.tab_drag = Some(TabDrag {
-                            tab: i,
-                            press_x: x,
-                            active: false,
-                        });
-                    }
-                }
-                TabHit::CloseTab(i) => {
-                    // The "✕" only renders with ≥2 tabs, so closing one never
-                    // empties the app (no exit path needed). Same close flow as
-                    // middle-click: confirm-if-busy via request_close.
-                    if let Some(id) = self.tree.tabs.get(i).map(|t| t.id) {
-                        let _ = self.request_close(PendingClose::Tab(id));
-                    }
-                }
-                TabHit::NewTab => self.new_tab(),
-                TabHit::Help => self.toggle_help(),
-                TabHit::Settings => self.toggle_settings(),
-            }
-            return;
-        }
-        // A click on a pane scrollbar grabs the thumb (priority over selection),
-        // and jumps to the clicked position.
-        if let Some(sid) = self.renderer.scrollbar_hit(x as f32, y as f32) {
-            self.scrollbar_drag = Some(sid.clone());
-            self.scroll_to_at(&sid, y as f32);
-            return;
-        }
-        // Remember a press that lands on a link; the open decision is made on
-        // release (click = same link + same cell, so drags still select).
-        self.pressed_link = self
-            .link_under_cursor()
-            .map(|(sid, id, _, row, col)| (sid, id, row, col));
-        if let Some((sid, ..)) = &self.pressed_link {
-            // In a mouse-reporting pane this press was claimed via the open
-            // modifier — consume it so the app doesn't also react to it.
-            if self.renderer.pane_modes(sid).mouse_reporting {
-                return;
-            }
-        }
-        // Mouse-aware app (vim :set mouse=a, htop): forward the click instead
-        // of selecting — unless Shift is held, the universal local-selection
-        // escape hatch.
-        if self.forward_mouse_press(0) {
-            return;
-        }
-        // A click in a pane body starts a selection (mode by click count).
-        self.begin_selection(x, y);
-    }
-
-    /// Encode one xterm mouse report. SGR (1006) when the app enabled it, else
-    /// legacy X10 bytes (coordinates clamped to its 223 limit).
-    fn mouse_report_bytes(sgr: bool, btn: u8, col: u16, row: u16, press: bool) -> Vec<u8> {
-        if sgr {
-            format!(
-                "\x1b[<{btn};{};{}{}",
-                col + 1,
-                row + 1,
-                if press { 'M' } else { 'm' }
-            )
-            .into_bytes()
-        } else {
-            // X10 has no release button id — releases send 3.
-            let b = if press { btn } else { 3 };
-            let cx = (col + 1).min(223) as u8 + 32;
-            let cy = (row + 1).min(223) as u8 + 32;
-            vec![0x1b, b'[', b'M', 32 + b, cx, cy]
-        }
-    }
-
-    /// The pane under the pointer + the cell the pointer is over, when that
-    /// pane has mouse reporting enabled and Shift isn't overriding it.
-    fn mouse_target(&self) -> Option<(SessionId, ember_core::MouseProto, u16, u16)> {
-        if self.modifiers.shift_key() {
-            return None;
-        }
-        let (x, y) = self.cursor;
-        let (sid, rect) = self
-            .pane_rects
-            .iter()
-            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)?
-            .clone();
-        let modes = self.renderer.pane_modes(&sid);
-        if !modes.mouse_reporting {
-            return None;
-        }
-        let (cw, ch) = self.renderer.cell_size();
-        let col = ((x - rect.x) / cw as f64).max(0.0) as u16;
-        let row = ((y - rect.y) / ch as f64).max(0.0) as u16;
-        Some((sid, modes.mouse, col, row))
-    }
-
-    /// Modifier bits added to the button code (xterm: alt +8, ctrl +16; shift
-    /// +4 is never sent — Shift is reserved as the local-selection override).
-    fn mouse_mod_bits(&self) -> u8 {
-        (self.modifiers.alt_key() as u8) * 8 + (self.modifiers.control_key() as u8) * 16
-    }
-
-    /// Forward a button press to the pane under the pointer if it listens.
-    /// Returns true when consumed (the caller must not start a selection).
-    fn forward_mouse_press(&mut self, btn: u8) -> bool {
-        let Some((sid, proto, col, row)) = self.mouse_target() else {
-            return false;
-        };
-        if !proto.click {
-            return false;
-        }
-        let code = btn + self.mouse_mod_bits();
-        let bytes = Self::mouse_report_bytes(proto.sgr, code, col, row, true);
-        if let Some(h) = self.sessions.get(&sid) {
-            let _ = h
-                .control
-                .send(BackendControl::Input(bytes.into_boxed_slice()));
-        }
-        self.mouse_press = Some((sid, btn));
-        self.last_mouse_cell = Some((col, row));
-        true
-    }
-
-    /// Forward the matching release for an in-flight forwarded press.
-    fn forward_mouse_release(&mut self, btn: u8) {
-        let Some((sid, pressed)) = self.mouse_press.clone() else {
-            return;
-        };
-        if pressed != btn {
-            return;
-        }
-        self.mouse_press = None;
-        self.last_mouse_cell = None;
-        let proto = self.renderer.pane_modes(&sid).mouse;
-        // Coordinates relative to the pressed pane, clamped inside it.
-        let Some((_, rect)) = self.pane_rects.iter().find(|(s, _)| *s == sid) else {
-            return;
-        };
-        let (cw, ch) = self.renderer.cell_size();
-        let (x, y) = self.cursor;
-        let col = ((x - rect.x).max(0.0) / cw as f64) as u16;
-        let row = ((y - rect.y).max(0.0) / ch as f64) as u16;
-        let code = btn + self.mouse_mod_bits();
-        let bytes = Self::mouse_report_bytes(proto.sgr, code, col, row, false);
-        if let Some(h) = self.sessions.get(&sid) {
-            let _ = h
-                .control
-                .send(BackendControl::Input(bytes.into_boxed_slice()));
-        }
-    }
-
-    /// Forward pointer motion: drag reports (1002) while a forwarded button is
-    /// held, or all-motion reports (1003), deduped per cell.
-    fn forward_mouse_motion(&mut self) {
-        // Drag with a forwarded button held.
-        if let Some((sid, btn)) = self.mouse_press.clone() {
-            let proto = self.renderer.pane_modes(&sid).mouse;
-            if !(proto.drag || proto.motion) {
-                return;
-            }
-            let Some((_, rect)) = self.pane_rects.iter().find(|(s, _)| *s == sid) else {
-                return;
-            };
-            let (cw, ch) = self.renderer.cell_size();
-            let (x, y) = self.cursor;
-            let col = ((x - rect.x).max(0.0) / cw as f64) as u16;
-            let row = ((y - rect.y).max(0.0) / ch as f64) as u16;
-            if self.last_mouse_cell == Some((col, row)) {
-                return;
-            }
-            self.last_mouse_cell = Some((col, row));
-            let code = btn + 32 + self.mouse_mod_bits();
-            let bytes = Self::mouse_report_bytes(proto.sgr, code, col, row, true);
-            if let Some(h) = self.sessions.get(&sid) {
-                let _ = h
-                    .control
-                    .send(BackendControl::Input(bytes.into_boxed_slice()));
-            }
-            return;
-        }
-        // Button-less motion (1003 only).
-        let Some((sid, proto, col, row)) = self.mouse_target() else {
-            return;
-        };
-        if !proto.motion {
-            return;
-        }
-        if self.last_mouse_cell == Some((col, row)) {
-            return;
-        }
-        self.last_mouse_cell = Some((col, row));
-        let code = 3 + 32 + self.mouse_mod_bits();
-        let bytes = Self::mouse_report_bytes(proto.sgr, code, col, row, true);
-        if let Some(h) = self.sessions.get(&sid) {
-            let _ = h
-                .control
-                .send(BackendControl::Input(bytes.into_boxed_slice()));
-        }
-    }
-
-    /// Send an absolute scroll for `session` mapping the mouse `y` to a display
-    /// offset via the scrollbar geometry (thumb drag / track click).
-    fn scroll_to_at(&self, session: &SessionId, y: f32) {
-        if let Some(off) = self.renderer.scroll_offset_at(session, y) {
-            if let Some(h) = self.sessions.get(session) {
-                let _ = h
-                    .control
-                    .send(BackendControl::Scroll(ScrollAmount::To(off)));
-            }
-        }
-    }
-
-    /// Live tab drag-reorder: once past the threshold, move the dragged tab to the
-    /// slot under the cursor as it crosses boundaries (Chrome-style).
-    fn drag_tab_to(&mut self, x: f64) {
-        let (from, active, press_x) = match &self.tab_drag {
-            Some(d) => (d.tab, d.active, d.press_x),
-            None => return,
-        };
-        if !active {
-            if (x - press_x).abs() < TAB_DRAG_THRESHOLD {
-                return;
-            }
-            if let Some(d) = self.tab_drag.as_mut() {
-                d.active = true;
-            }
-        }
-        if let Some(slot) = self.renderer.tab_slot_at(x as f32) {
-            if slot != from {
-                if let Some(d) = self.tab_drag.as_mut() {
-                    d.tab = slot;
-                }
-                let vp = self.viewport();
-                apply(
-                    &mut self.tree,
-                    LayoutCommand::MoveTab { from, to: slot },
-                    vp,
-                );
-                self.sync_layout();
-            }
-        }
-        // Push the lifted, cursor-following tab view every move (not just on a slot
-        // cross) so the drag reads as smooth motion.
-        let view = self
-            .tab_drag
-            .as_ref()
-            .filter(|d| d.active)
-            .map(|d| (d.tab, x as f32));
-        self.renderer.set_tab_drag(view);
-    }
-
-    /// Begin inline rename of tab `i` (double-click); seeds the buffer with its title.
-    fn start_rename(&mut self, i: usize) {
-        if i >= self.tree.tabs.len() {
-            return;
-        }
-        self.tab_drag = None;
-        self.renderer.set_tab_drag(None);
-        self.editing_tab = Some(i);
-        self.edit_buffer = self.tree.tabs[i].title.clone();
-        self.sync_layout();
-    }
-
-    /// Commit the in-progress rename (Enter / click away) → sets the tab title.
-    fn commit_rename(&mut self) {
-        let Some(i) = self.editing_tab.take() else {
-            return;
-        };
-        if let Some(t) = self.tree.tabs.get(i) {
-            let id = t.id;
-            let title = self.edit_buffer.clone();
-            let vp = self.viewport();
-            apply(
-                &mut self.tree,
-                LayoutCommand::RenameTab { tab: id, title },
-                vp,
-            );
-        }
-        self.edit_buffer.clear();
-        self.sync_layout();
-    }
-
-    /// Discard the in-progress rename (Esc).
-    fn cancel_rename(&mut self) {
-        if self.editing_tab.take().is_some() {
-            self.edit_buffer.clear();
-            self.sync_layout();
-        }
-    }
-
-    /// Route a key into the inline tab-rename editor.
-    fn rename_key(&mut self, key: &Key) {
-        match key {
-            Key::Named(NamedKey::Enter) => self.commit_rename(),
-            Key::Named(NamedKey::Escape) => self.cancel_rename(),
-            Key::Named(NamedKey::Backspace) => {
-                self.edit_buffer.pop();
-                self.sync_layout();
-            }
-            Key::Named(NamedKey::Space) => {
-                self.edit_buffer.push(' ');
-                self.sync_layout();
-            }
-            Key::Character(s) => {
-                for c in s.chars().filter(|c| !c.is_control()) {
-                    self.edit_buffer.push(c);
-                }
-                self.sync_layout();
-            }
-            _ => {}
-        }
-    }
-
-    /// Focus the pane backing `sid` in the active tab (click-to-focus). No-op if it
-    /// is already focused or the session isn't in this tab.
-    fn focus_pane_of_session(&mut self, sid: &SessionId) {
-        if self.focused_session_id().as_ref() == Some(sid) {
-            return;
-        }
-        let active = self.tree.active;
-        let pane = self.tree.tabs.get(active).and_then(|t| {
-            t.root
-                .leaves()
-                .into_iter()
-                .find(|(_, s)| s == sid)
-                .map(|(p, _)| p)
-        });
-        if let Some(pane) = pane {
-            self.tree.tabs[active].focus = pane;
-            self.sync_layout();
-        }
-    }
-
-    /// Map a logical-px point to `(session, row, col)` in whichever visible pane
-    /// contains it (clamped to that pane's grid), or `None` if outside all panes.
-    fn pixel_to_cell(&self, x: f64, y: f64) -> Option<(SessionId, u16, u16)> {
-        let (cw, ch) = self.renderer.cell_size();
-        let (cw, ch) = (cw as f64, ch as f64);
-        for (sid, rect) in &self.pane_rects {
-            if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
-                let dims = self
-                    .dims_cache
-                    .get(sid)
-                    .copied()
-                    .unwrap_or(GridDims::new(1, 1));
-                let col = (((x - rect.x) / cw).floor().max(0.0) as u16)
-                    .min(dims.columns.saturating_sub(1));
-                let row = (((y - rect.y) / ch).floor().max(0.0) as u16)
-                    .min(dims.screen_lines.saturating_sub(1));
-                return Some((sid.clone(), row, col));
-            }
-        }
-        None
-    }
-
-    /// The platform's link-open modifier: Cmd on macOS, Ctrl elsewhere. Used
-    /// only inside mouse-reporting panes, where plain clicks belong to the app.
-    fn open_modifier_held(&self) -> bool {
-        if cfg!(target_os = "macos") {
-            self.modifiers.super_key()
-        } else {
-            self.modifiers.control_key()
-        }
-    }
-
-    /// The link under the pointer, when opening/hovering is eligible: always
-    /// at a plain prompt; only with the open-modifier inside mouse-reporting
-    /// panes (there, plain clicks belong to the app).
-    fn link_under_cursor(&self) -> Option<(SessionId, u32, String, u16, u16)> {
-        let (x, y) = self.cursor;
-        let (sid, row, col) = self.pixel_to_cell(x, y)?;
-        if self.renderer.pane_modes(&sid).mouse_reporting && !self.open_modifier_held() {
-            return None;
-        }
-        let (id, url) = self.renderer.link_at(&sid, row, col)?;
-        Some((sid, id, url.to_string(), row, col))
-    }
-
-    /// Begin a selection at a pane-body point; click count picks the mode
-    /// (1 = cell, 2 = word, 3 = line).
-    fn begin_selection(&mut self, x: f64, y: f64) {
-        let Some((sid, row, col)) = self.pixel_to_cell(x, y) else {
-            self.clear_selection();
-            return;
-        };
-        // Clicking into a pane focuses it (also correct for single-pane selection:
-        // a selection is single-pane, so the click target must be the focused pane).
-        self.focus_pane_of_session(&sid);
-        let now = Instant::now();
-        let same = self.last_click.as_ref().is_some_and(|(t, s, r, c)| {
-            now.duration_since(*t) < MULTI_CLICK && *s == sid && *r == row && *c == col
-        });
-        self.click_count = if same {
-            (self.click_count + 1).min(3)
-        } else {
-            1
-        };
-        self.last_click = Some((now, sid.clone(), row, col));
-        let mode = match self.click_count {
-            2 => SelectionMode::Word,
-            3 => SelectionMode::Line,
-            _ => SelectionMode::Simple,
-        };
-        let selection = Selection::new(Point::new(row, col), mode);
-        self.sel = Some((sid, selection));
-        self.selecting = true;
-        self.renderer.set_selection(self.sel.clone());
-    }
-
-    /// Extend the in-progress selection to a logical-px point (drag).
-    fn extend_selection(&mut self, x: f64, y: f64) {
-        let Some((sid, row, col)) = self.pixel_to_cell(x, y) else {
-            return;
-        };
-        if let Some((ssid, selection)) = self.sel.as_mut() {
-            if *ssid == sid {
-                selection.update(Point::new(row, col));
-                self.renderer.set_selection(self.sel.clone());
-            }
-        }
-    }
-
-    /// Clear any selection.
-    fn clear_selection(&mut self) {
-        if self.sel.is_some() {
-            self.sel = None;
-            self.selecting = false;
-            self.renderer.set_selection(None);
-        }
-    }
-
-    /// Copy the current selection's text to the OS clipboard (Cmd+C).
-    fn copy_selection(&mut self) {
-        if let Some(text) = self.renderer.selected_text() {
-            self.platform.set_clipboard(&text);
-        }
-    }
-
-    /// Paste the OS clipboard into the focused pane's PTY (Cmd+V), bracketed when
-    /// the focused app enabled bracketed-paste mode.
-    fn paste_clipboard(&mut self) {
-        if let Some(text) = self.platform.clipboard() {
-            self.paste_into_focused(&text);
-        }
-    }
-
-    /// Toggle the cheat-sheet overlay (Cmd+/ and the Help menu item).
-    fn toggle_help(&mut self) {
-        if self.help {
-            self.hide_help();
-        } else {
-            self.show_help();
-        }
-    }
-
-    /// Hide the cheat-sheet overlay (no-op if not shown).
-    fn hide_help(&mut self) {
-        if self.help {
-            self.help = false;
-            self.renderer.set_help(None);
-        }
-    }
-
-    /// Show the About overlay (closing other overlays — they're exclusive).
-    fn show_about(&mut self) {
-        self.hide_help();
-        self.hide_settings();
-        self.about = true;
-        self.about_since = Instant::now();
-        self.renderer.set_about(Some(about_info()));
-    }
-
-    /// Hide the About overlay (no-op if not shown).
-    fn hide_about(&mut self) {
-        if self.about {
-            self.about = false;
-            self.renderer.set_about(None);
-        }
-    }
-
-    /// Toggle the About overlay (the Ember → About Ember menu item).
-    fn toggle_about(&mut self) {
-        if self.about {
-            self.hide_about();
-        } else {
-            self.show_about();
-        }
-    }
-
-    /// Whether any session that a `kind` close would destroy is running a
-    /// command (OSC 133). For `Pane`, only the focused pane's session; for
-    /// `Quit`, any session anywhere.
     /// Whether a session is running a foreground command (idle shell → false).
-    fn session_busy(&self, sid: &SessionId) -> bool {
+    pub(crate) fn session_busy(&self, sid: &SessionId) -> bool {
         self.sessions.get(sid).is_some_and(|h| h.is_busy())
     }
 
-    fn close_hits_running(&self, kind: PendingClose) -> bool {
-        match kind {
-            PendingClose::Quit => self.sessions.values().any(|h| h.is_busy()),
-            PendingClose::Pane => self
-                .active_tab()
-                .root
-                .session_of(self.active_tab().focus)
-                .is_some_and(|s| self.session_busy(s)),
-            PendingClose::Tab(tab) => self
-                .tree
-                .tabs
-                .iter()
-                .find(|t| t.id == tab)
-                .is_some_and(|t| t.root.leaves().iter().any(|(_, s)| self.session_busy(s))),
-        }
-    }
-
-    /// Run a close, or defer it behind a confirmation if it would kill a running
-    /// command. Returns true if the app should exit now.
-    fn request_close(&mut self, kind: PendingClose) -> bool {
-        if self.close_hits_running(kind) {
-            self.show_close_confirm(kind);
-            return false;
-        }
-        self.do_close(kind)
-    }
-
-    /// Actually perform a (possibly confirmed) close. Returns true to exit.
-    fn do_close(&mut self, kind: PendingClose) -> bool {
-        match kind {
-            PendingClose::Pane => {
-                self.close_focused();
-                self.tree.tabs.is_empty()
-            }
-            PendingClose::Tab(tab) => self.do_close_tab(tab),
-            PendingClose::Quit => true,
-        }
-    }
-
-    /// Show the running-process confirmation (reuses the help-overlay panel).
-    fn show_close_confirm(&mut self, kind: PendingClose) {
-        self.hide_help();
-        self.hide_about();
-        self.hide_settings();
-        self.pending_close = Some(kind);
-        self.confirm_focus = 0; // Cancel is the safe default.
-        self.update_confirm_view();
-    }
-
-    /// (Re)build the confirm modal from `pending_close` + `confirm_focus`.
-    fn update_confirm_view(&mut self) {
-        let Some(kind) = self.pending_close else {
-            return;
-        };
-        let (title, confirm_label) = match kind {
-            PendingClose::Pane => ("Close this pane?", "Close"),
-            PendingClose::Tab(_) => ("Close this tab?", "Close"),
-            PendingClose::Quit => ("Quit Ember?", "Quit"),
-        };
-        self.renderer.set_confirm(Some(ConfirmView {
-            title: title.to_string(),
-            message: "A command is still running.".to_string(),
-            cancel_label: "Cancel".to_string(),
-            confirm_label: confirm_label.to_string(),
-            focused: self.confirm_focus,
-        }));
-    }
-
-    /// Resolve a pending close confirmation. `Enter` performs it; any other key
-    /// cancels. Returns true if the app should exit.
-    fn resolve_confirm(&mut self, confirm: bool) -> bool {
-        let Some(kind) = self.pending_close.take() else {
-            return false;
-        };
-        self.renderer.set_confirm(None);
-        if confirm { self.do_close(kind) } else { false }
-    }
-
-    /// Dismiss whichever modal overlay is open; returns whether one was showing.
-    fn dismiss_overlay(&mut self) -> bool {
-        let shown = self.help || self.about || self.settings_open;
-        self.hide_help();
-        self.hide_about();
-        self.hide_settings();
-        shown
-    }
-
-    /// The Settings overlay rows as `(label, value)`, derived from the config.
     /// Bind or unbind the debug control socket at runtime (the Settings toggle).
     /// When enabling, logs the socket path so it can be handed off for inspection.
-    fn set_developer_mode(&mut self, on: bool) {
+    pub(crate) fn set_developer_mode(&mut self, on: bool) {
         if on {
             if self.control_server.is_some() {
                 return; // already bound (e.g. via EMBER_CONTROL)
@@ -2722,120 +1065,12 @@ impl RunState {
     /// The Settings overlay's rows, resolved against the live config. The row
     /// *table* (labels, kinds, formatters, mutators) lives in `ember-core`;
     /// this just asks it to format itself against `self.config`.
-    fn settings_rows(&self) -> Vec<SettingsRowView> {
+    pub(crate) fn settings_rows(&self) -> Vec<SettingsRowView> {
         resolve_rows(&self.config)
     }
 
-    /// Show the Settings overlay (closing other overlays — they're exclusive).
-    fn show_settings(&mut self) {
-        self.hide_help();
-        self.hide_about();
-        self.settings_open = true;
-        let rows = self.settings_rows();
-        self.ensure_settings_sel_selectable(&rows);
-        self.renderer.set_settings(Some((rows, self.settings_sel)));
-    }
-
-    /// Hide the Settings overlay (no-op if not shown).
-    fn hide_settings(&mut self) {
-        if self.settings_open {
-            self.settings_open = false;
-            self.renderer.set_settings(None);
-        }
-    }
-
-    /// Toggle the FPS/frame-time debug overlay (Cmd+Shift+P / `ctl fps`).
-    fn toggle_fps(&mut self) {
-        self.fps_overlay = !self.fps_overlay;
-        if !self.fps_overlay {
-            self.renderer.set_fps_overlay(None);
-        }
-        self.renderer.window().request_redraw();
-    }
-
-    /// Toggle the Settings overlay (Ember → Settings… / Cmd+,).
-    fn toggle_settings(&mut self) {
-        if self.settings_open {
-            self.hide_settings();
-        } else {
-            self.show_settings();
-        }
-    }
-
-    /// Re-push the Settings rows + selection to the renderer after a change.
-    fn refresh_settings(&mut self) {
-        let rows = self.settings_rows();
-        self.renderer.set_settings(Some((rows, self.settings_sel)));
-    }
-
-    /// If `settings_sel` doesn't point at a selectable row (a `SectionHeader`,
-    /// or out of bounds), snap it to the first selectable row. Guards the
-    /// overlay's initial open (it starts at index 0, which is always a
-    /// header) and any future row-table change.
-    fn ensure_settings_sel_selectable(&mut self, rows: &[SettingsRowView]) {
-        let invalid = match rows.get(self.settings_sel) {
-            Some(r) => r.kind == RowKind::SectionHeader,
-            None => true,
-        };
-        if invalid {
-            self.settings_sel = rows
-                .iter()
-                .position(|r| r.kind != RowKind::SectionHeader)
-                .unwrap_or(0);
-        }
-    }
-
-    /// Handle a key while the Settings overlay is open: navigate + change values.
-    fn settings_key(&mut self, key: &Key) {
-        let rows = self.settings_rows();
-        match key {
-            Key::Named(NamedKey::Escape) => {
-                self.hide_settings();
-                return;
-            }
-            Key::Named(NamedKey::ArrowUp) => {
-                self.settings_sel = step_selectable_row(&rows, self.settings_sel, -1);
-            }
-            Key::Named(NamedKey::ArrowDown) => {
-                self.settings_sel = step_selectable_row(&rows, self.settings_sel, 1);
-            }
-            Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Space) => {
-                self.adjust_setting(1.0)
-            }
-            Key::Named(NamedKey::ArrowLeft) => self.adjust_setting(-1.0),
-            _ => {}
-        }
-        self.refresh_settings();
-    }
-
-    /// Change the selected setting by `dir` (+1 / -1) via its own row's
-    /// `adjust` fn — the row table *is* the dispatch, there is no positional
-    /// match here to drift out of sync with it. Persists the config, then
-    /// re-applies every live side effect unconditionally: backdrop
-    /// appearance, font size, font family, and the developer-mode control
-    /// socket. Each is already a cheap no-op when its target value hasn't
-    /// changed (matching `zoom_to`'s existing no-op-if-unchanged pattern),
-    /// so this never needs to know which row actually fired.
-    fn adjust_setting(&mut self, dir: f32) {
-        if let Some(row) = setting_rows().get(self.settings_sel) {
-            if let Some(adjust) = row.adjust {
-                adjust(&mut self.config, dir);
-            }
-        }
-        if let Err(e) = config::save(&self.config) {
-            eprintln!("[ember] config save failed: {e}");
-        }
-        self.apply_appearance();
-        self.set_developer_mode(self.config.developer_mode);
-        let mut relayout = self.renderer.set_font_size(self.config.font.size);
-        relayout |= self.renderer.set_family(self.config.font.family.clone());
-        if relayout {
-            self.sync_layout();
-        }
-    }
-
     /// The backdrop params for the current config at animation time `t` seconds.
-    fn backdrop_params(&self, t: f32) -> BackdropParams {
+    pub(crate) fn backdrop_params(&self, t: f32) -> BackdropParams {
         let bg = &self.config.background;
         BackdropParams {
             gradient: bg.gradient,
@@ -2846,187 +1081,11 @@ impl RunState {
         }
     }
 
-    /// Push the current config's appearance (campfire backdrop + ember sparks) to
-    /// the renderer. Called on startup and whenever a setting changes. Decodes the
-    /// backdrop image only when the configured path changes (cheap on idle changes).
-    fn apply_appearance(&mut self) {
-        let t = self.backdrop_since.elapsed().as_secs_f32();
-        let params = self.backdrop_params(t);
-        self.renderer.set_backdrop(params);
-
-        let want = self.config.background.image.clone();
-        if want != self.image_loaded {
-            let fit = ImageFit::parse(&self.config.background.image_fit);
-            let img = want.as_deref().and_then(load_backdrop_image);
-            if want.is_some() && img.is_none() {
-                eprintln!(
-                    "[ember] backdrop image could not be loaded: {:?} (need a readable PNG)",
-                    want.as_deref().unwrap_or("")
-                );
-            }
-            self.renderer.set_backdrop_image(img, fit);
-            self.image_loaded = want;
-        }
-    }
-
     /// The ambient ember animation's frame interval, from the configured `ember_fps`
     /// cap (clamped 10–120). Lower fps ≈ proportionally less CPU.
-    fn ember_frame(&self) -> Duration {
+    pub(crate) fn ember_frame(&self) -> Duration {
         let fps = self.config.background.ember_fps.clamp(10, 120);
         Duration::from_millis((1000 / fps).max(1) as u64)
-    }
-
-    /// Advance every active animation to wall-clock time `now`: the About glow, the
-    /// ember sparks, and the visual-bell flash decay. Each `set_*` is a function of
-    /// elapsed time (not a delta), so an occasional long gap between frames just
-    /// samples the curve later — no jump. Called from the loop once per frame-interval.
-    fn advance_animations(&mut self, now: Instant) {
-        if self.about {
-            let t = now.duration_since(self.about_since).as_secs_f32();
-            self.renderer.set_about_anim(ember_glow(t), t);
-        }
-        if self.backdrop_animating() {
-            let params =
-                self.backdrop_params(now.duration_since(self.backdrop_since).as_secs_f32());
-            self.renderer.set_backdrop(params);
-        }
-        if let Some(since) = self.bell_flash_since {
-            let i = bell_flash_intensity(now.duration_since(since).as_secs_f32());
-            self.renderer.set_bell_flash(i);
-            if i <= 0.0 {
-                self.bell_flash_since = None;
-            }
-        }
-    }
-
-    /// Whether the ember sparks should be animating right now: opt-in, whenever
-    /// the window is visible (focused or not — the campfire burns while you work
-    /// elsewhere; Brandon's call 2026-07-04) and no modal overlay covers the
-    /// panes. Occluded/asleep windows still go fully quiet.
-    fn backdrop_animating(&self) -> bool {
-        self.config.background.ember_sparks
-            && !self.occluded
-            && !self.help
-            && !self.about
-            && !self.settings_open
-    }
-
-    /// Handle a BEL from `session` (visual bell): start/refresh the ember flash,
-    /// and if the belling tab isn't active, mark it with an unseen-bell indicator.
-    fn on_bell(&mut self, session: &SessionId) {
-        if !self.config.visual_bell {
-            return;
-        }
-        let tab_idx = self
-            .tree
-            .tabs
-            .iter()
-            .position(|t| t.root.leaves().iter().any(|(_, s)| s == session));
-        if let Some(i) = tab_idx {
-            if i != self.tree.active {
-                let id = self.tree.tabs[i].id;
-                if self.belled_tabs.insert(id) {
-                    self.sync_layout(); // repaint the tab with its bell dot
-                }
-            }
-        }
-        // Start (or refresh) the window flash; the animation loop decays it.
-        self.bell_flash_since = Some(Instant::now());
-        self.renderer.set_bell_flash(bell_flash_intensity(0.0));
-    }
-
-    /// Whether the visual-bell ember flash is currently animating.
-    fn bell_flashing(&self) -> bool {
-        self.bell_flash_since.is_some()
-    }
-
-    /// Jump to tab `n` (1-based); no-op if out of range.
-    /// Live-zoom the terminal font by `delta` points (Cmd +/-).
-    fn zoom_by(&mut self, delta: f32) {
-        let target = self.renderer.font_size() + delta;
-        self.zoom_to(target);
-    }
-
-    /// Set the terminal font to `size` and re-layout (the cell size, hence every
-    /// pane's grid dims, changed). No-op if the size didn't change.
-    fn zoom_to(&mut self, size: f32) {
-        if self.renderer.set_font_size(size) {
-            self.sync_layout();
-        }
-    }
-
-    fn select_tab(&mut self, n: usize) {
-        if n >= 1 && n <= self.tree.tabs.len() {
-            self.tree.active = n - 1;
-            self.sync_layout();
-        }
-    }
-
-    /// Bring the window to the front and give it focus (`ctl raise`, and the
-    /// tail of `ctl focus` — a Stream Deck press should land the user IN
-    /// Ember, not silently switch a background window's tab).
-    fn raise_window(&self) {
-        let w = self.renderer.window();
-        w.set_minimized(false);
-        w.focus_window();
-    }
-
-    /// Close the pane backing `session` wherever it lives (a shell exited, or a
-    /// background tab's pane was closed). Switches to that tab so `ClosePane`'s
-    /// active-tab semantics apply, then restores a sane active index.
-    fn close_session(&mut self, session: &SessionId) {
-        let found = self.tree.tabs.iter().enumerate().find_map(|(ti, tab)| {
-            tab.root
-                .leaves()
-                .into_iter()
-                .find(|(_, s)| s == session)
-                .map(|(pane, _)| (ti, pane))
-        });
-        let Some((ti, pane)) = found else {
-            // Not in the layout (already removed); just clean up the backend.
-            self.kill_session(session);
-            return;
-        };
-        // Remember which tab the USER is on (by id) so closing a background
-        // tab's pane doesn't teleport them there. ClosePane targets the active
-        // tab, so switch to `ti`, close, then restore the user's tab.
-        let user_tab = self.tree.tabs.get(self.tree.active).map(|t| t.id);
-        self.tree.active = ti;
-        let vp = self.viewport();
-        let effects = apply(
-            &mut self.tree,
-            LayoutCommand::ClosePane { target: pane },
-            vp,
-        );
-        self.apply_effects(effects);
-        if self.tree.tabs.is_empty() {
-            return;
-        }
-        // Restore the user's tab if it still exists (it may have shifted index,
-        // or been the very tab whose last pane just closed).
-        self.tree.active = user_tab
-            .and_then(|id| self.tree.tabs.iter().position(|t| t.id == id))
-            .unwrap_or(self.tree.active)
-            .min(self.tree.tabs.len() - 1);
-        self.sync_layout();
-    }
-
-    /// Perform a tab close (after any confirmation). Returns true to exit.
-    fn do_close_tab(&mut self, tab: TabId) -> bool {
-        let user_tab = self.tree.tabs.get(self.tree.active).map(|t| t.id);
-        let vp = self.viewport();
-        let effects = apply(&mut self.tree, LayoutCommand::CloseTab { tab }, vp);
-        self.apply_effects(effects);
-        if self.tree.tabs.is_empty() {
-            self.shutdown_all();
-            return true;
-        }
-        self.tree.active = user_tab
-            .and_then(|id| self.tree.tabs.iter().position(|t| t.id == id))
-            .unwrap_or(self.tree.active)
-            .min(self.tree.tabs.len() - 1);
-        self.sync_layout();
-        false
     }
 }
 
@@ -3233,7 +1292,7 @@ fn click_selection_should_clear(sel: Option<&Selection>) -> bool {
 }
 
 /// The keyboard cheat-sheet shown by the Cmd+/ overlay. Keep in sync with
-/// [`RunState::handle_shortcut`].
+/// [`WindowState::handle_shortcut`].
 /// Prepare paste bytes. When `bracketed`, wrap the text in the bracketed-paste
 /// guards `ESC[200~` … `ESC[201~`, stripping any embedded guard sequences first so
 /// a hostile clipboard can't close the bracket early and inject a command the shell
@@ -3252,7 +1311,7 @@ fn bracket_paste(text: &str, bracketed: bool) -> Vec<u8> {
 
 /// The keyboard cheat-sheet, grouped into sections. A row with an empty key is a
 /// **section header** (rendered as an accent heading by `build_help`); the rest are
-/// `(key, description)`. Keep in sync with [`RunState::handle_shortcut`].
+/// `(key, description)`. Keep in sync with [`WindowState::handle_shortcut`].
 pub(crate) fn help_lines() -> Vec<(String, String)> {
     // Every row carries its platform's true binding. macOS uses Cmd; Linux
     // uses the GNOME-safe conventional layer (Ctrl+Shift+X for Cmd+X,
@@ -3554,28 +1613,28 @@ mod tests {
 
     #[test]
     fn mouse_reports_encode_sgr_and_x10() {
-        use super::RunState;
+        use super::WindowState;
         // SGR press/release: 1-based coords, M/m terminator.
         assert_eq!(
-            RunState::mouse_report_bytes(true, 0, 4, 9, true),
+            WindowState::mouse_report_bytes(true, 0, 4, 9, true),
             b"\x1b[<0;5;10M"
         );
         assert_eq!(
-            RunState::mouse_report_bytes(true, 0, 4, 9, false),
+            WindowState::mouse_report_bytes(true, 0, 4, 9, false),
             b"\x1b[<0;5;10m"
         );
         // Wheel up with ctrl (+16).
         assert_eq!(
-            RunState::mouse_report_bytes(true, 64 + 16, 0, 0, true),
+            WindowState::mouse_report_bytes(true, 64 + 16, 0, 0, true),
             b"\x1b[<80;1;1M"
         );
         // X10: +32 offsets, release is button 3.
         assert_eq!(
-            RunState::mouse_report_bytes(false, 0, 4, 9, true),
+            WindowState::mouse_report_bytes(false, 0, 4, 9, true),
             vec![0x1b, b'[', b'M', 32, 37, 42]
         );
         assert_eq!(
-            RunState::mouse_report_bytes(false, 0, 4, 9, false),
+            WindowState::mouse_report_bytes(false, 0, 4, 9, false),
             vec![0x1b, b'[', b'M', 35, 37, 42]
         );
     }
