@@ -33,7 +33,7 @@ use ember_core::{
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
     BackdropParams, CELL_HEIGHT, CELL_WIDTH, RenderOutcome, Renderer, Selection, SelectionMode,
-    TabHit,
+    TabHit, WispRenderer, WispUnsupported,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -329,6 +329,232 @@ pub(crate) struct Shared {
     /// `ctl new-window`, move-tab-to-new-window) — those place the OS window
     /// at its default position, unchanged.
     pub(crate) new_window_position_hint: Option<winit::dpi::PhysicalPosition<i32>>,
+    /// THE WISP (release 2 task 5): the glowing drag-token window, lazily
+    /// created on the first carried transition of the FIRST drag in the
+    /// process and reused (shown/hidden) for every drag after that. Lives on
+    /// `Shared` (not `App`) so the free functions that already thread
+    /// `&mut Shared` everywhere a drag is created/advanced/ended
+    /// (`update_cross_window_drag`, `WindowState::left_release`,
+    /// `cancel_drag_everywhere`, `clear_drag_on_window_close`) can drive it
+    /// without a second parameter — those same call sites already have an
+    /// `&ActiveEventLoop` in scope for the one-time lazy creation.
+    pub(crate) wisp: WispSlot,
+}
+
+/// The wisp's lazy-creation/degradation state (Task 5). Not `Option<WispWindow>`
+/// alone: a GPU/surface that can't do alpha compositing must fail creation
+/// EXACTLY ONCE, not be retried every single drag — `Unsupported` remembers
+/// that so every later drag just skips the wisp for free, forever (cost
+/// discipline).
+pub(crate) enum WispSlot {
+    /// Never attempted — no drag has been carried yet this process.
+    Uninit,
+    /// Created and usable. Boxed: `WispWindow` (GPU device/surface/window)
+    /// is far larger than `Uninit`/`Unsupported`'s zero bytes, and every
+    /// `Shared` — even one that never sees a drag — pays this enum's size.
+    Ready(Box<WispWindow>),
+    /// Attempted once and failed (see [`WispUnsupported`]) — never retried.
+    Unsupported,
+}
+
+/// The wisp's own always-on-top, click-through, borderless window + renderer,
+/// plus the fade-ramp/velocity bookkeeping `ember-app` drives it with.
+/// NEVER inserted into `App::windows`/`Shared::window_order`/`focus_history`
+/// — see `window_frames`/`window_event`'s early `self.windows.get_mut` miss,
+/// which already no-ops any stray `WindowEvent` (CloseRequested, Focused,
+/// spontaneous RedrawRequested) delivered for its `WindowId`. The wisp is
+/// never driven by `RedrawRequested` at all: `about_to_wait`'s pacing loop
+/// calls `WispWindow::tick` directly, which calls `WispRenderer::render`
+/// synchronously (present-per-call, same as `Renderer::render`, just not
+/// gated behind a redraw round-trip).
+pub(crate) struct WispWindow {
+    window: Arc<winit::window::Window>,
+    renderer: WispRenderer,
+    fade: WispFade,
+    /// Hover target for `render`'s `intensity` arg: `1.0` over a drop
+    /// target, `0.6` otherwise (`Shared.drag.hover`'s `Some`/`None`, per the
+    /// brief). Updated every carried tick by `wisp_tick`; read by `tick`.
+    intensity_target: f32,
+    /// Previous SCREEN-space (physical px) position + when it was set, for
+    /// velocity — derived from successive `DragState::last_screen` deltas
+    /// (there's no other velocity signal available).
+    prev: Option<((f64, f64), Instant)>,
+    /// Smoothed screen-space px/s, fed to `WispRenderer::render`'s trail bias.
+    velocity: (f32, f32),
+    /// Free-running clock for the particle animation (never reset — same
+    /// "procedural from t alone" shape as the backdrop sparks).
+    since: Instant,
+    /// Last time `tick` actually advanced+rendered a frame (paces at
+    /// `WISP_FRAME`, independent of how often `about_to_wait` itself runs).
+    last_anim: Instant,
+}
+
+/// The wisp's fade-ramp state machine (Task 5 §2: "fade-in ~150ms at
+/// tear-off, fade-out ~200ms at drop/cancel").
+enum WispFade {
+    In {
+        start: Instant,
+    },
+    Steady,
+    Out {
+        start: Instant,
+    },
+    /// Not showing; not ticking. The only state `WispWindow::tick` isn't
+    /// called in (cost discipline: zero cost while no drag is carried).
+    Hidden,
+}
+
+/// Wisp redraw cadence (matches `ANIM_FRAME`; the sparks/fade don't need a
+/// tighter budget than the rest of the app's animations).
+const WISP_FRAME: Duration = Duration::from_millis(16);
+/// Fade-in duration at tear-off (Task 5 §2).
+const WISP_FADE_IN: Duration = Duration::from_millis(150);
+/// Fade-out duration at drop/cancel (Task 5 §2).
+const WISP_FADE_OUT: Duration = Duration::from_millis(200);
+/// Logical px side length of the wisp window (Task 5: "~140x140 logical").
+const WISP_SIZE: f32 = 140.0;
+
+impl WispWindow {
+    /// Build (and show) a brand-new wisp window + renderer. `Err` on any
+    /// failure — OS window creation or `WispRenderer::new`'s own alpha-mode
+    /// feature-detection — collapses to the same `WispUnsupported` the
+    /// caller degrades on; the wisp is entirely best-effort.
+    fn new(event_loop: &ActiveEventLoop) -> Result<Self, WispUnsupported> {
+        use winit::dpi::LogicalSize;
+        use winit::window::{Window, WindowLevel};
+
+        let attrs = Window::default_attributes()
+            .with_title("")
+            .with_inner_size(LogicalSize::new(WISP_SIZE, WISP_SIZE))
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_active(false)
+            .with_visible(false);
+        let window = event_loop
+            .create_window(attrs)
+            .map_err(|_| WispUnsupported)?;
+        // Click-through: the wisp sits directly under the cursor by
+        // definition, and must never win the drop hit-test against the real
+        // window underneath it. Best-effort (`Result` ignored) — platforms
+        // that don't support this (see winit's own doc) just leave hittest
+        // on, which only matters if the OS ever routes input to a
+        // non-active, `AlwaysOnTop`, decorationless window at all.
+        let _ = window.set_cursor_hittest(false);
+        let window = Arc::new(window);
+        let renderer = WispRenderer::new(Arc::clone(&window))?;
+        let now = Instant::now();
+        Ok(Self {
+            window,
+            renderer,
+            fade: WispFade::Hidden,
+            intensity_target: 0.6,
+            prev: None,
+            velocity: (0.0, 0.0),
+            since: now,
+            last_anim: now,
+        })
+    }
+
+    /// Show the window and start its fade-in ramp. Called once per drag, on
+    /// the first carried transition.
+    fn show(&mut self) {
+        self.window.set_visible(true);
+        self.fade = WispFade::In {
+            start: Instant::now(),
+        };
+    }
+
+    /// Start the fade-out ramp (drop/cancel). No-op if already hidden or
+    /// already fading out — idempotent, since every drag-end site calls this
+    /// unconditionally (most drags never carry far enough to have shown a
+    /// wisp at all).
+    fn begin_fade_out(&mut self) {
+        if matches!(self.fade, WispFade::In { .. } | WispFade::Steady) {
+            self.fade = WispFade::Out {
+                start: Instant::now(),
+            };
+        }
+    }
+
+    /// Whether `tick` still needs calling (fading in/out, or steady while
+    /// carried) — `about_to_wait`'s pacing loop uses this to fold the wisp
+    /// into its `next_wake` deadline exactly like a per-window animation.
+    fn is_active(&self) -> bool {
+        !matches!(self.fade, WispFade::Hidden)
+    }
+
+    /// Move the window so it's centered on the given SCREEN-space (physical
+    /// px) point, and update the velocity estimate from the delta since the
+    /// last call. Called every carried motion tick.
+    fn move_to(&mut self, screen_x: f64, screen_y: f64) {
+        let sf = self.window.scale_factor();
+        let half = (WISP_SIZE as f64 / 2.0) * sf;
+        self.window
+            .set_outer_position(winit::dpi::PhysicalPosition::new(
+                (screen_x - half).round() as i32,
+                (screen_y - half).round() as i32,
+            ));
+        let now = Instant::now();
+        if let Some((prev_pos, prev_t)) = self.prev {
+            let dt = now.duration_since(prev_t).as_secs_f32();
+            if dt > 0.0005 {
+                let vx = (screen_x - prev_pos.0) as f32 / dt;
+                let vy = (screen_y - prev_pos.1) as f32 / dt;
+                // Light smoothing so one noisy tick doesn't whip the trail.
+                self.velocity = (
+                    self.velocity.0 * 0.5 + vx * 0.5,
+                    self.velocity.1 * 0.5 + vy * 0.5,
+                );
+            }
+        }
+        self.prev = Some(((screen_x, screen_y), now));
+    }
+
+    fn set_target_intensity(&mut self, v: f32) {
+        self.intensity_target = v;
+    }
+
+    /// Advance the fade ramp and, at the `WISP_FRAME` cadence, render one
+    /// frame. Returns `true` if still active afterward (another tick is
+    /// needed — fold into `next_wake`), `false` once a fade-out just
+    /// finished and the window is hidden again (no more ticking until the
+    /// next carried drag: cost discipline).
+    fn tick(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.last_anim) < WISP_FRAME {
+            return self.is_active();
+        }
+        self.last_anim = now;
+        let alpha = match self.fade {
+            WispFade::Hidden => return false,
+            WispFade::In { start } => {
+                let e = now.duration_since(start);
+                if e >= WISP_FADE_IN {
+                    self.fade = WispFade::Steady;
+                    1.0
+                } else {
+                    e.as_secs_f32() / WISP_FADE_IN.as_secs_f32()
+                }
+            }
+            WispFade::Steady => 1.0,
+            WispFade::Out { start } => {
+                let e = now.duration_since(start);
+                if e >= WISP_FADE_OUT {
+                    self.window.set_visible(false);
+                    self.fade = WispFade::Hidden;
+                    self.prev = None;
+                    self.velocity = (0.0, 0.0);
+                    return false;
+                }
+                1.0 - e.as_secs_f32() / WISP_FADE_OUT.as_secs_f32()
+            }
+        };
+        let t = self.since.elapsed().as_secs_f32();
+        self.renderer
+            .render(t, alpha * self.intensity_target, self.velocity);
+        true
+    }
 }
 
 /// A drag in progress, spanning windows (hence on [`Shared`], not
@@ -497,6 +723,7 @@ impl ApplicationHandler<EmberEvent> for App {
             wake: self.wake.clone(),
             drag: None,
             new_window_position_hint: None,
+            wisp: WispSlot::Uninit,
         };
         let mut win = WindowState::new(renderer, tree);
         win.px = px;
@@ -612,6 +839,7 @@ impl ApplicationHandler<EmberEvent> for App {
                         id,
                         x,
                         y,
+                        event_loop,
                     );
                 }
             }
@@ -1527,6 +1755,21 @@ impl ApplicationHandler<EmberEvent> for App {
                 next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
             }
         }
+        // The wisp (Task 5) isn't a `WindowState` — it's not in `self.windows`
+        // and so isn't touched by the loop above — but needs the exact same
+        // wall-clock pacing while fading in/out or steady-carried: not driven
+        // by `RedrawRequested` at all (it's never in `self.windows` for that
+        // event to route through), so this is its ONLY render call site.
+        // Cost discipline: `is_active()` is `false` (skipped entirely, no
+        // `next_wake` contribution) whenever no drag has been carried yet,
+        // and `tick` itself returns `false` — one tick after a fade-out
+        // completes — which stops this from re-arming `next_wake` forever.
+        if let WispSlot::Ready(w) = &mut shared.wisp {
+            if w.is_active() && w.tick(now) {
+                let deadline = w.last_anim + WISP_FRAME;
+                next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
+            }
+        }
         if let Some(deadline) = next_wake {
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else {
@@ -1909,6 +2152,7 @@ fn clear_drag_on_window_close(
     };
     if drag.source_window == id {
         shared.drag = None;
+        shared.wisp_end_drag();
         clear_all_drag_visuals(windows);
         return;
     }
@@ -1944,6 +2188,7 @@ fn clear_all_drag_visuals(windows: &mut HashMap<WindowId, WindowState>) {
 /// window), so clearing must reach every window, not just `self`.
 fn cancel_drag_everywhere(windows: &mut HashMap<WindowId, WindowState>, shared: &mut Shared) {
     if shared.drag.take().is_some() {
+        shared.wisp_end_drag();
         clear_all_drag_visuals(windows);
         for w in windows.values_mut() {
             w.renderer.window().request_redraw();
@@ -2029,6 +2274,13 @@ fn clear_incoming_drop_except(
 /// and drives the previews: a different tracked window gets its
 /// `incoming_drop` set (Strip/Edge/Center preview), no window hit at all
 /// means `DropHover::Desktop`.
+///
+/// Also the wisp's (Task 5) one motion-tick choke point: by the time this
+/// returns, `shared.drag.hover` is final for the tick, so the common tail
+/// below drives `wisp_tick` off it once, covering both the in-bounds and
+/// carried branches (see `wisp_tick`'s doc for why it's not just "while
+/// `outside_source`" — `carried` is monotonic, `outside_source` isn't).
+/// `event_loop` is needed only for the wisp's lazy, one-time window creation.
 fn update_cross_window_drag(
     windows: &mut HashMap<WindowId, WindowState>,
     shared: &mut Shared,
@@ -2036,6 +2288,7 @@ fn update_cross_window_drag(
     source_id: WindowId,
     local_x: f64,
     local_y: f64,
+    event_loop: &ActiveEventLoop,
 ) {
     let Some(drag) = shared.drag.as_ref() else {
         return;
@@ -2043,6 +2296,7 @@ fn update_cross_window_drag(
     if drag.source_window != source_id {
         return;
     }
+    let was_carried = drag.carried;
     let Some(src) = windows.get(&source_id) else {
         return;
     };
@@ -2062,6 +2316,13 @@ fn update_cross_window_drag(
             d.carried = true;
         }
     }
+    // `carried` is monotonic (never flips back to `false`); `outside_source`
+    // can — the pointer can drift back over the source window mid-carry. The
+    // wisp stays live through that (it's a carry-scoped token, not an
+    // in-bounds-only one), so this reads the POST-update flag, not
+    // `outside_source` itself.
+    let just_carried = outside_source && !was_carried;
+    let carried_now = was_carried || outside_source;
 
     if !outside_source {
         // Still (or again) inside the source's own bounds: `on_cursor_moved`
@@ -2069,57 +2330,105 @@ fn update_cross_window_drag(
         // correctly via `update_drag_hover`. Just make sure no OTHER window
         // is left showing a stale target preview from a prior tick.
         clear_incoming_drop_except(windows, Some(source_id));
+    } else {
+        let frames = window_frames(windows, focus_history, &shared.window_order);
+        let hit = ember_core::window_under(
+            screen_x,
+            screen_y,
+            &frames.iter().map(|(_, f)| *f).collect::<Vec<_>>(),
+        );
+        let target = hit.and_then(|i| frames.get(i)).map(|(id, _)| *id);
+
+        match target {
+            Some(tid) if tid == source_id => {
+                // The point is geometrically back over the source's own frame
+                // (carried, but hovering itself again) — nothing else claims it.
+                // Drop any stale cross-window hover too: its preview was just
+                // cleared, and a release here must not apply an invisible target.
+                if let Some(d) = shared.drag.as_mut() {
+                    d.hover = None;
+                }
+                clear_incoming_drop_except(windows, Some(source_id));
+            }
+            Some(tid) => {
+                clear_incoming_drop_except(windows, Some(tid));
+                let target_pos = windows.get(&tid).and_then(|twin| {
+                    let tsf = twin.renderer.window().scale_factor();
+                    let tpos = twin.renderer.window().inner_position().ok()?;
+                    Some((
+                        (screen_x - tpos.x as f64) / tsf,
+                        (screen_y - tpos.y as f64) / tsf,
+                    ))
+                });
+                if let Some((tx, ty)) = target_pos {
+                    let hover = windows
+                        .get(&tid)
+                        .and_then(|twin| twin.hover_at(tid, tx, ty));
+                    if let Some(twin) = windows.get_mut(&tid) {
+                        twin.set_incoming_drop(hover, tx);
+                    }
+                    if let Some(d) = shared.drag.as_mut() {
+                        d.hover = hover;
+                    }
+                }
+            }
+            None => {
+                clear_incoming_drop_except(windows, None);
+                if let Some(d) = shared.drag.as_mut() {
+                    d.hover = Some(DropHover::Desktop);
+                }
+            }
+        }
+    }
+
+    if carried_now {
+        wisp_tick(shared, event_loop, just_carried, screen_x, screen_y);
+    }
+}
+
+/// Drive the wisp (Task 5) for one carried-drag tick. Lazily creates it on
+/// the FIRST carried transition of the process (`just_carried`), degrading
+/// to `WispSlot::Unsupported` — permanently, no retry — if window/GPU
+/// creation fails (`WispUnsupported`): every other drag mechanic is
+/// unaffected either way, which is the whole point of the ladder. A no-op
+/// when `config.wisp` is off, so toggling it off is a genuine zero-cost
+/// skip, not just "don't show it."
+fn wisp_tick(
+    shared: &mut Shared,
+    event_loop: &ActiveEventLoop,
+    just_carried: bool,
+    screen_x: f64,
+    screen_y: f64,
+) {
+    if !shared.config.wisp {
         return;
     }
-
-    let frames = window_frames(windows, focus_history, &shared.window_order);
-    let hit = ember_core::window_under(
-        screen_x,
-        screen_y,
-        &frames.iter().map(|(_, f)| *f).collect::<Vec<_>>(),
-    );
-    let target = hit.and_then(|i| frames.get(i)).map(|(id, _)| *id);
-
-    match target {
-        Some(tid) if tid == source_id => {
-            // The point is geometrically back over the source's own frame
-            // (carried, but hovering itself again) — nothing else claims it.
-            // Drop any stale cross-window hover too: its preview was just
-            // cleared, and a release here must not apply an invisible target.
-            if let Some(d) = shared.drag.as_mut() {
-                d.hover = None;
-            }
-            clear_incoming_drop_except(windows, Some(source_id));
-        }
-        Some(tid) => {
-            clear_incoming_drop_except(windows, Some(tid));
-            let Some((tx, ty)) = windows.get(&tid).and_then(|twin| {
-                let tsf = twin.renderer.window().scale_factor();
-                let tpos = twin.renderer.window().inner_position().ok()?;
-                Some((
-                    (screen_x - tpos.x as f64) / tsf,
-                    (screen_y - tpos.y as f64) / tsf,
-                ))
-            }) else {
-                return;
+    if just_carried {
+        if matches!(shared.wisp, WispSlot::Uninit) {
+            shared.wisp = match WispWindow::new(event_loop) {
+                Ok(w) => WispSlot::Ready(Box::new(w)),
+                Err(WispUnsupported) => {
+                    eprintln!(
+                        "[ember] wisp: unsupported on this GPU/surface; disabling for this session"
+                    );
+                    WispSlot::Unsupported
+                }
             };
-            let hover = windows
-                .get(&tid)
-                .and_then(|twin| twin.hover_at(tid, tx, ty));
-            if let Some(twin) = windows.get_mut(&tid) {
-                twin.set_incoming_drop(hover, tx);
-            }
-            if let Some(d) = shared.drag.as_mut() {
-                d.hover = hover;
-            }
         }
-        None => {
-            clear_incoming_drop_except(windows, None);
-            if let Some(d) = shared.drag.as_mut() {
-                d.hover = Some(DropHover::Desktop);
-            }
+        if let WispSlot::Ready(w) = &mut shared.wisp {
+            w.show();
         }
     }
+    let WispSlot::Ready(w) = &mut shared.wisp else {
+        return;
+    };
+    let intensity = if shared.drag.as_ref().is_some_and(|d| d.hover.is_some()) {
+        1.0
+    } else {
+        0.6
+    };
+    w.set_target_intensity(intensity);
+    w.move_to(screen_x, screen_y);
 }
 
 /// Tear down window `id` immediately: shut down every session it owns (send
@@ -2590,7 +2899,7 @@ fn run_ctl_drag(
             win.on_cursor_moved(shared, window, x, y);
         }
         if shared.drag.is_some() {
-            update_cross_window_drag(windows, shared, focus_history, window, x, y);
+            update_cross_window_drag(windows, shared, focus_history, window, x, y, event_loop);
         }
     }
     // "mid" = right before release/cancel resolves it — whether a genuine
@@ -2641,6 +2950,19 @@ impl Shared {
     pub(crate) fn shutdown_all(&mut self) {
         for (_, h) in self.sessions.drain() {
             let _ = h.control.send(BackendControl::Shutdown);
+        }
+    }
+
+    /// End-of-drag hook for the wisp (Task 5): starts its ~200ms fade-out if
+    /// it's currently showing. Called unconditionally from every site that
+    /// clears `shared.drag` (`WindowState::left_release`,
+    /// `cancel_drag_everywhere`, `clear_drag_on_window_close`) — a no-op
+    /// (cheap match + no-op inside `begin_fade_out`) for the common case of a
+    /// plain in-window tab reorder or a drag that never left its source
+    /// window, where the wisp was never created/shown in the first place.
+    pub(crate) fn wisp_end_drag(&mut self) {
+        if let WispSlot::Ready(w) = &mut self.wisp {
+            w.begin_fade_out();
         }
     }
 

@@ -27,6 +27,14 @@ pub struct Config {
     /// features. OFF by default: it's a keystroke-injection + screen-read
     /// surface. Toggle in Settings when you want to hand off inspection.
     pub developer_mode: bool,
+    /// THE WISP (release 2 surface-drag task 5): a small glowing drag token
+    /// that follows the pointer while a tab/pane is being carried across
+    /// windows. Purely decorative — every drag mechanic (drop resolution,
+    /// hover previews, cross-window tracking) behaves IDENTICALLY whether
+    /// this is on or off, or if the GPU can't support the alpha compositing
+    /// it needs (feature-detected on first use, degrading silently for the
+    /// rest of the session). On by default.
+    pub wisp: bool,
 }
 
 impl Default for Config {
@@ -38,6 +46,7 @@ impl Default for Config {
             shell_integration: true,
             option_as_meta: false,
             developer_mode: false,
+            wisp: true,
         }
     }
 }
@@ -117,6 +126,7 @@ mod tests {
         assert_eq!(c.background.ember_density, 1.0);
         assert_eq!(c.background.ember_fps, 30);
         assert!(c.visual_bell); // visual bell on by default
+        assert!(c.wisp); // decorative-only; safe to default on
     }
 
     #[test]

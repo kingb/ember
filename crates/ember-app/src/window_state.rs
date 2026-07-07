@@ -1451,6 +1451,10 @@ impl WindowState {
         let mut ended = DragEnded::None;
         if let Some(drag) = shared.drag.take() {
             ended = self.resolve_drag_drop(shared, window_id, drag);
+            // Task 5: end the wisp's fade-out here too — this is the ONLY
+            // release path shared by both a real mouse-up and `ctl drag`'s
+            // synthesized one (`run_ctl_drag` calls this same method).
+            shared.wisp_end_drag();
         } else if let Some(d) = self.tab_drag.take() {
             self.renderer.set_tab_drag(None);
             ended = if d.active {

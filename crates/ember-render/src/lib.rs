@@ -15,6 +15,7 @@ mod quads;
 pub mod renderer;
 pub mod selection;
 mod sprite;
+pub mod wisp;
 
 pub use grid_model::{GridModel, LinkSource, LinkSpan};
 pub use headless::CaptureError;
@@ -23,6 +24,7 @@ pub use renderer::{
     PaneSnapshot, RenderOutcome, Renderer, TabHit, TabLabel, VisiblePane,
 };
 pub use selection::{Point, Selection, SelectionMode};
+pub use wisp::{WispRenderer, WispUnsupported};
 
 /// Returns the `ember-core` version this render layer is built against.
 pub fn core_version() -> &'static str {
