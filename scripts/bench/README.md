@@ -42,13 +42,31 @@ quiet machine), idle CPU (`idle-cpu.sh`) — published in the release body:
 | gradient (on, sparks off) | 1.03% | 1.00% |
 | sparks (gradient + sparks) | 0.60% | 0.77% |
 
-An earlier dev-build run on the same machine measured 0.27–0.43% across the
-same scenarios: absolute numbers move with machine state, which is why each
-table records both passes and its conditions. Two findings have held across
-every run so far: gradient == flat, and sparks consistently *below* the
-un-animated scenarios (the capped 30fps cadence appears to batch wakeups
-better than the idle event loop's scattered ones — unexplained, worth a
-profile someday).
+**CORRECTION (v0.2.1, same day, genuinely quiet machine):** the table above
+was taken before the machine fully quiesced, and it understated the sparks
+cost badly. On a quiet machine (flat/gradient at the 0.0–0.3% noise floor):
+
+| Scenario | Pass 1 | Pass 2 |
+|---|---|---|
+| flat | 0.03% | 0.33% |
+| gradient | 0.03% | 0.07% |
+| sparks | 5.83% | 5.73% |
+
+Earlier runs (three of them) showed sparks *below* flat — an artifact of
+background load keeping CPU clocks boosted, which made the animation's work
+bill fewer cpu-seconds. The real findings: **gradient == flat == free** (held
+in every run), and **sparks cost ~5–6% of a core at default settings**.
+
+Dial sweep (30s each): fps30/d1.0 5.0%, fps30/d0.5 5.4%, fps15/d1.0 3.3%,
+fps15/d0.5 3.1%. Density is free; fps saves only ~⅓ when halved. The cost is
+the per-frame redraw wakeup itself (~1.7ms CPU per animated frame), not the
+sparks — which makes the animation frame path the optimization target if
+sparks are ever to be on by default.
+
+Meta-lesson, the strongest argument for CI runners this repo has produced:
+three consecutive runs on a load-noisy machine produced a consistent,
+plausible, *wrong* conclusion. Consistency across runs is not validity if the
+environment is consistently wrong.
 
 Gradient is identical to flat (it draws statically), which is why it's on by
 default. Sparks are CPU-negligible; their real cost is GPU/display power,
