@@ -116,6 +116,28 @@ impl Selection {
 
     /// The selected columns `[c0, c1]` (inclusive) for `row`, if any — drives the
     /// highlight quads. `None` for rows outside the selection.
+    ///
+    /// `self.anchor`/`self.active` are absolute cell coordinates captured at
+    /// whatever pane size was current when the selection was made or last
+    /// extended; nothing shrinks them when the pane is resized narrower
+    /// afterward (a split, or a keyboard-driven resize) — the `Selection`
+    /// just sits there, stale, until the next click clears it or a new drag
+    /// starts. `c1` was already clamped to the CURRENT `last_col` below, but
+    /// `c0` wasn't: a selection whose start column also falls past the new
+    /// (narrower) width produced `c0 > c1`, and every caller — this crate's
+    /// `selection_quads` computing `(c1 - c0 + 1) as f32 * cw` foremost —
+    /// assumes `c0 <= c1`, so that underflowed and panicked. Rather than
+    /// mutate/clear the `Selection` at resize time (which would need a hook
+    /// on every resize path — divider drag, split, keyboard chord — to find
+    /// and special-case, and would throw away a still-meaningful selection
+    /// on a one-column trim), clamp here, at the single query point every
+    /// consumer (this fn's callers: the highlight quads AND `text()`'s copy
+    /// path) already goes through: a row whose selection starts past the
+    /// visible width has nothing left to show for THAT row, so it's
+    /// dropped; a row where only the end overruns keeps showing its now-
+    /// truncated visible portion (this is also how Alacritty et al. treat a
+    /// live selection surviving a resize — clamped to what's visible, not
+    /// discarded wholesale).
     pub fn row_span(&self, grid: &GridModel, row: u16) -> Option<(u16, u16)> {
         let (s, e) = self.effective_range(grid);
         if row < s.row || row > e.row {
@@ -123,6 +145,9 @@ impl Selection {
         }
         let last_col = grid.dims.columns.saturating_sub(1);
         let c0 = if row == s.row { s.col } else { 0 };
+        if c0 > last_col {
+            return None;
+        }
         let c1 = if row == e.row { e.col } else { last_col };
         Some((c0, c1.min(last_col)))
     }
@@ -270,6 +295,46 @@ mod tests {
         let s = sel((0, 2), (0, 6), SelectionMode::Simple);
         assert_eq!(s.row_span(&g, 0), Some((2, 6)));
         assert_eq!(s.row_span(&g, 1), None);
+    }
+
+    /// Reproduces the P1 crash (surface-drag task 4's report, task 5's
+    /// fix): a selection made on a wide pane, entirely past the column
+    /// range of the SAME pane after a resize (e.g. a split) shrinks it
+    /// narrower — `paint::selection_quads` used to compute `c1 - c0 + 1` on
+    /// the raw `(c0, c1)` from `row_span` and underflow-panic the instant
+    /// `c0` (still the wide-pane column) exceeded the new, narrower
+    /// `last_col`. `row_span` must now drop that row (`None`) rather than
+    /// hand back a `c0 > c1` pair.
+    #[test]
+    fn row_span_drops_a_row_whose_start_column_outlives_a_shrink() {
+        let mut g = grid_from(&["0123456789abcdefghij"]); // 20 cols wide.
+        // Selected columns 12..=18 while the pane was 20 cols wide.
+        let s = sel((0, 12), (0, 18), SelectionMode::Simple);
+        assert_eq!(s.row_span(&g, 0), Some((12, 18)));
+
+        // The pane (e.g. a vertical split) shrinks to 5 cols — narrower
+        // than the selection's start column — WITHOUT the selection itself
+        // being cleared or re-clamped (this is the actual failure mode: a
+        // stale `Selection` surviving a resize with no hook to touch it).
+        g.dims = GridDims::new(5, 1);
+        assert_eq!(
+            s.row_span(&g, 0),
+            None,
+            "a selection start column past the new width must be dropped, not \
+             handed back with c0 > c1 (that's the underflow the crash was)"
+        );
+    }
+
+    /// The companion case: only the END column outlives the shrink, not the
+    /// start — the row still has SOMETHING visible to highlight/copy, just
+    /// truncated to the new width, matching how a live selection surviving
+    /// a resize reads elsewhere (Alacritty et al.): clamped, not discarded.
+    #[test]
+    fn row_span_clamps_end_column_that_outlives_a_shrink() {
+        let mut g = grid_from(&["0123456789abcdefghij"]); // 20 cols wide.
+        let s = sel((0, 2), (0, 18), SelectionMode::Simple);
+        g.dims = GridDims::new(5, 1); // last_col = 4 now.
+        assert_eq!(s.row_span(&g, 0), Some((2, 4)));
     }
 
     #[test]

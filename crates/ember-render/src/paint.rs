@@ -485,8 +485,19 @@ pub(crate) fn selection_quads(
     let oy = rect.y as f32;
     for row in 0..grid.dims.screen_lines {
         if let Some((c0, c1)) = selection.row_span(grid, row) {
+            // `row_span` already clamps `c0 <= c1` against the CURRENT pane
+            // dims (a P1 crash fixed alongside this: a stale selection —
+            // made before a resize shrank the pane — used to send a `c0`
+            // that was in range at selection time but past the new width by
+            // the time this ran, straight through to the `c1 - c0` below,
+            // underflowing this `u16` subtraction). `saturating_sub` here is
+            // the second, cheap layer of the same fix: free on the
+            // (overwhelmingly common) well-formed case, and turns any
+            // FUTURE `row_span`-alike caller's bug into a zero-width quad
+            // instead of a panic, rather than trusting this call site to be
+            // the only one that ever needs the invariant.
             let x = ox + c0 as f32 * cw;
-            let w = (c1 - c0 + 1) as f32 * cw;
+            let w = (c1.saturating_sub(c0) + 1) as f32 * cw;
             let y = oy + row as f32 * ch;
             out.push((scaled(x, y, w, ch, sf), lin_rgba(SELECT_BG, 0.45)));
         }
@@ -1681,5 +1692,56 @@ mod tests {
         assert_eq!(out[1].0, [10.0, 82.0, 32.0, 2.0]);
         // Hovered is more opaque than idle.
         assert!(out[1].1[3] > out[0].1[3]);
+    }
+
+    /// Reproduces the P1 crash from the surface-drag task-4 report: `thread
+    /// 'main' panicked at .../paint.rs:489:22: attempt to subtract with
+    /// overflow` in `selection_quads`'s `(c1 - c0 + 1) as f32 * cw` — hit by
+    /// a stale text selection (made while a pane was wide) surviving a
+    /// resize that shrinks the SAME pane narrower (a split, or a keyboard
+    /// resize chord), with nothing to clear/re-clamp the selection in
+    /// between. The real root cause and fix live in `Selection::row_span`
+    /// (`selection.rs`) — this test drives the exact call path the panic
+    /// actually happened on (`selection_quads` over a post-shrink `grid`),
+    /// so a regression here is caught at the layer the crash was observed
+    /// at, not just the one it was root-caused to.
+    #[test]
+    fn selection_quads_does_not_underflow_after_a_stale_selection_outlives_a_shrink() {
+        use super::{GridModel, selection_quads};
+        use crate::selection::{Point, Selection, SelectionMode};
+        use ember_core::{CellPatch, GridDelta, GridDims, NeutralCell, StyleId};
+
+        let wide = GridDims::new(20, 1);
+        let mut grid = GridModel::new(wide);
+        let cells: Vec<CellPatch> = (0..20)
+            .map(|c| CellPatch {
+                row: 0,
+                col: c,
+                cell: NeutralCell::new(ember_core::CellContent::Char('x'), StyleId(0)),
+            })
+            .collect();
+        grid.apply(GridDelta {
+            epoch: 1,
+            dims: wide,
+            reset: true,
+            cells,
+            ..Default::default()
+        });
+
+        // Selected columns 12..=18 while the pane was still 20 cols wide.
+        let mut selection = Selection::new(Point::new(0, 12), SelectionMode::Simple);
+        selection.update(Point::new(0, 18));
+
+        // The pane shrinks to 5 columns (e.g. a split) — the selection
+        // itself is never touched by a resize path, so it's now entirely
+        // past the visible width.
+        grid.dims = GridDims::new(5, 1);
+
+        let mut out = Vec::new();
+        let rect = ember_core::Rect::new(0.0, 0.0, 40.0, 16.0);
+        selection_quads(&grid, &selection, rect, 8.0, 16.0, 1.0, &mut out);
+        // No panic (the point of this test) and nothing to highlight — the
+        // whole selected span fell outside the shrunken pane.
+        assert!(out.is_empty());
     }
 }
