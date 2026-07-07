@@ -22,6 +22,13 @@ follow [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Linux keyboard shortcuts no longer fight the GNOME shell. GNOME reserves
+  many Super combinations (Super+1..9, Super+Arrows, Super+D, Super+V), so
+  Ember now also binds the conventional Linux forms: Ctrl+Shift+C/V/T/W/D,
+  Ctrl+Shift+Arrows to focus panes, Alt+Shift+D and Alt+Shift+Arrows,
+  Alt+1..9 to jump to a tab, and Ctrl+- / Ctrl+0 for zoom. Super still works
+  where the window manager passes it through, and the shortcuts overlay now
+  shows the bindings that work everywhere.
 - A plain click (no drag) now clears the selection, like other terminals,
   instead of leaving a single cell selected. Drag selections and
   double/triple-click word and line selections behave as before.

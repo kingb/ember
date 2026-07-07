@@ -37,7 +37,7 @@ use ember_session::{LocalPty, LocalPtyConfig};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, WindowId};
 
@@ -819,6 +819,26 @@ impl ApplicationHandler<EmberEvent> for App {
                         return;
                     }
                 }
+                // Linux tab jump: Alt+1..9 (the gnome-terminal convention).
+                // GNOME binds Super+digits itself (dash favorites), so on
+                // GNOME those never reach us; Super+N still works under WMs
+                // that deliver it. Tabs win over Alt-as-Meta digits, matching
+                // gnome-terminal's default.
+                #[cfg(target_os = "linux")]
+                if let Some(n) = alt_digit_tab(&key.logical_key, mods) {
+                    state.select_tab(n);
+                    return;
+                }
+                // The GNOME-safe conventional chords (Ctrl+Shift+X, Alt+Shift+X)
+                // translate onto the same shortcut handler Super uses.
+                #[cfg(target_os = "linux")]
+                if let Some((k, m)) = linux_chord_translate(&key.logical_key, mods) {
+                    if state.handle_shortcut(&k, m) && state.tree.tabs.is_empty() {
+                        state.shutdown_all();
+                        event_loop.exit();
+                    }
+                    return;
+                }
                 // DECCKM from the focused pane; Option-as-Meta strips the
                 // macOS compose (Opt+b = "∫") back to the plain key for the
                 // ESC prefix. With the option off, composing wins (é, ñ).
@@ -1298,6 +1318,19 @@ impl RunState {
             }
             ControlMsg::Chord(combo) => {
                 if let Some((key, mods)) = parse_chord(&combo) {
+                    #[cfg(target_os = "linux")]
+                    if let Some(n) = alt_digit_tab(&key, mods) {
+                        self.select_tab(n);
+                        return;
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Some((k, m)) = linux_chord_translate(&key, mods) {
+                        if self.handle_shortcut(&k, m) && self.tree.tabs.is_empty() {
+                            self.shutdown_all();
+                            event_loop.exit();
+                        }
+                        return;
+                    }
                     if mods.super_key() {
                         if self.handle_shortcut(&key, mods) && self.tree.tabs.is_empty() {
                             self.shutdown_all();
@@ -3085,6 +3118,110 @@ fn match_tab_title(titles: &[String], query: &str) -> Option<usize> {
     titles.iter().position(|t| t.to_lowercase().contains(&q))
 }
 
+/// Linux tab jump: `Alt+<digit 1-9>` -> tab number. GNOME owns Super+digits
+/// (dash-favorite activation) so `Super+1..9` never reaches the app there;
+/// `Alt+1..9` is the gnome-terminal/Tilix convention. Pure and un-gated so
+/// both platforms' test builds exercise it; call sites are Linux-only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn alt_digit_tab(key: &Key, mods: ModifiersState) -> Option<usize> {
+    if !mods.alt_key() || mods.super_key() || mods.control_key() {
+        return None;
+    }
+    match key {
+        Key::Character(s) => {
+            let mut it = s.chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) if ('1'..='9').contains(&c) => Some(c as usize - '0' as usize),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The GNOME-safe Linux chord layer (issue #5). GNOME itself owns much of
+/// bare Super (arrows = tiling, Shift+arrows = move-to-monitor, D = show
+/// desktop, V = notifications, digits = dash favorites), so those chords
+/// often never reach the app. Linux therefore gets conventional additive
+/// bindings under one learnable rule:
+///
+///   macOS `Cmd+X`       ->  `Ctrl+Shift+X`
+///   macOS `Cmd+Shift+X` ->  `Alt+Shift+X`
+///   zoom follows gnome-terminal: `Ctrl+-` (out) joins `Ctrl+Shift+=` (in)
+///
+/// Implemented as a translation onto the existing shortcut handler so there
+/// is exactly one source of truth for what each action does. Super chords
+/// keep working wherever the WM lets them through. Whitelisted, not blanket:
+/// only chords with an Ember meaning are consumed; everything else still
+/// reaches the shell.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_chord_translate(key: &Key, mods: ModifiersState) -> Option<(Key, ModifiersState)> {
+    if mods.super_key() {
+        return None; // Super path is handled by the primary gate.
+    }
+    let (ctrl, shift, alt) = (mods.control_key(), mods.shift_key(), mods.alt_key());
+    // Shift changes the delivered character; fold shifted forms back to the
+    // unshifted key the macOS handler matches on.
+    let unshift = |s: &str| -> Option<&'static str> {
+        Some(match s {
+            "c" | "C" => "c",
+            "v" | "V" => "v",
+            "t" | "T" => "t",
+            "w" | "W" => "w",
+            "d" | "D" => "d",
+            "p" | "P" => "p",
+            "/" | "?" => "/",
+            "," | "<" => ",",
+            "[" | "{" => "[",
+            "]" | "}" => "]",
+            "=" | "+" => "=",
+            "-" | "_" => "-",
+            "0" => "0",
+            _ => return None,
+        })
+    };
+    if ctrl && shift && !alt {
+        // Ctrl+Shift+X  ==  Cmd+X
+        return match key {
+            Key::Character(s) => {
+                unshift(s).map(|k| (Key::Character(SmolStr::new(k)), ModifiersState::empty()))
+            }
+            Key::Named(
+                a @ (NamedKey::ArrowLeft
+                | NamedKey::ArrowRight
+                | NamedKey::ArrowUp
+                | NamedKey::ArrowDown),
+            ) => Some((Key::Named(*a), ModifiersState::empty())),
+            _ => None,
+        };
+    }
+    if alt && shift && !ctrl {
+        // Alt+Shift+X  ==  Cmd+Shift+X
+        return match key {
+            Key::Character(s) => match unshift(s)? {
+                k @ ("d" | "p") => Some((Key::Character(SmolStr::new(k)), ModifiersState::SHIFT)),
+                _ => None,
+            },
+            Key::Named(
+                a @ (NamedKey::ArrowLeft
+                | NamedKey::ArrowRight
+                | NamedKey::ArrowUp
+                | NamedKey::ArrowDown),
+            ) => Some((Key::Named(*a), ModifiersState::SHIFT)),
+            _ => None,
+        };
+    }
+    if ctrl && !shift && !alt {
+        // gnome-terminal zoom-out/reset (zoom-in arrives as Ctrl+Shift+=).
+        if let Key::Character(s) = key {
+            if s.as_str() == "-" || s.as_str() == "0" {
+                return Some((Key::Character(s.clone()), ModifiersState::empty()));
+            }
+        }
+    }
+    None
+}
+
 /// Whether releasing the left button should CLEAR the selection instead of
 /// keeping it: a plain click (press+release, no drag) leaves a degenerate
 /// single-cell Simple selection, and terminals treat that as "clear what was
@@ -3117,48 +3254,58 @@ fn bracket_paste(text: &str, bracketed: bool) -> Vec<u8> {
 /// **section header** (rendered as an accent heading by `build_help`); the rest are
 /// `(key, description)`. Keep in sync with [`RunState::handle_shortcut`].
 pub(crate) fn help_lines() -> Vec<(String, String)> {
-    // The primary modifier and the option key differ by platform. The keymap
-    // matches winit super_key()/alt_key() with no target_os gating, so on Linux
-    // the real keys are Super and Alt, not Cmd and Opt. Label them accordingly
-    // so the cheat sheet is correct on both.
-    let m = if cfg!(target_os = "macos") {
-        "Cmd"
-    } else {
-        "Super"
+    // Every row carries its platform's true binding. macOS uses Cmd; Linux
+    // uses the GNOME-safe conventional layer (Ctrl+Shift+X for Cmd+X,
+    // Alt+Shift+X for Cmd+Shift+X, Alt+1..9 for tabs) because GNOME itself
+    // owns much of bare Super — see linux_chord_translate. Super variants
+    // still work on Linux where the WM delivers them; the sheet shows the
+    // bindings that work everywhere.
+    let mac = cfg!(target_os = "macos");
+    let k = |mac_k: &str, linux_k: &str| {
+        if mac {
+            mac_k.to_string()
+        } else {
+            linux_k.to_string()
+        }
     };
-    let o = if cfg!(target_os = "macos") {
-        "Opt"
-    } else {
-        "Alt"
-    };
-    let r = |k: &str, d: &str| (k.to_string(), d.to_string());
+    let r = |key: String, d: &str| (key, d.to_string());
     vec![
-        r("", "PANES"),
-        r(&format!("{m}+D"), "Split right (side by side)"),
-        r(&format!("{m}+Shift+D"), "Split down (stacked)"),
+        r("".into(), "PANES"),
+        r(k("Cmd+D", "Ctrl+Shift+D"), "Split right (side by side)"),
+        r(k("Cmd+Shift+D", "Alt+Shift+D"), "Split down (stacked)"),
         r(
-            &format!("Ctrl+{o}+Click"),
+            k("Ctrl+Opt+Click", "Ctrl+Alt+Click"),
             "Split by drop zone (drag to preview)",
         ),
-        r(&format!("{m}+W"), "Close pane"),
-        r("Click pane", "Focus it"),
-        r(&format!("{m}+Arrows"), "Focus pane"),
-        r("", "TABS"),
-        r(&format!("{m}+T"), "New tab"),
-        r(&format!("{m}+Shift+Arrows"), "Switch tab"),
-        r(&format!("{m}+1..9"), "Jump to tab"),
-        r("Drag / Double-click", "Reorder / rename tab"),
-        r("", "SELECTION & CLIPBOARD"),
-        r("Drag / 2×/3× click", "Select text / word / line"),
-        r(&format!("{m}+C / {m}+V"), "Copy / paste"),
-        r("", "SCROLLBACK"),
-        r("Wheel / Shift+PgUp/Dn", "Scroll history"),
-        r("Shift+Home/End", "Scroll to top / bottom"),
-        r("", "SHELL"),
-        r(&format!("{m}+[ / {m}+]"), "Jump to prev / next command"),
-        r("", "APP"),
-        r(&format!("{m}+,"), "Settings"),
-        r(&format!("{m}+/"), "Show this help"),
+        r(k("Cmd+W", "Ctrl+Shift+W"), "Close pane"),
+        r("Click pane".into(), "Focus it"),
+        r(k("Cmd+Arrows", "Ctrl+Shift+Arrows"), "Focus pane"),
+        r("".into(), "TABS"),
+        r(k("Cmd+T", "Ctrl+Shift+T"), "New tab"),
+        r(k("Cmd+Shift+Arrows", "Alt+Shift+Arrows"), "Switch tab"),
+        r(k("Cmd+1..9", "Alt+1..9"), "Jump to tab"),
+        r("Drag / Double-click".into(), "Reorder / rename tab"),
+        r("".into(), "SELECTION & CLIPBOARD"),
+        r(
+            "Drag / 2\u{d7}/3\u{d7} click".into(),
+            "Select text / word / line",
+        ),
+        r(
+            k("Cmd+C / Cmd+V", "Ctrl+Shift+C / Ctrl+Shift+V"),
+            "Copy / paste",
+        ),
+        r("".into(), "SCROLLBACK"),
+        r("Wheel / Shift+PgUp/Dn".into(), "Scroll history"),
+        r("Shift+Home / End".into(), "Jump to top / bottom"),
+        r(
+            k("Cmd+[ / Cmd+]", "Ctrl+Shift+[ / ]"),
+            "Previous / next prompt",
+        ),
+        r("".into(), "VIEW"),
+        r(k("Cmd+= / Cmd+-", "Ctrl+Shift+= / Ctrl+-"), "Zoom in / out"),
+        r(k("Cmd+0", "Ctrl+0"), "Reset zoom"),
+        r(k("Cmd+,", "Ctrl+Shift+,"), "Settings"),
+        r(k("Cmd+/", "Ctrl+Shift+/"), "This cheat sheet"),
     ]
 }
 
@@ -3492,6 +3639,59 @@ mod tests {
         assert_eq!(tab_display_title("build", 0), "build");
         assert_eq!(tab_display_title("", 0), "1");
         assert_eq!(tab_display_title("", 4), "5");
+    }
+
+    #[test]
+    fn alt_digit_selects_tabs_one_through_nine_only() {
+        use super::alt_digit_tab;
+        let ch = |c: &str| Key::Character(SmolStr::new(c));
+        let alt = ModifiersState::ALT;
+        assert_eq!(alt_digit_tab(&ch("1"), alt), Some(1));
+        assert_eq!(alt_digit_tab(&ch("9"), alt), Some(9));
+        // 0 is not a tab; multi-char and named keys don't count.
+        assert_eq!(alt_digit_tab(&ch("0"), alt), None);
+        assert_eq!(alt_digit_tab(&ch("12"), alt), None);
+        assert_eq!(alt_digit_tab(&Key::Named(NamedKey::Enter), alt), None);
+        // Alt must be the sole chord modifier (Shift alone is fine for AZERTY-
+        // style layouts, but Super/Ctrl combos belong to other bindings).
+        assert_eq!(alt_digit_tab(&ch("2"), ModifiersState::empty()), None);
+        assert_eq!(alt_digit_tab(&ch("2"), alt | ModifiersState::SUPER), None);
+        assert_eq!(alt_digit_tab(&ch("2"), alt | ModifiersState::CONTROL), None);
+    }
+
+    #[test]
+    fn linux_chords_translate_onto_the_mac_shortcut_table() {
+        use super::linux_chord_translate as tr;
+        let ch = |c: &str| Key::Character(SmolStr::new(c));
+        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let als = ModifiersState::ALT | ModifiersState::SHIFT;
+        let none = ModifiersState::empty();
+        // Ctrl+Shift+X == Cmd+X, shifted characters folded back.
+        assert_eq!(tr(&ch("T"), cs), Some((ch("t"), none)));
+        assert_eq!(tr(&ch("c"), cs), Some((ch("c"), none)));
+        assert_eq!(tr(&ch("?"), cs), Some((ch("/"), none)));
+        assert_eq!(tr(&ch("<"), cs), Some((ch(","), none)));
+        assert_eq!(tr(&ch("{"), cs), Some((ch("["), none)));
+        assert_eq!(tr(&ch("+"), cs), Some((ch("="), none)));
+        assert_eq!(
+            tr(&Key::Named(NamedKey::ArrowLeft), cs),
+            Some((Key::Named(NamedKey::ArrowLeft), none))
+        );
+        // Alt+Shift+X == Cmd+Shift+X (split down, tab cycling, fps overlay).
+        assert_eq!(tr(&ch("D"), als), Some((ch("d"), ModifiersState::SHIFT)));
+        assert_eq!(
+            tr(&Key::Named(NamedKey::ArrowRight), als),
+            Some((Key::Named(NamedKey::ArrowRight), ModifiersState::SHIFT))
+        );
+        // gnome-terminal zoom-out / reset.
+        assert_eq!(tr(&ch("-"), ModifiersState::CONTROL), Some((ch("-"), none)));
+        assert_eq!(tr(&ch("0"), ModifiersState::CONTROL), Some((ch("0"), none)));
+        // NOT consumed: plain Ctrl+C (SIGINT!), unknown chords, Super combos,
+        // and Alt+Shift+letters without a Cmd+Shift meaning.
+        assert_eq!(tr(&ch("c"), ModifiersState::CONTROL), None);
+        assert_eq!(tr(&ch("r"), cs), None);
+        assert_eq!(tr(&ch("t"), cs | ModifiersState::SUPER), None);
+        assert_eq!(tr(&ch("T"), als), None);
     }
 
     #[test]
