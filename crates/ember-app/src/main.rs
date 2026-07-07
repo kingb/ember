@@ -3024,6 +3024,15 @@ fn run_ctl_drag(
         );
         return;
     }
+    // A live drag (real mouse or a prior ctl press) must not be overwritten:
+    // a stranded DragState would still resolve safely, but the synthesized
+    // press/release sequence would interleave with the user's.
+    if shared.drag.is_some() {
+        let _ = reply.send(
+            serde_json::json!({"ok": false, "error": "a drag is already in progress"}).to_string(),
+        );
+        return;
+    }
     let steps = steps.max(1);
     {
         let win = windows.get_mut(&window).expect("checked above");

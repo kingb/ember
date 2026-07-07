@@ -75,6 +75,15 @@ tab drag (release 1's `WouldEmptyTab` rule made this explicit).
   session survival, style replay, focus, and window lifecycle are already
   proven paths.
 
+## v1 trims (shipped behavior vs. this document)
+
+The first implementation ships the mechanics in full and trims three
+presentation details described above: the wisp carries no text label, the
+suck-in/pour-out is an intensity fade rather than a rect morph, and a
+cross-window strip drop appends as the last tab rather than landing at the
+pointer's position. All three are follow-up candidates, none affect where
+surfaces land or session survival.
+
 ## Non-goals (this release)
 
 - Multi-surface drags, drag-out to OTHER apps (no OS drag-and-drop payload),
