@@ -2109,8 +2109,14 @@ impl WindowState {
 
     /// Close the pane backing `session` wherever it lives (a shell exited, or a
     /// background tab's pane was closed). Switches to that tab so `ClosePane`'s
-    /// active-tab semantics apply, then restores a sane active index.
-    pub(crate) fn close_session(&mut self, shared: &mut Shared, session: &SessionId) {
+    /// active-tab semantics apply, then restores a sane active index. Returns
+    /// `true` when this call left the window's tree empty (mirrors
+    /// `do_close_tab`'s contract) — the caller MUST then tear this window down
+    /// (e.g. via `finish_close`): unlike a tab closed from the keyboard, this is
+    /// reached from the exited-shell drain, which can route to a BACKGROUND
+    /// window just as easily as the focused one, and nothing else notices an
+    /// emptied background tree on its own.
+    pub(crate) fn close_session(&mut self, shared: &mut Shared, session: &SessionId) -> bool {
         let found = self.tree.tabs.iter().enumerate().find_map(|(ti, tab)| {
             tab.root
                 .leaves()
@@ -2121,7 +2127,7 @@ impl WindowState {
         let Some((ti, pane)) = found else {
             // Not in the layout (already removed); just clean up the backend.
             self.kill_session(shared, session);
-            return;
+            return self.tree.tabs.is_empty();
         };
         // Remember which tab the USER is on (by id) so closing a background
         // tab's pane doesn't teleport them there. ClosePane targets the active
@@ -2136,7 +2142,7 @@ impl WindowState {
         );
         self.apply_effects(shared, effects);
         if self.tree.tabs.is_empty() {
-            return;
+            return true;
         }
         // Restore the user's tab if it still exists (it may have shifted index,
         // or been the very tab whose last pane just closed).
@@ -2145,6 +2151,7 @@ impl WindowState {
             .unwrap_or(self.tree.active)
             .min(self.tree.tabs.len() - 1);
         self.sync_layout(shared);
+        false
     }
 
     /// Perform a tab close (after any confirmation). Returns true when this

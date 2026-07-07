@@ -18,8 +18,9 @@ follow [Semantic Versioning](https://semver.org).
   Linux), and move terminal surfaces freely between them: promote a split
   pane to its own tab or window, move tabs to another window, and merge a
   tab back into another as a split. Shells keep running through every move.
-  Available from the Window menu, keyboard shortcuts, and the control
-  surface (move-tab, promote-pane, merge-tab, new-window).
+  Available from the Window menu on macOS, keyboard shortcuts on both
+  platforms, and the control surface (move-tab, promote-pane, merge-tab,
+  new-window).
 - The control surface's state now reports every window (windows array plus
   focused_window), and focus <query> finds and raises the right window
   across all of them.

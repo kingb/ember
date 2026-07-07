@@ -1107,6 +1107,12 @@ impl ApplicationHandler<EmberEvent> for App {
         // it (it may not be the focused one), falling back to the focused
         // window for a session `session_window` never learned about (a spawn
         // racing this drain).
+        // Any window whose tree just emptied because its last shell exited —
+        // tracked so it can be torn down below, once `deferred_windows`
+        // exists. A BACKGROUND window can end up here (the whole point of
+        // this bug fix): the organic tabs-empty check further down only ever
+        // looks at `focused_id`, so nothing else notices one of these.
+        let mut emptied_windows: Vec<WindowId> = Vec::new();
         for session in exited {
             let wid = shared
                 .session_window
@@ -1114,7 +1120,9 @@ impl ApplicationHandler<EmberEvent> for App {
                 .copied()
                 .unwrap_or(focused_id);
             if let Some(w) = self.windows.get_mut(&wid) {
-                w.close_session(shared, &session);
+                if w.close_session(shared, &session) {
+                    emptied_windows.push(wid);
+                }
             }
         }
         for session in belled {
@@ -1171,6 +1179,19 @@ impl ApplicationHandler<EmberEvent> for App {
         // clobbered action entirely. Every queued action is processed, in
         // write order, at the tail once `win`'s borrow ends.
         let mut deferred_windows: Vec<DeferredWindowAction> = Vec::new();
+
+        // Tear down every BACKGROUND window emptied by the exited-shell drain
+        // above. `focused_id`'s own case is deliberately excluded here — it
+        // still falls through to the organic `win.tree.tabs.is_empty()` check
+        // further down, which already queues `CloseThis` for it (and dedups
+        // against this same tick's other close requests); handling it twice,
+        // once here and once there, would just be redundant, not wrong, but
+        // there's no need for two code paths to agree on one window.
+        for wid in emptied_windows {
+            if wid != focused_id {
+                queue_close_window(&mut deferred_windows, wid);
+            }
+        }
 
         // Drain debug-control commands (EMBER_CONTROL) and act on them.
         let cmds: Vec<ControlMsg> = shared
@@ -1436,6 +1457,15 @@ impl ApplicationHandler<EmberEvent> for App {
                         focused_id,
                     );
                 }
+                DeferredWindowAction::CloseWindow(id) => {
+                    finish_close(
+                        &mut self.windows,
+                        shared,
+                        &mut self.focused_window,
+                        event_loop,
+                        id,
+                    );
+                }
                 DeferredWindowAction::Move(source, op, reply) => {
                     // Resolve the op against `self.windows`/`shared.window_order`
                     // AS THEY STAND right now — not as they stood when this
@@ -1511,6 +1541,13 @@ impl ApplicationHandler<EmberEvent> for App {
 enum DeferredWindowAction {
     OpenNew(Option<String>),
     CloseThis,
+    /// Close a specific, possibly NON-focused window whose tree just emptied
+    /// (a background window's last shell exited via the exited-shell drain).
+    /// `CloseThis` always targets `focused_id` captured at the top of
+    /// `about_to_wait`, so it can't express "close THAT other window" — this
+    /// variant carries the id explicitly. Processed by `finish_close` exactly
+    /// like `CloseThis`, just against an explicit id instead of `focused_id`.
+    CloseWindow(WindowId),
     /// A surface-mobility op, deferred for the same reason as the other two
     /// variants: the sites that discover one (a ctl command, a native menu
     /// item) still hold `win`'s borrow of `self.windows` for the rest of the
@@ -1572,6 +1609,23 @@ fn queue_close_this(deferred_windows: &mut Vec<DeferredWindowAction>) {
         .any(|a| matches!(a, DeferredWindowAction::CloseThis))
     {
         deferred_windows.push(DeferredWindowAction::CloseThis);
+    }
+}
+
+/// Enqueue a `CloseWindow(id)` unless one targeting the same `id` is already
+/// queued this tick. Same idempotency reasoning as `queue_close_this`: a
+/// duplicate close request for the same window is harmless once
+/// `finish_close`'s own guard sees `id` already removed from `windows`, but
+/// this keeps `deferred_windows` from accumulating redundant entries for a
+/// window that emptied via more than one exited session in the same tick
+/// (e.g. a two-tab background window whose last two shells both exit
+/// together).
+fn queue_close_window(deferred_windows: &mut Vec<DeferredWindowAction>, id: WindowId) {
+    if !deferred_windows
+        .iter()
+        .any(|a| matches!(a, DeferredWindowAction::CloseWindow(w) if *w == id))
+    {
+        deferred_windows.push(DeferredWindowAction::CloseWindow(id));
     }
 }
 
@@ -2695,7 +2749,7 @@ mod tests {
     use super::{
         BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, bell_flash_intensity, bracket_paste,
         encode_key, match_tab_title, match_tab_title_across, next_prev_index, queue_close_this,
-        resolve_index, tab_display_title, url_is_openable,
+        queue_close_window, resolve_index, tab_display_title, url_is_openable,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
@@ -3061,6 +3115,37 @@ mod tests {
         queue_close_this(&mut v);
         queue_close_this(&mut v);
         assert_eq!(v.len(), 1);
+    }
+
+    /// `queue_close_window` is `CloseWindow`'s analogue of `queue_close_this`
+    /// (em-... background-window-never-torn-down fix): a background window's
+    /// last shell can exit twice in the same tick — a two-tab window whose
+    /// final two panes' shells both exit together, say — and `close_session`
+    /// reports the tree emptied for BOTH. Without this dedup, that queues
+    /// `finish_close` twice for the same already-removed id; harmless given
+    /// `finish_close`'s own `!windows.contains_key` guard, but this keeps the
+    /// action list free of redundant entries. A DIFFERENT window's close is
+    /// always kept — this must never merge two distinct windows' closes into
+    /// one.
+    #[test]
+    fn queue_close_window_dedups_same_id_but_keeps_distinct_ids() {
+        use winit::window::WindowId;
+        let a = WindowId::dummy();
+        let mut v: Vec<DeferredWindowAction> = Vec::new();
+        queue_close_window(&mut v, a);
+        queue_close_window(&mut v, a);
+        assert_eq!(v.len(), 1);
+        match &v[0] {
+            DeferredWindowAction::CloseWindow(id) => assert_eq!(*id, a),
+            other => panic!("expected CloseWindow(a), got {other:?}"),
+        }
+
+        // `WindowId` has no public constructor besides `dummy()`, so a second
+        // distinct id isn't available to test here; `winit::window::WindowId`
+        // is a thin wrapper this crate doesn't control, and this is already
+        // sufficient to pin the dedup-by-id (not dedup-any-CloseWindow)
+        // contract down against a regression to `queue_close_this`'s
+        // variant-only dedup shape.
     }
 
     /// `DeferredWindowAction::Move` carries the source window's IDENTITY
