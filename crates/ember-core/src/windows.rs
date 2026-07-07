@@ -391,6 +391,114 @@ fn move_pane(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Drop-zone geometry (release 2): pure hit-testing for surface drags. Every
+// drag hover in the UI lowers onto one of these two pure functions to decide
+// "where would this land" — inside a pane ([`drop_zone_for`]) or which
+// on-screen window frame a screen point is over ([`window_under`]). Callers
+// (ember-app) translate the result into a [`SurfaceDest`] for [`move_surface`].
+// ---------------------------------------------------------------------------
+
+/// Where a carried surface would land inside a pane, by pointer position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DropZone {
+    /// Outer edge band: split along the axis, new surface on the named side.
+    Edge { axis: Axis, before: bool },
+    /// Inner region: append as a new tab of that window.
+    Center,
+}
+
+/// Classify a point (pane-local coordinates) against a pane of size `w` x `h`.
+///
+/// The edge band is the outer 30% on each side, one band per side (West,
+/// East, North, South); the remaining middle 40% x 40% square is `Center`
+/// (the 30%/70% boundary lines themselves belong to `Center`, not the band).
+///
+/// Axis mapping — verified against [`Axis`]'s own doc comment (`Horizontal` =
+/// side-by-side panes, divider runs vertically; `Vertical` = stacked panes,
+/// divider runs horizontally) and against how `ember-app`'s pane-resize
+/// keybindings pair Left/Right with `Axis::Horizontal` and Up/Down with
+/// `Axis::Vertical` (`window_state.rs`'s `Cmd+Ctrl+Arrows` handler):
+///   - **West** band (left 30% of `w`) -> `Edge { axis: Horizontal, before: true }`:
+///     the moved surface becomes the LEFT sibling of a side-by-side split.
+///   - **East** band (right 30% of `w`) -> `Edge { axis: Horizontal, before: false }`:
+///     the moved surface becomes the RIGHT sibling of a side-by-side split.
+///   - **North** band (top 30% of `h`) -> `Edge { axis: Vertical, before: true }`:
+///     the moved surface becomes the TOP sibling of a stacked split.
+///   - **South** band (bottom 30% of `h`) -> `Edge { axis: Vertical, before: false }`:
+///     the moved surface becomes the BOTTOM sibling of a stacked split.
+///
+/// A point can fall in two bands at once (a corner): the NEARER edge wins,
+/// i.e. the smaller of the two edge distances. An exact tie resolves
+/// horizontal-first (West/East beats North/South).
+pub fn drop_zone_for(x: f64, y: f64, w: f64, h: f64) -> DropZone {
+    const BAND: f64 = 0.3;
+    let west = x < w * BAND;
+    let east = x > w * (1.0 - BAND);
+    let north = y < h * BAND;
+    let south = y > h * (1.0 - BAND);
+
+    // Order matters: ties resolve to the first-inserted candidate, so
+    // West/East (horizontal) are pushed before North/South (vertical) to
+    // give the required horizontal-first tie-break.
+    let mut candidates: Vec<(f64, DropZone)> = Vec::with_capacity(4);
+    if west {
+        candidates.push((
+            x,
+            DropZone::Edge {
+                axis: Axis::Horizontal,
+                before: true,
+            },
+        ));
+    }
+    if east {
+        candidates.push((
+            w - x,
+            DropZone::Edge {
+                axis: Axis::Horizontal,
+                before: false,
+            },
+        ));
+    }
+    if north {
+        candidates.push((
+            y,
+            DropZone::Edge {
+                axis: Axis::Vertical,
+                before: true,
+            },
+        ));
+    }
+    if south {
+        candidates.push((
+            h - y,
+            DropZone::Edge {
+                axis: Axis::Vertical,
+                before: false,
+            },
+        ));
+    }
+
+    candidates
+        .into_iter()
+        .min_by(|a, b| a.0.partial_cmp(&b.0).expect("finite distances"))
+        .map(|(_, zone)| zone)
+        .unwrap_or(DropZone::Center)
+}
+
+/// Topmost window frame containing a screen point. `frames` is ordered
+/// front-to-back (the caller passes focus order) as `(x, y, width, height)`
+/// tuples; returns the index into `frames` of the first (frontmost) hit, or
+/// `None` if the point misses every frame. Containment is edge-inclusive on
+/// the left/top and edge-exclusive on the right/bottom — `px` in
+/// `[frame.0, frame.0 + frame.2)`, `py` in `[frame.1, frame.1 + frame.3)` —
+/// so two abutting frames never both claim the shared boundary point.
+pub fn window_under(px: f64, py: f64, frames: &[(f64, f64, f64, f64)]) -> Option<usize> {
+    frames
+        .iter()
+        .position(|&(x, y, w, h)| px >= x && px < x + w && py >= y && py < y + h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1058,5 +1166,159 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Drop-zone geometry (release 2). See the `drop` section above for the
+    // verified Axis <-> left/right/up/down mapping this encodes.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn drop_zone_edges_map_to_axis_and_side() {
+        // Pane is 100x100. Probes sit well inside a single band (the
+        // orthogonal coordinate stays in [40,60], clear of any corner) so
+        // each assertion exercises exactly one edge, not a tie.
+        let west = [(5.0, 40.0), (5.0, 50.0), (5.0, 60.0)];
+        let east = [(95.0, 40.0), (95.0, 50.0), (95.0, 60.0)];
+        let north = [(40.0, 5.0), (50.0, 5.0), (60.0, 5.0)];
+        let south = [(40.0, 95.0), (50.0, 95.0), (60.0, 95.0)];
+
+        for &(x, y) in &west {
+            assert_eq!(
+                drop_zone_for(x, y, 100.0, 100.0),
+                DropZone::Edge {
+                    axis: Axis::Horizontal,
+                    before: true
+                },
+                "west probe ({x},{y})"
+            );
+        }
+        for &(x, y) in &east {
+            assert_eq!(
+                drop_zone_for(x, y, 100.0, 100.0),
+                DropZone::Edge {
+                    axis: Axis::Horizontal,
+                    before: false
+                },
+                "east probe ({x},{y})"
+            );
+        }
+        for &(x, y) in &north {
+            assert_eq!(
+                drop_zone_for(x, y, 100.0, 100.0),
+                DropZone::Edge {
+                    axis: Axis::Vertical,
+                    before: true
+                },
+                "north probe ({x},{y})"
+            );
+        }
+        for &(x, y) in &south {
+            assert_eq!(
+                drop_zone_for(x, y, 100.0, 100.0),
+                DropZone::Edge {
+                    axis: Axis::Vertical,
+                    before: false
+                },
+                "south probe ({x},{y})"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_zone_center_is_the_middle_square() {
+        // Strictly inside the middle 40% square.
+        for &(x, y) in &[
+            (50.0, 50.0),
+            (31.0, 31.0),
+            (69.0, 69.0),
+            (31.0, 69.0),
+            (69.0, 31.0),
+        ] {
+            assert_eq!(
+                drop_zone_for(x, y, 100.0, 100.0),
+                DropZone::Center,
+                "interior probe ({x},{y})"
+            );
+        }
+        // Exactly on the 30%/70% boundary lines: the band is the OUTER 30%,
+        // so the boundary itself belongs to the center square, not the band.
+        for &(x, y) in &[(30.0, 50.0), (70.0, 50.0), (50.0, 30.0), (50.0, 70.0)] {
+            assert_eq!(
+                drop_zone_for(x, y, 100.0, 100.0),
+                DropZone::Center,
+                "boundary probe ({x},{y})"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_zone_corners_pick_the_nearer_edge() {
+        // Top-left corner region: closer to the west edge than the north edge.
+        assert_eq!(
+            drop_zone_for(5.0, 20.0, 100.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Horizontal,
+                before: true
+            }
+        );
+        // Same corner region, but closer to the north edge than the west edge.
+        assert_eq!(
+            drop_zone_for(20.0, 5.0, 100.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Vertical,
+                before: true
+            }
+        );
+        // Top-right corner: closer to east than north.
+        assert_eq!(
+            drop_zone_for(95.0, 20.0, 100.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Horizontal,
+                before: false
+            }
+        );
+        // Bottom-left corner: closer to south than west.
+        assert_eq!(
+            drop_zone_for(20.0, 95.0, 100.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Vertical,
+                before: false
+            }
+        );
+        // Exact tie in the top-left corner resolves horizontal-first.
+        assert_eq!(
+            drop_zone_for(15.0, 15.0, 100.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Horizontal,
+                before: true
+            }
+        );
+        // Exact tie in the bottom-right corner: still horizontal-first.
+        assert_eq!(
+            drop_zone_for(85.0, 85.0, 100.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Horizontal,
+                before: false
+            }
+        );
+    }
+
+    #[test]
+    fn window_under_returns_topmost_first_hit() {
+        // Two overlapping frames; front (index 0) covers the shared region.
+        let frames = [(0.0, 0.0, 50.0, 50.0), (25.0, 25.0, 50.0, 50.0)];
+        assert_eq!(window_under(30.0, 30.0, &frames), Some(0));
+        // Only the back frame covers this point.
+        assert_eq!(window_under(60.0, 60.0, &frames), Some(1));
+        // Miss: outside both frames.
+        assert_eq!(window_under(200.0, 200.0, &frames), None);
+
+        // Edge inclusivity: left/top inclusive, right/bottom exclusive.
+        let one = [(10.0, 10.0, 20.0, 20.0)];
+        assert_eq!(window_under(10.0, 10.0, &one), Some(0)); // top-left corner: inside
+        assert_eq!(window_under(30.0, 10.0, &one), None); // right edge: outside
+        assert_eq!(window_under(10.0, 30.0, &one), None); // bottom edge: outside
+        assert_eq!(window_under(29.999, 29.999, &one), Some(0)); // just inside bottom-right
     }
 }

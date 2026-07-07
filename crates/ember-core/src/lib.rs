@@ -34,7 +34,10 @@ pub use ids::{PaneId, SessionId, TabId};
 pub use layout::{Axis, LayoutNode, Tab, WindowTree, layout};
 pub use links::{UrlMatch, find_urls};
 pub use settings::{Help, RowKind, SettingRow, SettingsRowView, resolve_rows, setting_rows};
-pub use windows::{MoveEffect, MoveError, SurfaceDest, SurfaceRef, Windows, move_surface};
+pub use windows::{
+    DropZone, MoveEffect, MoveError, SurfaceDest, SurfaceRef, Windows, drop_zone_for, move_surface,
+    window_under,
+};
 
 /// The crate version, surfaced for diagnostics and the `ember-term --version`
 /// banner. Acts as the workspace's first real, linkable symbol.
