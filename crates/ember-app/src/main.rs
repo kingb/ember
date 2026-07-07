@@ -1227,6 +1227,19 @@ impl ApplicationHandler<EmberEvent> for App {
                 ));
                 continue;
             }
+            // `state` and `focus` (Task 5): same reasoning as the surface-
+            // mobility verbs above — both need every window in `self.windows`
+            // (`state` to list them all, `focus` to search/raise across all
+            // of them), neither reachable while `win` still borrows
+            // `self.windows` for the rest of this tick.
+            if let ControlMsg::State(reply) = cmd {
+                deferred_windows.push(DeferredWindowAction::State(reply));
+                continue;
+            }
+            if let ControlMsg::Focus(query, reply) = cmd {
+                deferred_windows.push(DeferredWindowAction::Focus(query, reply));
+                continue;
+            }
             match win.handle_control(shared, cmd) {
                 Some(ControlClose::ExitApp) => {
                     shared.shutdown_all();
@@ -1469,6 +1482,14 @@ impl ApplicationHandler<EmberEvent> for App {
                         (Err(e), None) => eprintln!("[ember] move failed: {e}"),
                     }
                 }
+                DeferredWindowAction::State(reply) => {
+                    let json = build_state_json(shared, &self.windows, self.focused_window);
+                    let _ = reply.send(json);
+                }
+                DeferredWindowAction::Focus(query, reply) => {
+                    let resp = focus_across_windows(&mut self.windows, shared, &query);
+                    let _ = reply.send(resp);
+                }
             }
         }
     }
@@ -1503,6 +1524,15 @@ enum DeferredWindowAction {
         DeferredMoveOp,
         Option<std::sync::mpsc::Sender<String>>,
     ),
+    /// `ctl state` (Task 5): deferred for the same reason as `Move` — the
+    /// discovery site (the ctl-commands loop) still holds `win`'s borrow of
+    /// `self.windows` for the rest of the tick, but the multi-window builder
+    /// needs to see every window. Built at the tail by `build_state_json`.
+    State(std::sync::mpsc::Sender<String>),
+    /// `ctl focus` (Task 5): same reasoning — searches (and can raise/select
+    /// on) any window, not just the one `win` currently borrows. Resolved at
+    /// the tail by `focus_across_windows`.
+    Focus(String, std::sync::mpsc::Sender<String>),
 }
 
 /// Which surface-mobility builder a deferred [`DeferredWindowAction::Move`]
@@ -2177,6 +2207,111 @@ fn match_tab_title(titles: &[String], query: &str) -> Option<usize> {
     titles.iter().position(|t| t.to_lowercase().contains(&q))
 }
 
+/// Cross-window `ctl focus` (Task 5): search `window_titles` — one entry per
+/// window, in `Shared::window_order`, each holding that window's tab titles
+/// in tab order — for the first title containing `query`
+/// (case-insensitive substring, same semantics as `match_tab_title`, which
+/// this delegates to per-window). First window wins ties; within a window,
+/// first tab wins. Returns `(window_index, tab_index)`, both 0-based.
+fn match_tab_title_across(window_titles: &[Vec<String>], query: &str) -> Option<(usize, usize)> {
+    window_titles
+        .iter()
+        .enumerate()
+        .find_map(|(wi, titles)| match_tab_title(titles, query).map(|ti| (wi, ti)))
+}
+
+/// Build the `ctl state` JSON (Task 5): a top-level `windows` array — one
+/// summary per window in `Shared::window_order` (`{id,focused,active_tab,
+/// tabs}`, `id` 1-based) — plus `focused_window` (1-based), plus the
+/// PRE-EXISTING top-level fields (`scale_factor`/`surface`/`tabs`/
+/// `active_tab`/`focus_pane`/`bracketed_paste`/`panes`) describing the
+/// focused window, kept so existing single-window consumers (e.g. the
+/// Stream Deck plugin) keep working unchanged.
+fn build_state_json(
+    shared: &Shared,
+    windows: &HashMap<WindowId, WindowState>,
+    focused_window: Option<WindowId>,
+) -> String {
+    let windows_json: Vec<serde_json::Value> = shared
+        .window_order
+        .iter()
+        .enumerate()
+        .filter_map(|(i, wid)| {
+            windows.get(wid).map(|w| {
+                serde_json::json!({
+                    "id": i + 1,
+                    "focused": Some(*wid) == focused_window,
+                    "active_tab": w.tree.active,
+                    "tabs": w.tabs_summary_json(),
+                })
+            })
+        })
+        .collect();
+    let focused_index = focused_window.and_then(|id| resolve_window_index(shared, id));
+    let mut top: serde_json::Value = focused_window
+        .and_then(|id| windows.get(&id))
+        .map(|w| {
+            serde_json::from_str(&w.state_json(shared)).unwrap_or_else(|_| serde_json::json!({}))
+        })
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = top.as_object_mut() {
+        obj.insert(
+            "windows".to_string(),
+            serde_json::Value::Array(windows_json),
+        );
+        if let Some(i) = focused_index {
+            obj.insert("focused_window".to_string(), serde_json::json!(i + 1));
+        }
+    }
+    top.to_string()
+}
+
+/// `ctl focus <query>` across every window (Task 5): search
+/// `shared.window_order` (then tab order within each) via
+/// `match_tab_title_across`. On match: select that tab on its window and
+/// raise it (the OS `Focused` event then updates `App::focused_window`, same
+/// as any other window-focus change), reply gains 1-based `window`. On miss:
+/// the reply's `titles` is every window's titles flattened in search order —
+/// still a flat array, so existing callers that just print `titles` see no
+/// shape change, only more entries.
+fn focus_across_windows(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &Shared,
+    query: &str,
+) -> String {
+    let window_titles: Vec<Vec<String>> = shared
+        .window_order
+        .iter()
+        .map(|wid| {
+            windows
+                .get(wid)
+                .map(WindowState::tab_titles)
+                .unwrap_or_default()
+        })
+        .collect();
+    match match_tab_title_across(&window_titles, query) {
+        Some((wi, ti)) => {
+            let title = window_titles[wi][ti].clone();
+            let wid = shared.window_order[wi];
+            if let Some(w) = windows.get_mut(&wid) {
+                w.select_tab(shared, ti + 1);
+                w.raise_window();
+            }
+            serde_json::json!({
+                "ok": true, "index": ti + 1, "title": title, "window": wi + 1,
+            })
+            .to_string()
+        }
+        None => {
+            let titles: Vec<String> = window_titles.into_iter().flatten().collect();
+            serde_json::json!({
+                "ok": false, "error": "no tab title matches", "titles": titles,
+            })
+            .to_string()
+        }
+    }
+}
+
 /// Linux tab jump: `Alt+<digit 1-9>` -> tab number. GNOME owns Super+digits
 /// (dash-favorite activation) so `Super+1..9` never reaches the app there;
 /// `Alt+1..9` is the gnome-terminal/Tilix convention. Pure and un-gated so
@@ -2546,8 +2681,8 @@ fn encode_key(
 mod tests {
     use super::{
         BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, bell_flash_intensity, bracket_paste,
-        encode_key, match_tab_title, next_prev_index, queue_close_this, resolve_index,
-        tab_display_title, url_is_openable,
+        encode_key, match_tab_title, match_tab_title_across, next_prev_index, queue_close_this,
+        resolve_index, tab_display_title, url_is_openable,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
@@ -2839,6 +2974,42 @@ mod tests {
         assert_eq!(match_tab_title(&titles, "BETA"), Some(2));
         assert_eq!(match_tab_title(&titles, "uild"), Some(1), "substring");
         assert_eq!(match_tab_title(&titles, "gamma"), None);
+    }
+
+    #[test]
+    fn tab_title_matching_across_windows_first_window_wins_ties() {
+        // Both windows have a tab matching "shared" — the earlier window in
+        // `window_order` (index 0) wins, even though its match is the SECOND
+        // tab there (tab order within a window is still first-match).
+        let windows = vec![
+            vec!["alpha".to_string(), "shared".to_string()],
+            vec!["shared".to_string(), "beta".to_string()],
+        ];
+        assert_eq!(
+            match_tab_title_across(&windows, "shared"),
+            Some((0, 1)),
+            "first window wins the tie"
+        );
+    }
+
+    #[test]
+    fn tab_title_matching_across_windows_is_case_insensitive_substring() {
+        let windows = vec![
+            vec!["Agent Alpha".to_string()],
+            vec!["agent beta".to_string()],
+        ];
+        assert_eq!(match_tab_title_across(&windows, "BETA"), Some((1, 0)));
+        assert_eq!(
+            match_tab_title_across(&windows, "gent"),
+            Some((0, 0)),
+            "substring, first window wins"
+        );
+    }
+
+    #[test]
+    fn tab_title_matching_across_windows_miss_returns_none() {
+        let windows = vec![vec!["alpha".to_string()], vec!["beta".to_string()]];
+        assert_eq!(match_tab_title_across(&windows, "gamma"), None);
     }
 
     /// `deferred_windows` is a `Vec`, not a single `Option`, specifically so a

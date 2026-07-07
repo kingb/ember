@@ -40,7 +40,7 @@ use crate::control::ControlMsg;
 use crate::{
     ControlClose, DEFAULT_COLS, DEFAULT_ROWS, MULTI_CLICK, PAD, PendingClose, Shared, about_info,
     bell_flash_intensity, bracket_paste, click_selection_should_clear, dims_for_rect, ember_glow,
-    encode_key, help_lines, inset, load_backdrop_image, match_tab_title, named_key, parse_chord,
+    encode_key, help_lines, inset, load_backdrop_image, named_key, parse_chord,
     step_selectable_row, tab_display_title, url_is_openable,
 };
 #[cfg(target_os = "linux")]
@@ -485,33 +485,14 @@ impl WindowState {
                     }
                 }
             }
-            ControlMsg::State(reply) => {
-                let _ = reply.send(self.state_json(shared));
-            }
-            ControlMsg::Focus(query, reply) => {
-                let titles: Vec<String> = self
-                    .tree
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| tab_display_title(&t.title, i))
-                    .collect();
-                let resp = match match_tab_title(&titles, &query) {
-                    Some(i) => {
-                        self.select_tab(shared, i + 1);
-                        self.raise_window();
-                        serde_json::json!({"ok": true, "index": i + 1, "title": titles[i]})
-                            .to_string()
-                    }
-                    // Echo the titles we saw so a caller can debug its query
-                    // without a round of guesswork.
-                    None => serde_json::json!({
-                        "ok": false, "error": "no tab title matches", "titles": titles,
-                    })
-                    .to_string(),
-                };
-                let _ = reply.send(resp);
-            }
+            // Handled by the caller (`about_to_wait`) before this method is
+            // ever invoked — both need every window (`self.windows` +
+            // `shared.window_order`), not just this one: `State` builds the
+            // top-level `windows[]` array, and `Focus` searches (and can
+            // raise/select on) any window, not only this one. Kept here only
+            // so the match stays exhaustive.
+            ControlMsg::State(_) => {}
+            ControlMsg::Focus(..) => {}
             ControlMsg::Raise => self.raise_window(),
             ControlMsg::Screenshot(path, reply) => {
                 let resp = match self.renderer.capture_to_png(std::path::Path::new(&path)) {
@@ -594,8 +575,46 @@ impl WindowState {
         None
     }
 
+    /// Display titles for every tab, in tab order — the shared substring-match
+    /// input for both `ctl focus`'s single-window search (historical) and the
+    /// App-level cross-window search (`match_tab_title_across` in `main.rs`).
+    pub(crate) fn tab_titles(&self) -> Vec<String> {
+        self.tree
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| tab_display_title(&t.title, i))
+            .collect()
+    }
+
+    /// The `tabs` array shape shared by `ctl state`'s per-window `windows[]`
+    /// entries and its top-level (focused-window) fields: every tab's
+    /// 1-based `index`/`active`/displayed `title`/`sessions`.
+    pub(crate) fn tabs_summary_json(&self) -> Vec<serde_json::Value> {
+        self.tree
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let sessions: Vec<String> =
+                    t.root.leaves().iter().map(|(_, s)| s.0.clone()).collect();
+                serde_json::json!({
+                    "index": i + 1,
+                    "active": i == self.tree.active,
+                    "title": tab_display_title(&t.title, i),
+                    "sessions": sessions,
+                })
+            })
+            .collect()
+    }
+
     /// A JSON snapshot of the live app for the debug control surface: scale,
     /// surface size, tabs, and the active tab's panes (dims/cursor/styles/text).
+    ///
+    /// This describes ONE window. The App-level multi-window `ctl state`
+    /// builder (`build_state_json` in `main.rs`) uses this for the focused
+    /// window's top-level (compatibility) fields, and `tabs_summary_json` for
+    /// every OTHER window's lighter `windows[]` entry.
     pub(crate) fn state_json(&self, shared: &Shared) -> String {
         let sf = self.renderer.window().scale_factor();
         let tab = self.active_tab();
@@ -626,22 +645,7 @@ impl WindowState {
         // Every tab, not just the active one — external tools map a name to a
         // tab index with this (`index` is 1-based, matching `cmd+N` and
         // `ctl focus`). `title` is the strip's displayed title, same rule.
-        let tabs: Vec<serde_json::Value> = self
-            .tree
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let sessions: Vec<String> =
-                    t.root.leaves().iter().map(|(_, s)| s.0.clone()).collect();
-                serde_json::json!({
-                    "index": i + 1,
-                    "active": i == self.tree.active,
-                    "title": tab_display_title(&t.title, i),
-                    "sessions": sessions,
-                })
-            })
-            .collect();
+        let tabs = self.tabs_summary_json();
         serde_json::json!({
             "scale_factor": sf,
             "surface": [self.px.0, self.px.1],

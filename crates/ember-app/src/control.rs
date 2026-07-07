@@ -49,11 +49,17 @@ pub enum ControlMsg {
     /// Run a chord like `cmd+d`, `cmd+shift+arrowright`, `cmd+1`.
     Chord(String),
     /// Request a JSON state dump; the main thread replies on the channel.
+    /// The reply's top-level `windows` array covers every open window
+    /// (`{id,focused,active_tab,tabs}`, in `Shared::window_order`); the
+    /// existing top-level fields (`tabs`/`active_tab`/`panes`/etc.) still
+    /// describe the FOCUSED window, for callers that predate multi-window.
     State(Sender<String>),
-    /// Focus the first tab whose displayed title contains the query
-    /// (case-insensitive), then raise the window. Reply is the full JSON
-    /// response line: `{"ok":true,"index":..,"title":..}` or a not-found
-    /// error that lists the titles seen.
+    /// Focus the first tab, searched across EVERY window (window order, then
+    /// tab order within each) whose displayed title contains the query
+    /// (case-insensitive), then raise that window. Reply is the full JSON
+    /// response line: `{"ok":true,"index":..,"title":..,"window":..}` (both
+    /// 1-based) or a not-found error that lists every window's titles seen,
+    /// flattened in search order.
     Focus(String, Sender<String>),
     /// Bring the window to the front and give it keyboard focus.
     Raise,

@@ -81,12 +81,12 @@ fn tools() -> Value {
         },
         {
             "name": "ember_state",
-            "description": "Dump the live app state as JSON: scale_factor, surface size, a tabs array (index/active/title/sessions for EVERY tab), and each active-tab pane's dims/cursor/styles_known/screen-text. The primary way to SEE what a running ember-term is rendering.",
+            "description": "Dump the live app state as JSON: a top-level windows array (one entry per open OS window, each with id/focused/active_tab/tabs) plus focused_window, and — for the FOCUSED window — scale_factor, surface size, a tabs array (index/active/title/sessions for EVERY tab), and each active-tab pane's dims/cursor/styles_known/screen-text. The primary way to SEE what a running ember-term is rendering, across every one of its windows.",
             "inputSchema": {"type": "object", "properties": target_props()}
         },
         {
             "name": "ember_focus",
-            "description": "Focus the first tab whose title contains the query (case-insensitive) and raise the Ember window. Returns the matched index+title, or the list of titles seen when nothing matches.",
+            "description": "Focus the first tab whose title contains the query (case-insensitive), searching across EVERY open Ember window, then raise that window. Returns the matched window+index+title, or the list of titles seen (from all windows) when nothing matches.",
             "inputSchema": {"type": "object", "properties": with(target_props(), "query", json!({"type": "string", "description": "Substring to match against tab titles."})), "required": ["query"]}
         },
         {
