@@ -662,6 +662,25 @@ impl ApplicationHandler<EmberEvent> for App {
                 );
                 if button == MouseButton::Left {
                     win.left_release(shared, id);
+                    // A pane drop only STAGES its move (`WindowState::
+                    // pending_move`) — run it through the same canonical
+                    // `apply_move` path `ctl drag` (`run_ctl_drag`) and every
+                    // other surface-mobility gesture uses, right here: `win`
+                    // isn't touched again in this arm, so its borrow of
+                    // `self.windows` ends at the `take()` below, freeing
+                    // `self.windows` for `apply_move` to reborrow whole.
+                    if let Some((src, dest)) = win.pending_move.take() {
+                        if let Err(e) = apply_move(
+                            &mut self.windows,
+                            shared,
+                            &mut self.focused_window,
+                            event_loop,
+                            src,
+                            dest,
+                        ) {
+                            eprintln!("[ember] drag drop rejected: {e}");
+                        }
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
@@ -1581,6 +1600,8 @@ impl ApplicationHandler<EmberEvent> for App {
                     let resp = run_ctl_drag(
                         &mut self.windows,
                         shared,
+                        &mut self.focused_window,
+                        event_loop,
                         window,
                         x1,
                         y1,
@@ -1812,6 +1833,45 @@ fn open_new_window(
     window_id
 }
 
+/// Clear `shared.drag` if window `id` was its source, so a source window
+/// closing mid-drag doesn't leave the global key-swallow (the
+/// `shared.drag.is_some()` check in the `KeyboardInput` handler above) stuck
+/// forever — nothing else ever clears `shared.drag` once the source window
+/// itself is gone, since `WindowState::cancel_drag`/`left_release` (the only
+/// other things that clear it) are methods on THAT now-removed
+/// `WindowState`. Also clears any lifted-tab-chip/split-preview visuals left
+/// behind on a DIFFERENT window the drag was hovering (not the one
+/// closing) — the same visuals `WindowState::cancel_drag` clears on the
+/// source window itself; today's in-window-only hover always has
+/// `hover.window == source_window`, so this is a no-op in practice, but a
+/// later cross-window task can make them differ.
+fn clear_drag_on_window_close(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    id: WindowId,
+) {
+    let Some(drag) = shared.drag.as_ref() else {
+        return;
+    };
+    if drag.source_window != id {
+        return;
+    }
+    let hover_window = match drag.hover {
+        Some(DropHover::Strip { window, .. }) => Some(window),
+        Some(DropHover::Pane { window, .. }) => Some(window),
+        Some(DropHover::Desktop) | None => None,
+    };
+    shared.drag = None;
+    if let Some(hw) = hover_window {
+        if hw != id {
+            if let Some(w) = windows.get_mut(&hw) {
+                w.renderer.set_tab_drag(None);
+                w.clear_split_preview();
+            }
+        }
+    }
+}
+
 /// Tear down window `id` immediately: shut down every session it owns (send
 /// `Shutdown`, forget it in `shared.sessions`/`session_window`, and drop its
 /// per-session bookkeeping), then drop the `WindowState` itself — the last
@@ -1823,6 +1883,7 @@ fn close_window(
     focused_window: &mut Option<WindowId>,
     id: WindowId,
 ) {
+    clear_drag_on_window_close(windows, shared, id);
     if let Some(win) = windows.remove(&id) {
         for sid in win.window_session_ids() {
             if let Some(h) = shared.sessions.remove(&sid) {
@@ -1853,6 +1914,7 @@ fn close_window_shell_only(
     focused_window: &mut Option<WindowId>,
     id: WindowId,
 ) {
+    clear_drag_on_window_close(windows, shared, id);
     windows.remove(&id);
     shared.window_order.retain(|w| *w != id);
     if *focused_window == Some(id) {
@@ -2222,6 +2284,16 @@ fn parse_mods_only(spec: &str) -> ModifiersState {
 /// `WindowState::press_left`/`on_cursor_moved`/`left_release`/`cancel_drag`,
 /// the EXACT same methods a real mouse/keyboard hit. `mods` (already parsed
 /// by [`parse_mods_only`]) is held for the whole gesture, then restored.
+///
+/// A pane drop `left_release` resolves is only STAGED (`WindowState::
+/// pending_move`), not applied — this runs it through `apply_move` inline,
+/// right here, rather than re-queueing another `DeferredWindowAction`: this
+/// function already runs at the `about_to_wait` TAIL (see the call site),
+/// where `deferred_windows` has already been drained by-value into a `for`
+/// loop; pushing a new entry into it here would just sit unprocessed until
+/// next tick, and this reply would report an outcome ("move"/"cancel") that
+/// hadn't actually happened yet.
+///
 /// Free function (not a method) for the same reason as `apply_move`/
 /// `open_window`: every call site holds `&mut Shared` (and, here, `&mut
 /// self.windows`) borrowed out of `self` for the rest of `about_to_wait`.
@@ -2229,6 +2301,8 @@ fn parse_mods_only(spec: &str) -> ModifiersState {
 fn run_ctl_drag(
     windows: &mut HashMap<WindowId, WindowState>,
     shared: &mut Shared,
+    focused_window: &mut Option<WindowId>,
+    event_loop: &ActiveEventLoop,
     window: WindowId,
     x1: f64,
     y1: f64,
@@ -2252,19 +2326,36 @@ fn run_ctl_drag(
     // "mid" = right before release/cancel resolves it — whether a genuine
     // drag (not just a click) was actually in flight by then.
     let drag_active_mid = shared.drag.is_some() || win.tab_drag_is_active_drag();
-    let ended = if cancel {
+    let mut ended = if cancel {
         win.cancel_drag(shared);
         DragEnded::Cancel
     } else {
         win.left_release(shared, window)
     };
     win.modifiers = saved_mods;
-    serde_json::json!({
+    // Ends `win`'s borrow of `windows` — nothing below reuses it, which is
+    // what lets `apply_move` reborrow `windows` as a whole a few lines down.
+    let pending = win.pending_move.take();
+    let mut error = None;
+    if let Some((src, dest)) = pending {
+        match apply_move(windows, shared, focused_window, event_loop, src, dest) {
+            Ok(()) => ended = DragEnded::Move,
+            Err(e) => {
+                eprintln!("[ember] drag drop rejected: {e}");
+                ended = DragEnded::Cancel;
+                error = Some(e);
+            }
+        }
+    }
+    let mut reply = serde_json::json!({
         "ok": true,
         "drag_ended": ended.as_str(),
         "drag_active_mid": drag_active_mid,
-    })
-    .to_string()
+    });
+    if let Some(e) = error {
+        reply["error"] = serde_json::json!(e);
+    }
+    reply.to_string()
 }
 
 impl Shared {

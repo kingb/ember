@@ -24,9 +24,8 @@ use std::time::Instant;
 
 use ember_core::{
     Axis, BackendControl, BackendHandle, Direction, DropZone, GridDims, LayoutCommand,
-    LayoutEffect, MoveEffect, PaneId, Rect, RowKind, ScrollAmount, SessionBackend, SessionId,
-    SettingsRowView, SurfaceDest, SurfaceRef, Tab, TabId, Windows, apply, drop_zone_for, layout,
-    move_surface, setting_rows,
+    LayoutEffect, PaneId, Rect, RowKind, ScrollAmount, SessionBackend, SessionId, SettingsRowView,
+    SurfaceDest, SurfaceRef, Tab, TabId, apply, drop_zone_for, layout, setting_rows,
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
@@ -91,6 +90,23 @@ const TEAR_OFF_THRESHOLD: f64 = 24.0;
 /// convention in this codebase — see `ember_core::drop_zone_for`'s doc).
 pub(crate) fn strip_band_exit(pointer_y: f64, strip_bottom: f64, threshold: f64) -> bool {
     pointer_y - strip_bottom > threshold
+}
+
+/// The display-revert target at tear-off, when the pre-press origin tab
+/// (whatever was active before this press — see [`TabDrag::origin_tab`]'s
+/// doc) can't be found by id anymore, e.g. something closed it while the
+/// drag was in flight. The revert's only job is to show a tab OTHER than
+/// `dragged` (so an in-window pane drop has a different tab's pane to
+/// target — `move_surface` always rejects a tab dropped into its own pane),
+/// so any surviving tab does: the nearest one BY INDEX to `dragged` itself.
+/// `None` only when `dragged` is the sole survivor (`n_tabs <= 1`) — nothing
+/// else to revert to, and a drop-cancel is the correct, unchanged outcome
+/// there (every drop self-rejects, same as before this fallback existed).
+pub(crate) fn revert_target_tab(n_tabs: usize, dragged: usize) -> Option<usize> {
+    if n_tabs <= 1 {
+        return None;
+    }
+    Some(if dragged == 0 { 1 } else { dragged - 1 })
 }
 
 /// What a drag/reorder gesture resolved to on release — `ctl drag`'s
@@ -217,6 +233,17 @@ pub(crate) struct WindowState {
     /// machinery — the renderer's StarveGate caps actual frame prep at 4/s —
     /// so a missed frame repaints without the spin. Cleared by the first present.
     pub(crate) render_starved: bool,
+    /// A drag drop `resolve_drag_drop` resolved to an in-window surface move,
+    /// awaiting application. Set instead of applying it directly — the
+    /// canonical apply path is `apply_move` in `main.rs`, which needs
+    /// `&mut HashMap<WindowId, WindowState>`/`&ActiveEventLoop`, neither
+    /// reachable from a `WindowState` method — so `left_release`'s caller
+    /// (the real `WindowEvent::MouseInput` release handler, or `ctl drag`'s
+    /// `run_ctl_drag`) drains this immediately after and runs it through
+    /// `apply_move`, exactly like every other surface-mobility gesture
+    /// (`move-tab`/`promote-pane`/`merge-tab`). `None` outside that one-tick
+    /// window; nothing else should read or hold onto it.
+    pub(crate) pending_move: Option<(SurfaceRef, SurfaceDest)>,
 }
 
 impl WindowState {
@@ -266,6 +293,7 @@ impl WindowState {
             wheel_accum: 0.0,
             occluded: false,
             render_starved: false,
+            pending_move: None,
         }
     }
 
@@ -1752,7 +1780,10 @@ impl WindowState {
             let strip_bottom = Renderer::chrome_height() as f64;
             if active && strip_band_exit(y, strip_bottom, TEAR_OFF_THRESHOLD) {
                 self.tab_drag = None;
-                if let Some(idx) = self.tree.tabs.iter().position(|t| t.id == origin_tab) {
+                let origin_idx = self.tree.tabs.iter().position(|t| t.id == origin_tab);
+                if let Some(idx) =
+                    origin_idx.or_else(|| revert_target_tab(self.tree.tabs.len(), tab))
+                {
                     self.tree.active = idx;
                 }
                 self.sync_layout(shared);
@@ -1856,9 +1887,16 @@ impl WindowState {
     }
 
     /// Resolve a torn-off drag on release: `Strip` hover → the same reorder
-    /// a live in-strip drag commits progressively; `Pane` hover → an
-    /// in-window split; no hover (or a hover this task doesn't resolve, e.g.
-    /// a stale window identity) → cancel with zero mutation.
+    /// a live in-strip drag commits progressively (applied here directly —
+    /// an in-strip reorder is pure `LayoutCommand` bookkeeping on THIS
+    /// window's own tree, nothing `apply_move` needs to arbitrate); `Pane`
+    /// hover → builds the `(SurfaceRef, SurfaceDest)` pair for an in-window
+    /// split and stashes it in `self.pending_move` for the caller to run
+    /// through `apply_move` (the canonical surface-mobility path every other
+    /// gesture — `move-tab`/`promote-pane`/`merge-tab` — already uses; see
+    /// `pending_move`'s doc for why this method can't call it directly); no
+    /// hover (or a hover this task doesn't resolve, e.g. a stale window
+    /// identity) → cancel with zero mutation.
     fn resolve_drag_drop(
         &mut self,
         shared: &mut Shared,
@@ -1894,81 +1932,36 @@ impl WindowState {
                 pane,
                 zone,
             }) if window == window_id => {
-                match self.apply_in_window_drop(shared, src_tab, tab, pane, zone) {
-                    Ok(()) => DragEnded::Move,
-                    Err(e) => {
-                        eprintln!("[ember] drag drop rejected: {e}");
-                        DragEnded::Cancel
-                    }
-                }
+                let w = match resolve_window_index(shared, window_id) {
+                    Some(w) => w,
+                    None => return DragEnded::Cancel, // shouldn't happen: this IS that window
+                };
+                let dest = match zone {
+                    DropZone::Edge { axis, before } => SurfaceDest::SplitInto {
+                        window: w,
+                        tab,
+                        pane,
+                        axis,
+                        before,
+                    },
+                    // No in-window target yet: a same-window `NewTab` is
+                    // always rejected by `move_surface` as a no-op ("the
+                    // tab's already in that window") — `apply_move` surfaces
+                    // that as a humanized `Err`, which the caller turns into
+                    // `Cancel`.
+                    DropZone::Center => SurfaceDest::NewTab { window: w },
+                };
+                self.pending_move = Some((
+                    SurfaceRef::Tab {
+                        window: w,
+                        tab: src_tab,
+                    },
+                    dest,
+                ));
+                DragEnded::Move
             }
             _ => DragEnded::Cancel,
         }
-    }
-
-    /// Apply an in-window drop (this task's only wired destination): merge
-    /// `src_tab` (captured at drag start — indices into `self.tree`; nothing
-    /// else can have reordered it, since tear-off cleared `tab_drag` and
-    /// hover updates never mutate the tree) into `dest_tab`'s `dest_pane` as
-    /// a split, honoring `zone`'s axis + before/after side.
-    /// `DropZone::Center` has no in-window target yet: a same-window
-    /// `NewTab` is always rejected by `move_surface` as a no-op ("the tab's
-    /// already in that window"), so it surfaces as an `Err` here — the
-    /// caller turns any `Err` into `Cancel`.
-    fn apply_in_window_drop(
-        &mut self,
-        shared: &mut Shared,
-        src_tab: usize,
-        dest_tab: usize,
-        dest_pane: PaneId,
-        zone: DropZone,
-    ) -> Result<(), String> {
-        let dest = match zone {
-            DropZone::Edge { axis, before } => SurfaceDest::SplitInto {
-                window: 0,
-                tab: dest_tab,
-                pane: dest_pane,
-                axis,
-                before,
-            },
-            DropZone::Center => SurfaceDest::NewTab { window: 0 },
-        };
-        // A local, single-window `Windows` model — this task's drop target
-        // is ALWAYS the drag's own source window (checked by the caller), so
-        // there's no cross-window renderer bookkeeping to do: every session
-        // named by a `MoveEffect::SessionsRehomed` below already lives in
-        // THIS renderer and stays there; only the tree shape changes.
-        let mut model = Windows {
-            trees: vec![self.tree.clone()],
-            focused: 0,
-        };
-        let fresh_tab_id = TabId(shared.next_tab);
-        let effects = move_surface(
-            &mut model,
-            SurfaceRef::Tab {
-                window: 0,
-                tab: src_tab,
-            },
-            dest,
-            fresh_tab_id,
-        )
-        .map_err(|e| format!("{e:?}"))?;
-        shared.next_tab += 1;
-        debug_assert!(
-            !effects.iter().any(|e| matches!(
-                e,
-                MoveEffect::WindowOpened { .. } | MoveEffect::WindowClosed { .. }
-            )),
-            "an in-window merge can neither open nor close a window: {effects:?}"
-        );
-        self.tree = model
-            .trees
-            .into_iter()
-            .next()
-            .expect("single-window model always has exactly one tree");
-        self.sync_layout(shared);
-        self.renderer.window().request_redraw();
-        Ok(())
     }
 
     /// Cancel an in-progress torn-off drag (Escape / `ctl drag --cancel`):
@@ -2670,5 +2663,18 @@ mod tests {
     fn strip_band_exit_respects_a_custom_threshold() {
         assert!(!strip_band_exit(10.0, 0.0, 12.0));
         assert!(strip_band_exit(13.0, 0.0, 12.0));
+    }
+
+    #[test]
+    fn revert_target_tab_falls_back_to_the_nearest_survivor() {
+        use super::revert_target_tab;
+        // Middle tab dragged → the one just before it.
+        assert_eq!(revert_target_tab(4, 2), Some(1));
+        // Dragged tab is index 0 → nothing before it, so the one after.
+        assert_eq!(revert_target_tab(4, 0), Some(1));
+        // Last tab dragged → the one just before it.
+        assert_eq!(revert_target_tab(4, 3), Some(2));
+        // Only one tab left (the dragged one itself) → nothing to revert to.
+        assert_eq!(revert_target_tab(1, 0), None);
     }
 }
