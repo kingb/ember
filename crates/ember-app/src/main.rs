@@ -2490,6 +2490,25 @@ fn update_cross_window_drag(
                 clear_incoming_drop_except(windows, Some(source_id));
             }
             Some(tid) => {
+                // Raise the hover target the moment the carry first enters
+                // it, so the drop zones are actually visible (a buried
+                // target window made previews pointless — Brandon's first
+                // live session). Once per target change, not per tick: the
+                // previous tick's hover carries the last target's id.
+                // Keyboard focus moving with the raise is fine — keys are
+                // swallowed globally during a drag and Escape cancels from
+                // any window; macOS mouse capture survives (the source view
+                // keeps receiving motion regardless of key window).
+                let prev_target = shared.drag.as_ref().and_then(|d| match d.hover {
+                    Some(DropHover::Strip { window, .. }) => Some(window),
+                    Some(DropHover::Pane { window, .. }) => Some(window),
+                    _ => None,
+                });
+                if prev_target != Some(tid) {
+                    if let Some(twin) = windows.get(&tid) {
+                        twin.renderer.window().focus_window();
+                    }
+                }
                 clear_incoming_drop_except(windows, Some(tid));
                 let target_pos = windows.get(&tid).and_then(|twin| {
                     let tsf = twin.renderer.window().scale_factor();
