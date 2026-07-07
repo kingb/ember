@@ -24,6 +24,13 @@ follow [Semantic Versioning](https://semver.org).
 - The control surface's state now reports every window (windows array plus
   focused_window), and focus <query> finds and raises the right window
   across all of them.
+- Drag tabs and panes between windows. Tear a tab off the strip or hold
+  Cmd+Opt (macOS) or Ctrl+Alt+Shift (Linux) and drag a pane: edges of a
+  target pane split it, the center adds a tab, and empty desktop makes a
+  new window right there. While you carry a surface between windows it
+  becomes a wisp, a small ember that rides the pointer (turn it off with
+  wisp = false). Escape cancels any drag, and shells keep running through
+  every drop.
 
 ### Changed
 
