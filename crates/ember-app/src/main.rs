@@ -27,8 +27,8 @@ use control::{ControlMsg, MoveTabTarget, PromotePaneTarget};
 
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims, LayoutNode,
-    MoveEffect, OscEvent, PaneId, Rect, RowKind, ScrollAmount, SessionId, SettingsRowView,
-    SurfaceDest, SurfaceRef, Tab, TabId, resolve_rows,
+    MoveEffect, MoveError, OscEvent, PaneId, Rect, RowKind, ScrollAmount, SessionId,
+    SettingsRowView, SurfaceDest, SurfaceRef, Tab, TabId, resolve_rows,
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
@@ -1192,40 +1192,39 @@ impl ApplicationHandler<EmberEvent> for App {
             // reply with a real `{ok}`/`{ok:false,error}` line, so the
             // reply channel rides along in the deferred action and gets
             // answered once `apply_move` actually runs at the tail.
+            //
+            // Only `focused_id` (a `WindowId`) and the symbolic op/target are
+            // captured here — NOT a `build_*`-resolved `SurfaceRef`/
+            // `SurfaceDest` pair. Those carry raw `window_order` indices, and
+            // an earlier same-batch `Move` (processed first at the tail, in
+            // write order) can shift that order before this one runs, which
+            // would silently misroute it onto the wrong window. Deferring the
+            // `build_*` call itself to the tail — once every earlier action in
+            // this batch has already mutated `window_order` — re-resolves the
+            // window index (and, for `Next`/`Prev`, the neighbor) against the
+            // order as it stands then.
             if let ControlMsg::MoveTab(target, reply) = cmd {
-                match build_move_tab(win, shared, focused_id, target) {
-                    Ok((src, dest)) => {
-                        deferred_windows.push(DeferredWindowAction::Move(src, dest, Some(reply)));
-                    }
-                    Err(e) => {
-                        let _ =
-                            reply.send(serde_json::json!({"ok": false, "error": e}).to_string());
-                    }
-                }
+                deferred_windows.push(DeferredWindowAction::Move(
+                    focused_id,
+                    DeferredMoveOp::MoveTab(target),
+                    Some(reply),
+                ));
                 continue;
             }
             if let ControlMsg::PromotePane(target, reply) = cmd {
-                match build_promote_pane(win, shared, focused_id, target) {
-                    Ok((src, dest)) => {
-                        deferred_windows.push(DeferredWindowAction::Move(src, dest, Some(reply)));
-                    }
-                    Err(e) => {
-                        let _ =
-                            reply.send(serde_json::json!({"ok": false, "error": e}).to_string());
-                    }
-                }
+                deferred_windows.push(DeferredWindowAction::Move(
+                    focused_id,
+                    DeferredMoveOp::PromotePane(target),
+                    Some(reply),
+                ));
                 continue;
             }
             if let ControlMsg::MergeTab(reply) = cmd {
-                match build_merge_tab(win, shared, focused_id) {
-                    Ok((src, dest)) => {
-                        deferred_windows.push(DeferredWindowAction::Move(src, dest, Some(reply)));
-                    }
-                    Err(e) => {
-                        let _ =
-                            reply.send(serde_json::json!({"ok": false, "error": e}).to_string());
-                    }
-                }
+                deferred_windows.push(DeferredWindowAction::Move(
+                    focused_id,
+                    DeferredMoveOp::MergeTab,
+                    Some(reply),
+                ));
                 continue;
             }
             match win.handle_control(shared, cmd) {
@@ -1270,53 +1269,53 @@ impl ApplicationHandler<EmberEvent> for App {
                         }
                     }
                 }
+                // As with the ctl verbs above, only `focused_id` + the
+                // symbolic op/target are captured — the `build_*` call (and
+                // any error it can raise, e.g. "only one window open") is
+                // deferred to the tail, once this tick's earlier actions have
+                // already been applied, so it resolves against the CURRENT
+                // `window_order` rather than a possibly-stale one.
                 MenuAction::MoveTabToNewWindow => {
-                    match build_move_tab(win, shared, focused_id, MoveTabTarget::New) {
-                        Ok((src, dest)) => {
-                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
-                        }
-                        Err(e) => eprintln!("[ember] move tab to new window: {e}"),
-                    }
+                    deferred_windows.push(DeferredWindowAction::Move(
+                        focused_id,
+                        DeferredMoveOp::MoveTab(MoveTabTarget::New),
+                        None,
+                    ));
                 }
                 MenuAction::MoveTabToNextWindow => {
-                    match build_move_tab(win, shared, focused_id, MoveTabTarget::Next) {
-                        Ok((src, dest)) => {
-                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
-                        }
-                        Err(e) => eprintln!("[ember] move tab to next window: {e}"),
-                    }
+                    deferred_windows.push(DeferredWindowAction::Move(
+                        focused_id,
+                        DeferredMoveOp::MoveTab(MoveTabTarget::Next),
+                        None,
+                    ));
                 }
                 MenuAction::MoveTabToPrevWindow => {
-                    match build_move_tab(win, shared, focused_id, MoveTabTarget::Prev) {
-                        Ok((src, dest)) => {
-                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
-                        }
-                        Err(e) => eprintln!("[ember] move tab to previous window: {e}"),
-                    }
+                    deferred_windows.push(DeferredWindowAction::Move(
+                        focused_id,
+                        DeferredMoveOp::MoveTab(MoveTabTarget::Prev),
+                        None,
+                    ));
                 }
                 MenuAction::PromotePaneToTab => {
-                    match build_promote_pane(win, shared, focused_id, PromotePaneTarget::Tab) {
-                        Ok((src, dest)) => {
-                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
-                        }
-                        Err(e) => eprintln!("[ember] promote pane to tab: {e}"),
-                    }
+                    deferred_windows.push(DeferredWindowAction::Move(
+                        focused_id,
+                        DeferredMoveOp::PromotePane(PromotePaneTarget::Tab),
+                        None,
+                    ));
                 }
                 MenuAction::PromotePaneToWindow => {
-                    match build_promote_pane(win, shared, focused_id, PromotePaneTarget::Window) {
-                        Ok((src, dest)) => {
-                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
-                        }
-                        Err(e) => eprintln!("[ember] promote pane to new window: {e}"),
-                    }
+                    deferred_windows.push(DeferredWindowAction::Move(
+                        focused_id,
+                        DeferredMoveOp::PromotePane(PromotePaneTarget::Window),
+                        None,
+                    ));
                 }
                 MenuAction::MergeTabIntoPrevious => {
-                    match build_merge_tab(win, shared, focused_id) {
-                        Ok((src, dest)) => {
-                            deferred_windows.push(DeferredWindowAction::Move(src, dest, None));
-                        }
-                        Err(e) => eprintln!("[ember] merge tab: {e}"),
-                    }
+                    deferred_windows.push(DeferredWindowAction::Move(
+                        focused_id,
+                        DeferredMoveOp::MergeTab,
+                        None,
+                    ));
                 }
             }
         }
@@ -1424,15 +1423,40 @@ impl ApplicationHandler<EmberEvent> for App {
                         focused_id,
                     );
                 }
-                DeferredWindowAction::Move(src, dest, reply) => {
-                    let result = apply_move(
-                        &mut self.windows,
-                        shared,
-                        &mut self.focused_window,
-                        event_loop,
-                        src,
-                        dest,
-                    );
+                DeferredWindowAction::Move(source, op, reply) => {
+                    // Resolve the op against `self.windows`/`shared.window_order`
+                    // AS THEY STAND right now — not as they stood when this
+                    // action was enqueued. An earlier action in this same
+                    // batch (processed above, in write order) can have
+                    // closed/reopened/reordered windows; building the
+                    // `SurfaceRef`/`SurfaceDest` pair here, from `source`'s
+                    // CURRENT window (if it still exists), is what makes this
+                    // safe. `next`/`prev` targets are resolved the same way,
+                    // relative to the current window count/order.
+                    let built = match self.windows.get(&source) {
+                        Some(win) => match op {
+                            DeferredMoveOp::MoveTab(target) => {
+                                build_move_tab(win, shared, source, target)
+                            }
+                            DeferredMoveOp::PromotePane(target) => {
+                                build_promote_pane(win, shared, source, target)
+                            }
+                            DeferredMoveOp::MergeTab => build_merge_tab(win, shared, source),
+                        },
+                        None => {
+                            Err("the source window closed before this move could run".to_string())
+                        }
+                    };
+                    let result = built.and_then(|(src, dest)| {
+                        apply_move(
+                            &mut self.windows,
+                            shared,
+                            &mut self.focused_window,
+                            event_loop,
+                            src,
+                            dest,
+                        )
+                    });
                     match (result, reply) {
                         (Ok(()), Some(reply)) => {
                             let _ = reply.send("{\"ok\":true}".to_string());
@@ -1457,20 +1481,41 @@ impl ApplicationHandler<EmberEvent> for App {
 /// (`deferred_windows`), not a single slot: several independent sites in one
 /// `about_to_wait` tick can each want to enqueue one of these, and a single
 /// `Option` let a later write silently drop an earlier one.
+#[derive(Debug)]
 enum DeferredWindowAction {
     OpenNew(Option<String>),
     CloseThis,
-    /// A surface-mobility op (`apply_move`), deferred for the same reason as
-    /// the other two variants: the sites that discover one (a ctl command, a
-    /// native menu item) still hold `win`'s borrow of `self.windows` for the
-    /// rest of the tick. `Some` reply channel is a `ctl` command awaiting its
-    /// `{ok}`/`{ok:false,error}` line; `None` is a menu item (best-effort —
-    /// an error just gets logged).
+    /// A surface-mobility op, deferred for the same reason as the other two
+    /// variants: the sites that discover one (a ctl command, a native menu
+    /// item) still hold `win`'s borrow of `self.windows` for the rest of the
+    /// tick. Carries the SOURCE WINDOW'S IDENTITY (`WindowId`) and the
+    /// symbolic op/target, NOT a pre-resolved `SurfaceRef`/`SurfaceDest` pair
+    /// — those embed raw `window_order` indices, and an earlier same-batch
+    /// `Move` (this `Vec` is processed in write order) can shift that order
+    /// before this one runs, silently misrouting it onto the wrong window if
+    /// the indices were baked at dispatch time. The actual `build_*` call —
+    /// and thus the index resolution — happens at the tail, right before
+    /// `apply_move`, against `window_order` as it stands then. `Some` reply
+    /// channel is a `ctl` command awaiting its `{ok}`/`{ok:false,error}`
+    /// line; `None` is a menu item (best-effort — an error just gets logged).
     Move(
-        SurfaceRef,
-        SurfaceDest,
+        WindowId,
+        DeferredMoveOp,
         Option<std::sync::mpsc::Sender<String>>,
     ),
+}
+
+/// Which surface-mobility builder a deferred [`DeferredWindowAction::Move`]
+/// should call once it's resolved at the tail of `about_to_wait`. Mirrors
+/// `build_move_tab`/`build_promote_pane`/`build_merge_tab`'s targets exactly
+/// — this just carries the CHOICE of builder + target across the deferral,
+/// since the `SurfaceRef`/`SurfaceDest` those builders produce can't safely
+/// be precomputed (see `DeferredWindowAction::Move`'s doc).
+#[derive(Clone, Copy, Debug)]
+enum DeferredMoveOp {
+    MoveTab(MoveTabTarget),
+    PromotePane(PromotePaneTarget),
+    MergeTab,
 }
 
 /// Enqueue a `CloseThis` unless one is already queued this tick.
@@ -1656,6 +1701,18 @@ fn finish_close(
     event_loop: &ActiveEventLoop,
     id: WindowId,
 ) {
+    // A same-tick deferred action (e.g. a `Move` that closed and reopened
+    // windows earlier in this batch) may have already removed `id` from
+    // `windows` by the time this stale `CloseThis` runs. Without this guard,
+    // the `windows.len() <= 1` check below would evaluate against whatever
+    // window count is left AFTER that unrelated close/reopen — which can
+    // easily be exactly 1 — and trigger a full `shutdown_all()`/`exit()`,
+    // killing every remaining (possibly just-relocated) session over a close
+    // request that no longer refers to a real window. A stale close must be
+    // a no-op, never a full shutdown.
+    if !windows.contains_key(&id) {
+        return;
+    }
     if windows.len() <= 1 {
         shared.shutdown_all();
         event_loop.exit();
@@ -1712,10 +1769,21 @@ fn apply_move(
         focused: focused_idx,
     };
     let fresh_tab_id = TabId(shared.next_tab);
-    let effects = ember_core::move_surface(&mut model, src, dest, fresh_tab_id)
-        .map_err(|e| format!("{e:?}"))?;
+    let mut effects = ember_core::move_surface(&mut model, src, dest, fresh_tab_id)
+        .map_err(humanize_move_error)?;
     shared.next_tab += 1;
     let final_focused = model.focused;
+
+    // Stable-sort so any `WindowClosed` always processes LAST, regardless of
+    // where `move_surface` put it in the returned `Vec`. The rest of this
+    // function (the `SessionsRehomed`-before-`WindowClosed` re-homing dance)
+    // relies on that ordering, and today it happens to already hold — every
+    // `close_source_if_empty` call in ember-core's `windows.rs` appends after
+    // the effects vec is otherwise complete — but that's an internal emission
+    // detail of Task 1's code, not a documented contract `move_surface`
+    // promises to keep. Sorting here removes the reliance instead of trusting
+    // it silently holds forever.
+    effects.sort_by_key(|e| matches!(e, MoveEffect::WindowClosed { .. }));
 
     // At most one window can close per move (only the source can lose its
     // last tab), so every ORIGINAL index above it simply shifts down by one
@@ -1824,9 +1892,46 @@ fn apply_move(
     Ok(())
 }
 
-/// The 0-based index of `id` in `shared.window_order`, if tracked.
-fn window_index_of(shared: &Shared, id: WindowId) -> Option<usize> {
-    shared.window_order.iter().position(|w| *w == id)
+/// Turn a [`MoveError`] into the string every `apply_move` caller ultimately
+/// surfaces (a ctl `{ok:false,error}` reply, or an `eprintln!` for a
+/// menu-triggered move) — a `Debug`-formatted `WouldEmptyTab`/`Invalid("...")`
+/// reads like an internal enum name, not a message meant for a human at a
+/// terminal or reading a log.
+fn humanize_move_error(e: MoveError) -> String {
+    match e {
+        MoveError::WouldEmptyTab => {
+            "the tab's only pane cannot be promoted; move the tab instead".to_string()
+        }
+        MoveError::Invalid(msg) => msg.to_string(),
+    }
+}
+
+/// The 0-based index of `id` in `order`, if present. Generic (rather than
+/// hard-coded to `WindowId`) purely so it's unit-testable: winit's
+/// `WindowId::dummy()` always returns the SAME value on every call (by
+/// design — see its doc), so a multi-entry `window_order` fixture with
+/// distinct ids can't be built from real `WindowId`s in a test.
+fn resolve_index<T: PartialEq>(order: &[T], id: &T) -> Option<usize> {
+    order.iter().position(|w| w == id)
+}
+
+/// The 0-based index of `id` in `shared.window_order`, if tracked. Used both
+/// by `build_move_tab`/`build_promote_pane`/`build_merge_tab` for their
+/// normal (immediate) resolution, and — since a same-tick deferred `Move`
+/// batch can shift `window_order` between when an action is enqueued and
+/// when it actually runs — to re-resolve a deferred move's captured
+/// `WindowId` against `window_order` AS IT STANDS at the moment it's finally
+/// applied, not as it stood at dispatch time.
+fn resolve_window_index(shared: &Shared, id: WindowId) -> Option<usize> {
+    resolve_index(&shared.window_order, &id)
+}
+
+/// The `next`/`prev` neighbor index for a "move tab to next/previous window"
+/// op: modular arithmetic over `n` windows, from current window `w`. Pulled
+/// out of `build_move_tab` so it's unit-testable independent of `WindowId`
+/// (see `resolve_index`'s doc for why real ids don't work in a test fixture).
+fn next_prev_index(w: usize, n: usize, next: bool) -> usize {
+    if next { (w + 1) % n } else { (w + n - 1) % n }
 }
 
 /// Build the `SurfaceRef`/`SurfaceDest` pair for a "move tab" op (keyboard,
@@ -1837,7 +1942,7 @@ fn build_move_tab(
     focused_id: WindowId,
     target: MoveTabTarget,
 ) -> Result<(SurfaceRef, SurfaceDest), String> {
-    let w = window_index_of(shared, focused_id).ok_or("focused window not tracked")?;
+    let w = resolve_window_index(shared, focused_id).ok_or("focused window not tracked")?;
     let src = SurfaceRef::Tab {
         window: w,
         tab: win.tree.active,
@@ -1856,7 +1961,7 @@ fn build_move_tab(
                 return Err("only one window open".to_string());
             }
             SurfaceDest::NewTab {
-                window: (w + 1) % n,
+                window: next_prev_index(w, n, true),
             }
         }
         MoveTabTarget::Prev => {
@@ -1864,7 +1969,7 @@ fn build_move_tab(
                 return Err("only one window open".to_string());
             }
             SurfaceDest::NewTab {
-                window: (w + n - 1) % n,
+                window: next_prev_index(w, n, false),
             }
         }
     };
@@ -1880,7 +1985,7 @@ fn build_promote_pane(
     focused_id: WindowId,
     target: PromotePaneTarget,
 ) -> Result<(SurfaceRef, SurfaceDest), String> {
-    let w = window_index_of(shared, focused_id).ok_or("focused window not tracked")?;
+    let w = resolve_window_index(shared, focused_id).ok_or("focused window not tracked")?;
     let src = SurfaceRef::Pane {
         window: w,
         tab: win.tree.active,
@@ -1901,7 +2006,7 @@ fn build_merge_tab(
     shared: &Shared,
     focused_id: WindowId,
 ) -> Result<(SurfaceRef, SurfaceDest), String> {
-    let w = window_index_of(shared, focused_id).ok_or("focused window not tracked")?;
+    let w = resolve_window_index(shared, focused_id).ok_or("focused window not tracked")?;
     let t = win.tree.active;
     if t == 0 {
         return Err("no previous tab".to_string());
@@ -2440,8 +2545,9 @@ fn encode_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        BELL_FLASH_SECS, DeferredWindowAction, bell_flash_intensity, bracket_paste, encode_key,
-        match_tab_title, queue_close_this, tab_display_title, url_is_openable,
+        BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, bell_flash_intensity, bracket_paste,
+        encode_key, match_tab_title, next_prev_index, queue_close_this, resolve_index,
+        tab_display_title, url_is_openable,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
@@ -2771,5 +2877,63 @@ mod tests {
         queue_close_this(&mut v);
         queue_close_this(&mut v);
         assert_eq!(v.len(), 1);
+    }
+
+    /// `DeferredWindowAction::Move` carries the source window's IDENTITY
+    /// (`WindowId`) and a symbolic op, not a pre-resolved `SurfaceRef`/
+    /// `SurfaceDest` — this pins that payload shape down (a regression here
+    /// would silently reintroduce the baked-index staleness a same-tick
+    /// batch of moves can hit) and confirms it slots into the same
+    /// write-order `Vec` as every other deferred action, alongside them.
+    #[test]
+    fn deferred_move_carries_window_identity_and_preserves_write_order() {
+        use winit::window::WindowId;
+        let wid = WindowId::dummy();
+        let v: Vec<DeferredWindowAction> = vec![
+            DeferredWindowAction::OpenNew(None),
+            DeferredWindowAction::Move(wid, DeferredMoveOp::MergeTab, None),
+        ];
+        assert_eq!(v.len(), 2);
+        assert!(matches!(v[0], DeferredWindowAction::OpenNew(_)));
+        match &v[1] {
+            DeferredWindowAction::Move(source, DeferredMoveOp::MergeTab, None) => {
+                assert_eq!(*source, wid);
+            }
+            other => panic!("expected a MergeTab Move carrying `wid`, got {other:?}"),
+        }
+    }
+
+    /// `resolve_index` (the generic core behind `resolve_window_index`):
+    /// present -> its position in the order; absent -> `None`. Generic over
+    /// plain integers standing in for `WindowId`s, since `WindowId::dummy()`
+    /// can't produce distinct ids for a multi-entry fixture (see its doc).
+    #[test]
+    fn resolve_index_finds_present_ids_and_misses_absent_ones() {
+        let order = [10u32, 20, 30];
+        assert_eq!(resolve_index(&order, &10), Some(0));
+        assert_eq!(resolve_index(&order, &20), Some(1));
+        assert_eq!(resolve_index(&order, &30), Some(2));
+        // Not in the order at all (e.g. a window that closed since this id
+        // was captured) -> None, never a stale/wrong index.
+        assert_eq!(resolve_index(&order, &99), None);
+    }
+
+    /// `next_prev_index`'s modular arithmetic against a 3-entry order:
+    /// wraps at both ends, and next/prev are each other's inverse.
+    #[test]
+    fn next_prev_index_wraps_across_a_three_entry_order() {
+        let n = 3;
+        // Next: 0->1->2->0.
+        assert_eq!(next_prev_index(0, n, true), 1);
+        assert_eq!(next_prev_index(1, n, true), 2);
+        assert_eq!(next_prev_index(2, n, true), 0, "wraps forward past the end");
+        // Prev: 0->2->1->0.
+        assert_eq!(
+            next_prev_index(0, n, false),
+            2,
+            "wraps backward past the start"
+        );
+        assert_eq!(next_prev_index(1, n, false), 0);
+        assert_eq!(next_prev_index(2, n, false), 1);
     }
 }
