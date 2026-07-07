@@ -14,6 +14,15 @@ follow [Semantic Versioning](https://semver.org).
   and `ctl raise` raises the window on its own. All three are also exposed
   as MCP tools. Built for hardware macro decks and agent dashboards that
   map a name to "the tab running that thing".
+- Multiple windows. Open new windows (Cmd+N on macOS, Ctrl+Shift+N on
+  Linux), and move terminal surfaces freely between them: promote a split
+  pane to its own tab or window, move tabs to another window, and merge a
+  tab back into another as a split. Shells keep running through every move.
+  Available from the Window menu, keyboard shortcuts, and the control
+  surface (move-tab, promote-pane, merge-tab, new-window).
+- The control surface's state now reports every window (windows array plus
+  focused_window), and focus <query> finds and raises the right window
+  across all of them.
 
 ### Changed
 
