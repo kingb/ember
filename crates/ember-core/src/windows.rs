@@ -451,7 +451,12 @@ pub fn drop_zone_for(x: f64, y: f64, w: f64, h: f64) -> DropZone {
     if w <= 0.0 || w.is_nan() || h <= 0.0 || h.is_nan() {
         return DropZone::Center;
     }
-    const BAND: f64 = 0.3;
+    // Started at 0.3, which made ~84% of a pane's area mean "split" and
+    // turned casual tab drops into rogue splits (first live session).
+    // 0.15 flips the emphasis: the middle 70%x70% (~half the pane) reads
+    // "add as tab" — the forgiving default — and splitting is a deliberate
+    // aim at an edge.
+    const BAND: f64 = 0.15;
     let west = x < w * BAND;
     let east = x > w * (1.0 - BAND);
     let north = y < h * BAND;
@@ -1379,9 +1384,11 @@ mod tests {
 
     #[test]
     fn drop_zone_corners_pick_the_nearer_edge() {
+        // Probes sit inside BOTH 15% bands (x and y < 15 on a 100-pane) so
+        // the nearer-edge tiebreak is what's under test.
         // Top-left corner region: closer to the west edge than the north edge.
         assert_eq!(
-            drop_zone_for(5.0, 20.0, 100.0, 100.0),
+            drop_zone_for(4.0, 12.0, 100.0, 100.0),
             DropZone::Edge {
                 axis: Axis::Horizontal,
                 before: true
@@ -1389,7 +1396,7 @@ mod tests {
         );
         // Same corner region, but closer to the north edge than the west edge.
         assert_eq!(
-            drop_zone_for(20.0, 5.0, 100.0, 100.0),
+            drop_zone_for(12.0, 4.0, 100.0, 100.0),
             DropZone::Edge {
                 axis: Axis::Vertical,
                 before: true
@@ -1397,7 +1404,7 @@ mod tests {
         );
         // Top-right corner: closer to east than north.
         assert_eq!(
-            drop_zone_for(95.0, 20.0, 100.0, 100.0),
+            drop_zone_for(96.0, 12.0, 100.0, 100.0),
             DropZone::Edge {
                 axis: Axis::Horizontal,
                 before: false
@@ -1405,7 +1412,7 @@ mod tests {
         );
         // Bottom-left corner: closer to south than west.
         assert_eq!(
-            drop_zone_for(20.0, 95.0, 100.0, 100.0),
+            drop_zone_for(12.0, 96.0, 100.0, 100.0),
             DropZone::Edge {
                 axis: Axis::Vertical,
                 before: false
@@ -1413,7 +1420,7 @@ mod tests {
         );
         // Exact tie in the top-left corner resolves horizontal-first.
         assert_eq!(
-            drop_zone_for(15.0, 15.0, 100.0, 100.0),
+            drop_zone_for(10.0, 10.0, 100.0, 100.0),
             DropZone::Edge {
                 axis: Axis::Horizontal,
                 before: true
@@ -1421,7 +1428,7 @@ mod tests {
         );
         // Exact tie in the bottom-right corner: still horizontal-first.
         assert_eq!(
-            drop_zone_for(85.0, 85.0, 100.0, 100.0),
+            drop_zone_for(90.0, 90.0, 100.0, 100.0),
             DropZone::Edge {
                 axis: Axis::Horizontal,
                 before: false

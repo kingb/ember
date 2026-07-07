@@ -1504,16 +1504,26 @@ impl WindowState {
         if self.dismiss_overlay() {
             return;
         }
-        // A click while the Ctrl+Opt split preview is up commits that split.
-        if let Some(p) = self.split_preview.take() {
+        // A click while the Ctrl+Opt split preview is up commits that split —
+        // but ONLY while the chord is still held. The drop-preview visuals
+        // share this state's renderer half, and a preview that outlived its
+        // gesture must never turn a plain click into a surprise split with a
+        // fresh shell (the "rogue split" from the first live drag session).
+        if self.split_modifier_held() {
+            if let Some(p) = self.split_preview.take() {
+                self.renderer.set_split_preview(None);
+                let axis = if p.horizontal {
+                    Axis::Horizontal
+                } else {
+                    Axis::Vertical
+                };
+                self.split_pane(shared, p.pane, axis, p.ratio as f64);
+                return;
+            }
+        } else if self.split_preview.take().is_some() {
+            // Stale preview without the chord: dissolve it, treat the click
+            // as an ordinary click.
             self.renderer.set_split_preview(None);
-            let axis = if p.horizontal {
-                Axis::Horizontal
-            } else {
-                Axis::Vertical
-            };
-            self.split_pane(shared, p.pane, axis, p.ratio as f64);
-            return;
         }
         // Any click commits an in-progress tab rename first.
         let was_editing = self.editing_tab.is_some();
