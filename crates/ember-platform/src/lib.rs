@@ -30,6 +30,19 @@ pub trait PlatformBackend {
     fn set_clipboard(&mut self, text: &str);
     /// Open a path or URL (smart-selection / semantic-history / trigger effect).
     fn open_path(&self, target: &str);
+    /// Whether the OS is in a reduced-power state right now (sparks
+    /// guardrails, v0.3.1: macOS Low Power Mode via `NSProcessInfo`). The
+    /// caller treats this the same as the sparks dial's `off` — see
+    /// `ember-app`'s `WindowState::backdrop_animating`. Always `false` off
+    /// macOS; there's no equivalent OS-level signal there yet.
+    fn low_power_mode(&self) -> bool;
+    /// Whether the OS asks apps to reduce motion right now (sparks
+    /// guardrails, v0.3.1: macOS's Reduce Motion accessibility setting via
+    /// `NSWorkspace`). The caller freezes the sparks animation (they may
+    /// stay visible, just not moving) rather than hiding them outright — see
+    /// `ember-app`'s `WindowState::backdrop_animating`. Always `false` off
+    /// macOS.
+    fn reduce_motion(&self) -> bool;
 }
 
 /// One `arboard::Clipboard` handle, opened lazily at construction and reused
@@ -79,11 +92,44 @@ macro_rules! impl_backend {
             fn open_path(&self, target: &str) {
                 open_url(target);
             }
+            fn low_power_mode(&self) -> bool {
+                low_power_mode_now()
+            }
+            fn reduce_motion(&self) -> bool {
+                reduce_motion_now()
+            }
         }
     };
 }
 impl_backend!(LinuxBackend);
 impl_backend!(MacBackend);
+
+/// macOS Low Power Mode, read live via `NSProcessInfo` — see
+/// `PlatformBackend::low_power_mode`'s doc comment. `isLowPowerModeEnabled`
+/// is a safe (non-`unsafe fn`) objc2 binding: a plain property read, no
+/// preconditions.
+#[cfg(target_os = "macos")]
+fn low_power_mode_now() -> bool {
+    use objc2_foundation::NSProcessInfo;
+    NSProcessInfo::processInfo().isLowPowerModeEnabled()
+}
+#[cfg(not(target_os = "macos"))]
+fn low_power_mode_now() -> bool {
+    false
+}
+
+/// macOS Reduce Motion, read live via `NSWorkspace` — see
+/// `PlatformBackend::reduce_motion`'s doc comment.
+/// `accessibilityDisplayShouldReduceMotion` is likewise a safe objc2 binding.
+#[cfg(target_os = "macos")]
+fn reduce_motion_now() -> bool {
+    use objc2_app_kit::NSWorkspace;
+    NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+#[cfg(not(target_os = "macos"))]
+fn reduce_motion_now() -> bool {
+    false
+}
 
 /// The platform backend for the host OS.
 #[cfg(target_os = "macos")]
@@ -258,5 +304,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Sparks guardrails (v0.3.1): both queries are plain property reads (no
+    /// NSPasteboard involved), so unlike the clipboard tests these are safe
+    /// to run unconditionally in headless CI — we only assert they don't
+    /// panic, not a specific value (the real CI/dev box's power state isn't
+    /// something the test controls).
+    #[test]
+    fn low_power_mode_and_reduce_motion_are_callable_on_both_backends() {
+        let linux = LinuxBackend::default();
+        let mac = MacBackend::default();
+        let _ = linux.low_power_mode();
+        let _ = linux.reduce_motion();
+        let _ = mac.low_power_mode();
+        let _ = mac.reduce_motion();
+    }
+
+    /// Off macOS these must be hardwired `false` — there's no OS signal to
+    /// even read yet, so the sparks guardrails' `low_power_mode`/
+    /// `reduce_motion` overrides never fire off-platform (the dial alone
+    /// decides).
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn non_macos_guardrail_signals_are_always_false() {
+        let backend = HostBackend::default();
+        assert!(!backend.low_power_mode());
+        assert!(!backend.reduce_motion());
     }
 }
