@@ -845,10 +845,13 @@ pub(crate) fn ghost_pill_quads(
     t: f32,
 ) -> Vec<([f32; 4], [f32; 4], f32)> {
     let (px, inset_y, pw, ph, radius) = pill_geom(x, w, strip_h, cw);
-    // A slow, soft flicker (two off-beat sines) — an ember just barely
-    // alight, not the sparks' fast flame-flicker (this is a preview, not
-    // fire).
-    let flicker = 0.5 + 0.5 * ((t * 1.7).sin() * 0.6 + (t * 3.1 + 1.3).sin() * 0.4);
+    // A soft flicker (two off-beat sines) — an ember just barely alight,
+    // not the sparks' fast flame-flicker (this is a preview, not fire).
+    // Rates sized so a full bright-dim-bright swing lands inside a ~1.5s
+    // hover: the original 1.7/3.1 rad/s pair took ~4s per swing and read
+    // as static in live testing even once the shimmer-clock reset bug was
+    // fixed (see `WindowState::set_incoming_drop`'s doc).
+    let flicker = 0.5 + 0.5 * ((t * 4.2).sin() * 0.6 + (t * 7.3 + 1.3).sin() * 0.4);
     let ring_a = (0.35 + 0.4 * flicker).clamp(0.2, 0.85);
     let fill_a = (0.06 + 0.1 * flicker).clamp(0.03, 0.22);
     vec![
@@ -1033,10 +1036,12 @@ pub(crate) fn build_tabs(
                 .into_iter()
                 .for_each(|q| rounded.push(q));
             let label = if title.is_empty() { "＋" } else { title };
-            spans.push((
-                center(label, width),
-                Color::rgb(ACCENT.r, ACCENT.g, ACCENT.b),
-            ));
+            // The normal active-tab label color (white), NOT `ACCENT` — the
+            // ghost's own fill/ring are already ember-accent-colored
+            // (`ghost_pill_quads`), so an accent-on-accent label was
+            // unreadable (live-test finding). White matches what every
+            // other tab label on this strip uses over its own fill.
+            spans.push((center(label, width), Color::rgb(0xff, 0xff, 0xff)));
         }
     } else {
         // Single tab: no tab buttons, just the control toolbar. Pad the tab area so
