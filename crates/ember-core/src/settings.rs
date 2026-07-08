@@ -12,7 +12,7 @@
 //! row's logic only touches its own `Config` parameter (no captured
 //! environment), so non-capturing closures coerce to `fn` pointers for free.
 
-use crate::config::Config;
+use crate::config::{Config, SparksMode};
 
 /// What kind of row this is, driving both rendering and key-handling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,11 +156,24 @@ fn adjust_gradient(c: &mut Config, _dir: f32) {
     c.background.gradient = !c.background.gradient;
 }
 
-fn fmt_ember_sparks(c: &Config) -> String {
-    on_off(c.background.ember_sparks)
+/// The sparks dial's three-state cycle, `off → focused → always → off`.
+/// Direction-agnostic (like the other flat toggles here): a three-way dial
+/// doesn't need Left/Right to mean different things, so this always steps
+/// forward regardless of `dir` (kept `f32` to match [`SettingRow::adjust`]'s
+/// shared signature).
+fn fmt_sparks(c: &Config) -> String {
+    match c.background.sparks {
+        SparksMode::Off => "off".to_string(),
+        SparksMode::Focused => "focused".to_string(),
+        SparksMode::Always => "always".to_string(),
+    }
 }
-fn adjust_ember_sparks(c: &mut Config, _dir: f32) {
-    c.background.ember_sparks = !c.background.ember_sparks;
+fn adjust_sparks(c: &mut Config, _dir: f32) {
+    c.background.sparks = match c.background.sparks {
+        SparksMode::Off => SparksMode::Focused,
+        SparksMode::Focused => SparksMode::Always,
+        SparksMode::Always => SparksMode::Off,
+    };
 }
 
 fn fmt_ember_density(c: &Config) -> String {
@@ -271,11 +284,12 @@ pub fn setting_rows() -> &'static [SettingRow] {
         },
         SettingRow {
             label: "Ember sparks",
-            kind: RowKind::Toggle,
-            format: fmt_ember_sparks,
-            adjust: Some(adjust_ember_sparks),
+            kind: RowKind::Cycle,
+            format: fmt_sparks,
+            adjust: Some(adjust_sparks),
             help: Help::Inline(
-                "Drifting glowing embers behind the panes. Purely ambient; off by default.",
+                "Drifting glowing embers behind the panes: off, focused-window-only (default), \
+                 or always. Paused automatically under Low Power Mode or Reduce Motion.",
             ),
         },
         SettingRow {
@@ -502,17 +516,35 @@ mod tests {
         let before = c.clone();
         (row("Gradient backdrop").adjust.unwrap())(&mut c, 1.0);
         assert_ne!(c.background.gradient, before.background.gradient);
-        assert_eq!(c.background.ember_sparks, before.background.ember_sparks);
+        assert_eq!(c.background.sparks, before.background.sparks);
         assert_eq!(c.visual_bell, before.visual_bell);
     }
 
     #[test]
-    fn ember_sparks_toggle_mutates_only_ember_sparks() {
+    fn sparks_cycle_mutates_only_sparks() {
         let mut c = Config::default();
         let before = c.clone();
         (row("Ember sparks").adjust.unwrap())(&mut c, 1.0);
-        assert_ne!(c.background.ember_sparks, before.background.ember_sparks);
+        assert_ne!(c.background.sparks, before.background.sparks);
         assert_eq!(c.background.gradient, before.background.gradient);
+    }
+
+    #[test]
+    fn sparks_cycle_visits_all_three_states_and_wraps() {
+        let mut c = Config::default();
+        c.background.sparks = SparksMode::Off;
+        let adjust = row("Ember sparks").adjust.unwrap();
+        adjust(&mut c, 1.0);
+        assert_eq!(c.background.sparks, SparksMode::Focused);
+        adjust(&mut c, 1.0);
+        assert_eq!(c.background.sparks, SparksMode::Always);
+        adjust(&mut c, 1.0);
+        assert_eq!(c.background.sparks, SparksMode::Off);
+    }
+
+    #[test]
+    fn sparks_row_is_a_cycle() {
+        assert_eq!(row("Ember sparks").kind, RowKind::Cycle);
     }
 
     #[test]

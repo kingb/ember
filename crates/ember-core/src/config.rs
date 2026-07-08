@@ -71,6 +71,51 @@ impl Default for Font {
     }
 }
 
+/// The ember-sparks dial (sparks guardrails, v0.3.1): how the drifting-ember
+/// animation reacts to window focus and system power state.
+///
+/// Serialized lowercase (`"off"` / `"focused"` / `"always"`). **Backcompat:**
+/// a `config.toml` written by a pre-v0.3.1 Ember has `ember_sparks = true` or
+/// `= false` under `[background]`, not a `sparks` string — the custom
+/// deserializer on [`Background::sparks`] accepts both the old bool and the
+/// new string, mapping `true` → [`Focused`](SparksMode::Focused) and `false`
+/// → [`Off`](SparksMode::Off), so an old config still loads. A config saved
+/// by this version onward always writes the new string form.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SparksMode {
+    /// Never animate the sparks. The gradient/scrim still draw (static, free).
+    Off,
+    /// Animate only in the focused window; unfocused windows keep their
+    /// sparks visible but frozen. The shipping default: the campfire burns
+    /// where you're looking, not behind your back.
+    #[default]
+    Focused,
+    /// Animate in every visible window, focused or not — the pre-v0.3.1
+    /// "campfire burns while you work elsewhere" behavior (Brandon's
+    /// original 2026-07-04 call), now opt-in rather than the default.
+    Always,
+}
+
+/// Accepts either the old `ember_sparks` boolean or the new `sparks` string
+/// dial for [`Background::sparks`] — see that field's doc comment.
+fn deserialize_sparks_mode<'de, D>(deserializer: D) -> Result<SparksMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrMode {
+        Bool(bool),
+        Mode(SparksMode),
+    }
+    Ok(match BoolOrMode::deserialize(deserializer)? {
+        BoolOrMode::Bool(true) => SparksMode::Focused,
+        BoolOrMode::Bool(false) => SparksMode::Off,
+        BoolOrMode::Mode(m) => m,
+    })
+}
+
 /// Ambient backdrop + ember-glow appearance (the campfire aesthetic).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -79,11 +124,11 @@ pub struct Background {
     pub gradient: bool,
     /// Darkening scrim over the backdrop for text legibility (`0.0`–`1.0`).
     pub scrim: f32,
-    /// Drifting glowing ember sparks (velocity trails). On by default: at the
-    /// default 15fps the animation measures ~2% of one core and ~tens of mW
-    /// of GPU while the window is visible, and zero when occluded. Guardrails
-    /// (pause on unfocus / battery / Reduce Motion) arrive in the next patch.
-    pub ember_sparks: bool,
+    /// The ember-sparks dial: `off` | `focused` | `always` (default
+    /// `focused`). Accepts the pre-v0.3.1 `ember_sparks` boolean too — see
+    /// [`SparksMode`]'s doc comment for the migration mapping.
+    #[serde(alias = "ember_sparks", deserialize_with = "deserialize_sparks_mode")]
+    pub sparks: SparksMode,
     /// Spark count/rate multiplier (`0.0`–`2.0`).
     pub ember_density: f32,
     /// Frame-rate cap for the ember animation (fps). Lower = less CPU; the
@@ -102,14 +147,17 @@ pub struct Background {
 impl Default for Background {
     fn default() -> Self {
         Self {
-            // The campfire is Ember's signature and it's lit out of the box:
-            // static gradient (free) + spark trails at 15fps (measured ~2% of
-            // a core + ~tens of mW GPU while visible; 0% occluded). Trails are
-            // what make 15fps look smooth — see spark_quads. The dials remain
-            // for anyone who wants it calmer, faster, or off.
+            // The warm gradient is Ember's signature look and draws statically
+            // (no continuous redraw), so it's on out of the box. The sparks
+            // animation defaults to `focused` (v0.3.0 shipped plain-on at
+            // 15fps trails, measured ~2% of a core + tens of mW GPU while
+            // visible, 0% occluded): it animates only the window you're
+            // actually looking at,
+            // and the guardrails (Low Power Mode, Reduce Motion) pause it
+            // further when the system asks for less power/motion.
             gradient: true,
             scrim: 0.45,
-            ember_sparks: true,
+            sparks: SparksMode::Focused,
             ember_density: 1.0,
             ember_fps: 15,
             image: None,
@@ -125,11 +173,11 @@ mod tests {
     #[test]
     fn defaults_light_the_campfire_cheaply() {
         let c = Config::default();
-        // The signature look is on by default, at the measured-cheap settings:
-        // gradient (static, free) + sparks at 15fps with trails (~2% of a core
-        // visible, 0% occluded). Anything costlier stays a user choice.
+        // Conservative on *power*: the gradient is on (static draw, free);
+        // sparks default to `focused` (animates only the window you're
+        // looking at, guarded further by Low Power Mode/Reduce Motion).
         assert!(c.background.gradient);
-        assert!(c.background.ember_sparks);
+        assert_eq!(c.background.sparks, SparksMode::Focused);
         assert_eq!(c.background.ember_density, 1.0);
         assert_eq!(c.background.ember_fps, 15);
         assert!(c.visual_bell); // visual bell on by default
@@ -139,8 +187,8 @@ mod tests {
     #[test]
     fn partial_toml_fills_defaults() {
         // Only one key set; the rest must fall back to defaults.
-        let c: Config = toml::from_str("[background]\nember_sparks = true\n").unwrap();
-        assert!(c.background.ember_sparks);
+        let c: Config = toml::from_str("[background]\nsparks = \"always\"\n").unwrap();
+        assert_eq!(c.background.sparks, SparksMode::Always);
         assert!(c.background.gradient);
         assert_eq!(c.background.scrim, 0.45);
         assert_eq!(c.background.image, None);
@@ -153,5 +201,48 @@ mod tests {
         let s = toml::to_string(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(c, back);
+    }
+
+    // --- sparks dial: string form + bool backcompat -------------------------
+
+    #[test]
+    fn sparks_missing_defaults_to_focused() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.background.sparks, SparksMode::Focused);
+    }
+
+    #[test]
+    fn sparks_accepts_the_three_new_strings() {
+        for (s, want) in [
+            ("off", SparksMode::Off),
+            ("focused", SparksMode::Focused),
+            ("always", SparksMode::Always),
+        ] {
+            let toml_src = format!("[background]\nsparks = \"{s}\"\n");
+            let c: Config = toml::from_str(&toml_src).unwrap();
+            assert_eq!(c.background.sparks, want, "sparks = \"{s}\"");
+        }
+    }
+
+    #[test]
+    fn sparks_accepts_old_bool_true_as_focused() {
+        let c: Config = toml::from_str("[background]\nember_sparks = true\n").unwrap();
+        assert_eq!(c.background.sparks, SparksMode::Focused);
+    }
+
+    #[test]
+    fn sparks_accepts_old_bool_false_as_off() {
+        let c: Config = toml::from_str("[background]\nember_sparks = false\n").unwrap();
+        assert_eq!(c.background.sparks, SparksMode::Off);
+    }
+
+    #[test]
+    fn sparks_roundtrips_as_a_string_not_a_bool() {
+        let mut c = Config::default();
+        c.background.sparks = SparksMode::Always;
+        let s = toml::to_string(&c).unwrap();
+        assert!(s.contains("sparks = \"always\""), "serialized as: {s}");
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(back.background.sparks, SparksMode::Always);
     }
 }
