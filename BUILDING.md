@@ -55,6 +55,10 @@ first.
 
 ## Cutting a release
 
+For the full ordered, gated checklist see [RELEASING.md](RELEASING.md).
+This section covers the underlying mechanics.
+
+
 The cask lives in [`Casks/ember.rb`](Casks/ember.rb) and installs from a GitHub
 release artifact. To cut a release:
 
