@@ -1951,7 +1951,19 @@ impl WindowState {
             let strip_bottom = Renderer::chrome_height() as f64;
             if active && strip_band_exit(y, strip_bottom, TEAR_OFF_THRESHOLD) {
                 self.tab_drag = None;
-                let origin_idx = self.tree.tabs.iter().position(|t| t.id == origin_tab);
+                // Reveal a tab that ISN'T the dragged one, so in-window pane
+                // drops have a real merge target underneath. The origin tab
+                // qualifies only when it's a DIFFERENT tab: dragging the
+                // already-active tab resolves origin == dragged, which would
+                // re-display the dragged tab and make every in-window drop
+                // self-reject ("tab can't merge into itself") — same failure
+                // as a closed origin, same fallback.
+                let origin_idx = self
+                    .tree
+                    .tabs
+                    .iter()
+                    .position(|t| t.id == origin_tab)
+                    .filter(|idx| *idx != tab);
                 if let Some(idx) =
                     origin_idx.or_else(|| revert_target_tab(self.tree.tabs.len(), tab))
                 {
