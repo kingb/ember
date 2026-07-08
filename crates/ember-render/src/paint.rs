@@ -733,7 +733,10 @@ pub(crate) fn build_tabs(
     let mut spans: Vec<(String, Color)> = Vec::new();
     let n = tabs.len();
     let drag_slot = drag.map(|(s, _)| s);
-    if n > 1 {
+    // A lone tab renders too: it used to be hidden as chrome minimalism, but
+    // once tabs became draggable that made a single-tab window's most basic
+    // gesture ("grab this window's tab") invisible and un-pressable.
+    if n >= 1 {
         let seg = tab_cols / n;
         let mut col = 0usize;
         for (i, tab) in tabs.iter().enumerate() {

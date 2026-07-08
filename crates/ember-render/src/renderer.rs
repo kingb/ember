@@ -188,7 +188,7 @@ pub enum TabHit {
 /// [`build_tabs`]. `hovered` gates the left `CLOSE_COLS` "✕" close zone (only the
 /// hovered tab exposes it). Pure so the geometry is unit-testable without a GPU.
 fn tab_col_hit(n: usize, tab_cols: usize, hovered: Option<usize>, col: usize) -> Option<TabHit> {
-    if n <= 1 {
+    if n == 0 {
         return None;
     }
     let seg = tab_cols / n;
@@ -996,16 +996,15 @@ impl Renderer {
         if col >= tab_cols {
             return Some(TabHit::NewTab);
         }
-        // Tab buttons only exist when there's more than one tab.
         tab_col_hit(self.tabs.len(), tab_cols, self.hovered_tab, col)
     }
 
     /// Which tab slot logical-x falls over, clamped to a valid tab index — used
-    /// during a drag to pick the drop position. `None` when there are no tab
-    /// buttons (≤1 tab). Mirrors the tab-area column math in [`build_tabs`].
+    /// during a drag to pick the drop position. `None` only when the strip has
+    /// no tabs at all. Mirrors the tab-area column math in [`build_tabs`].
     pub fn tab_slot_at(&self, x: f32) -> Option<usize> {
         let n = self.tabs.len();
-        if n <= 1 {
+        if n == 0 {
             return None;
         }
         let sf = self.window.scale_factor() as f32;
@@ -1833,8 +1832,12 @@ mod tests {
     const COLS: usize = 30;
 
     #[test]
-    fn no_tab_buttons_with_one_tab() {
-        assert_eq!(tab_col_hit(1, COLS, None, 5), None);
+    fn a_lone_tab_is_still_pressable() {
+        // A single-tab strip used to render (and hit-test) nothing, which
+        // made "grab this window's tab" impossible once tabs became
+        // draggable. The lone tab now owns the whole tab area.
+        assert_eq!(tab_col_hit(1, COLS, None, 5), Some(TabHit::Tab(0)));
+        assert_eq!(tab_col_hit(0, COLS, None, 5), None);
     }
 
     #[test]
