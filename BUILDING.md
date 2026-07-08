@@ -78,6 +78,10 @@ cp Casks/ember.rb ../homebrew-ember/Casks/ && \
     (cd ../homebrew-ember && git commit -am "ember 0.1.0" && git push)
 ```
 
+The website's download page needs no manual bump: it reads the newest
+release whose macOS assets are fully attached (checked every 10 minutes), so
+uploading the release assets is what flips the page.
+
 Users install with:
 
 ```sh
