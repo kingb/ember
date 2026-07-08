@@ -16,7 +16,7 @@ mod mcp;
 mod screenshot;
 mod window_state;
 
-use window_state::{DragEnded, HoldTick, WindowState};
+use window_state::{DragEnded, HoldTick, MorphTick, WindowState};
 
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
@@ -661,6 +661,12 @@ pub(crate) struct DragState {
     /// tick over body regions — an activation storm that ballooned the event
     /// queue to gigabytes and froze the app in the first live session.
     pub(crate) last_raised: Option<WindowId>,
+    /// The carried surface's tab title, captured ONCE at tear-off (v0.4.0) —
+    /// threaded into a target window's ghost tab (`WindowState::
+    /// set_incoming_drop`) when cheaply available. Empty for the rare cases
+    /// with no title at hand yet; the ghost falls back to a static glyph
+    /// then (see `set_incoming_drop`'s doc).
+    pub(crate) title: String,
 }
 
 /// Where a carried surface would land, driving the live drag preview.
@@ -1006,7 +1012,7 @@ impl ApplicationHandler<EmberEvent> for App {
                 );
                 if button == MouseButton::Left {
                     let was_dragging = shared.drag.is_some() || win.tab_drag.is_some();
-                    win.left_release(shared, id);
+                    let ended = win.left_release(shared, id);
                     // A pane drop only STAGES its move (`WindowState::
                     // pending_move`) — run it through the same canonical
                     // `apply_move` path `ctl drag` (`run_ctl_drag`) and every
@@ -1026,7 +1032,7 @@ impl ApplicationHandler<EmberEvent> for App {
                         clear_all_drag_visuals(&mut self.windows);
                     }
                     if let Some((src, dest)) = pending {
-                        if let Err(e) = apply_move(
+                        match apply_move(
                             &mut self.windows,
                             shared,
                             &mut self.focused_window,
@@ -1034,7 +1040,19 @@ impl ApplicationHandler<EmberEvent> for App {
                             src,
                             dest,
                         ) {
-                            eprintln!("[ember] drag drop rejected: {e}");
+                            Ok(()) => {
+                                // Pour-out (v0.4.0): the landed window's own
+                                // renderer plays the "pours OUT... into the
+                                // landed surface's rect" morph.
+                                if ended == DragEnded::Move {
+                                    pour_out_after_move(
+                                        &mut self.windows,
+                                        shared,
+                                        self.focused_window,
+                                    );
+                                }
+                            }
+                            Err(e) => eprintln!("[ember] drag drop rejected: {e}"),
                         }
                     }
                 }
@@ -1822,6 +1840,7 @@ impl ApplicationHandler<EmberEvent> for App {
                 || w.fps_overlay
                 || w.bell_flashing()
                 || w.backdrop_animating(shared)
+                || w.ghost_active()
                 || starve_retry;
             if animating {
                 if now.duration_since(w.last_anim) >= frame {
@@ -1872,6 +1891,13 @@ impl ApplicationHandler<EmberEvent> for App {
                     let deadline = now + ANIM_FRAME;
                     next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
                 }
+            }
+            // Suck-in/pour-out morph (v0.4.0): advance any live morph on
+            // this window, independent of everything above — mirrors
+            // `tick_hold` exactly (a self-terminating, at-most-~200ms
+            // animation, `Idle` the overwhelmingly common case).
+            if let MorphTick::Running(deadline) = w.tick_morph(now) {
+                next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
             }
         }
         // The wisp (Task 5) isn't a `WindowState` — it's not in `self.windows`
@@ -2390,13 +2416,44 @@ fn clear_all_drag_visuals(windows: &mut HashMap<WindowId, WindowState>) {
 /// keyboard focus doesn't reliably track a captured mouse-drag's source
 /// window), so clearing must reach every window, not just `self`.
 fn cancel_drag_everywhere(windows: &mut HashMap<WindowId, WindowState>, shared: &mut Shared) {
-    if shared.drag.take().is_some() {
+    if let Some(drag) = shared.drag.take() {
         shared.wisp_end_drag();
+        // Pour-out (v0.4.0): "the reverse pours OUT... Escape/cancel: the
+        // pour-out plays at the SOURCE rect (the surface went home)." The
+        // source window may have closed mid-drag (`clear_drag_on_window_close`
+        // already handles that path); a missing source here is a no-op.
+        if let Some(w) = windows.get_mut(&drag.source_window) {
+            let rect = w.viewport();
+            let grab = w.cursor;
+            w.start_pour_out(shared, rect, grab);
+        }
         clear_all_drag_visuals(windows);
         for w in windows.values_mut() {
             w.renderer.window().request_redraw();
         }
     }
+}
+
+/// Best-effort pour-out target for a completed drag `Move` (v0.4.0): the
+/// window that ended up focused — a drop's landed tab/pane becomes active
+/// (see `apply_move`'s `final_focused` handling) — using its content rect
+/// and a point near the top of it as the emergence origin. Not the exact
+/// drop pixel: a cross-window carry's hover carries no stored local point to
+/// replay (see `DropHover`'s doc), so this is the same kind of v1
+/// approximation as the ghost tab's always-last strip slot — honest, not
+/// half-implemented.
+fn pour_out_after_move(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &Shared,
+    focused_window: Option<WindowId>,
+) {
+    let Some(wid) = focused_window else { return };
+    let Some(w) = windows.get_mut(&wid) else {
+        return;
+    };
+    let rect = w.viewport();
+    let grab = (rect.x + rect.width * 0.5, rect.y + rect.height * 0.12);
+    w.start_pour_out(shared, rect, grab);
 }
 
 /// Front-to-back window frames (physical px, screen space) for cross-window
@@ -2452,7 +2509,7 @@ fn clear_incoming_drop_except(
 ) {
     for (wid, w) in windows.iter_mut() {
         if Some(*wid) != keep && w.incoming_drop.is_some() {
-            w.set_incoming_drop(None, 0.0);
+            w.set_incoming_drop(None, None);
         }
     }
 }
@@ -2500,6 +2557,10 @@ fn update_cross_window_drag(
         return;
     }
     let was_carried = drag.carried;
+    // Captured now (`drag`'s last use before several `shared.drag.as_mut()`
+    // borrows below, which would otherwise conflict with holding `drag`
+    // alive across them) — cheap, and the title never changes mid-drag.
+    let title = drag.title.clone();
     let Some(src) = windows.get(&source_id) else {
         return;
     };
@@ -2588,7 +2649,7 @@ fn update_cross_window_drag(
                         .get(&tid)
                         .and_then(|twin| twin.hover_at(tid, tx, ty, false));
                     if let Some(twin) = windows.get_mut(&tid) {
-                        twin.set_incoming_drop(hover, tx);
+                        twin.set_incoming_drop(hover, Some(title.as_str()));
                     }
                     if let Some(d) = shared.drag.as_mut() {
                         d.hover = hover;
@@ -3236,7 +3297,10 @@ fn finish_ctl_drag_tail(
     let mut error = None;
     if let Some((src, dest)) = pending {
         match apply_move(windows, shared, focused_window, event_loop, src, dest) {
-            Ok(()) => ended = DragEnded::Move,
+            Ok(()) => {
+                ended = DragEnded::Move;
+                pour_out_after_move(windows, shared, *focused_window);
+            }
             Err(e) => {
                 eprintln!("[ember] drag drop rejected: {e}");
                 ended = DragEnded::Cancel;

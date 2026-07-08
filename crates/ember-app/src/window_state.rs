@@ -272,6 +272,48 @@ pub(crate) enum HoldTick {
     Completed,
 }
 
+// --- Suck-in/pour-out morph (v0.4.0, docs/design/2026-07-07-surface-drag-
+// wisp-design.md's "v1 trims": "the suck-in/pour-out is an intensity fade
+// rather than a rect morph" — this is that follow-up). SOURCE window plays a
+// suck-in at tear-off; the TARGET (or, on cancel/reorder, the SOURCE itself —
+// "the surface went home") plays a pour-out at resolution.
+
+/// Duration of the suck-in morph (tear-off) — design doc "~150 ms".
+const SUCK_IN_MS: u64 = 150;
+/// Duration of the pour-out morph (drop/cancel) — design doc "~200 ms".
+const POUR_OUT_MS: u64 = 200;
+/// Redraw cadence while a morph is live — matches every other animation
+/// pacer in this file (`ANIM_FRAME` in `main.rs`, `HOLD_SWEEP`'s implicit
+/// per-tick redraw).
+const MORPH_FRAME: Duration = Duration::from_millis(16);
+
+/// A live suck-in/pour-out morph on this window's renderer: timing +
+/// geometry needed to advance `Renderer::set_morph` every tick, mirroring
+/// [`Hold`]'s shape exactly. Self-terminating (see [`WindowState::
+/// tick_morph`]) — NOT part of `clear_drag_visuals`'s sweep.
+struct MorphAnim {
+    started: Instant,
+    duration: Duration,
+    /// The surface's own rect, logical px, THIS window's space.
+    rect: Rect,
+    /// The suck/pour point (grab or drop/cancel point), logical px, THIS
+    /// window's space.
+    grab: (f64, f64),
+    /// `true` = suck-in (collapsing toward `grab`), `false` = pour-out
+    /// (expanding from `grab`) — see `ember_render::Renderer::set_morph`'s doc.
+    inward: bool,
+}
+
+/// What [`WindowState::tick_morph`] found this tick — `about_to_wait` folds
+/// the result into its own animation pacing, mirroring [`HoldTick`].
+pub(crate) enum MorphTick {
+    /// No morph in progress on this window (the overwhelmingly common case).
+    Idle,
+    /// The morph was just advanced and pushed to the renderer (which
+    /// requests its own redraw); fold `deadline` into `next_wake`.
+    Running(Instant),
+}
+
 /// Everything tied to a single window and its surface.
 pub(crate) struct WindowState {
     pub(crate) renderer: Renderer,
@@ -379,6 +421,10 @@ pub(crate) struct WindowState {
     /// see [`Hold`]'s doc. `None` outside a live hold; cancelled (cleared)
     /// by motion past [`HOLD_TOLERANCE_PX`] or any release.
     hold: Option<Hold>,
+    /// A live suck-in/pour-out morph (v0.4.0) — see [`MorphAnim`]'s doc.
+    /// `None` outside a live morph; self-terminating (clears itself the tick
+    /// its duration elapses), never cancelled early.
+    morph: Option<MorphAnim>,
 }
 
 impl WindowState {
@@ -431,6 +477,7 @@ impl WindowState {
             pending_move: None,
             incoming_drop: None,
             hold: None,
+            morph: None,
         }
     }
 
@@ -1739,6 +1786,11 @@ impl WindowState {
         let tab = self.tree.active;
         let panes_in_tab = self.active_tab().root.pane_ids().len();
         let surface = pane_drag_source(window, tab, pane, panes_in_tab);
+        // `tab_display_title`, not the raw (often-empty) `Tab::title` — the
+        // ghost should show what the user actually SEES on the strip (the
+        // "1"/"2" position fallback), not fall back further to the "＋"
+        // glyph for the common untitled case.
+        let title = tab_display_title(&self.active_tab().title, tab);
         shared.drag = Some(DragState {
             surface,
             source_window: window_id,
@@ -1752,7 +1804,12 @@ impl WindowState {
             // `App::window_event`'s CursorMoved arm
             // (mirrors tab tear-off's identical
             // placeholder).
+            title,
         });
+        // Suck-in (v0.4.0): the grabbed surface's rect visibly collapses
+        // toward the grab point — see `start_suck_in`'s doc for the
+        // wisp-off/reduced-motion no-op.
+        self.start_suck_in(shared, rect, (x, y));
     }
 
     /// Advance a live hold-to-wisp gesture by one tick (`about_to_wait`'s
@@ -1797,6 +1854,71 @@ impl WindowState {
         self.renderer
             .set_hold_ring(Some((x as f32, y as f32, progress)));
         HoldTick::Sweeping
+    }
+
+    /// Start a morph (suck-in or pour-out) on THIS window's renderer.
+    /// No-ops (leaves/sets `self.morph` to `None`) when the wisp is off
+    /// (`shared.config.wisp`) or reduced motion is active — the design
+    /// doc's "both skipped under reduced-motion (instant transfer)" applies
+    /// to this v1 approximation exactly as it would the full wisp.
+    fn start_morph(&mut self, shared: &Shared, rect: Rect, grab: (f64, f64), inward: bool) {
+        if !shared.config.wisp || shared.reduce_motion() {
+            self.morph = None;
+            self.renderer.set_morph(None);
+            return;
+        }
+        let duration = Duration::from_millis(if inward { SUCK_IN_MS } else { POUR_OUT_MS });
+        self.morph = Some(MorphAnim {
+            started: Instant::now(),
+            duration,
+            rect,
+            grab,
+            inward,
+        });
+        self.tick_morph(Instant::now());
+    }
+
+    /// Start the tear-off suck-in on THIS (SOURCE) window: `rect` is the
+    /// grabbed surface's own rect, `grab` the point it's collapsing toward
+    /// (both logical px, this window's space).
+    pub(crate) fn start_suck_in(&mut self, shared: &Shared, rect: Rect, grab: (f64, f64)) {
+        self.start_morph(shared, rect, grab, true);
+    }
+
+    /// Start a pour-out on THIS window: `rect` is the landed (or, on
+    /// cancel/reorder, the going-home) surface's rect, `grab` the point it's
+    /// expanding from (both logical px, this window's space).
+    pub(crate) fn start_pour_out(&mut self, shared: &Shared, rect: Rect, grab: (f64, f64)) {
+        self.start_morph(shared, rect, grab, false);
+    }
+
+    /// Advance a live morph by one tick, mirroring [`Self::tick_hold`]'s
+    /// shape: `Idle` the overwhelmingly common case. Self-terminates the
+    /// instant its duration elapses — clears both `self.morph` and the
+    /// renderer's mirrored state right here, the sole place morph visuals
+    /// turn off (see [`MorphAnim`]'s doc for why `clear_drag_visuals`
+    /// deliberately never touches them).
+    pub(crate) fn tick_morph(&mut self, now: Instant) -> MorphTick {
+        let Some(anim) = self.morph.as_ref() else {
+            return MorphTick::Idle;
+        };
+        let elapsed = now.saturating_duration_since(anim.started);
+        if elapsed >= anim.duration {
+            self.morph = None;
+            self.renderer.set_morph(None);
+            return MorphTick::Idle;
+        }
+        let t01 = elapsed.as_secs_f32() / anim.duration.as_secs_f32();
+        let rect = [
+            anim.rect.x as f32,
+            anim.rect.y as f32,
+            anim.rect.width as f32,
+            anim.rect.height as f32,
+        ];
+        let grab = (anim.grab.0 as f32, anim.grab.1 as f32);
+        self.renderer
+            .set_morph(Some((rect, grab, t01, anim.inward)));
+        MorphTick::Running(now + MORPH_FRAME)
     }
 
     /// Encode one xterm mouse report. SGR (1006) when the app enabled it, else
@@ -2133,6 +2255,14 @@ impl WindowState {
                 }
                 self.sync_layout(shared);
                 let window = resolve_window_index(shared, window_id).unwrap_or(0);
+                // `tab_display_title` — see `start_pane_drag`'s identical
+                // comment for why this beats the raw (often-empty) title.
+                let title = self
+                    .tree
+                    .tabs
+                    .get(tab)
+                    .map(|t| tab_display_title(&t.title, tab))
+                    .unwrap_or_default();
                 shared.drag = Some(DragState {
                     surface: SurfaceRef::Tab { window, tab },
                     source_window: window_id,
@@ -2143,7 +2273,13 @@ impl WindowState {
                     last_raised: None,
                     // motion, immediately below by `update_drag_hover`'s
                     // caller — see `App::window_event`'s CursorMoved arm.
+                    title,
                 });
+                // Suck-in (v0.4.0): the torn-off tab's content rect visibly
+                // collapses toward the tear-off point (a v1 approximation —
+                // the whole viewport, not the dragged tab's specific pane(s);
+                // honest per the design doc's "v1 approximation" allowance).
+                self.start_suck_in(shared, self.viewport(), (x, strip_bottom));
             } else {
                 // Still an in-strip reorder — unchanged existing behavior.
                 self.drag_tab_to(shared, x);
@@ -2286,25 +2422,27 @@ impl WindowState {
 
     /// Set/clear THIS window's live cross-window drop preview — called by
     /// `App::update_cross_window_drag` when this window is (or stops being)
-    /// the current hover TARGET of some OTHER window's drag. `x` is the
-    /// local logical cursor x (only meaningful for the `Strip` case's
-    /// insertion caret). Mirrors the visual vocabulary `update_drag_hover`
-    /// drives for an in-window hover: a sided `Edge` split preview, a
-    /// near-full-pane `Center` tint (reusing the same split-preview quad
-    /// with `ratio: 0.0` rather than adding a new one — the manual-split
-    /// ratio floor caps the tinted region at 95%, not a hard 100%, but it
-    /// reads clearly as "drop here"), or a floating insertion-caret chip on
-    /// the strip (`set_tab_drag` with an out-of-range slot so no real tab of
-    /// THIS window is shown "recessed" — see `build_tabs`'s `dragging_this`
-    /// check, which only matches a real tab index).
-    pub(crate) fn set_incoming_drop(&mut self, hover: Option<DropHover>, x: f64) {
+    /// the current hover TARGET of some OTHER window's drag. `title` is the
+    /// carried surface's tab title (`DragState::title`, captured once at
+    /// tear-off), used only by the `Strip` case's ghost tab. Mirrors the
+    /// visual vocabulary `update_drag_hover` drives for an in-window hover: a
+    /// sided `Edge` split preview, a near-full-pane `Center` tint (reusing
+    /// the same split-preview quad with `ratio: 0.0` rather than adding a
+    /// new one — the manual-split ratio floor caps the tinted region at 95%,
+    /// not a hard 100%, but it reads clearly as "drop here"), or a wispy
+    /// ghost tab on the strip (v0.4.0, replacing the old bare insertion
+    /// caret — `set_ghost_tab`, always the LAST segment: v1 keeps append
+    /// semantics, see `crate::paint::build_tabs`'s doc, so the ghost is
+    /// honest about where the drop actually lands).
+    pub(crate) fn set_incoming_drop(&mut self, hover: Option<DropHover>, title: Option<&str>) {
         self.incoming_drop = hover;
         self.clear_split_preview();
         self.renderer.set_tab_drag(None);
+        self.renderer.set_ghost_tab(None);
         match hover {
             Some(DropHover::Strip { .. }) => {
-                let n = self.tree.tabs.len();
-                self.renderer.set_tab_drag(Some((n, x as f32)));
+                let label = title.filter(|t| !t.is_empty()).unwrap_or("＋");
+                self.renderer.set_ghost_tab(Some(label.to_string()));
             }
             Some(DropHover::Pane {
                 pane,
@@ -2332,12 +2470,17 @@ impl WindowState {
     }
 
     /// Clear this window's own drag-related visuals: the lifted tab chip,
-    /// the split preview, and any live cross-window incoming-drop preview.
-    /// Safe to call on any window regardless of its role in a drag (source,
-    /// target, or neither) — each individual clear already no-ops cheaply
-    /// when nothing was set.
+    /// the ghost tab, the split preview, and any live cross-window
+    /// incoming-drop preview. Safe to call on any window regardless of its
+    /// role in a drag (source, target, or neither) — each individual clear
+    /// already no-ops cheaply when nothing was set. Deliberately does NOT
+    /// touch `self.morph` — see [`MorphAnim`]'s doc: a self-terminating
+    /// suck-in/pour-out animation plays independently of this sweep (it's
+    /// started right around where this is called — clearing it here would
+    /// cut the very animation a drop/cancel just started).
     pub(crate) fn clear_drag_visuals(&mut self) {
         self.renderer.set_tab_drag(None);
+        self.renderer.set_ghost_tab(None);
         self.clear_split_preview();
         self.incoming_drop = None;
     }
@@ -2369,6 +2512,7 @@ impl WindowState {
             SurfaceRef::Tab { tab: src_tab, .. } => match drag.hover {
                 Some(DropHover::Strip { window, insert_at }) if window == window_id => {
                     if src_tab >= self.tree.tabs.len() {
+                        self.start_pour_out(shared, self.viewport(), self.cursor);
                         return DragEnded::Cancel;
                     }
                     let to = insert_at.min(self.tree.tabs.len() - 1);
@@ -2382,6 +2526,10 @@ impl WindowState {
                     }
                     self.tree.active = to;
                     self.sync_layout(shared);
+                    // Pour-out (v0.4.0): torn off, then dropped back onto its
+                    // own strip — the surface "lands" here again, so it pours
+                    // back into place exactly like a same-window Move would.
+                    self.start_pour_out(shared, self.viewport(), self.cursor);
                     DragEnded::Reorder
                 }
                 Some(DropHover::Strip { window, .. }) => {
@@ -2446,7 +2594,12 @@ impl WindowState {
                     ));
                     DragEnded::Move
                 }
-                None => DragEnded::Cancel,
+                None => {
+                    // Escape/no-hover cancel (v0.4.0): "the pour-out plays at
+                    // the SOURCE rect — the surface went home."
+                    self.start_pour_out(shared, self.viewport(), self.cursor);
+                    DragEnded::Cancel
+                }
             },
             SurfaceRef::Pane {
                 tab: src_tab,
@@ -2485,6 +2638,9 @@ impl WindowState {
                     None => None,
                 };
                 let Some(dest) = dest else {
+                    // Cancel (v0.4.0): "the pour-out plays at the SOURCE
+                    // rect — the surface went home."
+                    self.start_pour_out(shared, self.viewport(), self.cursor);
                     return DragEnded::Cancel; // no hover, or the target window vanished mid-drag
                 };
                 self.pending_move = Some((
@@ -3003,6 +3159,17 @@ impl WindowState {
                 self.bell_flash_since = None;
             }
         }
+        // Ghost tab shimmer (v0.4.0): re-mark the scene dirty each tick so
+        // the procedural flicker keeps advancing even while the pointer
+        // isn't moving — a no-op when no ghost is showing.
+        self.renderer.touch_ghost();
+    }
+
+    /// Whether an incoming-drag ghost tab is currently showing on this
+    /// window's strip — `about_to_wait`'s per-window animation gate ORs this
+    /// in alongside `backdrop_animating` so the shimmer keeps ticking.
+    pub(crate) fn ghost_active(&self) -> bool {
+        self.renderer.ghost_active()
     }
 
     /// Whether the ember sparks should be animating right now (sparks

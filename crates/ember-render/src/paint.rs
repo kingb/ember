@@ -626,6 +626,99 @@ pub(crate) fn hold_ring_quads(x: f32, y: f32, progress: f32, sf: f32) -> Vec<([f
     out
 }
 
+/// Number of streaming particles the suck-in/pour-out morph emits.
+const MORPH_PARTICLES: usize = 10;
+
+/// A point on the rect's perimeter (logical px), walked clockwise from the
+/// top-left corner starting at fraction `f` (`0..1`, wraps). Used to
+/// stratify [`morph_quads`]'s particle origins evenly around the collapsing
+/// rect instead of bunching them at one corner.
+fn perimeter_point(x: f32, y: f32, w: f32, h: f32, f: f32) -> (f32, f32) {
+    let perim = (2.0 * (w + h)).max(1.0);
+    let d = f.rem_euclid(1.0) * perim;
+    if d < w {
+        (x + d, y)
+    } else if d < w + h {
+        (x + w, y + (d - w))
+    } else if d < 2.0 * w + h {
+        (x + w - (d - w - h), y + h)
+    } else {
+        (x, y + h - (d - 2.0 * w - h))
+    }
+}
+
+/// Suck-in/pour-out morph quads (v0.4.0, release 2's "v1 trims" caught up):
+/// a shrinking (suck-in) or growing (pour-out) accent-outlined rect + a
+/// handful of particles streaming along its perimeter→`grab` radial lines —
+/// the design doc's explicit v1 approximation ("a shrinking accent-outlined
+/// rect + inward-streaming spark particles", NOT a pane-pixel screenshot
+/// morph). Pure function of `t01` (`0..1`, the caller's own elapsed/duration
+/// ratio — see [`crate::Renderer::set_morph`]): `inward` (`true` = suck-in,
+/// `false` = pour-out) only decides which end of the collapse `t01 = 0`
+/// starts at, so the caller always drives `t01` forward 0→1 for both
+/// directions. Fully collapsed (a point at `grab`, `k >= 1.0`) draws nothing
+/// — mirrors [`hold_ring_quads`]'s "empty at a boundary" idiom, and gives a
+/// pour-out its "hasn't poured yet" `t01 = 0` frame for free. `rect`/`grab`
+/// are logical px, this window's own space; `sf` scales to physical like
+/// every other paint fn here.
+pub(crate) fn morph_quads(
+    rect: [f32; 4],
+    grab: (f32, f32),
+    t01: f32,
+    inward: bool,
+    sf: f32,
+) -> Vec<([f32; 4], [f32; 4])> {
+    let t = t01.clamp(0.0, 1.0);
+    // `k` = how collapsed the shape is right now: 0 = full rect at `rect`,
+    // 1 = a point at `grab`. Suck-in collapses as `t` rises; pour-out starts
+    // collapsed (t=0 -> k=1) and un-collapses toward the destination rect.
+    let k = if inward { t } else { 1.0 - t };
+    if k >= 1.0 {
+        return Vec::new();
+    }
+    let (rx, ry, rw, rh) = (rect[0], rect[1], rect[2].max(1.0), rect[3].max(1.0));
+    let lerp = |a: f32, b: f32| a + (b - a) * k;
+    // Lerp each corner toward `grab` — a directional shrink-to-a-point, not a
+    // uniform center scale (which would read as a zoom, not a suck).
+    let x0 = lerp(rx, grab.0);
+    let y0 = lerp(ry, grab.1);
+    let x1 = lerp(rx + rw, grab.0);
+    let y1 = lerp(ry + rh, grab.1);
+    let (mx, my) = (x0.min(x1), y0.min(y1));
+    let (mw, mh) = ((x1 - x0).abs().max(0.5), (y1 - y0).abs().max(0.5));
+    let mut out = Vec::with_capacity(2 + MORPH_PARTICLES);
+    let alpha = 1.0 - k * 0.3; // fades a little as it collapses, never to zero
+    push_border(
+        &mut out,
+        Rect::new(mx as f64, my as f64, mw as f64, mh as f64),
+        ACCENT,
+        sf,
+    );
+    out.push((
+        scaled(mx, my, mw, mh, sf),
+        lin_rgba(ACCENT, 0.12 * (1.0 - k)),
+    ));
+    // Particles stratified around the ORIGINAL rect's perimeter, each
+    // streaming toward `grab` at its own phase-offset `pk` so they trail
+    // rather than move in lockstep.
+    for i in 0..MORPH_PARTICLES {
+        let fi = i as f32 / MORPH_PARTICLES as f32;
+        let (ox, oy) = perimeter_point(rx, ry, rw, rh, fi);
+        let pk = (k + fi * 0.35).min(1.0);
+        if pk <= 0.0 || pk >= 1.0 {
+            continue;
+        }
+        let px = ox + (grab.0 - ox) * pk;
+        let py = oy + (grab.1 - oy) * pk;
+        let size = 3.0 * (1.0 - pk) + 1.0;
+        out.push((
+            scaled(px - size * 0.5, py - size * 0.5, size, size, sf),
+            lin_rgba(ACCENT, (alpha * (1.0 - pk) * 0.9).max(0.0)),
+        ));
+    }
+    out
+}
+
 /// Background of the tab strip (a touch lighter than the terminal, iTerm-style).
 const STRIP_BG: Rgb = Rgb::new(0x1b, 0x1b, 0x1b);
 /// Fill of the active tab button.
@@ -734,6 +827,44 @@ fn push_pill(
     ));
 }
 
+/// The wispy "ghost tab" chip for an incoming cross-window drag hover over a
+/// target strip (v0.4.0) — replaces the old bare insertion caret. A
+/// translucent fill + ember-accent ring with a soft, slow procedural flicker
+/// (same "no stored state, driven by `t` alone" idiom as [`spark_quads`]) at
+/// the strip segment `x`/`w` (always the LAST segment — v1 keeps append
+/// semantics, see [`build_tabs`]'s doc, so the ghost is honest about where
+/// the drop actually lands). Pure geometry, directly unit-testable; the
+/// label text itself is shaped/positioned by the caller like every other tab
+/// title. Never empty — callers only invoke this while a ghost is active.
+pub(crate) fn ghost_pill_quads(
+    x: f32,
+    w: f32,
+    strip_h: f32,
+    cw: f32,
+    sf: f32,
+    t: f32,
+) -> Vec<([f32; 4], [f32; 4], f32)> {
+    let (px, inset_y, pw, ph, radius) = pill_geom(x, w, strip_h, cw);
+    // A slow, soft flicker (two off-beat sines) — an ember just barely
+    // alight, not the sparks' fast flame-flicker (this is a preview, not
+    // fire).
+    let flicker = 0.5 + 0.5 * ((t * 1.7).sin() * 0.6 + (t * 3.1 + 1.3).sin() * 0.4);
+    let ring_a = (0.35 + 0.4 * flicker).clamp(0.2, 0.85);
+    let fill_a = (0.06 + 0.1 * flicker).clamp(0.03, 0.22);
+    vec![
+        (
+            scaled(px - 1.0, inset_y - 1.0, pw + 2.0, ph + 2.0, sf),
+            lin_rgba(ACCENT, ring_a),
+            (radius + 1.0) * sf,
+        ),
+        (
+            scaled(px, inset_y, pw, ph, sf),
+            lin_rgba(ACCENT, fill_a),
+            radius * sf,
+        ),
+    ]
+}
+
 /// Shaping cache for the tab strip. `build_tabs` runs every frame,
 /// but the cosmic-text work (`set_rich_text` → `shape_until_scroll` → font
 /// fallback) is the expensive part — re-shaping it per redraw was 66% sustained
@@ -784,6 +915,13 @@ pub(crate) fn build_tabs(
     cache: &mut TabsCache,
     tabs: &[TabLabel],
     drag: Option<(usize, f32)>,
+    // An incoming cross-window drag hover's ghost tab (v0.4.0): `(title,
+    // elapsed seconds)` — `title` is the carried surface's tab title when
+    // cheaply available, else the static "＋" fallback (see
+    // `WindowState::set_incoming_drop`'s doc for which). Always rendered as
+    // the LAST segment (v1 append-only), compressing the real tabs into
+    // `n + 1` segments to make room — see `ghost_pill_quads`.
+    ghost: Option<(&str, f32)>,
     hovered: Option<usize>,
     cw: f32,
     logical_w: f32,
@@ -812,16 +950,27 @@ pub(crate) fn build_tabs(
     let base = Attrs::new().family(Family::Monospace);
     let mut spans: Vec<(String, Color)> = Vec::new();
     let n = tabs.len();
+    // A ghost tab (v0.4.0) claims one extra segment, always the LAST one —
+    // real tabs compress into `n + 1` segments to make room, exactly the
+    // same "divide `tab_cols` by the segment count" math, just with one more
+    // segment. `ghost_n` is that segment count.
+    let ghost_n = n + ghost.is_some() as usize;
     let drag_slot = drag.map(|(s, _)| s);
     // A lone tab renders too: it used to be hidden as chrome minimalism, but
     // once tabs became draggable that made a single-tab window's most basic
     // gesture ("grab this window's tab") invisible and un-pressable.
     if n >= 1 {
-        let seg = tab_cols / n;
+        let seg = tab_cols / ghost_n;
         let mut col = 0usize;
         for (i, tab) in tabs.iter().enumerate() {
-            // Last tab absorbs any leftover columns so the row fills exactly.
-            let width = if i == n - 1 { tab_cols - col } else { seg };
+            // The real tabs' last segment absorbs leftover columns ONLY when
+            // there's no ghost after them — with a ghost, IT is the true
+            // last segment and absorbs the leftover instead (below).
+            let width = if i == n - 1 && ghost.is_none() {
+                tab_cols - col
+            } else {
+                seg
+            };
             let x = col as f32 * cw;
             let w = width as f32 * cw;
             let dragging_this = drag_slot == Some(i);
@@ -873,6 +1022,21 @@ pub(crate) fn build_tabs(
             };
             spans.push((center(&label, width), fg));
             col += width;
+        }
+        if let Some((title, t)) = ghost {
+            // The ghost's own segment: absorbs the leftover columns, same
+            // "last segment fills exactly" rule the real tabs use without one.
+            let width = tab_cols - col;
+            let x = col as f32 * cw;
+            let w = width as f32 * cw;
+            ghost_pill_quads(x, w, strip_h, cw, sf, t)
+                .into_iter()
+                .for_each(|q| rounded.push(q));
+            let label = if title.is_empty() { "＋" } else { title };
+            spans.push((
+                center(label, width),
+                Color::rgb(ACCENT.r, ACCENT.g, ACCENT.b),
+            ));
         }
     } else {
         // Single tab: no tab buttons, just the control toolbar. Pad the tab area so
@@ -1706,6 +1870,7 @@ mod tests {
                     cache,
                     &tabs,
                     None,
+                    None,
                     Some(1),
                     8.0,
                     1200.0,
@@ -1884,6 +2049,80 @@ mod tests {
             last_alpha > first_alpha,
             "the newest (last) segment should be brighter than the oldest (first)"
         );
+    }
+
+    // --- morph_quads (suck-in/pour-out, v0.4.0) ---
+
+    use super::morph_quads;
+
+    const MORPH_RECT: [f32; 4] = [10.0, 20.0, 100.0, 40.0];
+    const MORPH_GRAB: (f32, f32) = (200.0, 200.0);
+
+    #[test]
+    fn suck_in_is_full_rect_at_zero_and_empty_at_one() {
+        let start = morph_quads(MORPH_RECT, MORPH_GRAB, 0.0, true, 1.0);
+        assert!(!start.is_empty());
+        // The outline+fill's bounding box at t=0 should match the source rect
+        // (the border is the first quad `push_border` pushes: its top edge).
+        let [x, y, w, _h] = start[0].0;
+        assert!((x - MORPH_RECT[0]).abs() < 2.0, "x={x}");
+        assert!((y - MORPH_RECT[1]).abs() < 2.0, "y={y}");
+        assert!(w > 1.0);
+        let end = morph_quads(MORPH_RECT, MORPH_GRAB, 1.0, true, 1.0);
+        assert!(end.is_empty(), "fully sucked in draws nothing");
+    }
+
+    #[test]
+    fn pour_out_is_empty_at_zero_and_full_rect_at_one() {
+        let start = morph_quads(MORPH_RECT, MORPH_GRAB, 0.0, false, 1.0);
+        assert!(start.is_empty(), "hasn't started pouring yet");
+        let end = morph_quads(MORPH_RECT, MORPH_GRAB, 1.0, false, 1.0);
+        assert!(!end.is_empty());
+    }
+
+    #[test]
+    fn midpoint_sits_between_rect_and_grab() {
+        let mid = morph_quads(MORPH_RECT, MORPH_GRAB, 0.5, true, 1.0);
+        assert!(!mid.is_empty());
+        let [x, y, w, h] = mid[0].0;
+        // Bounding box has shrunk from the source rect but hasn't collapsed
+        // to a point yet.
+        assert!(w < MORPH_RECT[2] && w > 0.0, "w={w}");
+        assert!(h < MORPH_RECT[3] && h > 0.0, "h={h}");
+        assert!(x > MORPH_RECT[0] && y > MORPH_RECT[1]);
+    }
+
+    #[test]
+    fn out_of_range_t01_clamps_without_panicking() {
+        assert!(!morph_quads(MORPH_RECT, MORPH_GRAB, -1.0, true, 1.0).is_empty());
+        assert!(morph_quads(MORPH_RECT, MORPH_GRAB, 2.0, true, 1.0).is_empty());
+    }
+
+    // --- ghost_pill_quads (ghost tab, v0.4.0) ---
+
+    use super::ghost_pill_quads;
+
+    #[test]
+    fn ghost_pill_is_never_empty_and_stays_in_alpha_range() {
+        for t in [0.0f32, 0.5, 1.3, 7.9] {
+            let quads = ghost_pill_quads(0.0, 120.0, 34.0, 8.0, 1.0, t);
+            assert_eq!(quads.len(), 2, "ring + fill, always both");
+            for (_, rgba, _) in &quads {
+                assert!(
+                    rgba[3] > 0.0 && rgba[3] <= 1.0,
+                    "alpha out of range: {rgba:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ghost_pill_shimmers_over_time() {
+        // Different `t` should (almost always) produce a different alpha —
+        // proof the flicker is actually driven by `t`, not a constant.
+        let a = ghost_pill_quads(0.0, 120.0, 34.0, 8.0, 1.0, 0.0)[0].1[3];
+        let b = ghost_pill_quads(0.0, 120.0, 34.0, 8.0, 1.0, 1.0)[0].1[3];
+        assert!((a - b).abs() > 0.001, "expected the flicker to vary with t");
     }
 }
 

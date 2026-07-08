@@ -22,8 +22,8 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help, build_settings,
-    build_tabs, grid_quads, hold_ring_quads, link_quads, measure_cell_width, push_backdrop,
-    scrollbar, selection_quads, shape_grid, spark_quads, split_preview,
+    build_tabs, grid_quads, hold_ring_quads, link_quads, measure_cell_width, morph_quads,
+    push_backdrop, scrollbar, selection_quads, shape_grid, spark_quads, split_preview,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
@@ -84,6 +84,14 @@ pub struct Shot<'a> {
     /// mirrors [`crate::Renderer`]'s live `hold_ring` state so a mid-gesture
     /// `ctl screenshot` shows the sweep for visual verification.
     pub hold_ring: Option<(f32, f32, f32)>,
+    /// Incoming-drag ghost tab (v0.4.0): `(label, elapsed seconds)` — mirrors
+    /// [`crate::Renderer`]'s live `ghost_tab` state so a mid-hover `ctl
+    /// screenshot` on the TARGET window shows it for visual verification.
+    pub ghost_tab: Option<(String, f32)>,
+    /// Suck-in/pour-out morph (v0.4.0): `(rect, grab point, t01, inward)` —
+    /// mirrors [`crate::Renderer`]'s live `morph` state so a mid-gesture
+    /// `ctl screenshot` shows the collapsing/expanding rect.
+    pub morph: Option<crate::renderer::MorphState>,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
@@ -412,9 +420,17 @@ pub fn capture_reusing(
                 .into_iter()
                 .for_each(|q| rects.push(q));
         }
+        // Suck-in/pour-out morph (v0.4.0): same window-space placement as the
+        // hold ring, for the same reason (not tied to any one pane).
+        if let Some((rect, grab, t01, inward)) = shot.morph {
+            morph_quads(rect, grab, t01, inward, sf)
+                .into_iter()
+                .for_each(|q| rects.push(q));
+        }
         // One-shot capture: a fresh cache (always shapes once) keeps the shared
         // signature without threading state through the headless path.
         let mut tabs_cache = crate::paint::TabsCache::default();
+        let ghost = shot.ghost_tab.as_ref().map(|(l, t)| (l.as_str(), *t));
         close_cx = build_tabs(
             font_system,
             &mut chrome,
@@ -422,6 +438,7 @@ pub fn capture_reusing(
             &mut tabs_cache,
             &shot.tabs,
             shot.tab_drag,
+            ghost,
             shot.hovered_tab,
             cw,
             shot.logical_w,

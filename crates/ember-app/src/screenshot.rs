@@ -413,6 +413,12 @@ pub fn run(opts: Opts) -> Result<String, String> {
             focused: 0,
         }),
         hold_ring: opts.hold_ring,
+        // No offline `--screenshot` flag for these (v0.4.0): both are live
+        // cross-window-drag/tear-off previews with no meaningful "just render
+        // this state" CLI equivalent — `ctl screenshot` against a live,
+        // scripted `ctl drag` is the verification path (design doc).
+        ghost_tab: None,
+        morph: None,
     };
     if opts.bg_image.is_some() && shot.image.is_none() {
         return Err(format!(

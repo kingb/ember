@@ -31,8 +31,8 @@ use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, CLOSE_COLS, bell_wash, build_about, build_confirm, build_fps, build_help,
     build_settings, build_tabs, debug_emit, grid_quads, hold_ring_quads, measure_cell_width,
-    push_backdrop, scrollbar, scrollbar_geometry, selection_quads, shape_grid, spark_quads,
-    split_preview,
+    morph_quads, push_backdrop, scrollbar, scrollbar_geometry, selection_quads, shape_grid,
+    spark_quads, split_preview,
 };
 use crate::selection::Selection;
 
@@ -68,6 +68,11 @@ pub struct VisiblePane {
     pub session: SessionId,
     pub rect: Rect,
 }
+
+/// Suck-in/pour-out morph state (v0.4.0): `(rect, grab point, t01, inward)`,
+/// all logical px/`0..1`, this window's own space — see
+/// [`Renderer::set_morph`]'s doc for what each field means.
+pub type MorphState = ([f32; 4], (f32, f32), f32, bool);
 
 /// One entry in the tab strip.
 #[derive(Clone, Debug)]
@@ -440,6 +445,19 @@ pub struct Renderer {
     /// the cursor a hold is armed/sweeping at, this window's own space.
     /// `None` while no hold is live. See [`crate::paint::hold_ring_quads`].
     hold_ring: Option<(f32, f32, f32)>,
+    /// The incoming-drag ghost tab (v0.4.0): `(label, since)` — `label` is
+    /// the carried surface's title, or the "＋" fallback (see
+    /// `Self::set_ghost_tab`'s doc); `since` anchors the procedural flicker
+    /// clock, kept across repeated `set_ghost_tab(Some(_))` calls with the
+    /// SAME label (a live hover re-sets this every motion tick) so the
+    /// shimmer doesn't restart every frame. `None` while no cross-window
+    /// drag is hovering this window's strip.
+    ghost_tab: Option<(String, Instant)>,
+    /// The suck-in/pour-out morph (v0.4.0): `(rect, grab point, t01, inward)`
+    /// — see [`Self::set_morph`]'s doc. `None` while no morph is playing (the
+    /// overwhelmingly common case — a self-terminating ~150-200ms animation,
+    /// not a persistent drag cue).
+    morph: Option<MorphState>,
     /// FPS/frame-time debug readout text (bottom-right), or `None` when hidden.
     fps_overlay: Option<String>,
     /// Glyph buffer for the FPS overlay.
@@ -622,6 +640,8 @@ impl Renderer {
             selection: None,
             split_preview: None,
             hold_ring: None,
+            ghost_tab: None,
+            morph: None,
             fps_overlay: None,
             fps_buffer,
             bell_flash: 0.0,
@@ -796,6 +816,11 @@ impl Renderer {
             font_family: self.family_name.clone(),
             confirm: self.confirm.clone(),
             hold_ring: self.hold_ring,
+            ghost_tab: self
+                .ghost_tab
+                .as_ref()
+                .map(|(label, since)| (label.clone(), since.elapsed().as_secs_f32())),
+            morph: self.morph,
         };
         crate::headless::capture_reusing(
             &self.device,
@@ -985,6 +1010,61 @@ impl Renderer {
     pub fn set_hold_ring(&mut self, ring: Option<(f32, f32, f32)>) {
         self.scene_dirty = true;
         self.hold_ring = ring;
+        self.window.request_redraw();
+    }
+
+    /// Set/clear the incoming-drag ghost tab (v0.4.0): the carried surface's
+    /// title, or `None` to clear. Always marks the scene dirty (unlike most
+    /// setters here, which no-op on an unchanged value) — a live hover
+    /// re-sets this every motion tick AND every `about_to_wait` animation
+    /// tick (`WindowState::advance_animations`) purely to keep the flicker
+    /// live, which needs a full rebuild each time; see [`Self::ghost_active`].
+    /// The start-of-shimmer clock is preserved across repeated `Some(_)`
+    /// calls with the SAME label so the flicker phase doesn't jump every
+    /// motion tick — only a label CHANGE (or a `None` → `Some` transition)
+    /// resets it.
+    pub fn set_ghost_tab(&mut self, label: Option<String>) {
+        self.scene_dirty = true;
+        match (&mut self.ghost_tab, label) {
+            (Some((cur, _)), Some(new)) if *cur == new => {}
+            (slot, Some(new)) => *slot = Some((new, Instant::now())),
+            (slot, None) => *slot = None,
+        }
+        self.window.request_redraw();
+    }
+
+    /// Whether a ghost tab is currently showing — `about_to_wait`'s
+    /// per-window animation gate ORs this in so the flicker keeps ticking
+    /// (via [`Self::touch_ghost`], called every animation tick) purely
+    /// while a cross-window drag is hovering this window's strip, and costs
+    /// nothing the rest of the time.
+    pub fn ghost_active(&self) -> bool {
+        self.ghost_tab.is_some()
+    }
+
+    /// Re-mark the scene dirty for a live ghost tab's shimmer, without
+    /// changing its label — a no-op when no ghost is showing. Called every
+    /// animation tick (`WindowState::advance_animations`) so the flicker
+    /// keeps advancing even when the pointer itself isn't moving (a static
+    /// hover, no new `set_ghost_tab` call otherwise).
+    pub fn touch_ghost(&mut self) {
+        if self.ghost_tab.is_some() {
+            self.scene_dirty = true;
+            self.window.request_redraw();
+        }
+    }
+
+    /// Set/clear the suck-in/pour-out morph (v0.4.0): `(rect, grab point,
+    /// t01, inward)`, all logical px/`0..1`, this window's own space —
+    /// `inward: true` for the tear-off suck-in, `false` for the drop/cancel
+    /// pour-out. See [`crate::paint::morph_quads`] for the quad geometry
+    /// this drives at scene-build time. Driven by `WindowState::tick_morph`
+    /// every `about_to_wait` tick, exactly like [`Self::set_hold_ring`] —
+    /// and, like it, NOT cleared by `WindowState::clear_drag_visuals`: a
+    /// self-terminating ~150-200ms animation, not a persistent drag cue.
+    pub fn set_morph(&mut self, morph: Option<MorphState>) {
+        self.scene_dirty = true;
+        self.morph = morph;
         self.window.request_redraw();
     }
 
@@ -1512,7 +1592,18 @@ impl Renderer {
                         .into_iter()
                         .for_each(|q| rects.push(q));
                 }
+                // Suck-in/pour-out morph (v0.4.0): same window-space
+                // placement as the hold ring, for the same reason.
+                if let Some((rect, grab, t01, inward)) = self.morph {
+                    morph_quads(rect, grab, t01, inward, sf)
+                        .into_iter()
+                        .for_each(|q| rects.push(q));
+                }
                 let logical_w = self.config.width as f32 / sf;
+                let ghost = self
+                    .ghost_tab
+                    .as_ref()
+                    .map(|(label, since)| (label.as_str(), since.elapsed().as_secs_f32()));
                 let close_cx = build_tabs(
                     &mut self.font_system,
                     &mut self.chrome,
@@ -1520,6 +1611,7 @@ impl Renderer {
                     &mut self.tabs_cache,
                     &self.tabs,
                     self.tab_drag,
+                    ghost,
                     self.hovered_tab,
                     cw,
                     logical_w,

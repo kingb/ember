@@ -86,6 +86,8 @@ fn main() {
         font_family: None,
         confirm: None,
         hold_ring: None,
+        ghost_tab: None,
+        morph: None,
     };
 
     capture(&shot, std::path::Path::new(&path)).expect("capture");
