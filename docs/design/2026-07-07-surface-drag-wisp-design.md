@@ -84,6 +84,23 @@ cross-window strip drop appends as the last tab rather than landing at the
 pointer's position. All three are follow-up candidates, none affect where
 surfaces land or session survival.
 
+## Hold-to-wisp (v1.1, from first live sessions)
+
+Hotkey-free pane grabbing: press and HOLD left on a pane body without
+moving. After a short arm delay a thin accent ring draws itself clockwise
+around the cursor; when the ring completes, the pane is wisped away (the
+suck-in) and the drag is live, carried, exactly as if chord-dragged. Moving
+past a small tolerance before the ring completes cancels the ring and the
+press falls back to what it always was (selection drag / mouse-mode
+forwarding); releasing early is a normal click. Starting numbers, all
+tunable live: arm 300 ms, ring sweep 600 ms, tolerance 6 logical px.
+Mouse-mode apps got the press forwarded at press time, so wisp-away sends
+the matching synthetic release to the PTY before the carry starts.
+
+The strip's empty background is also a drag handle for the ACTIVE tab, so a
+window is grabbable even where its strip has no chip under the pointer (and
+the lone-tab chip stays visible as the discoverable affordance).
+
 ## Non-goals (this release)
 
 - Multi-surface drags, drag-out to OTHER apps (no OS drag-and-drop payload),
