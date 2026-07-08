@@ -3298,6 +3298,7 @@ impl Shared {
             sparks: bg.ember_sparks,
             density: bg.ember_density,
             time: t,
+            frame_dt: 1.0 / (bg.ember_fps.clamp(1, 240) as f32),
         }
     }
 

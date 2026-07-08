@@ -388,6 +388,13 @@ pub fn run(opts: Opts) -> Result<String, String> {
             sparks: opts.ember,
             density: 1.0,
             time: opts.ember_phase,
+            // Trail sizing must match the cadence rendered frames will be
+            // played back at (animation GIFs step this via EMBER_SPARK_DT);
+            // stills default to a 30fps-equivalent streak length.
+            frame_dt: std::env::var("EMBER_SPARK_DT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0 / 30.0),
         },
         image: opts
             .bg_image
