@@ -64,11 +64,17 @@ echo "  reorder drag -> $(echo "$R1" | python3 -c "import json,sys; print(json.l
 PANES_BEFORE=$("$BIN" ctl state | python3 -c "import json,sys; print(len(json.load(sys.stdin)['state']['panes']))")
 R2=$("$BIN" ctl drag $((W/2)) $((H/2)) $((W-30)) $((H/2)) --steps 10 --cancel 2>&1)
 echo "  cancelled drag -> $(echo "$R2" | python3 -c "import json,sys; print(json.load(sys.stdin).get('drag_ended','parse-fail'))" 2>/dev/null || echo "$R2" | head -c 120)"
-# Real pane drag to the right edge: same-window edge drop = half-pane split.
+# Content drag across the pane: must be TEXT SELECTION (a plain click-drag
+# inside pane content selects; pane-carry requires the hold-to-wisp gesture,
+# which ctl drag cannot express yet — needs a --hold-ms arg, flagged upstream).
 R3=$("$BIN" ctl drag $((W/2)) $((H/2)) $((W-10)) $((H/2)) --steps 14 --paced 16 2>&1)
+ENDED=$(echo "$R3" | python3 -c "import json,sys; print(json.load(sys.stdin).get('drag_ended','parse-fail'))" 2>/dev/null || echo parse-fail)
 PANES_AFTER=$("$BIN" ctl state | python3 -c "import json,sys; print(len(json.load(sys.stdin)['state']['panes']))")
-echo "  edge drag -> $(echo "$R3" | python3 -c "import json,sys; print(json.load(sys.stdin).get('drag_ended','parse-fail'))" 2>/dev/null || echo "$R3" | head -c 120); panes $PANES_BEFORE -> $PANES_AFTER"
-if [ "$PANES_AFTER" -gt "$PANES_BEFORE" ]; then echo "  PASS: drag split a pane on X11"; else echo "  WARN: pane count unchanged (drop semantics may differ) — inspect responses above"; fi
+if [ "$ENDED" = "selection" ] && [ "$PANES_AFTER" = "$PANES_BEFORE" ]; then
+  echo "  PASS: content drag is selection, pane count stable ($ENDED)"
+else
+  echo "  FAIL: content drag ended '$ENDED', panes $PANES_BEFORE -> $PANES_AFTER"
+fi
 xwd -root -silent | convert xwd:- /out/x11-drag.png 2>/dev/null && echo "  captured /out/x11-drag.png"
 
 echo "=== SMOKE 5: stability — 30s idle, still alive, log clean ==="
