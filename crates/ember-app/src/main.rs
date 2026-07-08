@@ -632,6 +632,13 @@ pub(crate) struct DragState {
     /// `update_cross_window_drag`. Read by `resolve_drag_drop`'s `Desktop`
     /// arm for the new window's position hint.
     pub(crate) last_screen: (f64, f64),
+    /// The window most recently raised because the carry hovered it. Tracked
+    /// EXPLICITLY (not derived from `hover`, which flips `None` over a
+    /// window's body outside any pane/strip) so the raise fires exactly once
+    /// per target change. Deriving it from `hover` re-raised on every motion
+    /// tick over body regions — an activation storm that ballooned the event
+    /// queue to gigabytes and froze the app in the first live session.
+    pub(crate) last_raised: Option<WindowId>,
 }
 
 /// Where a carried surface would land, driving the live drag preview.
@@ -2493,20 +2500,21 @@ fn update_cross_window_drag(
                 // Raise the hover target the moment the carry first enters
                 // it, so the drop zones are actually visible (a buried
                 // target window made previews pointless — Brandon's first
-                // live session). Once per target change, not per tick: the
-                // previous tick's hover carries the last target's id.
+                // live session). Exactly once per target change, tracked in
+                // `last_raised` — NOT derived from `hover`, which is `None`
+                // over body regions and would re-raise every motion tick
+                // (the event-queue balloon/freeze of the same session).
                 // Keyboard focus moving with the raise is fine — keys are
                 // swallowed globally during a drag and Escape cancels from
                 // any window; macOS mouse capture survives (the source view
                 // keeps receiving motion regardless of key window).
-                let prev_target = shared.drag.as_ref().and_then(|d| match d.hover {
-                    Some(DropHover::Strip { window, .. }) => Some(window),
-                    Some(DropHover::Pane { window, .. }) => Some(window),
-                    _ => None,
-                });
-                if prev_target != Some(tid) {
+                let already = shared.drag.as_ref().and_then(|d| d.last_raised);
+                if already != Some(tid) {
                     if let Some(twin) = windows.get(&tid) {
                         twin.renderer.window().focus_window();
+                    }
+                    if let Some(d) = shared.drag.as_mut() {
+                        d.last_raised = Some(tid);
                     }
                 }
                 clear_incoming_drop_except(windows, Some(tid));

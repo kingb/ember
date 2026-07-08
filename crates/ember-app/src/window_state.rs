@@ -1647,11 +1647,12 @@ impl WindowState {
             carried: false,
             hover: None,
             last_screen: (0.0, 0.0), // set for real on this same tick's
-                                     // motion, immediately below by
-                                     // `update_drag_hover`'s caller — see
-                                     // `App::window_event`'s CursorMoved arm
-                                     // (mirrors tab tear-off's identical
-                                     // placeholder).
+            last_raised: None,
+            // motion, immediately below by
+            // `update_drag_hover`'s caller — see
+            // `App::window_event`'s CursorMoved arm
+            // (mirrors tab tear-off's identical
+            // placeholder).
         });
     }
 
@@ -1965,8 +1966,9 @@ impl WindowState {
                     carried: false,
                     hover: None,
                     last_screen: (0.0, 0.0), // set for real on this same tick's
-                                             // motion, immediately below by `update_drag_hover`'s
-                                             // caller — see `App::window_event`'s CursorMoved arm.
+                    last_raised: None,
+                    // motion, immediately below by `update_drag_hover`'s
+                    // caller — see `App::window_event`'s CursorMoved arm.
                 });
             } else {
                 // Still an in-strip reorder — unchanged existing behavior.
