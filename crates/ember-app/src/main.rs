@@ -2529,7 +2529,7 @@ fn update_cross_window_drag(
                 if let Some((tx, ty)) = target_pos {
                     let hover = windows
                         .get(&tid)
-                        .and_then(|twin| twin.hover_at(tid, tx, ty));
+                        .and_then(|twin| twin.hover_at(tid, tx, ty, false));
                     if let Some(twin) = windows.get_mut(&tid) {
                         twin.set_incoming_drop(hover, tx);
                     }
@@ -3088,15 +3088,24 @@ fn run_ctl_drag(
         .collect();
 
     if let Some(ms) = paced_ms {
+        let interval = Duration::from_millis(ms.max(1));
         shared.paced_drag = Some(PacedDrag {
             waypoints,
-            interval: Duration::from_millis(ms.max(1)),
+            interval,
             last_step: Instant::now(),
             window,
             cancel,
             saved_mods,
             reply,
         });
+        // This stash runs in the deferred tail — AFTER this pass's
+        // `set_control_flow` already committed. With nothing else animating
+        // the loop would park in a timeout-less Wait and the paced machine
+        // would only inch forward on unrelated events (observed live: a
+        // paced drag starved to the client's timeout while the main thread
+        // sat in BlockUntilNextEvent). Re-arm the control flow HERE so the
+        // first waypoint's deadline actually wakes the loop.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + interval));
         return; // The paced tick in `about_to_wait` sends the reply later.
     }
 

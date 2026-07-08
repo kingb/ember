@@ -36,7 +36,7 @@ pub use links::{UrlMatch, find_urls};
 pub use settings::{Help, RowKind, SettingRow, SettingsRowView, resolve_rows, setting_rows};
 pub use windows::{
     DropZone, MoveEffect, MoveError, SurfaceDest, SurfaceRef, Windows, drop_zone_for, move_surface,
-    window_under,
+    split_zone_for, window_under,
 };
 
 /// The crate version, surfaced for diagnostics and the `ember-term --version`

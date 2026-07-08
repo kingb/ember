@@ -447,6 +447,33 @@ pub enum DropZone {
 /// results on such dimensions — e.g. a 0-width pane still satisfies `x <
 /// w * BAND` for negative `x` — so this is guarded explicitly rather than
 /// left to fall out of the general case.
+/// [`drop_zone_for`]'s sibling for SAME-WINDOW drags, where `Center` ("add as
+/// a tab of this window") is meaningless — the surface already lives here, so
+/// a center drop would be a guaranteed no-op. Instead the WHOLE pane is split
+/// territory: the nearest edge wins everywhere (half-pane semantics, matching
+/// what dragging a tab onto a pane meant before cross-window drops existed).
+/// Degenerate dimensions still resolve `Center` (callers treat it as "no
+/// zone" and the drop cancels harmlessly).
+pub fn split_zone_for(x: f64, y: f64, w: f64, h: f64) -> DropZone {
+    if w <= 0.0 || w.is_nan() || h <= 0.0 || h.is_nan() {
+        return DropZone::Center;
+    }
+    // Distances to each edge, normalized by the pane's own dimension so a
+    // wide-flat pane doesn't bias toward its long sides. Ties horizontal-
+    // first, mirroring drop_zone_for's corner rule.
+    let candidates = [
+        (x / w, Axis::Horizontal, true),        // west
+        ((w - x) / w, Axis::Horizontal, false), // east
+        (y / h, Axis::Vertical, true),          // north
+        ((h - y) / h, Axis::Vertical, false),   // south
+    ];
+    let (_, axis, before) = candidates
+        .into_iter()
+        .min_by(|a, b| a.0.partial_cmp(&b.0).expect("finite distances"))
+        .expect("non-empty");
+    DropZone::Edge { axis, before }
+}
+
 pub fn drop_zone_for(x: f64, y: f64, w: f64, h: f64) -> DropZone {
     if w <= 0.0 || w.is_nan() || h <= 0.0 || h.is_nan() {
         return DropZone::Center;
@@ -1434,6 +1461,63 @@ mod tests {
                 before: false
             }
         );
+    }
+
+    #[test]
+    fn split_zone_always_picks_the_nearest_edge_no_center() {
+        // Dead center of a square pane: tie -> horizontal-first (west).
+        assert_eq!(
+            split_zone_for(50.0, 50.0, 100.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Horizontal,
+                before: true
+            }
+        );
+        // Clearly in the left half.
+        assert_eq!(
+            split_zone_for(20.0, 50.0, 100.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Horizontal,
+                before: true
+            }
+        );
+        // Right half.
+        assert_eq!(
+            split_zone_for(80.0, 50.0, 100.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Horizontal,
+                before: false
+            }
+        );
+        // Near the left end of a wide pane: normalized (envelope-quadrant)
+        // distance keeps this WEST (0.075) over north (0.1), even though the
+        // absolute pixel distance to the top edge is smaller — the X-diagonal
+        // division users know from editor drop zones.
+        assert_eq!(
+            split_zone_for(30.0, 10.0, 400.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Horizontal,
+                before: true
+            }
+        );
+        // Middle of the top band: genuinely north.
+        assert_eq!(
+            split_zone_for(200.0, 10.0, 400.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Vertical,
+                before: true
+            }
+        );
+        // Bottom half.
+        assert_eq!(
+            split_zone_for(200.0, 90.0, 400.0, 100.0),
+            DropZone::Edge {
+                axis: Axis::Vertical,
+                before: false
+            }
+        );
+        // Degenerate stays Center (harmless cancel).
+        assert_eq!(split_zone_for(5.0, 5.0, 0.0, 0.0), DropZone::Center);
     }
 
     #[test]

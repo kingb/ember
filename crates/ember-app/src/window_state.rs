@@ -1998,7 +1998,19 @@ impl WindowState {
     /// (`update_drag_hover`, called on the drag's own source) and the
     /// cross-window target's hover (`App::update_cross_window_drag` in
     /// `main.rs`, called on whichever OTHER window the pointer is over).
-    pub(crate) fn hover_at(&self, window_id: WindowId, x: f64, y: f64) -> Option<DropHover> {
+    /// `in_window`: the hovering drag ORIGINATES in this same window. Center
+    /// ("add as a tab here") is a guaranteed no-op for a same-window drag, so
+    /// pane zones switch to nearest-edge half-pane splits (`split_zone_for`)
+    /// — restoring the pre-multi-window "drag a tab onto a pane to split"
+    /// gesture that a huge Center region had silently eaten (nine rejected
+    /// drops in one live session).
+    pub(crate) fn hover_at(
+        &self,
+        window_id: WindowId,
+        x: f64,
+        y: f64,
+        in_window: bool,
+    ) -> Option<DropHover> {
         let sf = self.renderer.window().scale_factor();
         let (lw, lh) = (self.px.0 as f64 / sf, self.px.1 as f64 / sf);
         if x < 0.0 || y < 0.0 || x >= lw || y >= lh {
@@ -2027,7 +2039,11 @@ impl WindowState {
             .into_iter()
             .find(|(_, s)| *s == sid)
             .map(|(p, _)| p)?;
-        let zone = drop_zone_for(x - rect.x, y - rect.y, rect.width, rect.height);
+        let zone = if in_window {
+            ember_core::split_zone_for(x - rect.x, y - rect.y, rect.width, rect.height)
+        } else {
+            drop_zone_for(x - rect.x, y - rect.y, rect.width, rect.height)
+        };
         Some(DropHover::Pane {
             window: window_id,
             tab: self.tree.active,
@@ -2057,7 +2073,7 @@ impl WindowState {
         if drag.source_window != window_id {
             return;
         }
-        let hover = self.hover_at(window_id, x, y);
+        let hover = self.hover_at(window_id, x, y, true);
         match &hover {
             Some(DropHover::Pane {
                 pane,
