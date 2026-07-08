@@ -35,8 +35,10 @@ Or grab a signed, notarized build from the
   drag-to-reorder tabs.
 - **Shell integration** out of the box: exit-status marks in the gutter and
   jump-to-previous-command, no shell config required.
-- **A campfire built in**: a warm gradient backdrop out of the box, and
-  opt-in drifting ember sparks, live-tunable in Settings.
+- **A campfire built in**: the fire is lit out of the box, a warm gradient
+  with ember sparks drifting as glowing trails, measured cheap (about 2% of
+  one core while visible, nothing when hidden) and live-tunable or off in
+  Settings.
 - **One codebase, two platforms**: the same terminal on macOS and Linux.
 
 ## Architecture at a glance
