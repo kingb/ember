@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-08
+
 ### Added
 
 - External tools can now find and jump to tabs. `ctl state` reports every
@@ -42,12 +44,15 @@ follow [Semantic Versioning](https://semver.org).
 
 ### Changed
 
-- Ember sparks now render as short glowing trails (velocity-stretched motion
-  blur) instead of plain dots. The drift reads smoothly even at low animation
-  frame rates, so the campfire costs less to keep lit.
-
-### Changed
-
+- The campfire is now fully lit by default: a fresh install opens with the
+  warm gradient and drifting ember sparks. The sparks render as short glowing
+  trails (velocity-stretched motion blur) instead of plain dots, which keeps
+  the drift smooth at the gentle default of 15 frames per second. Measured on
+  an Apple Silicon MacBook, the animation costs about 2% of one core and a
+  few tens of milliwatts of GPU while the window is visible, and nothing when
+  the window is hidden. Tune or disable it in Settings (Ember sparks, Ember
+  FPS, Ember density); automatic pauses on unfocused windows, on battery, and
+  under Reduce Motion arrive in the next patch release.
 - In `ctl state`, the `tabs` field changed from a count to the array above.
   Callers that read it as a number should use the array's length.
 
@@ -169,7 +174,8 @@ this first release:
   created owner-only, use no fixed or predictable paths, and return
   JSON-encoded errors rather than leaking internal state.
 
-[Unreleased]: https://github.com/kingb/ember/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/kingb/ember/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kingb/ember/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/kingb/ember/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/kingb/ember/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kingb/ember/releases/tag/v0.1.0

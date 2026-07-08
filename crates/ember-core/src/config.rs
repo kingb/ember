@@ -79,12 +79,16 @@ pub struct Background {
     pub gradient: bool,
     /// Darkening scrim over the backdrop for text legibility (`0.0`–`1.0`).
     pub scrim: f32,
-    /// Drifting glowing ember sparks (opt-in; forces continuous redraw).
+    /// Drifting glowing ember sparks (velocity trails). On by default: at the
+    /// default 15fps the animation measures ~2% of one core and ~tens of mW
+    /// of GPU while the window is visible, and zero when occluded. Guardrails
+    /// (pause on unfocus / battery / Reduce Motion) arrive in the next patch.
     pub ember_sparks: bool,
     /// Spark count/rate multiplier (`0.0`–`2.0`).
     pub ember_density: f32,
-    /// Frame-rate cap for the ember animation (fps). Lower = less CPU; the sparks
-    /// drift fine at 30. Clamped to a sane range by the app.
+    /// Frame-rate cap for the ember animation (fps). Lower = less CPU; the
+    /// velocity trails keep the drift smooth at 15 (the default). Clamped to a
+    /// sane range by the app.
     pub ember_fps: u32,
     /// Path to a backdrop image (e.g. a fire photo) drawn behind the cells. When
     /// set, it replaces the gradient; the scrim still darkens it for legibility.
@@ -98,14 +102,16 @@ pub struct Background {
 impl Default for Background {
     fn default() -> Self {
         Self {
-            // The warm gradient is Ember's signature look and draws statically
-            // (no continuous redraw), so it's on out of the box. The sparks
-            // animation stays opt-in: it forces a redraw loop and costs power.
+            // The campfire is Ember's signature and it's lit out of the box:
+            // static gradient (free) + spark trails at 15fps (measured ~2% of
+            // a core + ~tens of mW GPU while visible; 0% occluded). Trails are
+            // what make 15fps look smooth — see spark_quads. The dials remain
+            // for anyone who wants it calmer, faster, or off.
             gradient: true,
             scrim: 0.45,
-            ember_sparks: false,
+            ember_sparks: true,
             ember_density: 1.0,
-            ember_fps: 30,
+            ember_fps: 15,
             image: None,
             image_fit: "cover".to_string(),
         }
@@ -117,14 +123,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_conservative() {
+    fn defaults_light_the_campfire_cheaply() {
         let c = Config::default();
-        // Conservative on *power*: the gradient is on (static draw, free) but
-        // anything that forces a continuous redraw loop starts off.
+        // The signature look is on by default, at the measured-cheap settings:
+        // gradient (static, free) + sparks at 15fps with trails (~2% of a core
+        // visible, 0% occluded). Anything costlier stays a user choice.
         assert!(c.background.gradient);
-        assert!(!c.background.ember_sparks);
+        assert!(c.background.ember_sparks);
         assert_eq!(c.background.ember_density, 1.0);
-        assert_eq!(c.background.ember_fps, 30);
+        assert_eq!(c.background.ember_fps, 15);
         assert!(c.visual_bell); // visual bell on by default
         assert!(c.wisp); // decorative-only; safe to default on
     }

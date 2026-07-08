@@ -134,7 +134,7 @@ impl Default for BackdropParams {
             sparks: false,
             density: 1.0,
             time: 0.0,
-            frame_dt: 1.0 / 30.0,
+            frame_dt: 1.0 / 15.0,
         }
     }
 }
