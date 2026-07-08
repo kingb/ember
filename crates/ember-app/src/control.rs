@@ -237,17 +237,34 @@ mod unix {
                     break; // stop() self-connected to unblock us
                 }
                 let Ok(stream) = stream else { continue };
-                if let Err(e) = serve(stream, &tx, &*waker) {
-                    eprintln!("[ember-control] request error: {e}");
-                }
-                // The event loop sleeps on ControlFlow::Wait; wake it so the
-                // just-forwarded command is drained this cycle, not on the next
-                // unrelated event. (Reply-waiting commands also wake it INSIDE
-                // dispatch — this after-the-fact wake alone stranded them: on a
-                // fully quiet window — hours idle, occluded, locked display —
-                // nothing else wakes the loop within the reply timeout, which
-                // was the daily-driver "state timeout" failure.)
-                waker();
+                // One thread PER CONNECTION, not a serial accept-serve loop:
+                // `serve` blocks until the command's reply is sent, and a
+                // paced `ctl drag` legitimately holds its connection open
+                // for the WHOLE gesture (seconds) — serially, every probe
+                // sent meanwhile (`state`, `screenshot`) queued behind it
+                // and resolved only when the gesture finished, which made
+                // observing a live drag mid-flight structurally impossible
+                // (the previous session burned hours on this as a
+                // "mysterious event-loop stall"; it was this accept loop).
+                // Each connection has its own stream + its own reply
+                // channel, and `tx` is a multi-producer sender, so
+                // concurrent serves don't share anything mutable.
+                let tx = tx.clone();
+                let waker = std::sync::Arc::clone(&waker);
+                thread::spawn(move || {
+                    if let Err(e) = serve(stream, &tx, &*waker) {
+                        eprintln!("[ember-control] request error: {e}");
+                    }
+                    // The event loop sleeps on ControlFlow::Wait; wake it so
+                    // the just-forwarded command is drained this cycle, not
+                    // on the next unrelated event. (Reply-waiting commands
+                    // also wake it INSIDE dispatch — this after-the-fact
+                    // wake alone stranded them: on a fully quiet window —
+                    // hours idle, occluded, locked display — nothing else
+                    // wakes the loop within the reply timeout, which was
+                    // the daily-driver "state timeout" failure.)
+                    waker();
+                });
             }
         });
         Ok((
