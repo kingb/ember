@@ -69,7 +69,8 @@ shape and only enriches each entry.
 - Font family and font size are deferred post-0.1.0 — see
   "Out of scope" below. Not rows in this bead.
 - Gradient backdrop (`Toggle`)
-- Ember sparks (`Toggle`)
+- Ember sparks (`Cycle`: `off` / `focused` / `always` — the sparks
+  guardrails dial, v0.3.1; was a `Toggle` pre-v0.3.1)
 - Ember density (`Number`, step 0.1, clamp 0.0–2.0)
 - Ember FPS (`Number`, step 5, clamp 10–120)
 - Scrim (`Number`, step 0.05, clamp 0.0–1.0)
