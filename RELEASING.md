@@ -123,6 +123,10 @@ Every one of these has bitten a real release. Read once.
 - [ ] Update the issue tracker: close shipped work, note follow-ups.
 - [ ] Notify the team of the release and hand off any follow-on work.
 - [ ] Confirm `brew upgrade` picks up the new version on a real machine.
+- [ ] **Symmetry:** the release carries assets for every platform (macOS
+      zip/dmg + both Linux bottles). Build a tag's Linux bottles before cutting
+      the next version, even if a patch supersedes it quickly, so no tagged
+      release is left half-populated.
 
 ---
 
