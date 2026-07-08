@@ -82,10 +82,15 @@ const HOLD_ARM_MS: u64 = 300;
 /// HOLD_SWEEP_MS` and the drag goes live.
 const HOLD_SWEEP_MS: u64 = 600;
 /// How far (logical px) the pointer may drift from the press origin before
-/// the hold cancels — the press falls back to whatever it already was
-/// (selection / mouse-mode forward), same tolerance family as
-/// [`TAB_DRAG_THRESHOLD`].
-const HOLD_TOLERANCE_PX: f64 = 6.0;
+/// an ARMING hold (ring not yet visible) cancels — this phase is what
+/// distinguishes "I'm holding" from "I'm starting a drag/selection", so it
+/// stays modest. Trackpad fingers drift; 6 was too tight in the first live
+/// test (every hold decayed into a selection).
+const HOLD_TOLERANCE_PX: f64 = 12.0;
+/// Drift allowance once the ring is visibly SWEEPING: the user is clearly
+/// committed to the gesture by then, so the leash is much longer — only a
+/// real yank away cancels.
+const HOLD_SWEEP_TOLERANCE_PX: f64 = 28.0;
 
 /// How far (logical px) the pointer must move horizontally before a tab press
 /// becomes a drag-reorder rather than a click.
@@ -1776,6 +1781,11 @@ impl WindowState {
             self.hold = None;
             self.renderer.set_hold_ring(None);
             self.forward_mouse_release(shared, 0);
+            // The same press began a selection (and jitter may have grown
+            // it); the gesture is the drag's now — drop the selection so it
+            // neither lingers under the carried pane nor fights the release.
+            self.selecting = false;
+            self.clear_selection();
             self.start_pane_drag(shared, pane, rect, origin.0, origin.1);
             if let Some(d) = shared.drag.as_mut() {
                 d.carried = true;
@@ -2015,7 +2025,13 @@ impl WindowState {
         // is doing (e.g. extending a selection the same press started).
         if let Some(hold) = &self.hold {
             let (ox, oy) = hold.origin;
-            if (x - ox).hypot(y - oy) > HOLD_TOLERANCE_PX {
+            let sweeping = hold.started.elapsed() >= Duration::from_millis(HOLD_ARM_MS);
+            let leash = if sweeping {
+                HOLD_SWEEP_TOLERANCE_PX
+            } else {
+                HOLD_TOLERANCE_PX
+            };
+            if (x - ox).hypot(y - oy) > leash {
                 self.hold = None;
                 self.renderer.set_hold_ring(None);
             }
