@@ -18,6 +18,7 @@ mod window_state;
 
 use window_state::{DragEnded, HoldTick, WindowState};
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -28,7 +29,7 @@ use control::{ControlMsg, MoveTabTarget, PromotePaneTarget};
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims, LayoutNode,
     MoveEffect, MoveError, OscEvent, PaneId, Rect, RowKind, ScrollAmount, SessionId,
-    SettingsRowView, SurfaceDest, SurfaceRef, Tab, TabId, resolve_rows,
+    SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, resolve_rows,
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
@@ -58,6 +59,13 @@ enum EmberEvent {
 }
 /// Redraw cadence (~60fps) while an animation (e.g. the About glow) is active.
 const ANIM_FRAME: Duration = Duration::from_millis(16);
+/// Sparks guardrails (v0.3.1): how long a cached Low Power Mode/Reduce Motion
+/// read (`Shared::power_state`) stays valid before the next check re-queries
+/// the OS. Neither setting changes on a timescale that matters for a sparks
+/// animation — a few seconds of staleness is invisible — so this trades a
+/// bounded staleness window for keeping the OS query off the animation-gate
+/// hot path.
+const POWER_STATE_TTL: Duration = Duration::from_secs(5);
 /// Max gap between clicks at the same cell to count as a double/triple click.
 pub(crate) const MULTI_CLICK: Duration = Duration::from_millis(400);
 /// Scrollback lines per mouse-wheel notch (Alacritty/Ghostty default).
@@ -290,6 +298,20 @@ pub(crate) struct Shared {
     /// The OS effect seam (design §7, ): clipboard + open-path,
     /// `MacBackend`/`LinuxBackend` for the host OS.
     pub(crate) platform: ember_platform::HostBackend,
+    /// Sparks guardrails (v0.3.1): cached `(checked_at, low_power, reduce_motion)`
+    /// read from `platform`. Each field is a cheap objc message send, but the
+    /// sparks animation gate (`WindowState::backdrop_animating`) is evaluated
+    /// once per window on every `about_to_wait` tick while anything is
+    /// animating — up to `ember_fps` times a second — so polling the OS that
+    /// often would itself be the kind of "new ticking" cost this feature
+    /// exists to avoid. Refreshed at most every `POWER_STATE_TTL` via
+    /// `Shared::low_power_mode`/`Shared::reduce_motion`. `Cell`, not a plain
+    /// field: those two gate methods only ever see `&Shared` (mirroring
+    /// `backdrop_animating`'s own `&self` signature), so this is the one
+    /// piece of interior mutability on the render-loop hot path — bounded
+    /// (worst case a `POWER_STATE_TTL`-stale power-state read), never a
+    /// wrong architecture.
+    pub(crate) power_state: Cell<Option<(Instant, bool, bool)>>,
     /// Per-session bracketed-paste (DEC 2004) mode, updated from each frame delta —
     /// so paste can wrap in `ESC[200~`…`ESC[201~` only when the app asked for it.
     pub(crate) bracketed: HashMap<SessionId, bool>,
@@ -761,6 +783,7 @@ impl ApplicationHandler<EmberEvent> for App {
             backdrop_since: Instant::now(),
             menu: ember_platform::build_menu(),
             platform: ember_platform::HostBackend::default(),
+            power_state: Cell::new(None),
             bracketed: HashMap::new(),
             focus_notified: None,
             mouse_press: None,
@@ -3290,16 +3313,65 @@ impl Shared {
     }
 
     /// The backdrop params for the current config at animation time `t` seconds.
+    ///
+    /// `sparks` (drawn at all, vs. not) follows the dial being anything but
+    /// `off`, further collapsed to `false` under Low Power Mode — see
+    /// `low_power_mode`'s doc comment for why that's a full hide rather than
+    /// just a paused animation. It's deliberately NOT gated on any window's
+    /// focus here: an unfocused window under `focused` still shows its
+    /// sparks, just frozen (`WindowState::backdrop_animating` is what stops
+    /// `time` from advancing for that window) — see the "no dead sparks in
+    /// the newly focused window" acceptance check in the guardrails report.
     pub(crate) fn backdrop_params(&self, t: f32) -> BackdropParams {
         let bg = &self.config.background;
+        let sparks = !matches!(bg.sparks, SparksMode::Off) && !self.low_power_mode();
         BackdropParams {
             gradient: bg.gradient,
             scrim: bg.scrim,
-            sparks: bg.ember_sparks,
+            sparks,
             density: bg.ember_density,
             time: t,
             frame_dt: 1.0 / (bg.ember_fps.clamp(1, 240) as f32),
         }
+    }
+
+    /// Sparks guardrails (v0.3.1): re-checks `platform.low_power_mode()`/
+    /// `platform.reduce_motion()` together at most every `POWER_STATE_TTL`
+    /// and caches the pair in `power_state` — see that field's doc comment
+    /// for why a cache (and why `Cell`) at all.
+    fn refresh_power_state(&self) {
+        if let Some((checked_at, _, _)) = self.power_state.get() {
+            if checked_at.elapsed() < POWER_STATE_TTL {
+                return;
+            }
+        }
+        self.power_state.set(Some((
+            Instant::now(),
+            self.platform.low_power_mode(),
+            self.platform.reduce_motion(),
+        )));
+    }
+
+    /// Sparks guardrails (v0.3.1): true while macOS Low Power Mode is on. The
+    /// animation gate (`WindowState::backdrop_animating`) and the sparks
+    /// visibility bool (`backdrop_params`) both treat this the same as the
+    /// dial being `off` — Low Power Mode is the user (or the OS, on low
+    /// battery) explicitly asking for less power draw, so the sparks don't
+    /// just pause, they stop being drawn at all. Cached — see `power_state`.
+    pub(crate) fn low_power_mode(&self) -> bool {
+        self.refresh_power_state();
+        self.power_state.get().is_some_and(|(_, lp, _)| lp)
+    }
+
+    /// Sparks guardrails (v0.3.1): true while the OS asks apps to reduce
+    /// motion. Unlike Low Power Mode this only freezes the animation
+    /// (`WindowState::backdrop_animating` returns `false`); it does not
+    /// affect `backdrop_params`'s `sparks` visibility bool, so already-drawn
+    /// sparks stay on screen at their last phase instead of vanishing.
+    /// Cached — see `power_state`.
+    pub(crate) fn reduce_motion(&self) -> bool {
+        self.refresh_power_state();
+        self.power_state.get().is_some_and(|(_, _, rm)| rm)
     }
 
     /// The ambient ember animation's frame interval, from the configured `ember_fps`

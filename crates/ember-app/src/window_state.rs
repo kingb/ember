@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use ember_core::{
     Axis, BackendControl, BackendHandle, Direction, DropZone, GridDims, LayoutCommand,
     LayoutEffect, PaneId, Rect, RowKind, ScrollAmount, SessionBackend, SessionId, SettingsRowView,
-    SurfaceDest, SurfaceRef, Tab, TabId, apply, drop_zone_for, layout, setting_rows,
+    SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, apply, drop_zone_for, layout, setting_rows,
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
@@ -2976,6 +2976,16 @@ impl WindowState {
     /// ember sparks, and the visual-bell flash decay. Each `set_*` is a function of
     /// elapsed time (not a delta), so an occasional long gap between frames just
     /// samples the curve later — no jump. Called from the loop once per frame-interval.
+    ///
+    /// Sparks guardrails (v0.3.1): the `backdrop_animating` gate below is the
+    /// ONLY place `time` advances for the sparks. When Reduce Motion (or the
+    /// `off` dial, or an unfocused window under `focused`) makes that gate
+    /// false, this whole block is simply skipped — the renderer keeps
+    /// whatever `BackdropParams` it was last given by `apply_appearance`
+    /// (startup, or the last settings change), sparks included. That's the
+    /// entire "freeze" implementation: no separate frozen-frame code path,
+    /// no extra redraw to force one — which is also why it can never add a
+    /// tick to `next_wake` on its own.
     pub(crate) fn advance_animations(&mut self, shared: &Shared, now: Instant) {
         if self.about {
             let t = now.duration_since(self.about_since).as_secs_f32();
@@ -2995,16 +3005,35 @@ impl WindowState {
         }
     }
 
-    /// Whether the ember sparks should be animating right now: opt-in, whenever
-    /// the window is visible (focused or not — the campfire burns while you work
-    /// elsewhere; Brandon's call 2026-07-04) and no modal overlay covers the
-    /// panes. Occluded/asleep windows still go fully quiet.
+    /// Whether the ember sparks should be animating right now (sparks
+    /// guardrails, v0.3.1). Gated by the sparks dial:
+    /// - `Off`: never.
+    /// - `Focused` (the shipping default): only in the focused window — the
+    ///   campfire burns where you're looking, not behind your back.
+    /// - `Always`: whenever the window is visible, focused or not — this is
+    ///   where the OLD unconditional "campfire burns while you work
+    ///   elsewhere" behavior (Brandon's original 2026-07-04 call) now lives,
+    ///   as an opt-in rather than the default.
+    ///
+    /// Two OS-level guardrails override the dial on top of that: macOS Low
+    /// Power Mode collapses it to `Off` (no animation, sparks not even drawn
+    /// — see `Shared::backdrop_params`), and Reduce Motion freezes the
+    /// animation without hiding already-visible sparks (they hold their last
+    /// phase; see the module-level note on `advance_animations` for why no
+    /// extra code is needed to make that "freeze" happen). A modal overlay
+    /// or an occluded/asleep window still goes fully quiet regardless.
     pub(crate) fn backdrop_animating(&self, shared: &Shared) -> bool {
-        shared.config.background.ember_sparks
-            && !self.occluded
-            && !self.help
-            && !self.about
-            && !self.settings_open
+        if self.occluded || self.help || self.about || self.settings_open {
+            return false;
+        }
+        if shared.low_power_mode() || shared.reduce_motion() {
+            return false;
+        }
+        match shared.config.background.sparks {
+            SparksMode::Off => false,
+            SparksMode::Focused => self.window_focused,
+            SparksMode::Always => true,
+        }
     }
 
     /// Handle a BEL from `session` (visual bell): start/refresh the ember flash,
