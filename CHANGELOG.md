@@ -6,6 +6,28 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Ghost tab. When you drag a tab or pane over a tab strip, yours or another
+  window's, the strip shows a wispy, shimmering tab chip in the spot it
+  will land, labeled with the surface's title, instead of the old bare
+  insertion caret. The other tabs shift over to make room, and the ghost
+  lands as the real tab the moment you drop.
+- Spring-loaded tabs while dragging. Hover a strip tab for a beat during a
+  live drag (about 150 ms, like macOS Finder folders) and it becomes the
+  displayed tab, so you can navigate to any tab mid-drag, move down into
+  its panes, and drop exactly where you mean to. Skating across the strip
+  does not thrash the display, and the ghost's own landing spot never
+  switches tabs.
+- Suck-in and pour-out. Tearing a surface off (tab drag, pane drag, or
+  hold-to-wisp) visibly collapses the whole surface toward your cursor as
+  it goes: the full pane for a pane drag, the whole tab content area for a
+  tab drag, the entire window when it is the window's only tab. Dropping
+  pours the rect back out at the landing spot, Escape pours it back out
+  where it started, and a window that gave up its last tab plays its
+  collapse before closing. All skipped under Reduce Motion for an instant
+  transfer.
+
 ## [0.3.1] - 2026-07-08
 
 ### Added
@@ -19,16 +41,6 @@ follow [Semantic Versioning](https://semver.org).
   mapped to `focused`/`off`. Two system signals pause the animation
   automatically on macOS: Low Power Mode turns sparks fully off, and Reduce
   Motion freezes them without hiding them, regardless of the dial.
-- Ghost tab. When you drag a tab or pane across windows and hover another
-  window's tab strip, that strip now shows a wispy, flickering tab chip in
-  the spot it will land, labeled with the surface's title, instead of the
-  old bare insertion caret. The other tabs shift over to make room, and the
-  ghost lands as the real tab the moment you drop.
-- Suck-in and pour-out. Tearing a surface off (tab drag, pane drag, or
-  hold-to-wisp) now visibly collapses its rect toward your cursor as it
-  goes; dropping it pours the rect back out at the landing spot, and
-  Escape pours it back out where it started. Both are skipped under
-  Reduce Motion for an instant transfer.
 
 ## [0.3.0] - 2026-07-08
 
