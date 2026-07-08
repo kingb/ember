@@ -195,6 +195,20 @@ pub enum TabHit {
     Settings,
 }
 
+/// Which strip slot a live-drag hover falls over (finding #2/#3's
+/// spring-loaded tab-select and ghost coexistence): an existing tab's own
+/// chip, or the trailing ghost/append segment when this window is currently
+/// showing one ([`Renderer::ghost_active`]). See [`Renderer::
+/// tab_slot_or_ghost_at`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StripSlot {
+    /// Hovering real tab `usize`'s own chip.
+    Tab(usize),
+    /// Hovering the reserved ghost/append segment (only possible while a
+    /// ghost is showing — see [`Renderer::ghost_active`]).
+    Ghost,
+}
+
 /// Resolve a tab-area column to a hit, mirroring the equal-width slot math in
 /// [`build_tabs`]. `hovered` gates the left `CLOSE_COLS` "✕" close zone (only the
 /// hovered tab exposes it). Pure so the geometry is unit-testable without a GPU.
@@ -215,6 +229,47 @@ fn tab_col_hit(n: usize, tab_cols: usize, hovered: Option<usize>, col: usize) ->
         acc += width;
     }
     None
+}
+
+/// Resolve a tab-area column to a [`StripSlot`], mirroring [`build_tabs`]'s
+/// `ghost_n` segmenting (real tabs compress into `n + 1` equal segments,
+/// ghost last, while `with_ghost` — see that fn's doc) — unlike
+/// [`tab_col_hit`]/[`Renderer::tab_slot_at`] (drop-position math, always
+/// resolves to a REAL tab, ghost-oblivious by design), this is what tells a
+/// live drag hover whether the cursor is over a chip it should
+/// spring-load-select, or the trailing ghost region it shouldn't (finding
+/// #2). Pure, unit-testable independent of a live `Renderer`.
+fn tab_or_ghost_col_hit(
+    n: usize,
+    with_ghost: bool,
+    tab_cols: usize,
+    col: usize,
+) -> Option<StripSlot> {
+    if n == 0 {
+        return None;
+    }
+    let ghost_n = n + with_ghost as usize;
+    let seg = (tab_cols / ghost_n).max(1);
+    let mut acc = 0usize;
+    for i in 0..n {
+        let width = if i == n - 1 && !with_ghost {
+            tab_cols - acc
+        } else {
+            seg
+        };
+        if col < acc + width {
+            return Some(StripSlot::Tab(i));
+        }
+        acc += width;
+    }
+    if with_ghost {
+        Some(StripSlot::Ghost)
+    } else {
+        // Ghost-oblivious callers can overshoot the last real segment by
+        // integer-division slack; clamp onto the last tab rather than
+        // reporting nothing (mirrors `tab_slot_at`'s own clamp).
+        Some(StripSlot::Tab(n - 1))
+    }
 }
 
 /// A pane's terminal modes (from the latest delta), driving mouse-wheel handling.
@@ -1125,6 +1180,33 @@ impl Renderer {
         Some((col / seg).min(n - 1))
     }
 
+    /// Which strip slot logical-x falls over during a live drag hover: a
+    /// real tab's own chip (spring-loads a `select_tab`, finding #2) or the
+    /// reserved ghost/append segment (finding #3 — this window is showing a
+    /// ghost tab for an incoming cross-window drag). `None` only when the
+    /// strip has no tabs. Ghost-AWARE unlike [`Self::tab_slot_at`] (drop
+    /// position math): segments `tab_cols` exactly like [`build_tabs`] does,
+    /// `n + 1`-wide only while THIS window's [`Self::ghost_active`].
+    pub fn tab_slot_or_ghost_at(&self, x: f32) -> Option<StripSlot> {
+        let n = self.tabs.len();
+        if n == 0 {
+            return None;
+        }
+        let sf = self.window.scale_factor() as f32;
+        let logical_w = self.config.width as f32 / sf;
+        let cw = self.cell_w;
+        let total_cols = (logical_w / cw).floor() as usize;
+        let plus_cols = BTN_COLS.min(total_cols);
+        let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
+        let gear_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols + help_cols));
+        let tab_cols = total_cols.saturating_sub(plus_cols + help_cols + gear_cols);
+        if tab_cols == 0 {
+            return Some(StripSlot::Tab(0));
+        }
+        let col = ((x / cw).floor().max(0.0) as usize).min(tab_cols - 1);
+        tab_or_ghost_col_hit(n, self.ghost_active(), tab_cols, col)
+    }
+
     /// Show the cheat-sheet overlay with these `(key, description)` rows, or hide
     /// it with `None`. The next `render` draws (or stops drawing) the modal.
     /// Override the help panel's `(title, hint)`, or reset to the shortcuts
@@ -1957,7 +2039,9 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Duration, Instant, StarveGate, TabHit, tab_col_hit};
+    use super::{
+        Duration, Instant, StarveGate, StripSlot, TabHit, tab_col_hit, tab_or_ghost_col_hit,
+    };
 
     // 3 equal tabs over 30 columns → 10 cols each (slots 0-9, 10-19, 20-29).
     const N: usize = 3;
@@ -1994,6 +2078,66 @@ mod tests {
         assert_eq!(tab_col_hit(N, COLS, Some(1), 0), Some(TabHit::Tab(0)));
         // No hover at all → never a close.
         assert_eq!(tab_col_hit(N, COLS, None, 10), Some(TabHit::Tab(1)));
+    }
+
+    // --- tab_or_ghost_col_hit: strip slots for a live drag hover ---
+
+    #[test]
+    fn without_a_ghost_the_slots_match_the_plain_hit_math() {
+        // Same 3x10 segmentation as `tab_col_hit`, plus the trailing-slack
+        // clamp onto the last tab.
+        assert_eq!(
+            tab_or_ghost_col_hit(N, false, COLS, 5),
+            Some(StripSlot::Tab(0))
+        );
+        assert_eq!(
+            tab_or_ghost_col_hit(N, false, COLS, 15),
+            Some(StripSlot::Tab(1))
+        );
+        assert_eq!(
+            tab_or_ghost_col_hit(N, false, COLS, 29),
+            Some(StripSlot::Tab(2))
+        );
+        assert_eq!(tab_or_ghost_col_hit(0, false, COLS, 5), None);
+    }
+
+    #[test]
+    fn a_ghost_claims_the_last_segment_and_compresses_the_real_tabs() {
+        // 3 real tabs + ghost over 30 cols → 4 segments of 7 (with 2 cols
+        // of slack landing in the ghost's trailing segment, exactly like
+        // `build_tabs`' "the true last segment absorbs the leftover").
+        assert_eq!(
+            tab_or_ghost_col_hit(N, true, COLS, 6),
+            Some(StripSlot::Tab(0))
+        );
+        assert_eq!(
+            tab_or_ghost_col_hit(N, true, COLS, 7),
+            Some(StripSlot::Tab(1))
+        );
+        assert_eq!(
+            tab_or_ghost_col_hit(N, true, COLS, 20),
+            Some(StripSlot::Tab(2))
+        );
+        assert_eq!(
+            tab_or_ghost_col_hit(N, true, COLS, 21),
+            Some(StripSlot::Ghost)
+        );
+        assert_eq!(
+            tab_or_ghost_col_hit(N, true, COLS, 29),
+            Some(StripSlot::Ghost)
+        );
+    }
+
+    #[test]
+    fn a_lone_tab_with_a_ghost_splits_the_strip_in_two() {
+        assert_eq!(
+            tab_or_ghost_col_hit(1, true, COLS, 14),
+            Some(StripSlot::Tab(0))
+        );
+        assert_eq!(
+            tab_or_ghost_col_hit(1, true, COLS, 15),
+            Some(StripSlot::Ghost)
+        );
     }
 
     // --- StarveGate: occluded-surface render throttle -------------

@@ -96,6 +96,17 @@ const HOLD_SWEEP_TOLERANCE_PX: f64 = 28.0;
 /// becomes a drag-reorder rather than a click.
 const TAB_DRAG_THRESHOLD: f64 = 6.0;
 
+/// Spring-loaded tab select (finding #2, macOS-Finder-folder style): how long
+/// (ms) a live drag must dwell over a strip tab's own chip before that tab
+/// becomes the DISPLAYED tab (`select_tab`) — long enough that skating
+/// across the strip toward a target doesn't thrash the display, short enough
+/// to feel like hover-navigation. Fixes the "tear tab 3, drop as pane into
+/// tab 1 lands unpredictably" live finding: the drop target used to be
+/// whatever revert tab happened to be displayed at tear-off; now the user
+/// NAVIGATES — dwell on tab 1's chip, it becomes visible, move down into
+/// its pane, drop exactly there.
+const SPRING_LOAD_MS: u64 = 150;
+
 /// How far (logical px) the pointer must move BELOW the tab strip's bottom
 /// edge before an in-strip tab drag tears off into a [`crate::DragState`]
 /// (a surface drag capable of leaving the strip — a pane drop this task, a
@@ -417,6 +428,11 @@ pub(crate) struct WindowState {
     /// (which shows the lifted tab chip via `update_drag_hover` instead) and
     /// on every window outside the drag entirely.
     pub(crate) incoming_drop: Option<DropHover>,
+    /// Spring-loaded tab-select dwell for a live drag hovering THIS window's
+    /// strip (finding #2): `(chip index, when this chip started being
+    /// hovered)`. `None` while no strip chip is currently being dwelled on.
+    /// See [`WindowState::spring_load_hover`].
+    spring_load: Option<(usize, Instant)>,
     /// A press-and-hold in progress on a pane body (hold-to-wisp, v1.1) —
     /// see [`Hold`]'s doc. `None` outside a live hold; cancelled (cleared)
     /// by motion past [`HOLD_TOLERANCE_PX`] or any release.
@@ -476,6 +492,7 @@ impl WindowState {
             render_starved: false,
             pending_move: None,
             incoming_drop: None,
+            spring_load: None,
             hold: None,
             morph: None,
         }
@@ -1806,10 +1823,18 @@ impl WindowState {
             // placeholder).
             title,
         });
-        // Suck-in (v0.4.0): the grabbed surface's rect visibly collapses
-        // toward the grab point — see `start_suck_in`'s doc for the
-        // wisp-off/reduced-motion no-op.
-        self.start_suck_in(shared, rect, (x, y));
+        // Suck-in (v0.4.0): the grabbed surface visibly collapses toward
+        // the grab point — see `start_suck_in`'s doc for the wisp-off/
+        // reduced-motion no-op. The rect must cover the WHOLE carried
+        // surface (finding #4): the pressed pane's own rect for a true
+        // pane drag, but when the sole-pane-tab rule upgraded the surface
+        // to the whole Tab, the whole tab content area — or the entire
+        // window when it's also the window's only tab.
+        let morph_rect = match surface {
+            SurfaceRef::Pane { .. } => rect,
+            SurfaceRef::Tab { .. } => self.tab_morph_rect(),
+        };
+        self.start_suck_in(shared, morph_rect, (x, y));
     }
 
     /// Advance a live hold-to-wisp gesture by one tick (`about_to_wait`'s
@@ -1885,11 +1910,47 @@ impl WindowState {
         self.start_morph(shared, rect, grab, true);
     }
 
+    /// The whole window's logical rect (strip included) — the suck-in's
+    /// canvas when the carried surface IS effectively the whole window (its
+    /// only tab), per finding #4's "entire shell/tab/(and window if it's
+    /// the only tab)".
+    pub(crate) fn full_window_rect(&self) -> Rect {
+        let sf = self.renderer.window().scale_factor();
+        Rect::new(
+            0.0,
+            0.0,
+            (self.px.0 as f64 / sf).max(1.0),
+            (self.px.1 as f64 / sf).max(1.0),
+        )
+    }
+
+    /// The rect a TAB-surface drag's suck-in should swallow (finding #4):
+    /// the whole tab content area (everything below the strip), escalating
+    /// to the ENTIRE window when the dragged tab is this window's only one —
+    /// carrying it away carries the whole window, and the collapse should
+    /// read that way.
+    pub(crate) fn tab_morph_rect(&self) -> Rect {
+        if self.tree.tabs.len() <= 1 {
+            self.full_window_rect()
+        } else {
+            self.viewport()
+        }
+    }
+
     /// Start a pour-out on THIS window: `rect` is the landed (or, on
     /// cancel/reorder, the going-home) surface's rect, `grab` the point it's
     /// expanding from (both logical px, this window's space).
     pub(crate) fn start_pour_out(&mut self, shared: &Shared, rect: Rect, grab: (f64, f64)) {
         self.start_morph(shared, rect, grab, false);
+    }
+
+    /// Whether a suck-in/pour-out morph is live on this window right now —
+    /// `close_window_shell_only` (`main.rs`) uses this to decide whether a
+    /// drop-emptied source window gets parked in `Shared::dying_windows` to
+    /// play its farewell collapse (finding #4), or just drops immediately
+    /// (wisp off / reduced motion: the `start_morph` gate no-opped).
+    pub(crate) fn morph_live(&self) -> bool {
+        self.morph.is_some()
     }
 
     /// Advance a live morph by one tick, mirroring [`Self::tick_hold`]'s
@@ -1919,6 +1980,46 @@ impl WindowState {
         self.renderer
             .set_morph(Some((rect, grab, t01, anim.inward)));
         MorphTick::Running(now + MORPH_FRAME)
+    }
+
+    /// Record what strip chip (if any) a live drag is hovering on THIS
+    /// window right now — the spring-loaded tab select's input (finding #2).
+    /// Restarts the dwell clock when the chip changes; keeps it running
+    /// across repeated same-chip calls (every motion tick re-reports the
+    /// hover); clears it on `None` (left the chips: a pane, the ghost
+    /// segment, another window, anywhere). Pure bookkeeping — the actual
+    /// select fires from [`Self::tick_spring_load`], which is also what
+    /// makes a perfectly still pointer (no further motion ticks) still
+    /// complete its dwell.
+    pub(crate) fn note_spring_hover(&mut self, chip: Option<usize>) {
+        match (chip, &self.spring_load) {
+            (Some(c), Some((cur, _))) if *cur == c => {} // same chip: clock runs on
+            (Some(c), _) => self.spring_load = Some((c, Instant::now())),
+            (None, _) => self.spring_load = None,
+        }
+    }
+
+    /// Advance the spring-loaded tab select by one tick (`about_to_wait`'s
+    /// per-window loop, mirroring [`Self::tick_hold`]/[`Self::tick_morph`]):
+    /// once the dwell elapses, the hovered chip's tab becomes the displayed
+    /// tab, exactly as if the user had clicked it — the whole point: they
+    /// can now navigate INTO that tab's panes and drop precisely. Returns
+    /// the pending dwell deadline for `next_wake` while one is live (`None`
+    /// otherwise — the overwhelmingly common case). No-select cases (chip
+    /// already active, or index stale after a mid-drag close) still clear
+    /// the dwell so it doesn't re-arm every tick.
+    pub(crate) fn tick_spring_load(&mut self, shared: &Shared, now: Instant) -> Option<Instant> {
+        let (chip, since) = self.spring_load?;
+        let deadline = since + Duration::from_millis(SPRING_LOAD_MS);
+        if now < deadline {
+            return Some(deadline);
+        }
+        self.spring_load = None;
+        if chip != self.tree.active && chip < self.tree.tabs.len() {
+            self.select_tab(shared, chip + 1);
+            self.renderer.window().request_redraw();
+        }
+        None
     }
 
     /// Encode one xterm mouse report. SGR (1006) when the app enabled it, else
@@ -2275,11 +2376,12 @@ impl WindowState {
                     // caller — see `App::window_event`'s CursorMoved arm.
                     title,
                 });
-                // Suck-in (v0.4.0): the torn-off tab's content rect visibly
-                // collapses toward the tear-off point (a v1 approximation —
-                // the whole viewport, not the dragged tab's specific pane(s);
-                // honest per the design doc's "v1 approximation" allowance).
-                self.start_suck_in(shared, self.viewport(), (x, strip_bottom));
+                // Suck-in (v0.4.0): the torn-off tab's WHOLE content area
+                // (everything below the strip) collapses toward the tear-off
+                // point — the entire window when this is its only tab
+                // (finding #4: the surface being carried is the tab, so the
+                // collapse must swallow all of it, not just one pane).
+                self.start_suck_in(shared, self.tab_morph_rect(), (x, strip_bottom));
             } else {
                 // Still an in-strip reorder — unchanged existing behavior.
                 self.drag_tab_to(shared, x);
@@ -2328,13 +2430,27 @@ impl WindowState {
         }
         let strip_bottom = Renderer::chrome_height() as f64;
         if y <= strip_bottom {
-            return self
-                .renderer
-                .tab_slot_at(x as f32)
-                .map(|insert_at| DropHover::Strip {
+            // `tab_slot_or_ghost_at` (ghost-aware) rather than `tab_slot_at`
+            // (drop-position math, always a real tab) — this needs to know
+            // whether the hover is over a REAL chip (spring-loads a
+            // `select_tab`, finding #2) or the trailing ghost/append segment
+            // (finding #3), which `tab_slot_at` alone can't distinguish.
+            // `insert_at` keeps `tab_slot_at`'s own real-tab-index meaning
+            // for the Ghost case too (the last real tab) — every existing
+            // reorder/append caller only reads `insert_at`, unchanged.
+            return self.renderer.tab_slot_or_ghost_at(x as f32).map(|slot| {
+                let (insert_at, chip) = match slot {
+                    ember_render::StripSlot::Tab(i) => (i, Some(i)),
+                    ember_render::StripSlot::Ghost => {
+                        (self.tree.tabs.len().saturating_sub(1), None)
+                    }
+                };
+                DropHover::Strip {
                     window: window_id,
                     insert_at,
-                });
+                    chip,
+                }
+            });
         }
         let hit = self
             .pane_rects
@@ -2373,9 +2489,9 @@ impl WindowState {
             return;
         };
         // A tab drag keeps the lifted chip following the cursor (below); a
-        // pane drag has no chip equivalent yet — its only in-window preview
-        // is the split/center highlight both surfaces share, immediately
-        // below.
+        // pane drag shows the wispy ghost tab on a strip hover instead
+        // (finding #3 — it used to show NOTHING there, even though the drop
+        // itself was already wired: "promote pane to a new tab").
         let dragged_tab = match drag.surface {
             SurfaceRef::Tab { tab, .. } => Some(tab),
             SurfaceRef::Pane { .. } => None,
@@ -2383,13 +2499,30 @@ impl WindowState {
         if drag.source_window != window_id {
             return;
         }
+        let title = drag.title.clone();
         let hover = self.hover_at(window_id, x, y, true);
         match &hover {
+            Some(DropHover::Strip { chip, .. }) => {
+                // Spring-loaded tab select (finding #2): dwelling on a REAL
+                // chip selects it; the ghost/append segment never does.
+                self.note_spring_hover(*chip);
+                self.clear_split_preview();
+                if dragged_tab.is_none() {
+                    // Pane-sourced drag hovering the strip: the same wispy
+                    // ghost tab a cross-window strip hover shows (finding
+                    // #3), with the same title threading — an honest "drop
+                    // here appends a new tab" preview. Tab drags keep their
+                    // lifted-chip visual instead (below).
+                    self.renderer.set_ghost_tab(Some(title));
+                }
+            }
             Some(DropHover::Pane {
                 pane,
                 zone: DropZone::Edge { axis, before },
                 ..
             }) => {
+                self.note_spring_hover(None);
+                self.renderer.set_ghost_tab(None);
                 if let Some(sid) = self.active_tab().root.session_of(*pane).cloned() {
                     let horizontal = matches!(axis, Axis::Horizontal);
                     // A fixed 50/50 preview — a drag-drop split is always
@@ -2404,7 +2537,11 @@ impl WindowState {
                         .set_split_preview(Some((sid, horizontal, 0.5, *before)));
                 }
             }
-            _ => self.clear_split_preview(),
+            _ => {
+                self.note_spring_hover(None);
+                self.renderer.set_ghost_tab(None);
+                self.clear_split_preview();
+            }
         }
         // Keep the lifted tab chip following the cursor the whole time (the
         // crude "lift" visual this task reuses — a full ghost is Task 5's).
@@ -2438,9 +2575,24 @@ impl WindowState {
         self.incoming_drop = hover;
         self.clear_split_preview();
         self.renderer.set_tab_drag(None);
-        self.renderer.set_ghost_tab(None);
+        // Deliberately NOT an unconditional `set_ghost_tab(None)` here before
+        // the match (as an earlier version of this method had): every real
+        // mouse motion tick over the strip calls this again with the SAME
+        // Strip hover, and a `Some -> None -> Some` round trip on every one
+        // of those ticks defeated `set_ghost_tab`'s own "same label ->
+        // preserve the shimmer clock" dedup (it never got a chance to see
+        // two `Some`s in a row) — the ghost's flicker looked frozen while
+        // the pointer was moving, which is most of a live hover (live-test
+        // finding). Each non-Strip arm below clears it explicitly instead,
+        // so the ghost still disappears the instant the hover leaves the
+        // strip.
         match hover {
-            Some(DropHover::Strip { .. }) => {
+            Some(DropHover::Strip { chip, .. }) => {
+                // Spring-loaded tab select (finding #2), cross-window flavor:
+                // dwelling on one of THIS (target) window's real chips
+                // selects it here, exactly like the in-window path — the
+                // ghost/append segment never does (chip is `None` there).
+                self.note_spring_hover(chip);
                 let label = title.filter(|t| !t.is_empty()).unwrap_or("＋");
                 self.renderer.set_ghost_tab(Some(label.to_string()));
             }
@@ -2449,6 +2601,8 @@ impl WindowState {
                 zone: DropZone::Edge { axis, before },
                 ..
             }) => {
+                self.note_spring_hover(None);
+                self.renderer.set_ghost_tab(None);
                 if let Some(sid) = self.active_tab().root.session_of(pane).cloned() {
                     let horizontal = matches!(axis, Axis::Horizontal);
                     self.renderer
@@ -2460,12 +2614,17 @@ impl WindowState {
                 zone: DropZone::Center,
                 ..
             }) => {
+                self.note_spring_hover(None);
+                self.renderer.set_ghost_tab(None);
                 if let Some(sid) = self.active_tab().root.session_of(pane).cloned() {
                     self.renderer
                         .set_split_preview(Some((sid, true, 0.0, false)));
                 }
             }
-            Some(DropHover::Desktop) | None => {}
+            Some(DropHover::Desktop) | None => {
+                self.note_spring_hover(None);
+                self.renderer.set_ghost_tab(None);
+            }
         }
     }
 
@@ -2483,6 +2642,10 @@ impl WindowState {
         self.renderer.set_ghost_tab(None);
         self.clear_split_preview();
         self.incoming_drop = None;
+        // A dwell that hadn't fired yet must die with the drag — without
+        // this, a release/cancel within SPRING_LOAD_MS of touching a chip
+        // would still flip the displayed tab ~150ms AFTER the drag ended.
+        self.spring_load = None;
     }
 
     /// Resolve a torn-off drag on release: `Strip` hover on the SOURCE's own
@@ -2510,7 +2673,9 @@ impl WindowState {
         };
         match drag.surface {
             SurfaceRef::Tab { tab: src_tab, .. } => match drag.hover {
-                Some(DropHover::Strip { window, insert_at }) if window == window_id => {
+                Some(DropHover::Strip {
+                    window, insert_at, ..
+                }) if window == window_id => {
                     if src_tab >= self.tree.tabs.len() {
                         self.start_pour_out(shared, self.viewport(), self.cursor);
                         return DragEnded::Cancel;

@@ -368,6 +368,17 @@ pub(crate) struct Shared {
     /// same reason `drag` does: it must survive across many `about_to_wait`
     /// calls, not just the one that received the `ControlMsg::Drag`.
     pub(crate) paced_drag: Option<PacedDrag>,
+    /// Windows playing their farewell suck-in (finding #4): a source window
+    /// whose last tab just moved away by a drop is REMOVED from
+    /// `App::windows`/`window_order` immediately (so index math, focus, and
+    /// input routing all see it gone — no half-alive window can corrupt a
+    /// follow-up move), but its `WindowState` parks here so the OS window
+    /// stays open just long enough (`SUCK_IN_MS`) to play "the window's
+    /// content vanishes into the wisp". Ticked+rendered directly by
+    /// `about_to_wait` (it's not in `App::windows`, so `RedrawRequested`
+    /// can't reach it); dropped — which is what actually closes the OS
+    /// window — the tick its morph self-terminates.
+    pub(crate) dying_windows: Vec<WindowState>,
 }
 
 /// State for an in-flight paced `ctl drag`. Never advanced by a blocking
@@ -673,8 +684,19 @@ pub(crate) struct DragState {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DropHover {
     /// Hovering a window's tab strip: dropping here reorders/re-inserts the
-    /// carried tab at `insert_at`.
-    Strip { window: WindowId, insert_at: usize },
+    /// carried tab at `insert_at`. `chip` is `Some(i)` while the pointer sits
+    /// directly over an EXISTING tab `i`'s own chip (as opposed to the
+    /// trailing ghost/append segment, when one is showing) — spring-loaded
+    /// tab-select (`WindowState::spring_load_hover`, finding #2) only fires
+    /// on a `chip` hover, so skating past the ghost's own segment never
+    /// flips the displayed tab. `insert_at` keeps its pre-existing meaning
+    /// unchanged (a real tab index either way — see
+    /// `WindowState::hover_at`'s doc).
+    Strip {
+        window: WindowId,
+        insert_at: usize,
+        chip: Option<usize>,
+    },
     /// Hovering a pane: dropping here either splits `pane` (an `Edge` zone)
     /// or appends as a new tab of `window` (`Center`) — see
     /// `ember_core::DropZone`.
@@ -801,6 +823,7 @@ impl ApplicationHandler<EmberEvent> for App {
             new_window_position_hint: None,
             wisp: WispSlot::Uninit,
             paced_drag: None,
+            dying_windows: Vec::new(),
         };
         let mut win = WindowState::new(renderer, tree);
         win.px = px;
@@ -1899,6 +1922,14 @@ impl ApplicationHandler<EmberEvent> for App {
             if let MorphTick::Running(deadline) = w.tick_morph(now) {
                 next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
             }
+            // Spring-loaded tab select (finding #2): fire a pending strip
+            // dwell even once the pointer goes perfectly still (no more
+            // motion ticks to piggyback on) — the same `tick_hold`/
+            // `tick_morph` pacing idiom, a no-op `None` the overwhelmingly
+            // common case.
+            if let Some(deadline) = w.tick_spring_load(shared, now) {
+                next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
+            }
         }
         // The wisp (Task 5) isn't a `WindowState` — it's not in `self.windows`
         // and so isn't touched by the loop above — but needs the exact same
@@ -1915,6 +1946,35 @@ impl ApplicationHandler<EmberEvent> for App {
                 next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
             }
         }
+        // Dying windows (finding #4): a drop-emptied source window parked in
+        // `Shared::dying_windows` plays its farewell suck-in here — like the
+        // wisp above, it's no longer in `self.windows`, so `RedrawRequested`
+        // can't reach it and this is its ONLY tick+render call site. The
+        // `retain_mut` drops each state the tick its morph self-terminates,
+        // which is what finally closes the OS window. Empty (zero cost) at
+        // all times except the ~150ms after such a drop.
+        shared.dying_windows.retain_mut(|w| {
+            // Pace on the window's own animation clock (like the pacing loop
+            // above does for live windows): `tick_morph` ends in `set_morph`,
+            // whose `request_redraw` wakes this loop right back up — ticking
+            // unconditionally on every wake was a hot spin (~30k iterations
+            // for one 150ms morph, observed live) of exactly the class the
+            // render-loop OOM postmortem warns about.
+            if now.duration_since(w.last_anim) < ANIM_FRAME {
+                let deadline = w.last_anim + ANIM_FRAME;
+                next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
+                return true; // alive, just not due yet
+            }
+            w.last_anim = now;
+            match w.tick_morph(now) {
+                MorphTick::Running(deadline) => {
+                    next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
+                    let _ = w.renderer.render();
+                    true
+                }
+                MorphTick::Idle => false,
+            }
+        });
         // A paced `ctl drag --paced <ms>` (Task 6's test machinery):
         // advance at most ONE waypoint this tick, through the exact same
         // `on_cursor_moved`/`update_cross_window_drag` pair a real mouse
@@ -2758,10 +2818,30 @@ fn close_window_shell_only(
     id: WindowId,
 ) {
     clear_drag_on_window_close(windows, shared, id);
-    windows.remove(&id);
+    let removed = windows.remove(&id);
     shared.window_order.retain(|w| *w != id);
     if *focused_window == Some(id) {
         *focused_window = windows.keys().next().copied();
+    }
+    // Farewell suck-in (finding #4): the whole window's content collapses
+    // toward the pointer (which sits at the drop that emptied this window)
+    // before the OS window actually closes. Every bit of bookkeeping above
+    // already ran — the window is gone from `windows`/`window_order`/focus,
+    // so nothing (input routing, index math, a follow-up move) can see a
+    // half-alive window; only the `WindowState` itself (hence the OS window)
+    // is kept breathing in `Shared::dying_windows`, ticked+rendered by
+    // `about_to_wait` until the ~150ms morph self-terminates and the drop
+    // of the state closes the window for real. When the morph gate no-ops
+    // (wisp off / reduced motion), the state drops right here — the
+    // pre-finding instant close, unchanged.
+    if let Some(mut w) = removed {
+        let rect = w.full_window_rect();
+        let grab = w.cursor;
+        w.start_suck_in(shared, rect, grab);
+        if w.morph_live() {
+            w.renderer.window().request_redraw();
+            shared.dying_windows.push(w);
+        }
     }
 }
 
