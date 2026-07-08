@@ -19,6 +19,16 @@ follow [Semantic Versioning](https://semver.org).
   mapped to `focused`/`off`. Two system signals pause the animation
   automatically on macOS: Low Power Mode turns sparks fully off, and Reduce
   Motion freezes them without hiding them, regardless of the dial.
+- Ghost tab. When you drag a tab or pane across windows and hover another
+  window's tab strip, that strip now shows a wispy, flickering tab chip in
+  the spot it will land, labeled with the surface's title, instead of the
+  old bare insertion caret. The other tabs shift over to make room, and the
+  ghost lands as the real tab the moment you drop.
+- Suck-in and pour-out. Tearing a surface off (tab drag, pane drag, or
+  hold-to-wisp) now visibly collapses its rect toward your cursor as it
+  goes; dropping it pours the rect back out at the landing spot, and
+  Escape pours it back out where it started. Both are skipped under
+  Reduce Motion for an instant transfer.
 
 ## [0.3.0] - 2026-07-08
 
