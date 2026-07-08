@@ -1794,14 +1794,15 @@ impl ApplicationHandler<EmberEvent> for App {
         // once a frame-interval has actually elapsed, so this doesn't spin either.
         //
         // Driven for EVERY window this tick, not just the focused one:
-        // `backdrop_animating`'s contract is "the campfire burns while you
-        // work elsewhere" — any VISIBLE window, focused or not — so pacing
-        // only `self.focused_window` here would freeze an unfocused-but-
-        // visible window's ember sparks at whatever phase they were in the
-        // moment focus left it. Focus-notify and menu/ctl-command handling
-        // above stay focused-window-only (they're inherently about the
-        // focused window); only this pacing loop needs to fan out to every
-        // window (2026-07-07 fix).
+        // each window evaluates its OWN `backdrop_animating` gate (the
+        // sparks dial: `always` burns while visible-unfocused, the default
+        // `focused` holds still there, plus Low Power Mode/Reduce Motion) —
+        // so pacing only `self.focused_window` would break the `always`
+        // mode and freeze any window the gate says should animate.
+        // Focus-notify and menu/ctl-command handling above stay
+        // focused-window-only (they're inherently about the focused
+        // window); only this pacing loop fans out (2026-07-07 fix,
+        // contract updated for the dial in 0.3.1).
         let now = Instant::now();
         let mut next_wake: Option<Instant> = None;
         for w in self.windows.values_mut() {

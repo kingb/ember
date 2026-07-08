@@ -6,6 +6,18 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Ember sparks guardrails. The `ember_sparks` on/off switch is now a
+  three-way dial, `sparks = "off" | "focused" | "always"` in config.toml
+  (default `focused`), cycled from the Settings overlay's "Ember sparks"
+  row. `focused` animates sparks only in the window you're actually looking
+  at; unfocused windows keep their sparks visible but hold still until you
+  switch back. Old configs with `ember_sparks = true`/`false` still load,
+  mapped to `focused`/`off`. Two system signals pause the animation
+  automatically on macOS: Low Power Mode turns sparks fully off, and Reduce
+  Motion freezes them without hiding them, regardless of the dial.
+
 ## [0.3.0] - 2026-07-08
 
 ### Added
@@ -41,15 +53,6 @@ follow [Semantic Versioning](https://semver.org).
   the window a carried surface hovers comes forward so you can see where
   it will land, and a window's only tab now shows its chip so there is
   always something to grab.
-- Ember sparks guardrails. The `ember_sparks` on/off switch is now a
-  three-way dial, `sparks = "off" | "focused" | "always"` in config.toml
-  (default `focused`), cycled from the Settings overlay's "Ember sparks"
-  row. `focused` animates sparks only in the window you're actually looking
-  at; unfocused windows keep their sparks visible but hold still until you
-  switch back. Old configs with `ember_sparks = true`/`false` still load,
-  mapped to `focused`/`off`. Two system signals pause the animation
-  automatically on macOS: Low Power Mode turns sparks fully off, and Reduce
-  Motion freezes them without hiding them, regardless of the dial.
 
 ### Changed
 
