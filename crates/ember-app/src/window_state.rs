@@ -5,7 +5,7 @@
 //! - **`WindowState`** (this file) — everything tied to one window/surface:
 //!   `renderer`, `tree`, `px`, `dims_cache`, `modifiers`, `cursor`,
 //!   `pointer_cursor`, selection (`sel`/`selecting`/`last_click`/`click_count`),
-//!   drags (`tab_drag`/`divider_drag`/`scrollbar_drag`/`split_preview`),
+//!   drags (`tab_drag`/`divider_drag`/`scrollbar_drag`/`split_preview`/`hold`),
 //!   overlays (`help`/`about`/`about_since`/`settings_open`/`settings_sel`/
 //!   `editing_tab`/`edit_buffer`/`pending_close`/`confirm_focus`), `pressed_link`,
 //!   bell state (`bell_flash_since`/`belled_tabs`), `last_tab_click`,
@@ -20,7 +20,7 @@
 //!   `mouse_press`, `last_mouse_cell`, `titles`).
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ember_core::{
     Axis, BackendControl, BackendHandle, Direction, DropZone, GridDims, LayoutCommand,
@@ -69,6 +69,23 @@ pub(crate) struct TabDrag {
     /// tear-off time.
     origin_tab: TabId,
 }
+
+// --- Hold-to-wisp (v1.1, docs/design/2026-07-07-surface-drag-wisp-design.md
+// §"Hold-to-wisp") — press-and-hold on a pane body, no modifier chord: after
+// `HOLD_ARM_MS` a thin ring sweeps clockwise over `HOLD_SWEEP_MS`, and
+// completing it tears the pane off exactly like the chord-gated drag.
+// Starting numbers from the design doc; all three tunable live by eye.
+
+/// Delay (ms), from press, before the ring starts sweeping.
+const HOLD_ARM_MS: u64 = 300;
+/// Sweep duration (ms) once armed — the hold completes at `HOLD_ARM_MS +
+/// HOLD_SWEEP_MS` and the drag goes live.
+const HOLD_SWEEP_MS: u64 = 600;
+/// How far (logical px) the pointer may drift from the press origin before
+/// the hold cancels — the press falls back to whatever it already was
+/// (selection / mouse-mode forward), same tolerance family as
+/// [`TAB_DRAG_THRESHOLD`].
+const HOLD_TOLERANCE_PX: f64 = 6.0;
 
 /// How far (logical px) the pointer must move horizontally before a tab press
 /// becomes a drag-reorder rather than a click.
@@ -215,6 +232,41 @@ pub(crate) struct SplitPreview {
     ratio: f32,
 }
 
+/// A press-and-hold in progress on a pane body (hold-to-wisp, v1.1): timing +
+/// identity needed to draw the ring and, on completion, tear the pane off via
+/// [`WindowState::start_pane_drag`] exactly as the chord gesture does. Armed
+/// alongside whatever the press already does (selection / mouse-mode
+/// forward) — see [`WindowState::left_click`]'s doc.
+struct Hold {
+    pane: PaneId,
+    /// The pressed pane's own rect (logical px, this window's space) at
+    /// press time — carried through to `start_pane_drag` unchanged.
+    rect: Rect,
+    /// Press origin (logical px) — both the ring's center and the point
+    /// motion is measured from for [`HOLD_TOLERANCE_PX`] cancellation.
+    origin: (f64, f64),
+    started: Instant,
+}
+
+/// What [`WindowState::tick_hold`] found this tick — `about_to_wait` folds
+/// the result into its own animation pacing.
+pub(crate) enum HoldTick {
+    /// No hold in progress on this window.
+    Idle,
+    /// Armed, not yet sweeping (still inside `HOLD_ARM_MS`) — no ring drawn
+    /// yet, so nothing to redraw; fold this deadline into `next_wake`.
+    Waiting(Instant),
+    /// The ring was just advanced and pushed to the renderer (which requests
+    /// its own redraw) — fold `now + ANIM_FRAME` into `next_wake`.
+    Sweeping,
+    /// The ring just completed: `shared.drag` is now `Some`, already
+    /// `carried = true` (design: "wisp visible immediately"). The caller
+    /// must give the wisp the one-tick nudge a real motion tick would have
+    /// via `update_cross_window_drag` — a completed hold has no pointer
+    /// motion of its own to piggyback on.
+    Completed,
+}
+
 /// Everything tied to a single window and its surface.
 pub(crate) struct WindowState {
     pub(crate) renderer: Renderer,
@@ -318,6 +370,10 @@ pub(crate) struct WindowState {
     /// (which shows the lifted tab chip via `update_drag_hover` instead) and
     /// on every window outside the drag entirely.
     pub(crate) incoming_drop: Option<DropHover>,
+    /// A press-and-hold in progress on a pane body (hold-to-wisp, v1.1) —
+    /// see [`Hold`]'s doc. `None` outside a live hold; cancelled (cleared)
+    /// by motion past [`HOLD_TOLERANCE_PX`] or any release.
+    hold: Option<Hold>,
 }
 
 impl WindowState {
@@ -369,6 +425,7 @@ impl WindowState {
             render_starved: false,
             pending_move: None,
             incoming_drop: None,
+            hold: None,
         }
     }
 
@@ -1455,6 +1512,13 @@ impl WindowState {
     /// so drags still select instead of opening). Returns what (if anything)
     /// the release resolved — the classification `ctl drag` replies with.
     pub(crate) fn left_release(&mut self, shared: &mut Shared, window_id: WindowId) -> DragEnded {
+        // Hold-to-wisp: a live hold that never completed is just a normal
+        // release (early release = normal click, per the design doc) —
+        // clear it before anything else below. Already-completed holds
+        // cleared themselves in `tick_hold`, so this is a no-op then.
+        if self.hold.take().is_some() {
+            self.renderer.set_hold_ring(None);
+        }
         let mut ended = DragEnded::None;
         if let Some(drag) = shared.drag.take() {
             ended = self.resolve_drag_drop(shared, window_id, drag);
@@ -1599,24 +1663,26 @@ impl WindowState {
         // mouse-aware-app-forward/selection branch on modifiers already
         // lived, so a chord-gated press never reaches either.
         if self.pane_drag_modifier_held() {
-            if let Some((sid, rect)) = self
-                .pane_rects
-                .iter()
-                .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-                .cloned()
-            {
-                let pane = self
-                    .active_tab()
-                    .root
-                    .leaves()
-                    .into_iter()
-                    .find(|(_, s)| *s == sid)
-                    .map(|(p, _)| p);
-                if let Some(pane) = pane {
-                    self.start_pane_drag(shared, pane, rect, x, y);
-                    return;
-                }
+            if let Some((pane, rect)) = self.pane_at(x, y) {
+                self.start_pane_drag(shared, pane, rect, x, y);
+                return;
             }
+        }
+        // Hold-to-wisp (v1.1): a PLAIN press on a pane body arms a hold
+        // timer alongside whatever the press already does below (forwarded
+        // click / selection) — completing the ring (HOLD_ARM_MS +
+        // HOLD_SWEEP_MS, driven from `about_to_wait` via `tick_hold`) tears
+        // the pane off exactly like the chord gesture above. Moving past
+        // HOLD_TOLERANCE_PX (`on_cursor_moved`) or releasing early
+        // (`left_release`) just clears this — the press's own behavior,
+        // set below, is never touched by arming it.
+        if let Some((pane, rect)) = self.pane_at(x, y) {
+            self.hold = Some(Hold {
+                pane,
+                rect,
+                origin: (x, y),
+                started: Instant::now(),
+            });
         }
         // Mouse-aware app (vim :set mouse=a, htop): forward the click instead
         // of selecting — unless Shift is held, the universal local-selection
@@ -1626,6 +1692,27 @@ impl WindowState {
         }
         // A click in a pane body starts a selection (mode by click count).
         self.begin_selection(shared, x, y);
+    }
+
+    /// The pane (and its own rect, logical px) under point `(x, y)`, this
+    /// window's own coordinate space — `None` outside every visible pane
+    /// (strip, scrollbar, dividers, or empty margin). Shared by the
+    /// chord-gated pane drag and the hold-to-wisp arm check, which both need
+    /// exactly this hit-test.
+    fn pane_at(&self, x: f64, y: f64) -> Option<(PaneId, Rect)> {
+        let (sid, rect) = self
+            .pane_rects
+            .iter()
+            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .cloned()?;
+        let pane = self
+            .active_tab()
+            .root
+            .leaves()
+            .into_iter()
+            .find(|(_, s)| *s == sid)
+            .map(|(p, _)| p)?;
+        Some((pane, rect))
     }
 
     /// Start a chord-gated pane drag at a pane-body press: computes the
@@ -1661,6 +1748,45 @@ impl WindowState {
             // (mirrors tab tear-off's identical
             // placeholder).
         });
+    }
+
+    /// Advance a live hold-to-wisp gesture by one tick (`about_to_wait`'s
+    /// per-window pacing loop calls this every wake, mirroring how it paces
+    /// backdrop/bell animations). `Idle` when there's nothing to do — the
+    /// overwhelmingly common case, so this stays cheap for every window that
+    /// isn't mid-hold. On completion, reuses [`Self::start_pane_drag`]
+    /// EXACTLY as the chord gesture does (same sole-pane-tab upgrade, same
+    /// `DragState` shape), then marks it `carried` immediately so the wisp
+    /// shows without waiting for a motion tick (design: "wisp visible
+    /// immediately") — a mouse-reporting app that had this press forwarded
+    /// gets the matching synthetic release first, so it never sees a stuck
+    /// button.
+    pub(crate) fn tick_hold(&mut self, shared: &mut Shared, now: Instant) -> HoldTick {
+        let Some(hold) = self.hold.as_ref() else {
+            return HoldTick::Idle;
+        };
+        let armed_at = hold.started + Duration::from_millis(HOLD_ARM_MS);
+        if now < armed_at {
+            return HoldTick::Waiting(armed_at);
+        }
+        let sweep = Duration::from_millis(HOLD_SWEEP_MS);
+        let elapsed = now.duration_since(armed_at);
+        if elapsed >= sweep {
+            let (pane, rect, origin) = (hold.pane, hold.rect, hold.origin);
+            self.hold = None;
+            self.renderer.set_hold_ring(None);
+            self.forward_mouse_release(shared, 0);
+            self.start_pane_drag(shared, pane, rect, origin.0, origin.1);
+            if let Some(d) = shared.drag.as_mut() {
+                d.carried = true;
+            }
+            return HoldTick::Completed;
+        }
+        let progress = elapsed.as_secs_f32() / sweep.as_secs_f32();
+        let (x, y) = hold.origin;
+        self.renderer
+            .set_hold_ring(Some((x as f32, y as f32, progress)));
+        HoldTick::Sweeping
     }
 
     /// Encode one xterm mouse report. SGR (1006) when the app enabled it, else
@@ -1881,6 +2007,19 @@ impl WindowState {
         y: f64,
     ) {
         self.cursor = (x, y);
+        // Hold-to-wisp: moving past HOLD_TOLERANCE_PX before the ring
+        // completes cancels it — the press falls back to whatever it
+        // already was (selection / mouse-mode forward, both driven further
+        // below, untouched by this). Checked unconditionally, before every
+        // other branch, so it cancels regardless of what else this motion
+        // is doing (e.g. extending a selection the same press started).
+        if let Some(hold) = &self.hold {
+            let (ox, oy) = hold.origin;
+            if (x - ox).hypot(y - oy) > HOLD_TOLERANCE_PX {
+                self.hold = None;
+                self.renderer.set_hold_ring(None);
+            }
+        }
         // Ctrl+Opt held → live split drop-zone preview over the hovered pane.
         if self.split_modifier_held() {
             self.update_split_preview();

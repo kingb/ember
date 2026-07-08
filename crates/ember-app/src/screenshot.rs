@@ -74,6 +74,10 @@ pub struct Opts {
     /// from `--font`/`--font-size` so a doc shot can show a chosen font, and
     /// the highlight lands on the Font family row.
     pub settings: bool,
+    /// Hold-to-wisp ring (v1.1) preview: `(logical x, logical y, progress
+    /// 0..1)` — debug plumbing so the ring's quad geometry can be eyeballed
+    /// via a headless screenshot without a live windowed hold.
+    pub hold_ring: Option<(f32, f32, f32)>,
 }
 
 impl Default for Opts {
@@ -105,6 +109,7 @@ impl Default for Opts {
             font: None,
             help_overlay: false,
             settings: false,
+            hold_ring: None,
         }
     }
 }
@@ -150,6 +155,14 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
                     .parse()
                     .map_err(|e| format!("--split-preview ratio: {e}"))?;
                 opts.split_preview = Some((h, ratio));
+            }
+            "--hold-ring" => {
+                let x = next()?.parse().map_err(|e| format!("--hold-ring x: {e}"))?;
+                let y = next()?.parse().map_err(|e| format!("--hold-ring y: {e}"))?;
+                let progress = next()?
+                    .parse()
+                    .map_err(|e| format!("--hold-ring progress: {e}"))?;
+                opts.hold_ring = Some((x, y, progress));
             }
             "--settle" => opts.settle_ms = next()?.parse().map_err(|e| format!("--settle: {e}"))?,
             "--split" => {
@@ -392,6 +405,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
             confirm_label: "Close".to_string(),
             focused: 0,
         }),
+        hold_ring: opts.hold_ring,
     };
     if opts.bg_image.is_some() && shot.image.is_none() {
         return Err(format!(

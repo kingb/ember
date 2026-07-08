@@ -22,8 +22,8 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help, build_settings,
-    build_tabs, grid_quads, link_quads, measure_cell_width, push_backdrop, scrollbar,
-    selection_quads, shape_grid, spark_quads, split_preview,
+    build_tabs, grid_quads, hold_ring_quads, link_quads, measure_cell_width, push_backdrop,
+    scrollbar, selection_quads, shape_grid, spark_quads, split_preview,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
@@ -80,6 +80,10 @@ pub struct Shot<'a> {
     pub font_family: Option<String>,
     /// A blocking confirm modal drawn over everything, if shown.
     pub confirm: Option<crate::renderer::ConfirmView>,
+    /// Hold-to-wisp ring (v1.1): `(logical x, logical y, progress 0..1)` —
+    /// mirrors [`crate::Renderer`]'s live `hold_ring` state so a mid-gesture
+    /// `ctl screenshot` shows the sweep for visual verification.
+    pub hold_ring: Option<(f32, f32, f32)>,
 }
 
 /// The measured `(cell_width, cell_height)` in logical px — lets a caller derive
@@ -398,6 +402,14 @@ pub fn capture_reusing(
                     &mut rects,
                 );
             }
+        }
+        // Hold-to-wisp ring: window-space, not tied to any one pane, so it's
+        // drawn once here (mirrors the live renderer's placement — after
+        // every pane's own content, before the tab strip).
+        if let Some((rx, ry, progress)) = shot.hold_ring {
+            hold_ring_quads(rx, ry, progress, sf)
+                .into_iter()
+                .for_each(|q| rects.push(q));
         }
         // One-shot capture: a fresh cache (always shapes once) keeps the shared
         // signature without threading state through the headless path.

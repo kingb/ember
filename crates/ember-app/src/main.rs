@@ -16,7 +16,7 @@ mod mcp;
 mod screenshot;
 mod window_state;
 
-use window_state::{DragEnded, WindowState};
+use window_state::{DragEnded, HoldTick, WindowState};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -1815,6 +1815,39 @@ impl ApplicationHandler<EmberEvent> for App {
                 // across every animating window.
                 let deadline = w.last_anim + frame;
                 next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
+            }
+            // Hold-to-wisp (v1.1): advance any live press-and-hold ring on
+            // this window, independent of the animation gate above — a hold
+            // can be live on a window that's otherwise doing nothing else
+            // (no backdrop, no bell, no FPS overlay).
+            match w.tick_hold(shared, now) {
+                HoldTick::Idle => {}
+                HoldTick::Waiting(deadline) => {
+                    next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
+                }
+                HoldTick::Sweeping => {
+                    let deadline = now + ANIM_FRAME;
+                    next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
+                }
+                HoldTick::Completed => {
+                    // The hold just tore the pane off, already `carried =
+                    // true` (design: "wisp visible immediately") — nudge the
+                    // wisp the same way a real motion tick would via
+                    // `update_cross_window_drag`, since a completed hold has
+                    // no pointer motion of its own to piggyback on.
+                    let sf = w.renderer.window().scale_factor();
+                    if let Ok(pos) = w.renderer.window().inner_position() {
+                        let (lx, ly) = w.cursor;
+                        let screen_x = pos.x as f64 + lx * sf;
+                        let screen_y = pos.y as f64 + ly * sf;
+                        if let Some(d) = shared.drag.as_mut() {
+                            d.last_screen = (screen_x, screen_y);
+                        }
+                        wisp_tick(shared, event_loop, true, screen_x, screen_y);
+                    }
+                    let deadline = now + ANIM_FRAME;
+                    next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
+                }
             }
         }
         // The wisp (Task 5) isn't a `WindowState` — it's not in `self.windows`

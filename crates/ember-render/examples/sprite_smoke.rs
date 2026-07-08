@@ -85,6 +85,7 @@ fn main() {
         font_size: 12.0,
         font_family: None,
         confirm: None,
+        hold_ring: None,
     };
 
     capture(&shot, std::path::Path::new(&path)).expect("capture");

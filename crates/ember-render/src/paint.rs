@@ -546,6 +546,52 @@ pub(crate) fn split_preview(
     }
 }
 
+/// Number of quads that make up a complete hold-to-wisp ring (v1.1).
+const HOLD_RING_SEGMENTS: usize = 28;
+/// Ring radius, logical px, around the hold's press point.
+const HOLD_RING_RADIUS: f32 = 24.0;
+/// Side length of each ring quad, logical px.
+const HOLD_RING_DOT: f32 = 2.5;
+
+/// Quad geometry for the hold-to-wisp ring (v1.1): up to
+/// [`HOLD_RING_SEGMENTS`] small quads placed clockwise around `(x, y)`
+/// (logical px, this window's own space) starting at 12 o'clock, with only
+/// the first `progress * HOLD_RING_SEGMENTS` of them lit — the newest
+/// (closest to the current sweep point) brightest, ramping down toward the
+/// tail so the ring reads as an active sweep rather than a static dial.
+/// `progress` is clamped to `0..1` (0 = empty, 1 = the full ring). Pure quad-
+/// position math — no renderer/window dependency — so it's directly
+/// unit-testable; [`crate::Renderer`] calls this with its own `sf` at
+/// scene-build time, same shape as [`spark_quads`]/[`split_preview`].
+pub(crate) fn hold_ring_quads(x: f32, y: f32, progress: f32, sf: f32) -> Vec<([f32; 4], [f32; 4])> {
+    use std::f32::consts::{FRAC_PI_2, TAU};
+    let lit =
+        ((progress.clamp(0.0, 1.0) * HOLD_RING_SEGMENTS as f32) as usize).min(HOLD_RING_SEGMENTS);
+    let mut out = Vec::with_capacity(lit);
+    for i in 0..lit {
+        let t = i as f32 / HOLD_RING_SEGMENTS as f32;
+        let angle = -FRAC_PI_2 + t * TAU;
+        let cx = x + angle.cos() * HOLD_RING_RADIUS;
+        let cy = y + angle.sin() * HOLD_RING_RADIUS;
+        // Ramp from dim (oldest, i = 0) to bright (newest, i = lit - 1) across
+        // the CURRENTLY LIT arc, not the full ring — so the sweep always ends
+        // on a bright leading edge regardless of how far it's progressed.
+        let age_frac = i as f32 / lit.max(1) as f32;
+        let alpha = 0.35 + 0.65 * age_frac;
+        out.push((
+            scaled(
+                cx - HOLD_RING_DOT * 0.5,
+                cy - HOLD_RING_DOT * 0.5,
+                HOLD_RING_DOT,
+                HOLD_RING_DOT,
+                sf,
+            ),
+            lin_rgba(ACCENT, alpha),
+        ));
+    }
+    out
+}
+
 /// Background of the tab strip (a touch lighter than the terminal, iTerm-style).
 const STRIP_BG: Rgb = Rgb::new(0x1b, 0x1b, 0x1b);
 /// Fill of the active tab button.
@@ -1746,5 +1792,63 @@ mod tests {
         // No panic (the point of this test) and nothing to highlight — the
         // whole selected span fell outside the shrunken pane.
         assert!(out.is_empty());
+    }
+
+    // --- hold_ring_quads (hold-to-wisp, v1.1) ---
+
+    use super::{HOLD_RING_SEGMENTS, hold_ring_quads};
+
+    #[test]
+    fn hold_ring_is_empty_at_zero_progress() {
+        assert!(hold_ring_quads(100.0, 100.0, 0.0, 1.0).is_empty());
+        // Clamped: negative progress is also empty, never panics/underflows.
+        assert!(hold_ring_quads(100.0, 100.0, -0.5, 1.0).is_empty());
+    }
+
+    #[test]
+    fn hold_ring_segment_count_scales_with_progress() {
+        let quarter = hold_ring_quads(0.0, 0.0, 0.25, 1.0).len();
+        let half = hold_ring_quads(0.0, 0.0, 0.5, 1.0).len();
+        let three_quarter = hold_ring_quads(0.0, 0.0, 0.75, 1.0).len();
+        assert!(quarter > 0);
+        assert!(half > quarter);
+        assert!(three_quarter > half);
+        assert!(three_quarter < HOLD_RING_SEGMENTS);
+    }
+
+    #[test]
+    fn hold_ring_is_full_at_progress_one() {
+        let full = hold_ring_quads(0.0, 0.0, 1.0, 1.0);
+        assert_eq!(full.len(), HOLD_RING_SEGMENTS);
+        // Clamped: progress past 1.0 never exceeds a full ring.
+        assert_eq!(
+            hold_ring_quads(0.0, 0.0, 1.5, 1.0).len(),
+            HOLD_RING_SEGMENTS
+        );
+    }
+
+    #[test]
+    fn hold_ring_first_segment_sits_at_twelve_oclock() {
+        // angle = -PI/2 at t=0 → straight up from center: same x, radius
+        // above in y (screen space, +y is down).
+        let (x, y) = (50.0, 50.0);
+        let quads = hold_ring_quads(x, y, 1.0 / 28.0, 1.0);
+        assert_eq!(quads.len(), 1);
+        let [qx, qy, qw, qh] = quads[0].0;
+        let (cx, cy) = (qx + qw / 2.0, qy + qh / 2.0);
+        assert!((cx - x).abs() < 0.01, "expected centered on x, got {cx}");
+        assert!(cy < y, "12 o'clock should be above the center");
+    }
+
+    #[test]
+    fn hold_ring_newest_segment_is_brightest() {
+        let quads = hold_ring_quads(0.0, 0.0, 0.5, 1.0);
+        assert!(quads.len() >= 2);
+        let first_alpha = quads.first().unwrap().1[3];
+        let last_alpha = quads.last().unwrap().1[3];
+        assert!(
+            last_alpha > first_alpha,
+            "the newest (last) segment should be brighter than the oldest (first)"
+        );
     }
 }

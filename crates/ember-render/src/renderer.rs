@@ -30,8 +30,9 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, CLOSE_COLS, bell_wash, build_about, build_confirm, build_fps, build_help,
-    build_settings, build_tabs, debug_emit, grid_quads, measure_cell_width, push_backdrop,
-    scrollbar, scrollbar_geometry, selection_quads, shape_grid, spark_quads, split_preview,
+    build_settings, build_tabs, debug_emit, grid_quads, hold_ring_quads, measure_cell_width,
+    push_backdrop, scrollbar, scrollbar_geometry, selection_quads, shape_grid, spark_quads,
+    split_preview,
 };
 use crate::selection::Selection;
 
@@ -430,6 +431,10 @@ pub struct Renderer {
     /// Ctrl+Opt manual split preview always passes `before: false` (that
     /// gesture only ever appends the new pane on the far side).
     split_preview: Option<(SessionId, bool, f32, bool)>,
+    /// Hold-to-wisp ring (v1.1): `(logical x, logical y, progress 0..1)` of
+    /// the cursor a hold is armed/sweeping at, this window's own space.
+    /// `None` while no hold is live. See [`crate::paint::hold_ring_quads`].
+    hold_ring: Option<(f32, f32, f32)>,
     /// FPS/frame-time debug readout text (bottom-right), or `None` when hidden.
     fps_overlay: Option<String>,
     /// Glyph buffer for the FPS overlay.
@@ -611,6 +616,7 @@ impl Renderer {
             image_rgba: None,
             selection: None,
             split_preview: None,
+            hold_ring: None,
             fps_overlay: None,
             fps_buffer,
             bell_flash: 0.0,
@@ -784,6 +790,7 @@ impl Renderer {
             font_size: self.font_size,
             font_family: self.family_name.clone(),
             confirm: self.confirm.clone(),
+            hold_ring: self.hold_ring,
         };
         crate::headless::capture_reusing(
             &self.device,
@@ -963,6 +970,16 @@ impl Renderer {
     pub fn set_split_preview(&mut self, preview: Option<(SessionId, bool, f32, bool)>) {
         self.scene_dirty = true;
         self.split_preview = preview;
+        self.window.request_redraw();
+    }
+
+    /// Set/clear the hold-to-wisp ring (v1.1): logical `(x, y)` cursor
+    /// position + sweep progress (0..1). `None` while no hold is
+    /// armed/sweeping — see [`crate::paint::hold_ring_quads`] for the quad
+    /// geometry this drives at scene-build time.
+    pub fn set_hold_ring(&mut self, ring: Option<(f32, f32, f32)>) {
+        self.scene_dirty = true;
+        self.hold_ring = ring;
         self.window.request_redraw();
     }
 
@@ -1471,6 +1488,15 @@ impl Renderer {
                             );
                         }
                     }
+                }
+                // Hold-to-wisp ring (v1.1): window-space, not tied to any
+                // one pane, so it's drawn once here — after every pane's
+                // own content (including that pane's split preview), before
+                // the tab strip — so it reads as sitting above pane content.
+                if let Some((rx, ry, progress)) = self.hold_ring {
+                    hold_ring_quads(rx, ry, progress, sf)
+                        .into_iter()
+                        .for_each(|q| rects.push(q));
                 }
                 let logical_w = self.config.width as f32 / sf;
                 let close_cx = build_tabs(
