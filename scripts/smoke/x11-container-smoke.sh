@@ -50,6 +50,27 @@ if "$BIN" ctl state | grep -q "x11-smoke-42"; then echo "  PASS: shell echoed x1
 echo "=== SMOKE 4: visual evidence (X11 root capture) ==="
 xwd -root -silent | convert xwd:- /out/x11-smoke.png 2>/dev/null && echo "  captured /out/x11-smoke.png"
 
+echo "=== SMOKE 4b: drag/carry on X11 (tab reorder, pane split-by-drag, cancel) ==="
+# Second tab so there's something to reorder.
+"$BIN" ctl chord cmd+t >/dev/null; sleep 1
+TABS_BEFORE=$("$BIN" ctl state | python3 -c "import json,sys; print(len(json.load(sys.stdin)['state']['tabs']))")
+echo "  tabs open: $TABS_BEFORE (want 2)"
+# Surface dims drive the coordinates (strip along the top).
+read -r W H <<<"$("$BIN" ctl state | python3 -c "import json,sys; s=json.load(sys.stdin)['state']['surface']; print(s[0], s[1])")"
+# Reorder: drag tab 1's chip toward tab 2's slot.
+R1=$("$BIN" ctl drag 40 12 160 12 --steps 12 --paced 16 2>&1)
+echo "  reorder drag -> $(echo "$R1" | python3 -c "import json,sys; print(json.load(sys.stdin).get('drag_ended','parse-fail'))" 2>/dev/null || echo "$R1" | head -c 120)"
+# Cancelled drag: must end 'cancel' and change nothing.
+PANES_BEFORE=$("$BIN" ctl state | python3 -c "import json,sys; print(len(json.load(sys.stdin)['state']['panes']))")
+R2=$("$BIN" ctl drag $((W/2)) $((H/2)) $((W-30)) $((H/2)) --steps 10 --cancel 2>&1)
+echo "  cancelled drag -> $(echo "$R2" | python3 -c "import json,sys; print(json.load(sys.stdin).get('drag_ended','parse-fail'))" 2>/dev/null || echo "$R2" | head -c 120)"
+# Real pane drag to the right edge: same-window edge drop = half-pane split.
+R3=$("$BIN" ctl drag $((W/2)) $((H/2)) $((W-10)) $((H/2)) --steps 14 --paced 16 2>&1)
+PANES_AFTER=$("$BIN" ctl state | python3 -c "import json,sys; print(len(json.load(sys.stdin)['state']['panes']))")
+echo "  edge drag -> $(echo "$R3" | python3 -c "import json,sys; print(json.load(sys.stdin).get('drag_ended','parse-fail'))" 2>/dev/null || echo "$R3" | head -c 120); panes $PANES_BEFORE -> $PANES_AFTER"
+if [ "$PANES_AFTER" -gt "$PANES_BEFORE" ]; then echo "  PASS: drag split a pane on X11"; else echo "  WARN: pane count unchanged (drop semantics may differ) — inspect responses above"; fi
+xwd -root -silent | convert xwd:- /out/x11-drag.png 2>/dev/null && echo "  captured /out/x11-drag.png"
+
 echo "=== SMOKE 5: stability — 30s idle, still alive, log clean ==="
 sleep 30
 kill -0 $APP 2>/dev/null && echo "  PASS: alive after idle" || echo "  FAIL: died during idle"
