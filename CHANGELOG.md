@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-08
+
 ### Added
 
 - Ember sparks guardrails. The `ember_sparks` on/off switch is now a
@@ -186,7 +188,8 @@ this first release:
   created owner-only, use no fixed or predictable paths, and return
   JSON-encoded errors rather than leaking internal state.
 
-[Unreleased]: https://github.com/kingb/ember/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/kingb/ember/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/kingb/ember/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/kingb/ember/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/kingb/ember/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/kingb/ember/compare/v0.1.0...v0.2.0
