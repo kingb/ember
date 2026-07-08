@@ -1237,10 +1237,17 @@ impl WindowState {
     }
 
     /// Clear the split preview (modifier released / cursor left the panes).
+    /// Clear BOTH halves of the split-preview state: the model (the
+    /// quick-split commit target) and the renderer's visual. The visual has
+    /// two INDEPENDENT writers — the Ctrl+Opt quick-split path arms model +
+    /// renderer together, but the drag-drop preview paths (`set_incoming_
+    /// drop`, `update_drag_hover`) arm the renderer alone — so this must
+    /// never gate the renderer clear on the model being armed. It did once:
+    /// every drop-preview clear was a silent no-op and the abandoned quad
+    /// haunted the pane until process exit (the "rogue split" band).
     pub(crate) fn clear_split_preview(&mut self) {
-        if self.split_preview.take().is_some() {
-            self.renderer.set_split_preview(None);
-        }
+        self.split_preview = None;
+        self.renderer.set_split_preview(None);
     }
 
     pub(crate) fn close_focused(&mut self, shared: &mut Shared) {
