@@ -31,6 +31,14 @@ follow [Semantic Versioning](https://semver.org).
   becomes a wisp, a small ember that rides the pointer (turn it off with
   wisp = false). Escape cancels any drag, and shells keep running through
   every drop.
+- Hold to wisp. Press and hold on any pane and a small ring draws itself
+  closed around your cursor; when it completes, the pane is swept into the
+  wisp and you are carrying it, no keyboard involved. Move before the ring
+  closes and the press falls back to an ordinary selection. Within a
+  window, dragging a surface onto a pane splits it on the nearest side;
+  the window a carried surface hovers comes forward so you can see where
+  it will land, and a window's only tab now shows its chip so there is
+  always something to grab.
 
 ### Changed
 
