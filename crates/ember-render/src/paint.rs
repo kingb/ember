@@ -77,20 +77,14 @@ pub(crate) fn bell_wash(
     ));
 }
 
-/// EXPERIMENT: velocity-stretched spark trails — cheap motion blur so
-/// low animation frame rates read as smooth drift instead of judder. Off unless
-/// `EMBER_SPARK_TRAIL=1`. Film's 180°-shutter insight: a frame that *covers* the
-/// motion between samples looks continuous; a point sample looks like a jumping
-/// dot (worst for small, bright, slow particles — exactly our sparks).
-fn spark_trail_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("EMBER_SPARK_TRAIL").is_ok_and(|v| v != "0"))
-}
-
-/// Trail segments per spark when trails are on. The head is brightest; the tail
-/// tapers in size and alpha, spanning the full inter-frame displacement so
-/// consecutive frames' streaks connect end-to-end.
+/// Trail segments per spark. Sparks render as short velocity-stretched streaks
+/// (motion blur): the head is brightest, the tail tapers in size and alpha, and
+/// the streak spans the full inter-frame displacement so consecutive frames
+/// connect end-to-end. Film's 180°-shutter insight: a frame that *covers* the
+/// motion between samples reads as continuous drift; a point sample reads as a
+/// jumping dot — worst for small, bright, slow particles, exactly our sparks.
+/// This is what makes low animation frame rates (15fps) look smooth, which is
+/// what makes the sparks cheap enough to run by default.
 const TRAIL_SEGMENTS: usize = 4;
 
 /// Compute the drifting ember-spark instances for the **additive** pass:
@@ -109,8 +103,7 @@ pub(crate) fn spark_quads(
 ) -> Vec<([f32; 4], [f32; 4])> {
     use std::f32::consts::PI;
     let n = ((50.0 * density).round() as i32).clamp(0, 240) as usize;
-    let trail = spark_trail_enabled();
-    let mut out = Vec::with_capacity(if trail { n * TRAIL_SEGMENTS } else { n });
+    let mut out = Vec::with_capacity(n * TRAIL_SEGMENTS);
     for i in 0..n {
         let fi = i as f32;
         let hash = |a: f32, b: f32| {
@@ -140,13 +133,6 @@ pub(crate) fn spark_quads(
         let flicker = 0.8 + 0.2 * (t * (8.0 + seed * 6.0) + fi).sin();
         let alpha = (PI * phase).sin().max(0.0) * 0.85 * flicker;
         let size = 2.0 + seed * 4.0;
-        if !trail {
-            out.push((
-                scaled(x - size * 0.5, y - size * 0.5, size, size, sf),
-                lin_rgba(color, alpha),
-            ));
-            continue;
-        }
         // Analytic velocity (logical px/s) of the closed-form motion above:
         // vertical rise from the phase ramp, lateral from the sway derivative.
         let vy = -(logical_h + 24.0) / life;
@@ -1898,5 +1884,33 @@ mod tests {
             last_alpha > first_alpha,
             "the newest (last) segment should be brighter than the oldest (first)"
         );
+    }
+}
+
+#[cfg(test)]
+mod spark_tests {
+    use super::*;
+
+    #[test]
+    fn every_spark_renders_a_full_trail() {
+        let q = spark_quads(1.0, 8.0, 1000.0, 620.0, 2.0, 1.0 / 15.0);
+        assert_eq!(q.len(), 50 * TRAIL_SEGMENTS);
+    }
+
+    #[test]
+    fn deterministic_in_time() {
+        let a = spark_quads(1.0, 8.0, 1000.0, 620.0, 2.0, 1.0 / 15.0);
+        let b = spark_quads(1.0, 8.0, 1000.0, 620.0, 2.0, 1.0 / 15.0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn tail_fades_and_shrinks_behind_the_head() {
+        let q = spark_quads(1.0, 8.0, 1000.0, 620.0, 2.0, 1.0 / 15.0);
+        // First TRAIL_SEGMENTS entries are one spark, head first.
+        let head = &q[0];
+        let tail = &q[TRAIL_SEGMENTS - 1];
+        assert!(tail.0[2] < head.0[2], "tail segment should be smaller");
+        assert!(tail.1[3] < head.1[3], "tail segment should be dimmer");
     }
 }

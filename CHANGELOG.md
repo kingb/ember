@@ -42,6 +42,12 @@ follow [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Ember sparks now render as short glowing trails (velocity-stretched motion
+  blur) instead of plain dots. The drift reads smoothly even at low animation
+  frame rates, so the campfire costs less to keep lit.
+
+### Changed
+
 - In `ctl state`, the `tabs` field changed from a count to the array above.
   Callers that read it as a number should use the array's length.
 

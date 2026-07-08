@@ -120,9 +120,9 @@ pub struct BackdropParams {
     pub density: f32,
     /// Elapsed seconds, driving the spark animation.
     pub time: f32,
-    /// Seconds between animation ticks (`1 / ember_fps`). Sizes the
-    /// velocity-stretched trail segments (when enabled) so consecutive
-    /// frames' streaks connect end-to-end at any configured frame rate.
+    /// Seconds between animation ticks (`1 / ember_fps`). Sizes the sparks'
+    /// velocity-stretched trail segments so consecutive frames' streaks
+    /// connect end-to-end at any configured frame rate.
     pub frame_dt: f32,
 }
 
