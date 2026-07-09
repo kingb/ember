@@ -188,6 +188,30 @@ pub(crate) fn drop_zone_to_dest(
     }
 }
 
+/// Whether hovering `pane` in tab `hovered_tab` of a drag's OWN SOURCE
+/// window would resolve to one of `move_surface`'s no-op self-merge
+/// rejections — mirrors `windows.rs`'s `validate` exactly (window equality
+/// is already guaranteed by every caller, which only ever checks a hover on
+/// the drag's own source window):
+/// - a `Tab`-sourced drag over any pane of its OWN tab ("tab can't merge
+///   into itself" — any pane within that tab is an equally dead drop, not
+///   just its own historical rect).
+/// - a `Pane`-sourced drag over its own exact pane ("split into self").
+///   Structurally rare in practice (a `Pane` exclusion removes that pane's
+///   own rect from `pane_rects`, so it's not normally hoverable), but
+///   checked anyway so this predicate matches `validate`'s conditions
+///   exactly rather than relying on that staying true forever.
+pub(crate) fn hover_is_self_merge(
+    surface: SurfaceRef,
+    hovered_tab: usize,
+    hovered_pane: PaneId,
+) -> bool {
+    match surface {
+        SurfaceRef::Tab { tab, .. } => tab == hovered_tab,
+        SurfaceRef::Pane { tab, pane, .. } => tab == hovered_tab && pane == hovered_pane,
+    }
+}
+
 /// The new window's SCREEN-space top-left `(x, y)`, physical px, for a
 /// desktop drag drop: the drop point (`screen`) minus the grab offset
 /// (`grab_logical`, captured at tear-off in the SOURCE window's logical px —
@@ -2831,11 +2855,34 @@ impl WindowState {
             SurfaceRef::Tab { tab, .. } => Some(tab),
             SurfaceRef::Pane { .. } => None,
         };
+        let surface = drag.surface;
         if drag.source_window != window_id {
             return;
         }
         let title = drag.title.clone();
-        let hover = self.hover_at(window_id, x, y, true);
+        let mut hover = self.hover_at(window_id, x, y, true);
+        // A same-window Pane hover that would resolve to one of
+        // `move_surface`'s no-op self-merge rejections ("split into self" /
+        // "tab can't merge into itself" — see `windows.rs`'s `validate`)
+        // must never show a split preview: with the reveal-a-different-tab
+        // step this method's caller (`update_drag`/`tear_off_tab`) always
+        // runs at tear-off, this is structurally rare, but a Pane-sourced
+        // drag that got sole-pane-tab-promoted to a `Tab` surface
+        // (`pane_drag_source`) doesn't switch the active tab at all — so its
+        // own (still-displayed) panes can still be hovered. Suppressing here
+        // (rather than only in `resolve_drag_drop`) also clears `drag.hover`
+        // itself, so a release on a phantom band cleanly cancels instead of
+        // surfacing `apply_move`'s rejection as a console error.
+        if let Some(DropHover::Pane {
+            tab: hovered_tab,
+            pane: hovered_pane,
+            ..
+        }) = &hover
+        {
+            if hover_is_self_merge(surface, *hovered_tab, *hovered_pane) {
+                hover = None;
+            }
+        }
         match &hover {
             Some(DropHover::Strip { chip, .. }) => {
                 // Spring-loaded tab select (finding #2): dwelling on a REAL
@@ -2906,6 +2953,13 @@ impl WindowState {
     /// caret — `set_ghost_tab`, always the LAST segment: v1 keeps append
     /// semantics, see `crate::paint::build_tabs`'s doc, so the ghost is
     /// honest about where the drop actually lands).
+    ///
+    /// Unlike `update_drag_hover`'s in-window Pane arm, this never needs a
+    /// `hover_is_self_merge` check: `App::update_cross_window_drag` only
+    /// ever calls this on a window whose id is NOT `drag.source_window` (it
+    /// special-cases the carry drifting back over its own source as a
+    /// hover-clear, not a call here) — a self-merge requires the same window
+    /// on both ends, which is structurally unreachable through this path.
     pub(crate) fn set_incoming_drop(&mut self, hover: Option<DropHover>, title: Option<&str>) {
         self.incoming_drop = hover;
         self.clear_split_preview();
