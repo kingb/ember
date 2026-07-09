@@ -344,32 +344,130 @@ pub enum RenderOutcome {
 /// it, content-driven redraws re-enter full frame prep at PTY rate — the
 ///  spin that leaked ~3,500 GPU allocations/s and OOM'd the machine.
 /// A successful present clears the gate, so a revealed window never waits.
+///
+/// The holdoff backs off exponentially the longer starvation persists (sleep
+/// balloon postmortem: a fixed 4/s retry forever is "bounded" per
+/// attempt but not per NIGHT — display sleep can starve a window for eight-plus
+/// hours, during which winit's real `Occluded`/`Focused` events still clear
+/// this gate INSTANTLY via `surface_revealed` — they never go through
+/// `should_attempt` at all — so backing off the blind poll path costs nothing
+/// on a real reveal and only trims the total attempt count across a long,
+/// otherwise-invisible stretch.
 struct StarveGate {
     starved_at: Option<Instant>,
+    /// Consecutive starved attempts since the last `clear()` — drives the
+    /// exponential backoff. Reset to 0 on every `clear()`.
+    consecutive: u32,
 }
 
 impl StarveGate {
-    /// Max attempt rate while starved: one per 250ms (4/s) bounds the waste.
+    /// Starting attempt rate while starved: one per 250ms (4/s) — unchanged
+    /// from the original fix, so a single transient starve (e.g. a startup
+    /// burst) still self-heals just as fast as before.
     const HOLDOFF: Duration = Duration::from_millis(250);
+    /// Ceiling the backoff ramps to (250ms * 2^5 = 8s) and holds there —
+    /// reached on the 6th consecutive starve, roughly 8 seconds into an
+    /// unbroken stretch.
+    const MAX_BACKOFF_SHIFT: u32 = 5;
 
     fn new() -> Self {
-        Self { starved_at: None }
+        Self {
+            starved_at: None,
+            consecutive: 0,
+        }
+    }
+
+    /// The current holdoff: `HOLDOFF` for the first starve, doubling each
+    /// consecutive one after that, up to the cap.
+    fn current_holdoff(&self) -> Duration {
+        let shift = self
+            .consecutive
+            .saturating_sub(1)
+            .min(Self::MAX_BACKOFF_SHIFT);
+        Self::HOLDOFF * (1u32 << shift)
     }
 
     /// Whether a render attempt is allowed at `now`.
     fn should_attempt(&self, now: Instant) -> bool {
         self.starved_at
-            .is_none_or(|t| now.duration_since(t) >= Self::HOLDOFF)
+            .is_none_or(|t| now.duration_since(t) >= self.current_holdoff())
     }
 
-    /// Record a starved attempt at `now`; holds off retries for [`Self::HOLDOFF`].
+    /// Record a starved attempt at `now`; holds off retries for the current
+    /// (growing) backoff and widens it for next time. Logs to `EMBER_DEBUG`
+    /// on the first starve and every 60th thereafter (a no-op when the var is
+    /// unset), plus an ALWAYS-ON stderr tripwire every 1,000th — a streak
+    /// that long is hours of starvation, and the sleep-balloon incident log
+    /// was silent precisely because everything here was opt-in. With the
+    /// backoff at its 8s cap, an 8-hour sleep is ~3,600 attempts total
+    /// (instead of the old ~115,000), so the tripwire fires at most a few
+    /// times per night.
     fn starve(&mut self, now: Instant) {
         self.starved_at = Some(now);
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive == 1 || self.consecutive % 60 == 0 {
+            debug_emit(&format!(
+                "[ember] starve-gate: {} consecutive starved attempts, holdoff now {:?}",
+                self.consecutive,
+                self.current_holdoff()
+            ));
+        }
+        if self.consecutive % 1000 == 0 {
+            eprintln!(
+                "[ember] starve-gate: {} consecutive starved render attempts (holdoff {:?}) — \
+                 surface has produced no drawable for a long stretch",
+                self.consecutive,
+                self.current_holdoff()
+            );
+        }
     }
 
-    /// A drawable came through — stop gating.
+    /// A drawable came through — stop gating and reset the backoff.
     fn clear(&mut self) {
         self.starved_at = None;
+        self.consecutive = 0;
+    }
+}
+
+/// Bounds the reconfigure-per-attempt loop on a persistently Lost/Outdated
+/// surface (sleep-balloon postmortem). A Lost/Outdated acquire reconfigures
+/// the surface — which allocates a fresh swapchain (~tens of MB at Retina
+/// sizes) — and returns `Retry`, which the app answers with an immediate
+/// `request_redraw`. On a healthy surface that settles in one round trip
+/// (resize race), but while the GPU is asleep (display sleep / dark wake) the
+/// surface can stay Lost for hours, turning that round trip into an unbounded
+/// event-loop-speed spin: one swapchain allocation per iteration, faster than
+/// Metal reclaims the abandoned ones. This counter lets the first couple of
+/// losses keep the fast immediate-retry path, then hands persistent loss to
+/// the [`StarveGate`] cadence, where reclamation trivially keeps up.
+struct LostSurfaceBound {
+    /// Consecutive Lost/Outdated/Validation acquires since the last
+    /// successful acquire (or reveal/resize).
+    consecutive: u32,
+}
+
+impl LostSurfaceBound {
+    /// How many consecutive losses still earn an immediate retry. One covers
+    /// the benign resize race; the second is margin for a reveal that lands
+    /// mid-reconfigure. The third consecutive loss means the surface is not
+    /// coming back on its own — stop spinning.
+    const MAX_IMMEDIATE: u32 = 2;
+
+    fn new() -> Self {
+        Self { consecutive: 0 }
+    }
+
+    /// Record one more lost acquire. `true` = an immediate retry is still
+    /// allowed; `false` = fall back to the starve cadence.
+    fn record(&mut self) -> bool {
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.consecutive <= Self::MAX_IMMEDIATE
+    }
+
+    /// The surface produced a drawable (or was rebuilt for a reveal/resize):
+    /// the next loss is a fresh incident, not a continuation.
+    fn clear(&mut self) {
+        self.consecutive = 0;
     }
 }
 
@@ -522,6 +620,8 @@ pub struct Renderer {
     bell_flash: f32,
     /// Throttles render attempts while the surface has no drawable.
     starve_gate: StarveGate,
+    /// Bounds immediate retries while the surface is persistently lost.
+    lost_bound: LostSurfaceBound,
     // Keep the window LAST so it drops after the surface (winit/wgpu requirement).
     window: Arc<Window>,
 }
@@ -701,6 +801,7 @@ impl Renderer {
             fps_buffer,
             bell_flash: 0.0,
             starve_gate: StarveGate::new(),
+            lost_bound: LostSurfaceBound::new(),
             window,
         }
     }
@@ -714,6 +815,7 @@ impl Renderer {
     pub fn surface_revealed(&mut self) {
         self.scene_dirty = true;
         self.starve_gate.clear();
+        self.lost_bound.clear();
     }
 
     pub fn window(&self) -> &Arc<Window> {
@@ -1391,6 +1493,9 @@ impl Renderer {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
+        // A real resize is a fresh situation for the swapchain — don't let a
+        // stale lost-streak from before the resize starve the repaint.
+        self.lost_bound.clear();
         // Chrome sizing is owned by `build_tabs` (keyed on logical width in its
         // shaping cache) — sizing it here to the *physical* width was both
         // redundant and wrong, masked only by the old per-frame re-shape.
@@ -1958,15 +2063,32 @@ impl Renderer {
             }
             // The surface genuinely needs rebuilding (resize race, device
             // loss, validation): reconfigure and ask for one immediate retry.
+            // But only a couple of times in a row — each reconfigure here
+            // allocates a fresh swapchain, and while the GPU is asleep the
+            // surface can stay Lost for hours: an unbounded Retry loop at
+            // event-loop speed is the sleep balloon (GBs of abandoned
+            // swapchains, reclaimed only slowly after wake). Persistent loss
+            // falls back to the starve cadence, which still reconfigures on
+            // each (backed-off) attempt so the surface heals the moment the
+            // GPU can actually produce a drawable again.
             wgpu::CurrentSurfaceTexture::Outdated
             | wgpu::CurrentSurfaceTexture::Lost
             | wgpu::CurrentSurfaceTexture::Validation => {
                 self.surface.configure(&self.device, &self.config);
                 let _ = self.device.poll(wgpu::PollType::Poll);
-                return RenderOutcome::Retry;
+                if self.lost_bound.record() {
+                    return RenderOutcome::Retry;
+                }
+                debug_emit(&format!(
+                    "[ember] surface lost {} times consecutively: starving redraws",
+                    self.lost_bound.consecutive
+                ));
+                self.starve_gate.starve(frame_start);
+                return RenderOutcome::Starved;
             }
         };
         self.starve_gate.clear();
+        self.lost_bound.clear();
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -2040,7 +2162,8 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        Duration, Instant, StarveGate, StripSlot, TabHit, tab_col_hit, tab_or_ghost_col_hit,
+        Duration, Instant, LostSurfaceBound, StarveGate, StripSlot, TabHit, tab_col_hit,
+        tab_or_ghost_col_hit,
     };
 
     // 3 equal tabs over 30 columns → 10 cols each (slots 0-9, 10-19, 20-29).
@@ -2171,5 +2294,104 @@ mod tests {
         gate.starve(t0);
         gate.clear();
         assert!(gate.should_attempt(t0));
+    }
+
+    // --- StarveGate backoff: sleep-balloon regression --------------
+
+    #[test]
+    fn holdoff_doubles_each_consecutive_starve_up_to_the_cap() {
+        // A display-sleep stretch winit never reports as `Occluded` must not
+        // poll forever at the original 4/s: each consecutive starve (no
+        // `clear()` in between, i.e. never actually revealed) should widen
+        // the holdoff, not repeat it.
+        let mut gate = StarveGate::new();
+        let t0 = Instant::now();
+        assert_eq!(gate.current_holdoff(), StarveGate::HOLDOFF); // fresh gate
+        gate.starve(t0);
+        assert_eq!(gate.current_holdoff(), Duration::from_millis(250));
+        gate.starve(t0);
+        assert_eq!(gate.current_holdoff(), Duration::from_millis(500));
+        gate.starve(t0);
+        assert_eq!(gate.current_holdoff(), Duration::from_secs(1));
+        gate.starve(t0);
+        assert_eq!(gate.current_holdoff(), Duration::from_secs(2));
+        gate.starve(t0);
+        assert_eq!(gate.current_holdoff(), Duration::from_secs(4));
+        gate.starve(t0);
+        assert_eq!(gate.current_holdoff(), Duration::from_secs(8));
+        // Further consecutive starves hold at the cap rather than growing
+        // unbounded — an all-night sleep must settle, not keep widening.
+        gate.starve(t0);
+        assert_eq!(gate.current_holdoff(), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn an_eight_hour_sleep_attempts_hundreds_not_hundreds_of_thousands_of_times() {
+        // The regression this backoff exists for: at the old flat 4/s, an
+        // 8-hour display sleep would attempt ~115,200 acquires. With the
+        // backoff ramped to its 8s cap, the same stretch should attempt on
+        // the order of a few thousand at most.
+        let mut gate = StarveGate::new();
+        let mut now = Instant::now();
+        let deadline = now + Duration::from_secs(8 * 3600);
+        let mut attempts = 0u32;
+        while now < deadline {
+            if gate.should_attempt(now) {
+                attempts += 1;
+                gate.starve(now);
+            }
+            now += Duration::from_millis(50); // finer than any holdoff in play
+        }
+        assert!(
+            attempts < 5_000,
+            "expected the backoff to bound an 8h sleep to a few thousand attempts, got {attempts}"
+        );
+    }
+
+    #[test]
+    fn clearing_resets_the_backoff_for_the_next_stretch() {
+        // One long starved stretch must not permanently slow down the NEXT
+        // one — a real reveal (`clear()`) has to reset the ramp back to the
+        // fast 250ms starting holdoff.
+        let mut gate = StarveGate::new();
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            gate.starve(t0);
+        }
+        assert_eq!(gate.current_holdoff(), Duration::from_secs(8));
+        gate.clear();
+        assert_eq!(gate.current_holdoff(), StarveGate::HOLDOFF);
+    }
+
+    // --- LostSurfaceBound: persistent-loss reconfigure spin (sleep balloon) --
+
+    #[test]
+    fn persistent_surface_loss_stops_earning_immediate_retries() {
+        // The sleep-balloon mechanism: Lost → reconfigure (fresh swapchain)
+        // → Retry → immediate request_redraw → Lost → ... unbounded while
+        // the GPU sleeps. The first couple of losses keep the fast path (the
+        // benign resize race must still settle in one round trip); from the
+        // third on, the caller must be told to starve, not retry.
+        let mut bound = LostSurfaceBound::new();
+        assert!(bound.record(), "1st loss: immediate retry (resize race)");
+        assert!(bound.record(), "2nd loss: one more for margin");
+        assert!(!bound.record(), "3rd loss: fall back to starve cadence");
+        // ...and it must STAY on the starve cadence, not oscillate back.
+        for _ in 0..100 {
+            assert!(!bound.record());
+        }
+    }
+
+    #[test]
+    fn a_successful_acquire_resets_the_lost_streak() {
+        // Distinct incidents get the fast path each time: a loss streak that
+        // ended in a real drawable (or reveal/resize) must not leave the next
+        // resize race starved.
+        let mut bound = LostSurfaceBound::new();
+        for _ in 0..10 {
+            bound.record();
+        }
+        bound.clear();
+        assert!(bound.record(), "fresh incident earns the fast path again");
     }
 }
