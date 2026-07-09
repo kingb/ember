@@ -29,7 +29,8 @@ use control::{ControlMsg, MoveTabTarget, PromotePaneTarget};
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims, LayoutNode,
     MoveEffect, MoveError, OscEvent, PaneId, Rect, RowKind, ScrollAmount, SessionId,
-    SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, resolve_rows,
+    SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, WispStyle,
+    WispStyleSelection, resolve_rows,
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
@@ -458,6 +459,17 @@ pub(crate) struct WispWindow {
     /// Last time `tick` actually advanced+rendered a frame (paces at
     /// `WISP_FRAME`, independent of how often `about_to_wait` itself runs).
     last_anim: Instant,
+    /// The concrete style this drag renders (v0.4.1's 5 wisp styles) —
+    /// resolved once per drag by `show`, from `Config::wisp_style`. Held
+    /// here (not re-resolved every tick) so a `random`-mode drag keeps the
+    /// SAME style for its whole lifetime, not a new roll every frame.
+    style: WispStyle,
+    /// Per-process drag sequence number, incremented on every `show` —
+    /// `random` mode's round-robin key (see `WispStyleSelection::resolve`).
+    /// Lives here (not `Shared`) because `WispWindow` itself already
+    /// persists across every drag in the process (lazily created once,
+    /// reused via show/hide — see the struct doc).
+    drag_seq: u32,
 }
 
 /// The wisp's fade-ramp state machine (Task 5 §2: "fade-in ~150ms at
@@ -527,12 +539,19 @@ impl WispWindow {
             velocity: (0.0, 0.0),
             since: now,
             last_anim: now,
+            style: WispStyle::Ember,
+            drag_seq: 0,
         })
     }
 
     /// Show the window and start its fade-in ramp. Called once per drag, on
-    /// the first carried transition.
-    fn show(&mut self) {
+    /// the first carried transition — also where this drag's concrete style
+    /// is resolved from `selection` (a `random` selection round-robins a
+    /// fresh style each call via `drag_seq`; a concrete selection just picks
+    /// that style every time).
+    fn show(&mut self, selection: WispStyleSelection) {
+        self.style = selection.resolve(self.drag_seq);
+        self.drag_seq = self.drag_seq.wrapping_add(1);
         self.window.set_visible(true);
         self.fade = WispFade::In {
             start: Instant::now(),
@@ -625,7 +644,7 @@ impl WispWindow {
         };
         let t = self.since.elapsed().as_secs_f32();
         self.renderer
-            .render(t, alpha * self.intensity_target, self.velocity);
+            .render(self.style, t, alpha * self.intensity_target, self.velocity);
         true
     }
 }
@@ -2851,7 +2870,7 @@ fn wisp_tick(
             };
         }
         if let WispSlot::Ready(w) = &mut shared.wisp {
-            w.show();
+            w.show(shared.config.wisp_style);
         }
     }
     let WispSlot::Ready(w) = &mut shared.wisp else {
