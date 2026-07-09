@@ -20,8 +20,13 @@ cd "$HOMEDIR/project/ember"
 # /bin/sh which reads neither. Prefer zsh (its .zshrc), then bash, so the demo
 # renders identically on macOS (default zsh) and inside the Linux container.
 export SHELL="$(command -v zsh || command -v bash || echo "${SHELL:-/bin/sh}")"
+# Trail-segment length matches the 15fps the app ships as the sparks default.
+export EMBER_SPARK_DT="${EMBER_SPARK_DT:-0.0667}"
 
-COMMON=(--width 1000 --height 620 --scale 2 --settle 900 --font-size 13 --ember-phase 1.6)
+# The campfire (warm gradient + ember-trail sparks) is the default look as of
+# 0.3.1, so every shot carries it — the docs should show what a user opens to.
+COMMON=(--width 1000 --height 620 --scale 2 --settle 900 --font-size 13 \
+  --backdrop --ember --ember-phase 1.6)
 
 shot() {
   local name="$1"; shift
@@ -38,6 +43,12 @@ shot splits-horizontal.png --split h --run "ls -la"         --run "git log --one
 
 # Tabs (the strip).
 shot tabs.png --tabs 4 --run "git log --oneline -6"
+
+# Surface mobility: a tab lifted mid-drag (tear-off / move between windows).
+shot tab-tearoff.png --tabs 4 --tab-drag 1 340 --run "git log --oneline -5"
+
+# Hold-to-wisp: the ember ring closing around the cursor before a pane lifts.
+shot hold-to-wisp.png --hold-ring 640 330 0.66 --run "git log --oneline -5"
 
 # Keyboard-shortcut cheat sheet.
 shot shortcuts.png --help-overlay
