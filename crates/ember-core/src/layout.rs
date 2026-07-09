@@ -162,6 +162,86 @@ impl LayoutNode {
         *ratio = (*ratio + signed / extent).clamp(min_r, 1.0 - min_r);
         true
     }
+
+    /// Grow `a_side`'s side of the split that **separates** `a_side` and
+    /// `b_side` by `delta` **physical pixels**. A divider is bordered by
+    /// exactly two panes; this identifies the split by BOTH of them rather
+    /// than by one pane + axis, which is ambiguous whenever that pane sits
+    /// inside more than one same-axis split (e.g. a left-leaning
+    /// `Split(H, Split(H, P1, P2), P3)`: `resize_pane(P2, H, ..)` would hit
+    /// the *inner* P1|P2 split first, even when the caller meant the outer
+    /// P2|P3 divider). The separating split is the unique node whose two
+    /// children respectively contain `a_side` and `b_side` — their nearest
+    /// common ancestor. Positive `delta` grows `a_side`. `area` is this
+    /// node's current rect; `min_px` is the smallest extent either child may
+    /// shrink to (the clamp, same semantics as [`resize_pane`]). Returns
+    /// whether a matching split was found and adjusted.
+    ///
+    /// [`resize_pane`]: LayoutNode::resize_pane
+    pub fn resize_split(
+        &mut self,
+        a_side: PaneId,
+        b_side: PaneId,
+        axis: Axis,
+        delta: f64,
+        area: Rect,
+        min_px: f64,
+    ) -> bool {
+        let LayoutNode::Split {
+            axis: split_axis,
+            ratio,
+            a,
+            b,
+        } = self
+        else {
+            return false;
+        };
+        let split_axis = *split_axis;
+        let a_has_a_side = a.contains(a_side);
+        let a_has_b_side = a.contains(b_side);
+        let b_has_a_side = b.contains(a_side);
+        let b_has_b_side = b.contains(b_side);
+
+        // This split's children hold one flanking pane each: it separates
+        // them, so it's the divider's split — adjust here regardless of
+        // depth. (Unlike `resize_pane`, we do NOT prefer a deeper match: a
+        // deeper split may contain one of the two panes without being their
+        // separator.) Handle both orderings defensively, though `a_side` is
+        // always spatially left/top of `b_side` (see `divider_at`), so it
+        // should always land in this split's `a` child.
+        let (grow_a, found) = if a_has_a_side && b_has_b_side {
+            (true, true)
+        } else if a_has_b_side && b_has_a_side {
+            (false, true)
+        } else {
+            (false, false)
+        };
+        if found {
+            if split_axis != axis {
+                return false;
+            }
+            let extent = axis_extent(axis, area);
+            if extent <= 0.0 {
+                return false;
+            }
+            let min_r = (min_px / extent).min(0.5);
+            let signed = if grow_a { delta } else { -delta };
+            *ratio = (*ratio + signed / extent).clamp(min_r, 1.0 - min_r);
+            return true;
+        }
+
+        // Both panes live in the same child: this split doesn't separate
+        // them, so descend without touching its ratio.
+        let (ra, rb) = split_child_rects(split_axis, *ratio, area);
+        if a_has_a_side && a_has_b_side {
+            return a.resize_split(a_side, b_side, axis, delta, ra, min_px);
+        }
+        if b_has_a_side && b_has_b_side {
+            return b.resize_split(a_side, b_side, axis, delta, rb, min_px);
+        }
+        // Neither pane found together in either subtree (malformed input).
+        false
+    }
 }
 
 /// The two child rects of a split, given its axis/ratio and outer area.
@@ -426,5 +506,176 @@ mod tests {
                 (PaneId(3), Rect::new(50.0, 50.0, 50.0, 50.0)),
             ]
         );
+    }
+
+    // --- resize_split: divider identified by BOTH flanking panes ----------
+    //
+    // Regression coverage for the tab-merge divider-resize bug: `resize_pane`
+    // identifies a divider by one pane + axis and always adjusts the
+    // *deepest* enclosing same-axis split, so in a left-leaning tree
+    // `Split(H, Split(H, P1, P2), P3)`, resizing what the user sees as the
+    // P2|P3 divider (a-side pane P2) actually moved the inner P1|P2 ratio.
+    // `resize_split` instead takes both flanking panes and adjusts the split
+    // that is their separating ancestor, so it can't pick the wrong one.
+
+    fn outer_ratio(tree: &LayoutNode) -> f64 {
+        match tree {
+            LayoutNode::Split { ratio, .. } => *ratio,
+            LayoutNode::Pane { .. } => panic!("expected split"),
+        }
+    }
+
+    fn inner_ratio(tree: &LayoutNode, side: &str) -> f64 {
+        match tree {
+            LayoutNode::Split { a, b, .. } => match side {
+                "a" => outer_ratio(a),
+                "b" => outer_ratio(b),
+                _ => panic!("side must be \"a\" or \"b\""),
+            },
+            LayoutNode::Pane { .. } => panic!("expected split"),
+        }
+    }
+
+    #[test]
+    fn resize_split_left_leaning_outer_divider_moves_outer_ratio_only() {
+        // Split(H, Split(H, P1, P2), P3) — panes read P1 | P2 | P3.
+        let mut tree = LayoutNode::split(
+            Axis::Horizontal,
+            0.5,
+            LayoutNode::split(Axis::Horizontal, 0.5, p(1), p(2)),
+            p(3),
+        );
+        let area = Rect::new(0.0, 0.0, 120.0, 100.0);
+        // The P2|P3 divider: a-side P2, b-side P3.
+        let moved = tree.resize_split(PaneId(2), PaneId(3), Axis::Horizontal, 10.0, area, 5.0);
+        assert!(moved);
+        assert_eq!(outer_ratio(&tree), 0.5 + 10.0 / 120.0);
+        assert_eq!(inner_ratio(&tree, "a"), 0.5); // P1|P2 (inner) untouched
+    }
+
+    #[test]
+    fn resize_split_left_leaning_inner_divider_moves_inner_ratio_only() {
+        let mut tree = LayoutNode::split(
+            Axis::Horizontal,
+            0.5,
+            LayoutNode::split(Axis::Horizontal, 0.5, p(1), p(2)),
+            p(3),
+        );
+        let area = Rect::new(0.0, 0.0, 120.0, 100.0);
+        // The P1|P2 divider: a-side P1, b-side P2. The inner split's rect is
+        // the left 60px of the outer area (outer ratio 0.5 of 120).
+        let moved = tree.resize_split(PaneId(1), PaneId(2), Axis::Horizontal, 10.0, area, 5.0);
+        assert!(moved);
+        assert_eq!(outer_ratio(&tree), 0.5); // outer (P2|P3-separating) untouched
+        assert_eq!(inner_ratio(&tree, "a"), 0.5 + 10.0 / 60.0);
+    }
+
+    #[test]
+    fn resize_split_right_leaning_outer_divider_moves_outer_ratio_only() {
+        // Split(H, P1, Split(H, P2, P3)) — panes read P1 | P2 | P3.
+        let mut tree = LayoutNode::split(
+            Axis::Horizontal,
+            0.5,
+            p(1),
+            LayoutNode::split(Axis::Horizontal, 0.5, p(2), p(3)),
+        );
+        let area = Rect::new(0.0, 0.0, 120.0, 100.0);
+        // The P1|P2 divider: a-side P1, b-side P2.
+        let moved = tree.resize_split(PaneId(1), PaneId(2), Axis::Horizontal, 10.0, area, 5.0);
+        assert!(moved);
+        assert_eq!(outer_ratio(&tree), 0.5 + 10.0 / 120.0);
+        assert_eq!(inner_ratio(&tree, "b"), 0.5); // P2|P3 (inner) untouched
+    }
+
+    #[test]
+    fn resize_split_right_leaning_inner_divider_moves_inner_ratio_only() {
+        let mut tree = LayoutNode::split(
+            Axis::Horizontal,
+            0.5,
+            p(1),
+            LayoutNode::split(Axis::Horizontal, 0.5, p(2), p(3)),
+        );
+        let area = Rect::new(0.0, 0.0, 120.0, 100.0);
+        // The P2|P3 divider: a-side P2, b-side P3. The inner split's rect is
+        // the right 60px of the outer area.
+        let moved = tree.resize_split(PaneId(2), PaneId(3), Axis::Horizontal, 10.0, area, 5.0);
+        assert!(moved);
+        assert_eq!(outer_ratio(&tree), 0.5); // outer (P1|P2-separating) untouched
+        assert_eq!(inner_ratio(&tree, "b"), 0.5 + 10.0 / 60.0);
+    }
+
+    #[test]
+    fn resize_split_vertical_nest_moves_correct_ratio() {
+        // Split(V, Split(V, P1, P2), P3) — panes read P1 above P2 above P3.
+        let mut tree = LayoutNode::split(
+            Axis::Vertical,
+            0.5,
+            LayoutNode::split(Axis::Vertical, 0.5, p(1), p(2)),
+            p(3),
+        );
+        let area = Rect::new(0.0, 0.0, 100.0, 120.0);
+        // Outer divider (P2|P3).
+        let moved = tree.resize_split(PaneId(2), PaneId(3), Axis::Vertical, 10.0, area, 5.0);
+        assert!(moved);
+        assert_eq!(outer_ratio(&tree), 0.5 + 10.0 / 120.0);
+        assert_eq!(inner_ratio(&tree, "a"), 0.5);
+
+        // Inner divider (P1|P2) on a fresh tree of the same shape.
+        let mut tree2 = LayoutNode::split(
+            Axis::Vertical,
+            0.5,
+            LayoutNode::split(Axis::Vertical, 0.5, p(1), p(2)),
+            p(3),
+        );
+        let moved2 = tree2.resize_split(PaneId(1), PaneId(2), Axis::Vertical, 10.0, area, 5.0);
+        assert!(moved2);
+        assert_eq!(outer_ratio(&tree2), 0.5);
+        assert_eq!(inner_ratio(&tree2, "a"), 0.5 + 10.0 / 60.0);
+    }
+
+    #[test]
+    fn resize_split_mixed_axis_nest_does_not_confuse_axes() {
+        // Split(H, P1, Split(V, P2, P3)) — P1 beside a P2-above-P3 stack.
+        let mut tree = LayoutNode::split(
+            Axis::Horizontal,
+            0.5,
+            p(1),
+            LayoutNode::split(Axis::Vertical, 0.5, p(2), p(3)),
+        );
+        let area = Rect::new(0.0, 0.0, 100.0, 100.0);
+        // Outer P1|P2 divider is a Horizontal-axis divider.
+        let moved = tree.resize_split(PaneId(1), PaneId(2), Axis::Horizontal, 10.0, area, 5.0);
+        assert!(moved);
+        assert_eq!(outer_ratio(&tree), 0.5 + 10.0 / 100.0);
+        assert_eq!(inner_ratio(&tree, "b"), 0.5); // inner V-split untouched
+
+        // Inner P2|P3 divider is a Vertical-axis divider, on a fresh tree.
+        let mut tree2 = LayoutNode::split(
+            Axis::Horizontal,
+            0.5,
+            p(1),
+            LayoutNode::split(Axis::Vertical, 0.5, p(2), p(3)),
+        );
+        let moved2 = tree2.resize_split(PaneId(2), PaneId(3), Axis::Vertical, 10.0, area, 5.0);
+        assert!(moved2);
+        assert_eq!(outer_ratio(&tree2), 0.5); // outer H-split untouched
+        // Inner split's rect is the right half (50x100) of the outer area.
+        assert_eq!(inner_ratio(&tree2, "b"), 0.5 + 10.0 / 100.0);
+    }
+
+    #[test]
+    fn resize_split_clamps_to_min_px() {
+        let mut tree = LayoutNode::split(Axis::Horizontal, 0.5, p(1), p(2));
+        let area = Rect::new(0.0, 0.0, 100.0, 100.0);
+        // A huge negative delta should clamp a_side (P1) down to min_px, not
+        // go negative or push b_side below its own minimum.
+        let moved = tree.resize_split(PaneId(1), PaneId(2), Axis::Horizontal, -1000.0, area, 10.0);
+        assert!(moved);
+        assert_eq!(outer_ratio(&tree), 0.1); // min_px 10 / extent 100
+
+        let mut tree2 = LayoutNode::split(Axis::Horizontal, 0.5, p(1), p(2));
+        let moved2 = tree2.resize_split(PaneId(1), PaneId(2), Axis::Horizontal, 1000.0, area, 10.0);
+        assert!(moved2);
+        assert_eq!(outer_ratio(&tree2), 0.9); // 1.0 - min_r
     }
 }

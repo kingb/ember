@@ -46,9 +46,26 @@ pub enum LayoutCommand {
         title: String,
     },
     /// Grow `target`'s side of the nearest enclosing split of `axis` by `delta`
-    /// physical pixels. Pane-relative — no divider identity.
+    /// physical pixels. Pane-relative — no divider identity. Used by keyboard
+    /// resize, where there's only ever one pane (the focused one) to key off.
     ResizePane {
         target: PaneId,
+        axis: Axis,
+        delta: f64,
+        /// Minimum extent (px) either child may shrink to (the clamp).
+        min_px: f64,
+    },
+    /// Grow `a_side`'s side of the split that separates `a_side` and `b_side`
+    /// by `delta` physical pixels. Divider-relative: identifies the split by
+    /// BOTH panes flanking the divider, so it can't be confused with a
+    /// same-axis split elsewhere in the tree (see [`LayoutNode::resize_split`]
+    /// for why `ResizePane`'s single-pane targeting is ambiguous). Used by
+    /// mouse divider drag, which always knows both flanking panes.
+    ///
+    /// [`LayoutNode::resize_split`]: crate::layout::LayoutNode::resize_split
+    ResizeSplit {
+        a_side: PaneId,
+        b_side: PaneId,
         axis: Axis,
         delta: f64,
         /// Minimum extent (px) either child may shrink to (the clamp).
@@ -214,6 +231,17 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
             // Geometry (and thus the backend resize) is reconciled by the app;
             // core only mutates the ratio.
             tab.root.resize_pane(target, axis, delta, viewport, min_px);
+        }
+        LayoutCommand::ResizeSplit {
+            a_side,
+            b_side,
+            axis,
+            delta,
+            min_px,
+        } => {
+            let tab = &mut tree.tabs[tree.active];
+            tab.root
+                .resize_split(a_side, b_side, axis, delta, viewport, min_px);
         }
         LayoutCommand::CloseTab { tab } => {
             if let Some(idx) = tree.tabs.iter().position(|t| t.id == tab) {
@@ -482,6 +510,79 @@ mod tests {
             w(&after, PaneId(1)) < w(&before, PaneId(1)),
             "p3 grew → p1 should shrink: {after:?}"
         );
+    }
+
+    #[test]
+    fn resize_split_targets_the_separating_divider_not_the_deepest_match() {
+        // The left-leaning tree from the tab-merge bug: H-split[ H-split[p1,p2],
+        // p3 ] — panes read p1 | p2 | p3. This shape isn't reachable through a
+        // sequence of `SplitPane`s (which always grows a leaf into a 2-pane
+        // split, never wraps an existing subtree), but IS what a tab-merge
+        // drop builds — so construct it directly, as tab-merge does.
+        // `ResizePane { target: p2, .. }` (the old, ambiguous, single-pane
+        // resolution) always hits the INNER p1|p2 split because it's deeper;
+        // a user dragging the p2|p3 divider would move the wrong one.
+        // `ResizeSplit` with both flanking panes must hit the OUTER p2|p3
+        // divider instead.
+        let mut tree = single_tab();
+        tree.tabs[0].root = LayoutNode::split(
+            Axis::Horizontal,
+            0.5,
+            LayoutNode::split(
+                Axis::Horizontal,
+                0.5,
+                LayoutNode::pane(PaneId(1), SessionId::new("s1")),
+                LayoutNode::pane(PaneId(2), SessionId::new("s2")),
+            ),
+            LayoutNode::pane(PaneId(3), SessionId::new("s3")),
+        );
+        apply(
+            &mut tree,
+            LayoutCommand::ResizeSplit {
+                a_side: PaneId(2),
+                b_side: PaneId(3),
+                axis: Axis::Horizontal,
+                delta: 10.0,
+                min_px: 0.0,
+            },
+            vp(),
+        );
+        let (outer_ratio, inner_ratio) = match &tree.active_tab().root {
+            LayoutNode::Split {
+                ratio: outer, a, ..
+            } => match a.as_ref() {
+                LayoutNode::Split { ratio: inner, .. } => (*outer, *inner),
+                _ => panic!("expected nested split"),
+            },
+            _ => panic!("expected split"),
+        };
+        // The OUTER (p2|p3-separating) ratio moved; the INNER p1|p2 ratio
+        // (the bug's wrong target) is untouched.
+        assert_eq!(outer_ratio, 0.5 + 10.0 / 100.0);
+        assert_eq!(inner_ratio, 0.5);
+        // Sanity via rendered rects: p3 (outside the divider's group) shrank;
+        // p1 and p2 (both inside the group the divider grew) grew together,
+        // in lockstep — that's the inner ratio staying fixed while the
+        // group's total share of the window increased.
+        let before = layout(
+            &LayoutNode::split(
+                Axis::Horizontal,
+                0.5,
+                LayoutNode::split(
+                    Axis::Horizontal,
+                    0.5,
+                    LayoutNode::pane(PaneId(1), SessionId::new("s1")),
+                    LayoutNode::pane(PaneId(2), SessionId::new("s2")),
+                ),
+                LayoutNode::pane(PaneId(3), SessionId::new("s3")),
+            ),
+            vp(),
+        );
+        let after = layout(&tree.active_tab().root, vp());
+        let w = |rs: &[(PaneId, Rect)], id| rs.iter().find(|(p, _)| *p == id).unwrap().1.width;
+        assert!(w(&after, PaneId(1)) > w(&before, PaneId(1)));
+        assert!(w(&after, PaneId(2)) > w(&before, PaneId(2)));
+        assert!(w(&after, PaneId(3)) < w(&before, PaneId(3)));
     }
 
     #[test]
