@@ -69,6 +69,9 @@ _commit "2026-01-05T16:40:00" "Enable release LTO"
 # files carry the wall-clock time of this run, which shows up in listings and
 # makes otherwise-identical shots differ run to run (and would flag false
 # positives in the macOS/Linux parity comparison).
-find "$HOMEDIR/project/ember" -exec touch -t 202601051200 {} +
+# Pin the project dir too, not just its contents: `ls -la` inside the project
+# shows `..` (the project dir's own mtime), so leaving it unpinned made the
+# splits-horizontal shot differ run-to-run and false-flag the render diff.
+find "$HOMEDIR/project" -exec touch -t 202601051200 {} +
 
 echo "demo env ready: $HOMEDIR"
