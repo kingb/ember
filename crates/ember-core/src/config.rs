@@ -35,6 +35,10 @@ pub struct Config {
     /// it needs (feature-detected on first use, degrading silently for the
     /// rest of the session). On by default.
     pub wisp: bool,
+    /// Which of the wisp's visual styles to draw — see [`WispStyleSelection`].
+    /// Orthogonal to `wisp` (the on/off switch): this only matters while
+    /// `wisp` is true. Default `ember` (the original look, unchanged).
+    pub wisp_style: WispStyleSelection,
 }
 
 impl Default for Config {
@@ -47,6 +51,104 @@ impl Default for Config {
             option_as_meta: false,
             developer_mode: false,
             wisp: true,
+            wisp_style: WispStyleSelection::Ember,
+        }
+    }
+}
+
+/// A concrete wisp visual style (no "random" case) — what [`WispStyleSelection`]
+/// resolves to and what the render layer's style dispatch (`ember-render`'s
+/// `wisp::wisp_quads`) actually matches on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WispStyle {
+    /// The original look (pre-v0.4.1): pulsing amber/accent core, an
+    /// orbiting ring of sparks, a velocity trail.
+    #[default]
+    Ember,
+    /// A faceted chunk of hot coal: an angular core with white-hot cracks,
+    /// sparks flung outward from the edges.
+    Coal,
+    /// The literal will-o'-the-wisp: a soft, cool, breathing orb with a
+    /// wispy vapor tail. No hard sparks.
+    WillOWisp,
+    /// A brilliant white-hot head with a long dramatic tail streaming
+    /// opposite the direction of travel.
+    Comet,
+    /// A wobbling molten droplet (World of Goo homage) with slow drips.
+    Goo,
+}
+
+impl WispStyle {
+    /// All five concrete styles, in a fixed order — the round-robin
+    /// sequence [`WispStyleSelection::resolve`]'s `Random` case walks, and
+    /// the order the `--wisp-preview` tooling and design docs enumerate them
+    /// in.
+    pub const ALL: [WispStyle; 5] = [
+        WispStyle::Ember,
+        WispStyle::Coal,
+        WispStyle::WillOWisp,
+        WispStyle::Comet,
+        WispStyle::Goo,
+    ];
+}
+
+/// The `wisp_style` config knob: one of the five concrete [`WispStyle`]s, or
+/// `Random` — a concrete style is picked fresh for each drag (see
+/// [`WispStyleSelection::resolve`]), not once per process. Serializes the
+/// same as [`WispStyle`] (lowercase), plus the extra `"random"` value.
+///
+/// **Backcompat:** an unrecognized string — a typo, or a value a *future*
+/// Ember version writes that this build predates — falls back to `Ember`
+/// rather than failing to load the whole config; see
+/// [`deserialize_wisp_style`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WispStyleSelection {
+    #[default]
+    Ember,
+    Coal,
+    WillOWisp,
+    Comet,
+    Goo,
+    /// Pick a concrete style per drag (round-robins [`WispStyle::ALL`] —
+    /// see [`Self::resolve`]).
+    Random,
+}
+
+impl<'de> Deserialize<'de> for WispStyleSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "coal" => Self::Coal,
+            "willowisp" => Self::WillOWisp,
+            "comet" => Self::Comet,
+            "goo" => Self::Goo,
+            "random" => Self::Random,
+            // "ember", plus any typo or unrecognized value (including a
+            // style name from a newer Ember this build doesn't know about).
+            _ => Self::Ember,
+        })
+    }
+}
+
+impl WispStyleSelection {
+    /// Resolve to a concrete [`WispStyle`] to actually render this drag.
+    /// `Random` round-robins [`WispStyle::ALL`] keyed by `counter` (a
+    /// caller-owned per-process drag sequence number) rather than re-rolling
+    /// — deterministic and cheap, but guarantees variety across successive
+    /// drags instead of risking the same style twice in a row.
+    pub fn resolve(self, counter: u32) -> WispStyle {
+        match self {
+            Self::Ember => WispStyle::Ember,
+            Self::Coal => WispStyle::Coal,
+            Self::WillOWisp => WispStyle::WillOWisp,
+            Self::Comet => WispStyle::Comet,
+            Self::Goo => WispStyle::Goo,
+            Self::Random => WispStyle::ALL[(counter as usize) % WispStyle::ALL.len()],
         }
     }
 }
@@ -182,6 +284,7 @@ mod tests {
         assert_eq!(c.background.ember_fps, 15);
         assert!(c.visual_bell); // visual bell on by default
         assert!(c.wisp); // decorative-only; safe to default on
+        assert_eq!(c.wisp_style, WispStyleSelection::Ember); // today's look, unchanged
     }
 
     #[test]
@@ -244,5 +347,78 @@ mod tests {
         assert!(s.contains("sparks = \"always\""), "serialized as: {s}");
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(back.background.sparks, SparksMode::Always);
+    }
+
+    // --- wisp_style: 5 styles + random, backcompat, resolution --------------
+
+    #[test]
+    fn wisp_style_missing_defaults_to_ember() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.wisp_style, WispStyleSelection::Ember);
+    }
+
+    #[test]
+    fn wisp_style_accepts_all_five_names_plus_random() {
+        for (s, want) in [
+            ("ember", WispStyleSelection::Ember),
+            ("coal", WispStyleSelection::Coal),
+            ("willowisp", WispStyleSelection::WillOWisp),
+            ("comet", WispStyleSelection::Comet),
+            ("goo", WispStyleSelection::Goo),
+            ("random", WispStyleSelection::Random),
+        ] {
+            let toml_src = format!("wisp_style = \"{s}\"\n");
+            let c: Config = toml::from_str(&toml_src).unwrap();
+            assert_eq!(c.wisp_style, want, "wisp_style = \"{s}\"");
+        }
+    }
+
+    #[test]
+    fn wisp_style_unknown_value_falls_back_to_ember() {
+        let c: Config = toml::from_str("wisp_style = \"glorbnax\"\n").unwrap();
+        assert_eq!(c.wisp_style, WispStyleSelection::Ember);
+    }
+
+    #[test]
+    fn wisp_style_roundtrips_through_toml() {
+        for sel in [
+            WispStyleSelection::Ember,
+            WispStyleSelection::Coal,
+            WispStyleSelection::WillOWisp,
+            WispStyleSelection::Comet,
+            WispStyleSelection::Goo,
+            WispStyleSelection::Random,
+        ] {
+            let c = Config {
+                wisp_style: sel,
+                ..Config::default()
+            };
+            let s = toml::to_string(&c).unwrap();
+            let back: Config = toml::from_str(&s).unwrap();
+            assert_eq!(back.wisp_style, sel, "roundtrip of {sel:?} via: {s}");
+        }
+    }
+
+    #[test]
+    fn wisp_style_resolve_is_identity_for_concrete_styles() {
+        assert_eq!(WispStyleSelection::Ember.resolve(0), WispStyle::Ember);
+        assert_eq!(WispStyleSelection::Coal.resolve(7), WispStyle::Coal);
+        assert_eq!(
+            WispStyleSelection::WillOWisp.resolve(99),
+            WispStyle::WillOWisp
+        );
+        assert_eq!(WispStyleSelection::Comet.resolve(1), WispStyle::Comet);
+        assert_eq!(WispStyleSelection::Goo.resolve(2), WispStyle::Goo);
+    }
+
+    #[test]
+    fn wisp_style_resolve_random_round_robins_and_varies() {
+        let seen: Vec<WispStyle> = (0..5)
+            .map(|i| WispStyleSelection::Random.resolve(i))
+            .collect();
+        // All 5 concrete styles appear exactly once across 5 consecutive draws.
+        assert_eq!(seen, WispStyle::ALL.to_vec());
+        // Wraps back to the start on the 6th draw.
+        assert_eq!(WispStyleSelection::Random.resolve(5), WispStyle::Ember);
     }
 }

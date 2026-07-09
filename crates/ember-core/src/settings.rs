@@ -12,7 +12,7 @@
 //! row's logic only touches its own `Config` parameter (no captured
 //! environment), so non-capturing closures coerce to `fn` pointers for free.
 
-use crate::config::{Config, SparksMode};
+use crate::config::{Config, SparksMode, WispStyleSelection};
 
 /// What kind of row this is, driving both rendering and key-handling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,6 +198,30 @@ fn adjust_scrim(c: &mut Config, dir: f32) {
     c.background.scrim = (c.background.scrim + 0.05 * dir).clamp(0.0, 1.0);
 }
 
+/// The wisp style dial's six-state cycle: `ember → coal → willowisp →
+/// comet → goo → random → ember`. Direction-agnostic (like the sparks
+/// dial): always steps forward regardless of `dir`.
+fn fmt_wisp_style(c: &Config) -> String {
+    match c.wisp_style {
+        WispStyleSelection::Ember => "ember".to_string(),
+        WispStyleSelection::Coal => "coal".to_string(),
+        WispStyleSelection::WillOWisp => "willowisp".to_string(),
+        WispStyleSelection::Comet => "comet".to_string(),
+        WispStyleSelection::Goo => "goo".to_string(),
+        WispStyleSelection::Random => "random".to_string(),
+    }
+}
+fn adjust_wisp_style(c: &mut Config, _dir: f32) {
+    c.wisp_style = match c.wisp_style {
+        WispStyleSelection::Ember => WispStyleSelection::Coal,
+        WispStyleSelection::Coal => WispStyleSelection::WillOWisp,
+        WispStyleSelection::WillOWisp => WispStyleSelection::Comet,
+        WispStyleSelection::Comet => WispStyleSelection::Goo,
+        WispStyleSelection::Goo => WispStyleSelection::Random,
+        WispStyleSelection::Random => WispStyleSelection::Ember,
+    };
+}
+
 fn fmt_backdrop_image(c: &Config) -> String {
     match c.background.image.as_deref() {
         Some(p) => {
@@ -324,6 +348,16 @@ pub fn setting_rows() -> &'static [SettingRow] {
             adjust: None,
             help: Help::Inline(
                 "A background image drawn behind the cells. Set the path in config.toml, not here.",
+            ),
+        },
+        SettingRow {
+            label: "Wisp style",
+            kind: RowKind::Cycle,
+            format: fmt_wisp_style,
+            adjust: Some(adjust_wisp_style),
+            help: Help::Inline(
+                "The glowing drag token's look while carrying a tab/pane between windows: \
+                 ember, coal, will-o'-the-wisp, comet, goo, or random (a fresh pick each drag).",
             ),
         },
         SettingRow {
@@ -590,6 +624,41 @@ mod tests {
         c.background.scrim = 0.0;
         adjust(&mut c, -1.0);
         assert_eq!(c.background.scrim, 0.0);
+    }
+
+    #[test]
+    fn wisp_style_row_is_a_cycle() {
+        assert_eq!(row("Wisp style").kind, RowKind::Cycle);
+    }
+
+    #[test]
+    fn wisp_style_cycle_mutates_only_wisp_style() {
+        let mut c = Config::default();
+        let before = c.clone();
+        (row("Wisp style").adjust.unwrap())(&mut c, 1.0);
+        assert_ne!(c.wisp_style, before.wisp_style);
+        assert_eq!(c.background, before.background);
+        assert_eq!(c.wisp, before.wisp);
+    }
+
+    #[test]
+    fn wisp_style_cycle_visits_all_six_states_and_wraps() {
+        // `Config::default()` already starts at `Ember` — the cycle's home
+        // position.
+        let mut c = Config::default();
+        let adjust = row("Wisp style").adjust.unwrap();
+        let expected = [
+            WispStyleSelection::Coal,
+            WispStyleSelection::WillOWisp,
+            WispStyleSelection::Comet,
+            WispStyleSelection::Goo,
+            WispStyleSelection::Random,
+            WispStyleSelection::Ember,
+        ];
+        for want in expected {
+            adjust(&mut c, 1.0);
+            assert_eq!(c.wisp_style, want);
+        }
     }
 
     #[test]
