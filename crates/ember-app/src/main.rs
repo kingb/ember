@@ -1922,6 +1922,22 @@ impl ApplicationHandler<EmberEvent> for App {
             if let MorphTick::Running(deadline) = w.tick_morph(now) {
                 next_wake = Some(next_wake.map_or(deadline, |d| d.min(deadline)));
             }
+            // Carry-time source vanish: re-check whether this
+            // window's own carried-surface exclusion can take visual effect
+            // yet — cheap (`carried_exclusion_live` gates on a field read)
+            // for every window NOT currently dragging, and idempotent for
+            // the one that is (`apply_carried_exclusion` no-ops once
+            // already applied). This is what turns "suck-in just finished"
+            // into "now filter/hide" for a drag whose motion has gone
+            // still (no further `CursorMoved`/`ctl drag` tick to piggyback
+            // the transition on, same reasoning as `tick_spring_load`).
+            if w.carried_exclusion_live() {
+                let carried = shared
+                    .drag
+                    .as_ref()
+                    .is_some_and(|d| d.source_window == w.renderer.window().id() && d.carried);
+                w.apply_carried_exclusion(shared, carried);
+            }
             // Spring-loaded tab select (finding #2): fire a pending strip
             // dwell even once the pointer goes perfectly still (no more
             // motion ticks to piggyback on) — the same `tick_hold`/
@@ -2483,6 +2499,12 @@ fn cancel_drag_everywhere(windows: &mut HashMap<WindowId, WindowState>, shared: 
         // source window may have closed mid-drag (`clear_drag_on_window_close`
         // already handles that path); a missing source here is a no-op.
         if let Some(w) = windows.get_mut(&drag.source_window) {
+            // Carry-time source vanish: "pops back exactly where
+            // it was" — re-show the OS window / restore the filtered
+            // layout BEFORE the pour-out below repaints over it, so the
+            // very first frame of the pour-out is already showing the
+            // real, restored content, not a stale exclusion.
+            w.clear_carried_exclusion(shared);
             let rect = w.viewport();
             let grab = w.cursor;
             w.start_pour_out(shared, rect, grab);

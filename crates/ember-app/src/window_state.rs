@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 use ember_core::{
     Axis, BackendControl, BackendHandle, Direction, DropZone, GridDims, LayoutCommand,
     LayoutEffect, PaneId, Rect, RowKind, ScrollAmount, SessionBackend, SessionId, SettingsRowView,
-    SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, apply, drop_zone_for, layout, setting_rows,
+    SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, apply, drop_zone_for, layout, remove_pane,
+    setting_rows,
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
@@ -325,6 +326,38 @@ pub(crate) enum MorphTick {
     Running(Instant),
 }
 
+// --- Carry-time source vanish (docs/design/2026-07-07-surface-
+// drag-wisp-design.md's "sucked into a wisp… carry it anywhere"): the design
+// says the carried surface leaves its SOURCE the instant the suck-in
+// finishes — not just the momentary collapse animation, the pane/tab/window
+// itself stops being on-screen there until a drop lands it (or a cancel
+// pours it back). Purely a rendering-time exclusion: `self.tree` is NEVER
+// touched by this — a drop is still exactly one `move_surface` call, a
+// cancel is still zero tree mutation.
+
+/// What a torn-off drag visually excludes from THIS (source) window's own
+/// render, once its suck-in has finished. Set alongside the tear-off
+/// (`start_pane_drag`/`update_drag`'s tab-tear-off branch), cleared the
+/// instant the drag resolves ([`WindowState::clear_carried_exclusion`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarriedExclusion {
+    /// A single pane, still part of a multi-pane tab: `sync_layout`
+    /// computes rects on a CLONED, pane-removed tree
+    /// ([`ember_core::remove_pane`]) so the sibling visually re-flows into
+    /// the freed space.
+    Pane(PaneId),
+    /// A whole tab, in a window that has others: hidden from the strip's
+    /// `TabLabel` list — the revealed/active tab (already switched at
+    /// tear-off, see `update_drag`'s `origin_tab`/`revert_target_tab`
+    /// handling) keeps rendering normally underneath.
+    Tab(TabId),
+    /// The dragged tab IS this window's only tab: excluding it would leave
+    /// an empty strip/viewport, so instead the WHOLE OS window hides
+    /// (`set_visible(false)`) — see [`WindowState::apply_carried_exclusion`]'s
+    /// doc for why this one case additionally waits for `carried`.
+    WholeWindow,
+}
+
 /// Everything tied to a single window and its surface.
 pub(crate) struct WindowState {
     pub(crate) renderer: Renderer,
@@ -441,6 +474,19 @@ pub(crate) struct WindowState {
     /// `None` outside a live morph; self-terminating (clears itself the tick
     /// its duration elapses), never cancelled early.
     morph: Option<MorphAnim>,
+    /// What a live drag sourced from THIS window is visually excluding —
+    /// see [`CarriedExclusion`]'s doc. Set at tear-off; `None` outside a
+    /// drag this window originated.
+    carried_exclusion: Option<CarriedExclusion>,
+    /// Whether `carried_exclusion` has actually been made visible yet
+    /// (suck-in finished and, for `WholeWindow`, the carry has left this
+    /// window) — see [`WindowState::apply_carried_exclusion`]. Tracked
+    /// separately from `carried_exclusion.is_some()` so `sync_layout`
+    /// keeps rendering normally WHILE the suck-in is still collapsing over
+    /// the real content, and so `clear_carried_exclusion` only undoes work
+    /// that was actually done (a very fast release inside the suck-in
+    /// window hid/filtered nothing).
+    exclusion_applied: bool,
 }
 
 impl WindowState {
@@ -495,6 +541,8 @@ impl WindowState {
             spring_load: None,
             hold: None,
             morph: None,
+            carried_exclusion: None,
+            exclusion_applied: false,
         }
     }
 
@@ -982,7 +1030,30 @@ impl WindowState {
         let tab = self.active_tab();
         let focus_pane = tab.focus;
         let sessions: HashMap<PaneId, SessionId> = tab.root.leaves().into_iter().collect();
-        let rects = layout(&tab.root, vp);
+        // Carried-pane visual exclusion: once `apply_carried_
+        // exclusion` has flipped this on, rects are computed on a CLONED,
+        // pane-removed tree — `self.tree` itself is never mutated here (a
+        // drop is still one pure `move_surface`, a cancel still zero
+        // mutation) — so the sibling visually re-flows into the freed
+        // space. `exclusion_applied` (not just `carried_exclusion.is_some()`)
+        // gates this: while the suck-in is still collapsing over the real
+        // content, layout stays normal underneath it.
+        let excluded_pane = match self.carried_exclusion {
+            Some(CarriedExclusion::Pane(p)) if self.exclusion_applied => Some(p),
+            _ => None,
+        };
+        let rects = match excluded_pane {
+            Some(p) => match remove_pane(tab.root.clone(), p).0 {
+                Some(root) => layout(&root, vp),
+                // Unreachable in practice: a pane drag never carries a
+                // tab's sole pane (`pane_drag_source` upgrades that case to
+                // a whole-`Tab` drag instead) — falling back to the
+                // unfiltered layout is safer than an empty screen if that
+                // invariant is ever violated.
+                None => layout(&tab.root, vp),
+            },
+            None => layout(&tab.root, vp),
+        };
 
         let mut visible = Vec::with_capacity(rects.len());
         let mut focused_session: Option<SessionId> = None;
@@ -1019,11 +1090,21 @@ impl WindowState {
             self.belled_tabs.remove(&id);
         }
         let belled = &self.belled_tabs;
+        // Carried-tab visual exclusion: drop the dragged tab's
+        // label from the strip entirely once applied — same `exclusion_
+        // applied` gate as the pane case above. The revert tab
+        // (`update_drag`'s tear-off) is already the displayed `active` one,
+        // so nothing else here needs to change.
+        let excluded_tab = match self.carried_exclusion {
+            Some(CarriedExclusion::Tab(id)) if self.exclusion_applied => Some(id),
+            _ => None,
+        };
         let tabs: Vec<TabLabel> = self
             .tree
             .tabs
             .iter()
             .enumerate()
+            .filter(|(_, t)| Some(t.id) != excluded_tab)
             .map(|(i, t)| {
                 let editing = editing_tab == Some(i);
                 TabLabel {
@@ -1834,7 +1915,13 @@ impl WindowState {
             SurfaceRef::Pane { .. } => rect,
             SurfaceRef::Tab { .. } => self.tab_morph_rect(),
         };
+        // Carry-time source vanish: arm the exclusion now, apply
+        // it immediately after — a no-op while the suck-in above is still
+        // live (wisp on), but instant when it no-opped (wisp off/reduced
+        // motion: "or tear-off, if no morph").
+        self.begin_carried_exclusion(surface);
         self.start_suck_in(shared, morph_rect, (x, y));
+        self.apply_carried_exclusion(shared, false);
     }
 
     /// Advance a live hold-to-wisp gesture by one tick (`about_to_wait`'s
@@ -1980,6 +2067,108 @@ impl WindowState {
         self.renderer
             .set_morph(Some((rect, grab, t01, anim.inward)));
         MorphTick::Running(now + MORPH_FRAME)
+    }
+
+    /// Which [`CarriedExclusion`] a torn-off `surface` should visually apply
+    /// on THIS (source) window — mirrors [`Self::tab_morph_rect`]'s
+    /// window-vs-tab escalation: a `Tab` surface that's this window's only
+    /// tab carries the whole window away, so the WHOLE OS window hides
+    /// rather than trying to render an empty strip. Reads `surface`'s own
+    /// `tab`/`pane` fields directly rather than `self.active_tab()` — at the
+    /// tab-tear-off call site, the active tab has already been switched to
+    /// the revert target by the time this runs (see `update_drag`'s
+    /// `origin_tab` handling), so it's no longer the dragged one.
+    fn exclusion_for(&self, surface: SurfaceRef) -> CarriedExclusion {
+        match surface {
+            SurfaceRef::Pane { pane, .. } => CarriedExclusion::Pane(pane),
+            SurfaceRef::Tab { tab, .. } => {
+                if self.tree.tabs.len() <= 1 {
+                    CarriedExclusion::WholeWindow
+                } else {
+                    self.tree
+                        .tabs
+                        .get(tab)
+                        .map(|t| CarriedExclusion::Tab(t.id))
+                        .unwrap_or(CarriedExclusion::WholeWindow)
+                }
+            }
+        }
+    }
+
+    /// Arm this window's carried-surface exclusion for a fresh tear-off:
+    /// records WHAT will vanish (`exclusion_for`) without yet making
+    /// anything vanish — [`Self::apply_carried_exclusion`] does that once
+    /// the suck-in (if any) finishes. Called once per tear-off, right
+    /// alongside `start_suck_in`/`start_pane_drag`'s `shared.drag =
+    /// Some(...)`.
+    fn begin_carried_exclusion(&mut self, surface: SurfaceRef) {
+        self.carried_exclusion = Some(self.exclusion_for(surface));
+        self.exclusion_applied = false;
+    }
+
+    /// Re-apply this window's carried-surface visual exclusion if it isn't
+    /// already in effect — idempotent, so it's safe to call every tick a
+    /// drag sourced from this window is live (`about_to_wait`'s per-window
+    /// pacing loop does exactly that). No-ops while a suck-in is still
+    /// animating (`self.morph_live()`) — the design's "from the moment the
+    /// suck-in completes" — or while nothing is excluded at all. `carried`
+    /// (`DragState::carried`: has the pointer left this window's own bounds
+    /// yet) gates ONLY the `WholeWindow` case: hiding the OS window out from
+    /// under a pointer that's still on it would pull the rug out from under
+    /// its own mouse capture, which the whole cross-window carry depends on
+    /// staying alive (the source window keeps receiving motion past its own
+    /// bounds only while it's a live, visible OS window) — so a sole-tab
+    /// window keeps showing its (about to be carried) content until the
+    /// carry genuinely leaves it. `Pane`/`Tab` exclusion has no such constraint:
+    /// the surface reflows/disappears the instant the suck-in ends, whether
+    /// or not the pointer has left the window yet.
+    pub(crate) fn apply_carried_exclusion(&mut self, shared: &Shared, carried: bool) {
+        let Some(ex) = self.carried_exclusion else {
+            return;
+        };
+        if self.exclusion_applied || self.morph_live() {
+            return;
+        }
+        match ex {
+            CarriedExclusion::Pane(_) | CarriedExclusion::Tab(_) => {
+                self.exclusion_applied = true;
+                self.sync_layout(shared);
+            }
+            CarriedExclusion::WholeWindow => {
+                if carried {
+                    self.exclusion_applied = true;
+                    self.renderer.window().set_visible(false);
+                }
+            }
+        }
+    }
+
+    /// Whether this window currently has a live carried-surface exclusion
+    /// (armed or applied) — `about_to_wait`'s cheap per-tick gate for
+    /// whether [`Self::apply_carried_exclusion`] is worth calling at all.
+    pub(crate) fn carried_exclusion_live(&self) -> bool {
+        self.carried_exclusion.is_some()
+    }
+
+    /// End this window's carried-surface visual exclusion — called the
+    /// instant a drag sourced from this window resolves, whatever the
+    /// outcome (drop, cancel, or an own-strip reorder): restores whatever
+    /// was hidden (re-shows the OS window, if that's what vanished) and
+    /// re-syncs the layout so a surviving tab/pane reflects reality again.
+    /// A no-op past the `.take()` when the exclusion never actually took
+    /// visual effect (a release inside the suck-in window itself hid/
+    /// filtered nothing, so there's nothing to undo).
+    pub(crate) fn clear_carried_exclusion(&mut self, shared: &Shared) {
+        let was_applied = self.exclusion_applied;
+        let ex = self.carried_exclusion.take();
+        self.exclusion_applied = false;
+        if !was_applied {
+            return;
+        }
+        if ex == Some(CarriedExclusion::WholeWindow) {
+            self.renderer.window().set_visible(true);
+        }
+        self.sync_layout(shared);
     }
 
     /// Record what strip chip (if any) a live drag is hovering on THIS
@@ -2364,8 +2553,9 @@ impl WindowState {
                     .get(tab)
                     .map(|t| tab_display_title(&t.title, tab))
                     .unwrap_or_default();
+                let surface = SurfaceRef::Tab { window, tab };
                 shared.drag = Some(DragState {
-                    surface: SurfaceRef::Tab { window, tab },
+                    surface,
                     source_window: window_id,
                     grab: (x - press_x, y - strip_bottom),
                     carried: false,
@@ -2381,7 +2571,11 @@ impl WindowState {
                 // point — the entire window when this is its only tab
                 // (finding #4: the surface being carried is the tab, so the
                 // collapse must swallow all of it, not just one pane).
+                // Carry-time source vanish — see
+                // `start_pane_drag`'s identical arm/apply pair.
+                self.begin_carried_exclusion(surface);
                 self.start_suck_in(shared, self.tab_morph_rect(), (x, strip_bottom));
+                self.apply_carried_exclusion(shared, false);
             } else {
                 // Still an in-strip reorder — unchanged existing behavior.
                 self.drag_tab_to(shared, x);
@@ -2438,9 +2632,35 @@ impl WindowState {
             // `insert_at` keeps `tab_slot_at`'s own real-tab-index meaning
             // for the Ghost case too (the last real tab) — every existing
             // reorder/append caller only reads `insert_at`, unchanged.
+            //
+            // Carry-time source vanish: while this window's own
+            // exclusion is APPLIED, the renderer's own `tabs` list is
+            // missing the excluded tab (see `sync_layout`'s `excluded_tab`
+            // filter) — so a `StripSlot::Tab(i)` from it is an index into
+            // that SHORTER list, not `self.tree.tabs`. Every downstream
+            // consumer (`update_drag_hover`'s spring-load select,
+            // `resolve_drag_drop`'s own-strip reorder) expects a REAL tree
+            // index, so remap it back here, the one place both spaces are
+            // in scope together.
+            let excluded_idx = if self.exclusion_applied {
+                match self.carried_exclusion {
+                    Some(CarriedExclusion::Tab(id)) => {
+                        self.tree.tabs.iter().position(|t| t.id == id)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
             return self.renderer.tab_slot_or_ghost_at(x as f32).map(|slot| {
                 let (insert_at, chip) = match slot {
-                    ember_render::StripSlot::Tab(i) => (i, Some(i)),
+                    ember_render::StripSlot::Tab(i) => {
+                        let real_i = match excluded_idx {
+                            Some(e) if i >= e => i + 1,
+                            _ => i,
+                        };
+                        (real_i, Some(real_i))
+                    }
                     ember_render::StripSlot::Ghost => {
                         (self.tree.tabs.len().saturating_sub(1), None)
                     }
@@ -2666,6 +2886,15 @@ impl WindowState {
         window_id: WindowId,
         drag: DragState,
     ) -> DragEnded {
+        // Carry-time source vanish ends here, whatever the
+        // outcome below turns out to be: `self` is this drag's SOURCE
+        // window (mirrors this method's own existing convention — see the
+        // `Cancel`/`Reorder` arms below already calling `self.start_pour_out`
+        // and describing `self` as "the SOURCE rect"). Restores any hidden
+        // OS window / filtered layout before a real move (if any) or the
+        // pour-out below repaints over it — a stale exclusion must never
+        // outlive the drag that armed it.
+        self.clear_carried_exclusion(shared);
         self.renderer.set_tab_drag(None);
         self.clear_split_preview();
         let Some(src_w) = resolve_window_index(shared, drag.source_window) else {
