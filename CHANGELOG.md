@@ -27,6 +27,19 @@ follow [Semantic Versioning](https://semver.org).
   where it started, and a window that gave up its last tab plays its
   collapse before closing. All skipped under Reduce Motion for an instant
   transfer.
+- Hold to wisp now works on tabs, not just panes. Press and hold a tab and
+  the same ring sweeps it into the wisp to carry, no drag needed.
+
+### Fixed
+
+- Dragging a divider now moves the divider you grabbed. In a window with
+  nested splits, most easily made by merging a multi-pane tab into another
+  window, grabbing one divider could move an adjacent one instead.
+- Ember no longer grows its memory use while the display sleeps. A window
+  whose GPU surface goes away now backs off between attempts instead of
+  retrying as fast as it can, which could balloon memory over a long sleep.
+- The control surface serves several connections at once and drops idle
+  ones, so a stuck client can no longer block other `ctl` commands.
 
 ## [0.3.1] - 2026-07-08
 
