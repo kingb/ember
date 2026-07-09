@@ -455,9 +455,11 @@ pub(crate) struct WindowState {
     pub(crate) tab_drag: Option<TabDrag>,
     /// In-progress scrollbar-thumb drag: the session whose scrollbar is grabbed.
     pub(crate) scrollbar_drag: Option<SessionId>,
-    /// In-progress divider drag to resize a split: `(a-side pane, split axis,
-    /// last cursor position along that axis in logical px)`.
-    pub(crate) divider_drag: Option<(PaneId, Axis, f64)>,
+    /// In-progress divider drag to resize a split: `(a-side pane, b-side pane,
+    /// split axis, last cursor position along that axis in logical px)`. Both
+    /// flanking panes are carried (not just the a-side) because a divider is
+    /// only unambiguously identified by the pair — see `divider_at`.
+    pub(crate) divider_drag: Option<(PaneId, PaneId, Axis, f64)>,
     /// The pointer cursor currently shown (so we don't reset it every move).
     pub(crate) pointer_cursor: CursorIcon,
     /// Left press that started on a link: `(session, link id, row, col)`.
@@ -1559,8 +1561,9 @@ impl WindowState {
         true
     }
 
-    /// Resize the split enclosing `target` along `axis` by `delta` px. Shared by
-    /// keyboard resize and mouse divider drag. Core clamps against `min_px`.
+    /// Resize the split enclosing `target` along `axis` by `delta` px. Used by
+    /// keyboard resize, which only ever has one pane (the focused one) to key
+    /// off. Core clamps against `min_px`.
     pub(crate) fn resize_pane_px(
         &mut self,
         shared: &Shared,
@@ -1583,9 +1586,44 @@ impl WindowState {
         self.sync_layout(shared);
     }
 
-    /// The split divider under logical `(x, y)`, as `(a-side pane, axis)`, when
-    /// the cursor is in the gap between two adjacent panes. `None` otherwise.
-    pub(crate) fn divider_at(&self, x: f64, y: f64) -> Option<(PaneId, Axis)> {
+    /// Resize the split that separates `a_side` and `b_side` along `axis` by
+    /// `delta` px. Used by mouse divider drag, which always knows both
+    /// flanking panes (from `divider_at`) — identifying the divider by the
+    /// pair, rather than by one pane + axis, is what fixes the divider
+    /// picking the wrong (too-deep) same-axis split in a nested layout. Core
+    /// clamps against `min_px`.
+    pub(crate) fn resize_split_px(
+        &mut self,
+        shared: &Shared,
+        a_side: PaneId,
+        b_side: PaneId,
+        axis: Axis,
+        delta: f64,
+    ) {
+        let vp = self.viewport();
+        let min_px = self.min_px(axis);
+        apply(
+            &mut self.tree,
+            LayoutCommand::ResizeSplit {
+                a_side,
+                b_side,
+                axis,
+                delta,
+                min_px,
+            },
+            vp,
+        );
+        self.sync_layout(shared);
+    }
+
+    /// The split divider under logical `(x, y)`, as `(a-side pane, b-side
+    /// pane, axis)`, when the cursor is in the gap between two adjacent
+    /// panes. `None` otherwise. Both flanking panes are returned — a divider
+    /// is the split whose two children SEPARATE these two panes, and a
+    /// single pane + axis doesn't uniquely identify that split when the pane
+    /// sits inside more than one same-axis split (see
+    /// `LayoutNode::resize_split`).
+    pub(crate) fn divider_at(&self, x: f64, y: f64) -> Option<(PaneId, PaneId, Axis)> {
         let leaves: HashMap<SessionId, PaneId> = self
             .active_tab()
             .root
@@ -1602,24 +1640,24 @@ impl WindowState {
             if (x - right).abs() <= grab
                 && y >= r.y
                 && y < r.y + r.height
-                && self.pane_rects.iter().any(|(_, o)| {
+                && let Some((osid, _)) = self.pane_rects.iter().find(|(_, o)| {
                     (o.x - (right + gap)).abs() <= grab && y >= o.y && y < o.y + o.height
                 })
             {
-                if let Some(&p) = leaves.get(sid) {
-                    return Some((p, Axis::Horizontal));
+                if let (Some(&p), Some(&op)) = (leaves.get(sid), leaves.get(osid)) {
+                    return Some((p, op, Axis::Horizontal));
                 }
             }
             // Horizontal divider on this pane's bottom edge.
             if (y - bottom).abs() <= grab
                 && x >= r.x
                 && x < r.x + r.width
-                && self.pane_rects.iter().any(|(_, o)| {
+                && let Some((osid, _)) = self.pane_rects.iter().find(|(_, o)| {
                     (o.y - (bottom + gap)).abs() <= grab && x >= o.x && x < o.x + o.width
                 })
             {
-                if let Some(&p) = leaves.get(sid) {
-                    return Some((p, Axis::Vertical));
+                if let (Some(&p), Some(&op)) = (leaves.get(sid), leaves.get(osid)) {
+                    return Some((p, op, Axis::Vertical));
                 }
             }
         }
@@ -1695,13 +1733,13 @@ impl WindowState {
     /// press.
     pub(crate) fn press_left(&mut self, shared: &mut Shared, x: f64, y: f64) {
         self.cursor = (x, y);
-        if let Some((target, axis)) = self.divider_at(x, y) {
+        if let Some((a_side, b_side, axis)) = self.divider_at(x, y) {
             let pos = if matches!(axis, Axis::Horizontal) {
                 x
             } else {
                 y
             };
-            self.divider_drag = Some((target, axis, pos));
+            self.divider_drag = Some((a_side, b_side, axis, pos));
         } else {
             self.left_click(shared);
         }
@@ -2568,14 +2606,14 @@ impl WindowState {
             self.update_split_preview();
             return;
         }
-        if let Some((target, axis, last)) = self.divider_drag {
+        if let Some((a_side, b_side, axis, last)) = self.divider_drag {
             let pos = if matches!(axis, Axis::Horizontal) {
                 x
             } else {
                 y
             };
-            self.resize_pane_px(shared, target, axis, pos - last);
-            self.divider_drag = Some((target, axis, pos));
+            self.resize_split_px(shared, a_side, b_side, axis, pos - last);
+            self.divider_drag = Some((a_side, b_side, axis, pos));
         } else if self.tab_drag.is_some() || shared.drag.is_some() {
             self.update_drag(shared, window_id, x, y);
         } else if let Some(sid) = self.scrollbar_drag.clone() {
@@ -2590,7 +2628,7 @@ impl WindowState {
             }
             // Show a resize cursor over a divider, a pointer over a link
             // (divider wins), else forward motion to mouse-aware apps.
-            let over = self.divider_at(x, y).map(|(_, a)| a);
+            let over = self.divider_at(x, y).map(|(_, _, a)| a);
             let link = if over.is_none() {
                 self.link_under_cursor()
             } else {
