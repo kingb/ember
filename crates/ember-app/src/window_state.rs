@@ -249,16 +249,34 @@ pub(crate) struct SplitPreview {
     ratio: f32,
 }
 
-/// A press-and-hold in progress on a pane body (hold-to-wisp, v1.1): timing +
-/// identity needed to draw the ring and, on completion, tear the pane off via
-/// [`WindowState::start_pane_drag`] exactly as the chord gesture does. Armed
-/// alongside whatever the press already does (selection / mouse-mode
-/// forward) — see [`WindowState::left_click`]'s doc.
+/// What a live [`Hold`] is armed on — a pane body (the original v1.1 gesture)
+/// or a tab-strip chip (this task's addition: press-and-hold a tab tears it
+/// off exactly like a pane hold does, reusing the tab-strip's own tear-off
+/// path rather than `start_pane_drag`'s).
+#[derive(Clone, Copy)]
+enum HoldTarget {
+    Pane {
+        pane: PaneId,
+        /// The pressed pane's own rect (logical px, this window's space) at
+        /// press time — carried through to `start_pane_drag` unchanged.
+        rect: Rect,
+    },
+    /// Index of the pressed tab (this window's `tree.tabs`, stable across
+    /// the hold: nothing reorders tabs while a plain press-and-hold, as
+    /// opposed to a live drag, is in progress).
+    Tab { tab: usize },
+}
+
+/// A press-and-hold in progress on a pane body or a tab-strip chip
+/// (hold-to-wisp, v1.1 + this task's tab extension): timing + identity
+/// needed to draw the ring and, on completion, tear the target off into a
+/// carried drag — [`WindowState::start_pane_drag`] for a pane,
+/// [`WindowState::tear_off_tab`] for a tab — exactly as the chord gesture
+/// (pane) or a motion-driven tear-off (tab) already do. Armed alongside
+/// whatever the press already does (selection / mouse-mode forward for a
+/// pane; tab select for a tab) — see [`WindowState::left_click`]'s doc.
 struct Hold {
-    pane: PaneId,
-    /// The pressed pane's own rect (logical px, this window's space) at
-    /// press time — carried through to `start_pane_drag` unchanged.
-    rect: Rect,
+    target: HoldTarget,
     /// Press origin (logical px) — both the ring's center and the point
     /// motion is measured from for [`HOLD_TOLERANCE_PX`] cancellation.
     origin: (f64, f64),
@@ -1780,6 +1798,20 @@ impl WindowState {
                             active: false,
                             origin_tab,
                         });
+                        // Hold-to-wisp on a tab chip (this task's addition):
+                        // armed alongside the reorder-capable `tab_drag`
+                        // above exactly like a pane-body press arms it
+                        // alongside the forwarded click/selection below —
+                        // motion past tolerance (`on_cursor_moved`) cancels
+                        // it same as the pane case, and a quick release
+                        // (`left_release`) with neither this completed nor
+                        // `tab_drag` gone active leaves a plain tab select,
+                        // unaffected either way.
+                        self.hold = Some(Hold {
+                            target: HoldTarget::Tab { tab: i },
+                            origin: (x, y),
+                            started: Instant::now(),
+                        });
                     }
                 }
                 TabHit::CloseTab(i) => {
@@ -1836,8 +1868,7 @@ impl WindowState {
         // set below, is never touched by arming it.
         if let Some((pane, rect)) = self.pane_at(x, y) {
             self.hold = Some(Hold {
-                pane,
-                rect,
+                target: HoldTarget::Pane { pane, rect },
                 origin: (x, y),
                 started: Instant::now(),
             });
@@ -1954,16 +1985,45 @@ impl WindowState {
         let sweep = Duration::from_millis(HOLD_SWEEP_MS);
         let elapsed = now.duration_since(armed_at);
         if elapsed >= sweep {
-            let (pane, rect, origin) = (hold.pane, hold.rect, hold.origin);
+            let (target, origin) = (hold.target, hold.origin);
             self.hold = None;
             self.renderer.set_hold_ring(None);
-            self.forward_mouse_release(shared, 0);
-            // The same press began a selection (and jitter may have grown
-            // it); the gesture is the drag's now — drop the selection so it
-            // neither lingers under the carried pane nor fights the release.
-            self.selecting = false;
-            self.clear_selection();
-            self.start_pane_drag(shared, pane, rect, origin.0, origin.1);
+            match target {
+                HoldTarget::Pane { pane, rect } => {
+                    self.forward_mouse_release(shared, 0);
+                    // The same press began a selection (and jitter may have
+                    // grown it); the gesture is the drag's now — drop the
+                    // selection so it neither lingers under the carried pane
+                    // nor fights the release.
+                    self.selecting = false;
+                    self.clear_selection();
+                    self.start_pane_drag(shared, pane, rect, origin.0, origin.1);
+                }
+                HoldTarget::Tab { tab } => {
+                    // A tab press has no forwarded click/selection to undo
+                    // (unlike a pane body, `left_click`'s `TabHit::Tab` arm
+                    // returns before either): the only thing armed alongside
+                    // this hold is `tab_drag`, which `tear_off_tab` clears.
+                    // `origin_tab` mirrors `update_drag`'s own tear-off:
+                    // whichever tab was active immediately before THIS press
+                    // (captured in `tab_drag` at press time, before its own
+                    // `select_tab` switched to the pressed one).
+                    let origin_tab = self
+                        .tab_drag
+                        .as_ref()
+                        .map(|d| d.origin_tab)
+                        .unwrap_or_else(|| self.tree.tabs[self.tree.active].id);
+                    let window_id = self.renderer.window().id();
+                    // No lateral motion to report (a completed hold means
+                    // the pointer never left `HOLD_TOLERANCE_PX`/
+                    // `HOLD_SWEEP_TOLERANCE_PX`) — the chip is grabbed at
+                    // its own press point, same as `start_pane_drag`'s
+                    // `grab` offset is zero at the exact press pixel.
+                    self.tear_off_tab(
+                        shared, window_id, tab, origin_tab, origin.0, origin.0, origin.1,
+                    );
+                }
+            }
             if let Some(d) = shared.drag.as_mut() {
                 d.carried = true;
             }
@@ -2555,58 +2615,7 @@ impl WindowState {
             }
             let strip_bottom = Renderer::chrome_height() as f64;
             if active && strip_band_exit(y, strip_bottom, TEAR_OFF_THRESHOLD) {
-                self.tab_drag = None;
-                // Reveal a tab that ISN'T the dragged one, so in-window pane
-                // drops have a real merge target underneath. The origin tab
-                // qualifies only when it's a DIFFERENT tab: dragging the
-                // already-active tab resolves origin == dragged, which would
-                // re-display the dragged tab and make every in-window drop
-                // self-reject ("tab can't merge into itself") — same failure
-                // as a closed origin, same fallback.
-                let origin_idx = self
-                    .tree
-                    .tabs
-                    .iter()
-                    .position(|t| t.id == origin_tab)
-                    .filter(|idx| *idx != tab);
-                if let Some(idx) =
-                    origin_idx.or_else(|| revert_target_tab(self.tree.tabs.len(), tab))
-                {
-                    self.tree.active = idx;
-                }
-                self.sync_layout(shared);
-                let window = resolve_window_index(shared, window_id).unwrap_or(0);
-                // `tab_display_title` — see `start_pane_drag`'s identical
-                // comment for why this beats the raw (often-empty) title.
-                let title = self
-                    .tree
-                    .tabs
-                    .get(tab)
-                    .map(|t| tab_display_title(&t.title, tab))
-                    .unwrap_or_default();
-                let surface = SurfaceRef::Tab { window, tab };
-                shared.drag = Some(DragState {
-                    surface,
-                    source_window: window_id,
-                    grab: (x - press_x, y - strip_bottom),
-                    carried: false,
-                    hover: None,
-                    last_screen: (0.0, 0.0), // set for real on this same tick's
-                    last_raised: None,
-                    // motion, immediately below by `update_drag_hover`'s
-                    // caller — see `App::window_event`'s CursorMoved arm.
-                    title,
-                });
-                // Suck-in (v0.4.0): the torn-off tab's WHOLE content area
-                // (everything below the strip) collapses toward the tear-off
-                // point — the entire window when this is its only tab
-                // (finding #4: the surface being carried is the tab, so the
-                // collapse must swallow all of it, not just one pane).
-                // Carry-time source vanish — see
-                // `start_pane_drag`'s identical arm/apply pair.
-                self.begin_carried_exclusion(surface);
-                self.start_suck_in(shared, self.tab_morph_rect(), (x, strip_bottom));
-                self.apply_carried_exclusion(shared, false);
+                self.tear_off_tab(shared, window_id, tab, origin_tab, press_x, x, y);
             } else {
                 // Still an in-strip reorder — unchanged existing behavior.
                 self.drag_tab_to(shared, x);
@@ -2616,6 +2625,81 @@ impl WindowState {
         if shared.drag.is_some() {
             self.update_drag_hover(shared, window_id, x, y);
         }
+    }
+
+    /// Tear tab `tab` off into a freshly carried `shared.drag` — the shared
+    /// core of both a motion-driven tear-off (`update_drag`, once the
+    /// pointer crosses [`TEAR_OFF_THRESHOLD`] below the strip) and a
+    /// completed hold-to-wisp on a tab chip ([`Self::tick_hold`]'s
+    /// `HoldTarget::Tab` branch, a STATIONARY tear-off with no drag motion
+    /// of its own). `press_x` is the original press point (used for the
+    /// carried chip's `grab` offset — zero for a hold, since it never moved);
+    /// `(x, y)` is the current pointer position (== the press point for a
+    /// hold). `origin_tab` is whichever tab was active immediately BEFORE
+    /// this press (see [`TabDrag::origin_tab`]'s doc) — reveals a real merge
+    /// target underneath rather than re-displaying the tab being dragged.
+    #[allow(clippy::too_many_arguments)]
+    fn tear_off_tab(
+        &mut self,
+        shared: &mut Shared,
+        window_id: WindowId,
+        tab: usize,
+        origin_tab: TabId,
+        press_x: f64,
+        x: f64,
+        y: f64,
+    ) {
+        self.tab_drag = None;
+        let strip_bottom = Renderer::chrome_height() as f64;
+        // Reveal a tab that ISN'T the dragged one, so in-window pane
+        // drops have a real merge target underneath. The origin tab
+        // qualifies only when it's a DIFFERENT tab: dragging the
+        // already-active tab resolves origin == dragged, which would
+        // re-display the dragged tab and make every in-window drop
+        // self-reject ("tab can't merge into itself") — same failure
+        // as a closed origin, same fallback.
+        let origin_idx = self
+            .tree
+            .tabs
+            .iter()
+            .position(|t| t.id == origin_tab)
+            .filter(|idx| *idx != tab);
+        if let Some(idx) = origin_idx.or_else(|| revert_target_tab(self.tree.tabs.len(), tab)) {
+            self.tree.active = idx;
+        }
+        self.sync_layout(shared);
+        let window = resolve_window_index(shared, window_id).unwrap_or(0);
+        // `tab_display_title` — see `start_pane_drag`'s identical
+        // comment for why this beats the raw (often-empty) title.
+        let title = self
+            .tree
+            .tabs
+            .get(tab)
+            .map(|t| tab_display_title(&t.title, tab))
+            .unwrap_or_default();
+        let surface = SurfaceRef::Tab { window, tab };
+        shared.drag = Some(DragState {
+            surface,
+            source_window: window_id,
+            grab: (x - press_x, y - strip_bottom),
+            carried: false,
+            hover: None,
+            last_screen: (0.0, 0.0), // set for real on this same tick's
+            last_raised: None,
+            // motion, immediately below by `update_drag_hover`'s
+            // caller — see `App::window_event`'s CursorMoved arm.
+            title,
+        });
+        // Suck-in (v0.4.0): the torn-off tab's WHOLE content area
+        // (everything below the strip) collapses toward the tear-off
+        // point — the entire window when this is its only tab
+        // (finding #4: the surface being carried is the tab, so the
+        // collapse must swallow all of it, not just one pane).
+        // Carry-time source vanish — see
+        // `start_pane_drag`'s identical arm/apply pair.
+        self.begin_carried_exclusion(surface);
+        self.start_suck_in(shared, self.tab_morph_rect(), (x, strip_bottom));
+        self.apply_carried_exclusion(shared, false);
     }
 
     /// Classify a local point `(x, y)` — logical px, THIS window's own
