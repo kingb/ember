@@ -487,6 +487,13 @@ pub(crate) struct WindowState {
     /// that was actually done (a very fast release inside the suck-in
     /// window hid/filtered nothing).
     exclusion_applied: bool,
+    /// Set when a `WholeWindow` carried exclusion hid this OS window
+    /// (`set_visible(false)`) and the matching re-show has been DEFERRED
+    /// rather than applied immediately — see [`Self::clear_carried_exclusion`]
+    /// and [`Self::finish_carry_reshow`]'s docs: a sole-tab window whose
+    /// drag resolves to a `Move` might be about to be DESTROYED by that
+    /// same move, in which case it must never re-appear first.
+    hidden_for_carry: bool,
 }
 
 impl WindowState {
@@ -543,6 +550,7 @@ impl WindowState {
             morph: None,
             carried_exclusion: None,
             exclusion_applied: false,
+            hidden_for_carry: false,
         }
     }
 
@@ -2152,12 +2160,20 @@ impl WindowState {
 
     /// End this window's carried-surface visual exclusion — called the
     /// instant a drag sourced from this window resolves, whatever the
-    /// outcome (drop, cancel, or an own-strip reorder): restores whatever
-    /// was hidden (re-shows the OS window, if that's what vanished) and
-    /// re-syncs the layout so a surviving tab/pane reflects reality again.
-    /// A no-op past the `.take()` when the exclusion never actually took
-    /// visual effect (a release inside the suck-in window itself hid/
-    /// filtered nothing, so there's nothing to undo).
+    /// outcome (drop, cancel, or an own-strip reorder): restores the
+    /// filtered layout, and re-syncs it so a surviving tab/pane reflects
+    /// reality again. A no-op past the `.take()` when the exclusion never
+    /// actually took visual effect (a release inside the suck-in window
+    /// itself hid/filtered nothing, so there's nothing to undo).
+    ///
+    /// Deliberately does NOT `set_visible(true)` the `WholeWindow` case here:
+    /// a sole-tab window's drag can resolve to a `Move`
+    /// that's about to CLOSE this very window (its only tab moved out); a
+    /// synchronous re-show-then-close reads as a visible flash of the old
+    /// window before it vanishes. Instead this marks `hidden_for_carry` and
+    /// leaves the OS window hidden; the caller re-shows it only once it
+    /// knows the window survived — see [`Self::finish_carry_reshow`]'s doc
+    /// for exactly where that happens.
     pub(crate) fn clear_carried_exclusion(&mut self, shared: &Shared) {
         let was_applied = self.exclusion_applied;
         let ex = self.carried_exclusion.take();
@@ -2166,9 +2182,24 @@ impl WindowState {
             return;
         }
         if ex == Some(CarriedExclusion::WholeWindow) {
-            self.renderer.window().set_visible(true);
+            self.hidden_for_carry = true;
         }
         self.sync_layout(shared);
+    }
+
+    /// Re-show an OS window left hidden by [`Self::clear_carried_exclusion`]'s
+    /// deferred `WholeWindow` re-show — a no-op when nothing is deferred,
+    /// so it's safe to call on every window unconditionally.
+    /// Callers run this AFTER `apply_move` (or, on a cancel, immediately —
+    /// see `cancel_drag_everywhere`, which never closes the source): a
+    /// window `apply_move` closed is gone from `self.windows` by then and
+    /// this method is simply never reached for it, so a window on the verge
+    /// of destruction never re-appears first.
+    pub(crate) fn finish_carry_reshow(&mut self) {
+        if self.hidden_for_carry {
+            self.renderer.window().set_visible(true);
+            self.hidden_for_carry = false;
+        }
     }
 
     /// Record what strip chip (if any) a live drag is hovering on THIS

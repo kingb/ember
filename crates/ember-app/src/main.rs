@@ -1082,6 +1082,18 @@ impl ApplicationHandler<EmberEvent> for App {
                             Err(e) => eprintln!("[ember] drag drop rejected: {e}"),
                         }
                     }
+                    // Fix 2: a window whose carried-surface exclusion is
+                    // still hidden (`hidden_for_carry`) gets its OS re-show
+                    // deferred here — AFTER `apply_move` — so a
+                    // sole-tab window that's about to be destroyed by this
+                    // very move (its only tab moved out → `WindowClosed`)
+                    // never flashes back on screen first. A window
+                    // `apply_move` closed is already gone from
+                    // `self.windows`, so it's silently skipped below —
+                    // exactly the point.
+                    for w in self.windows.values_mut() {
+                        w.finish_carry_reshow();
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
@@ -2509,6 +2521,12 @@ fn cancel_drag_everywhere(windows: &mut HashMap<WindowId, WindowState>, shared: 
             // very first frame of the pour-out is already showing the
             // real, restored content, not a stale exclusion.
             w.clear_carried_exclusion(shared);
+            // Fix 2: a cancel never closes the source
+            // window (unlike a completed move, where the whole point of
+            // deferring the re-show is that the window might be about to
+            // die) — so unlike the drop paths, re-show it immediately
+            // rather than leaving it deferred.
+            w.finish_carry_reshow();
             let rect = w.viewport();
             let grab = w.cursor;
             w.start_pour_out(shared, rect, grab);
@@ -3463,6 +3481,13 @@ fn finish_ctl_drag_tail(
                 error = Some(e);
             }
         }
+    }
+    // Fix 2: see the identical comment at the real-mouse
+    // release site (`App::window_event`'s `MouseInput` release arm) — same
+    // reasoning, same "after apply_move, regardless of whether pending was
+    // Some" placement.
+    for w in windows.values_mut() {
+        w.finish_carry_reshow();
     }
     let mut reply = serde_json::json!({
         "ok": true,
