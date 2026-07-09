@@ -281,7 +281,15 @@ mod unix {
         tx: &Sender<ControlMsg>,
         waker: &(dyn Fn() + Send + Sync),
     ) -> std::io::Result<()> {
-        let mut reader = BufReader::new(stream.try_clone()?);
+        // A client gets 10s to deliver its one request line, and at most 1 MiB
+        // of it. Without the timeout, a wedged client (connected, half a line,
+        // never a newline) pins this detached thread FOREVER — these threads
+        // are one-shot and self-reaping only if `read_line` actually returns.
+        // The timeout applies to the socket reads only; the potentially long
+        // part of a command (a paced drag's multi-second reply wait) happens
+        // in `dispatch`, after the request line is already in hand.
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut reader = std::io::Read::take(BufReader::new(stream.try_clone()?), 1024 * 1024);
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
             return Ok(()); // liveness probe (no payload) — just close.
