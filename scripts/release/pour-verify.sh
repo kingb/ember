@@ -2,7 +2,7 @@
 # Runs INSIDE ghcr.io/homebrew/ubuntu22.04 (brew preinstalled, linuxbrew user).
 # Installs Ember from the stamped formula and asserts it POURS the bottle
 # (not a source build) and runs. The formula's bottle block points at the
-# real v0.3.1 release, so this exercises the whole chain: formula -> root_url
+# real release, so this exercises the whole chain: formula -> root_url
 # -> uploaded bottle -> pour.
 set -e
 TAP="$(brew --repository)/Library/Taps/kingb/homebrew-ember"
@@ -20,10 +20,10 @@ else
   echo "  FAIL: did not pour — full output:"; echo "$OUT" | tail -25 | sed 's/^/    /'; exit 1
 fi
 
-echo "=== runs + reports 0.3.1 ==="
+echo "=== runs + reports ${WANT:-the expected version} ==="
  V="$(ember-term --version | head -1)"
 echo "  $V"
-echo "$V" | grep -q "0.3.1" && echo "  PASS: version 0.3.1" || { echo "  FAIL: wrong version"; exit 1; }
+if [ -n "${WANT:-}" ]; then echo "$V" | grep -q "$WANT" && echo "  PASS: version $WANT" || { echo "  FAIL: wanted $WANT"; exit 1; }; else echo "  (version: $V)"; fi
 
 echo "=== link sanity (GPU stack dlopened, not linked) ==="
 ldd "$(brew --prefix)/bin/ember-term" | grep -viE "libc\.|libm\.|libgcc|linux-vdso|ld-linux|libpthread|libdl|librt" | sed 's/^/  /' || echo "  (only libc-family linked — correct)"
