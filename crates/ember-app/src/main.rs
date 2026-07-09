@@ -1055,6 +1055,9 @@ impl ApplicationHandler<EmberEvent> for App {
                         clear_all_drag_visuals(&mut self.windows);
                     }
                     if let Some((src, dest)) = pending {
+                        // Captured BEFORE `apply_move` relocates them — see
+                        // `moved_sessions`'s doc.
+                        let moved = moved_sessions(&self.windows, shared, src);
                         match apply_move(
                             &mut self.windows,
                             shared,
@@ -1072,6 +1075,7 @@ impl ApplicationHandler<EmberEvent> for App {
                                         &mut self.windows,
                                         shared,
                                         self.focused_window,
+                                        &moved,
                                     );
                                 }
                             }
@@ -2516,24 +2520,71 @@ fn cancel_drag_everywhere(windows: &mut HashMap<WindowId, WindowState>, shared: 
     }
 }
 
-/// Best-effort pour-out target for a completed drag `Move` (v0.4.0): the
-/// window that ended up focused — a drop's landed tab/pane becomes active
-/// (see `apply_move`'s `final_focused` handling) — using its content rect
-/// and a point near the top of it as the emergence origin. Not the exact
-/// drop pixel: a cross-window carry's hover carries no stored local point to
-/// replay (see `DropHover`'s doc), so this is the same kind of v1
-/// approximation as the ghost tab's always-last strip slot — honest, not
-/// half-implemented.
+/// The session ids `src` currently names, resolved against the SOURCE
+/// window's tree as it stands right now — must be called BEFORE `apply_move`
+/// runs (that's what actually relocates them). `pour_out_after_move` uses
+/// this to find where the moved surface actually landed, rather than
+/// guessing from the destination window's whole viewport. `shared.
+/// window_order` is the same index space `SurfaceRef::window` names
+/// (`apply_move` resolves it identically via `surface_window_index`).
+fn moved_sessions(
+    windows: &HashMap<WindowId, WindowState>,
+    shared: &Shared,
+    src: SurfaceRef,
+) -> Vec<SessionId> {
+    let Some(wid) = shared.window_order.get(surface_window_index(src)).copied() else {
+        return Vec::new();
+    };
+    let Some(w) = windows.get(&wid) else {
+        return Vec::new();
+    };
+    match src {
+        SurfaceRef::Pane { tab, pane, .. } => w
+            .tree
+            .tabs
+            .get(tab)
+            .and_then(|t| t.root.session_of(pane))
+            .cloned()
+            .into_iter()
+            .collect(),
+        SurfaceRef::Tab { tab, .. } => w
+            .tree
+            .tabs
+            .get(tab)
+            .map(|t| t.root.leaves().into_iter().map(|(_, s)| s).collect())
+            .unwrap_or_default(),
+    }
+}
+
+/// Pour-out target for a completed drag `Move` (v0.4.0): the window that
+/// ended up focused — a drop's landed tab/pane becomes active (see
+/// `apply_move`'s `final_focused` handling) — using the bounding rect of
+/// `moved`'s sessions within it (their `pane_rects` entries) and a point
+/// near the top-center of THAT rect as the emergence origin. For a
+/// `SurfaceDest::SplitInto` drop the surface lands in only HALF the window,
+/// so pouring over the whole `viewport()` used to spill the morph across the
+/// sibling pane too; `NewTab`/`NewWindow` land full-size, so their bounding
+/// rect already comes out ≈ `viewport()` and needs no special case. Falls
+/// back to `viewport()` when none of `moved`'s sessions are found (shouldn't
+/// happen post-move, but `apply_move`'s rehoming is best-effort — see its
+/// doc — so this stays honest rather than panicking).
 fn pour_out_after_move(
     windows: &mut HashMap<WindowId, WindowState>,
     shared: &Shared,
     focused_window: Option<WindowId>,
+    moved: &[SessionId],
 ) {
     let Some(wid) = focused_window else { return };
     let Some(w) = windows.get_mut(&wid) else {
         return;
     };
-    let rect = w.viewport();
+    let rect = w
+        .pane_rects
+        .iter()
+        .filter(|(sid, _)| moved.contains(sid))
+        .map(|(_, r)| *r)
+        .reduce(|a, b| a.union(&b))
+        .unwrap_or_else(|| w.viewport());
     let grab = (rect.x + rect.width * 0.5, rect.y + rect.height * 0.12);
     w.start_pour_out(shared, rect, grab);
 }
@@ -3398,10 +3449,13 @@ fn finish_ctl_drag_tail(
     let pending = windows.get_mut(&window).and_then(|w| w.pending_move.take());
     let mut error = None;
     if let Some((src, dest)) = pending {
+        // Captured BEFORE `apply_move` relocates them — see
+        // `moved_sessions`'s doc.
+        let moved = moved_sessions(windows, shared, src);
         match apply_move(windows, shared, focused_window, event_loop, src, dest) {
             Ok(()) => {
                 ended = DragEnded::Move;
-                pour_out_after_move(windows, shared, *focused_window);
+                pour_out_after_move(windows, shared, *focused_window, &moved);
             }
             Err(e) => {
                 eprintln!("[ember] drag drop rejected: {e}");
