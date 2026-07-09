@@ -47,6 +47,10 @@ shot tabs.png --tabs 4 --run "git log --oneline -6"
 # Surface mobility: a tab lifted mid-drag (tear-off / move between windows).
 shot tab-tearoff.png --tabs 4 --tab-drag 1 340 --run "git log --oneline -5"
 
+# Ghost tab (v0.4.0): the shimmering landing-spot preview a drag shows in the
+# strip. Cursor over the far slots so the ghost renders there.
+shot ghost-tab.png --tabs 4 --tab-drag 0 620 --run "git log --oneline -5"
+
 # Hold-to-wisp: the ember ring closing around the cursor before a pane lifts.
 shot hold-to-wisp.png --hold-ring 640 330 0.66 --run "git log --oneline -5"
 
