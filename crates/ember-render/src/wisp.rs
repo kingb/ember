@@ -32,13 +32,13 @@ use crate::renderer::{ACCENT, AMBER};
 // contained palettes here — they're wisp-only looks, not reused elsewhere,
 // so there's no reason to promote them to `renderer.rs`.
 
-/// Coal: deep red-orange body.
-const COAL_BODY: Rgb = Rgb::new(0x8a, 0x1f, 0x05);
-/// Coal: a slightly brighter body tone for the outer facets (still deep,
-/// not amber) so the overlapping quads read as angular, not a flat blob.
-const COAL_BODY_LIT: Rgb = Rgb::new(0xb8, 0x3a, 0x0e);
-/// Coal: white-hot facet cracks + emitted sparks.
+// (Coal's BODY colors live in `coal.rs`'s procedural shader now;
+// only its spark palette remains here.)
+/// Coal: the hottest, freshest sparks.
 const COAL_HOT: Rgb = Rgb::new(0xff, 0xf1, 0xd8);
+/// Coal: the vivid mid-flight spark orange (hot -> this -> deep body red),
+/// and the lit faces of the glowing rock.
+const COAL_SPARK: Rgb = Rgb::new(0xff, 0x8a, 0x1e);
 
 /// Will-o'-the-wisp: pale ghost-cyan.
 const WISP_CYAN: Rgb = Rgb::new(150, 220, 230);
@@ -84,6 +84,10 @@ pub struct WispRenderer {
     surface: wgpu::Surface<'static>,
     config: SurfaceConfiguration,
     sparks: SparkRenderer,
+    /// The `coal` style's solid procedural burning-rock body, drawn
+    /// under the additive sparks. Built eagerly — one tiny pipeline, and the
+    /// wisp window itself is already lazily created per drag.
+    coal: crate::coal::CoalRenderer,
     // Keep the window LAST so it drops after the surface (winit/wgpu
     // requirement — mirrors `renderer::Renderer`).
     window: Arc<Window>,
@@ -163,6 +167,7 @@ impl WispRenderer {
         surface.configure(&device, &config);
 
         let sparks = SparkRenderer::new(&device, format);
+        let coal = crate::coal::CoalRenderer::new(&device, format);
 
         Ok(Self {
             device,
@@ -170,6 +175,7 @@ impl WispRenderer {
             surface,
             config,
             sparks,
+            coal,
             window,
         })
     }
@@ -240,6 +246,15 @@ impl WispRenderer {
             (self.config.width as f32, self.config.height as f32),
             &quads,
         );
+        let is_coal = style == WispStyle::Coal;
+        if is_coal {
+            self.coal.prepare(
+                &self.queue,
+                (self.config.width as f32, self.config.height as f32),
+                t,
+                intensity,
+            );
+        }
 
         let view = frame
             .texture
@@ -273,6 +288,9 @@ impl WispRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if is_coal {
+                self.coal.draw(&mut pass);
+            }
             self.sparks.draw(&mut pass);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -316,6 +334,7 @@ pub(crate) fn wisp_quads(
         WispStyle::WillOWisp => willowisp_quads(t, intensity, velocity, w, h),
         WispStyle::Comet => comet_quads(t, intensity, velocity, w, h),
         WispStyle::Goo => goo_quads(t, intensity, velocity, w, h),
+        WispStyle::Star => star_quads(t, intensity, velocity, w, h),
     }
 }
 
@@ -413,15 +432,15 @@ fn ember_quads(
     out
 }
 
-/// Coal: a faceted chunk of hot ember rock. The additive spark pipeline
-/// only draws axis-aligned rects (no rotation), so "faceted" is faked with
-/// several overlapping rects of different aspect ratios and fixed relative
-/// offsets rather than a literal rotated polygon — the overlaps read as
-/// angular planes catching light, not a smooth circle. White-hot cracks sit
-/// at the center, brightest, pulsing faster than the body. Sparks are flung
-/// outward from the core's edges on individual trajectories (each with its
-/// own hashed direction/speed and a continuously looping flight phase),
-/// fading as they leave — not a shared orbit like `ember_quads`' ring.
+/// Coal: a solid, procedurally-rendered burning coal that throws a gentle
+/// shower of embers. The rock BODY is NOT quads — it's drawn by
+/// [`crate::coal::CoalRenderer`], an alpha-blended lava-rock sprite with
+/// animated hot cracks, because the additive spark shader can only make soft
+/// round glows (a solid lump is impossible there — it reads as ooze / gas /
+/// sparkler). This function returns only the additive extras layered ON TOP of
+/// that body: a soft centered ember glow, plus a modest shower of round sparks
+/// rising off the top, cooling + twinkling like the ambient campfire sparks
+/// ([`crate::paint::spark_quads`]). Velocity is ignored — sparks always rise.
 fn coal_quads(
     t: f32,
     intensity: f32,
@@ -429,60 +448,27 @@ fn coal_quads(
     w: f32,
     h: f32,
 ) -> Vec<([f32; 4], [f32; 4])> {
-    let _ = velocity; // coal doesn't stream a drag trail — its sparks fly on their own
+    let _ = velocity; // coal's sparks rise on their own; no drag trail
     let intensity = guard_intensity!(intensity);
     let cx = w * 0.5;
     let cy = h * 0.5;
     let s = w.min(h);
-    let mut out = Vec::with_capacity(16);
+    let mut out = Vec::with_capacity(24);
 
-    // The anchor facet: index 0, always exactly centered (every style keeps
-    // this invariant, so a "stays centered" test works uniformly).
-    let pulse = 0.9 + 0.1 * (t * 4.0).sin();
-    let body = s * 0.24 * pulse;
+    // Index 0: a small centered warm glow sitting under the procedural coal
+    // body — keeps the shared centered-anchor invariant and adds a soft ember
+    // core glow. (The solid rock itself is drawn by `CoalRenderer`, not here.)
+    let pulse = 0.85 + 0.15 * (t * 4.0).sin();
+    let core = s * 0.06 * pulse;
     out.push((
-        [cx - body * 0.5, cy - body * 0.42, body, body * 0.84],
-        lin_rgba(COAL_BODY, 0.85 * intensity),
-    ));
-    // A handful of offset, differently-proportioned facets around the
-    // anchor at FIXED relative offsets (not time-varying) — only the pulse
-    // and crack brightness animate, so the rock's silhouette itself doesn't
-    // jitter frame to frame.
-    const FACETS: [(f32, f32, f32, f32); 4] = [
-        // (dx, dy, w_frac, h_frac), all as fractions of `body`.
-        (-0.30, 0.10, 0.55, 0.60),
-        (0.28, 0.16, 0.50, 0.55),
-        (-0.08, -0.34, 0.48, 0.42),
-        (0.14, 0.30, 0.46, 0.40),
-    ];
-    for (dx, dy, wf, hf) in FACETS {
-        let fw = body * wf;
-        let fh = body * hf;
-        out.push((
-            [cx + dx * body - fw * 0.5, cy + dy * body - fh * 0.5, fw, fh],
-            lin_rgba(COAL_BODY_LIT, 0.55 * intensity),
-        ));
-    }
-
-    // White-hot cracks: two thin crossing quads through the center,
-    // brightest of everything, pulsing faster than the body.
-    let crack_pulse = 0.7 + 0.3 * (t * 9.0).sin().abs();
-    let crack_a = 0.9 * intensity * crack_pulse;
-    let crack_w = body * 0.10;
-    out.push((
-        [cx - crack_w * 0.5, cy - body * 0.46, crack_w, body * 0.92],
-        lin_rgba(COAL_HOT, crack_a),
-    ));
-    let crack_h = body * 0.10;
-    out.push((
-        [cx - body * 0.40, cy - crack_h * 0.5, body * 0.80, crack_h],
-        lin_rgba(COAL_HOT, crack_a * 0.85),
+        [cx - core * 0.5, cy - core * 0.5, core, core],
+        lin_rgba(COAL_SPARK, 0.35 * intensity),
     ));
 
-    // Sparks flung outward, each on its own trajectory: a hashed direction
-    // and speed, a continuously looping "flight" phase (born at the core,
-    // flies out + rises, fades near the end, then a new one begins).
-    const N: usize = 9;
+    // The spark shower: a modest number of round embers rising off the top of
+    // the rock, cooling + twinkling like the ambient campfire sparks. Kept
+    // gentle (not a dense sparkler spew) now that the body carries the read.
+    const N: usize = 20;
     for i in 0..N {
         let fi = i as f32;
         let hash = |a: f32, b: f32| {
@@ -491,19 +477,30 @@ fn coal_quads(
         };
         let seed_a = hash(17.13, 3.7);
         let seed_b = hash(41.9, 9.2);
-        let dir = seed_a * std::f32::consts::TAU;
-        let speed_mul = 0.6 + seed_b * 0.8;
-        let life = ((t * (0.5 + speed_mul)) + fi / N as f32).fract();
-        let dist = life * s * 0.42;
-        let (dirx, diry) = (dir.cos(), dir.sin());
-        let x = cx + dirx * dist;
-        let y = cy + diry * dist - s * 0.10 * life; // embers rise as they fly
-        let fade = (1.0 - life).powf(1.5);
-        let size = s * (0.02 + seed_b * 0.02) * (1.0 - 0.4 * life);
-        let color = lerp_rgb(COAL_HOT, COAL_BODY_LIT, life);
+        let seed_c = hash(7.31, 1.3);
+        let seed_d = hash(29.7, 5.9);
+        let speed_mul = 0.6 + seed_b * 0.7;
+        let life = ((t * (0.3 + speed_mul * 0.4)) + fi / N as f32).fract();
+        let rise = life * s * 0.55;
+        let cone = (seed_a - 0.5) * s * 0.16 * life;
+        let turb = (t * (3.0 + seed_c * 4.0) + fi).sin() * s * 0.015 * life;
+        // Born anywhere on the rock's surface (the sprite body is ~s*0.055 in
+        // radius), not from a single vent point.
+        let bx = (seed_a - 0.5) * s * 0.10;
+        let by = (seed_d - 0.5) * s * 0.08;
+        let x = cx + bx + cone + turb;
+        let y = cy + by - rise;
+        let color = if life < 0.35 {
+            lerp_rgb(COAL_HOT, AMBER, life / 0.35)
+        } else {
+            lerp_rgb(AMBER, ACCENT, (life - 0.35) / 0.65)
+        };
+        let twinkle = 0.7 + 0.3 * (t * (8.0 + seed_c * 6.0) + fi).sin();
+        let fade = (std::f32::consts::PI * life).sin().max(0.0);
+        let sz = s * (0.007 + seed_b * seed_b * 0.02);
         out.push((
-            [x - size * 0.5, y - size * 0.5, size, size],
-            lin_rgba(color, 0.85 * intensity * fade),
+            [x - sz * 0.5, y - sz * 0.5, sz, sz],
+            lin_rgba(color, 0.85 * intensity * fade * twinkle.max(0.0)),
         ));
     }
 
@@ -574,11 +571,10 @@ fn willowisp_quads(
     out
 }
 
-/// Comet: a brilliant, small, white-hot head with a long dramatic tail
-/// streaming opposite the direction of travel — many quads tapering in
-/// size and alpha over a long distance, head white cooling to blue-white at
-/// the tip. Tail length scales with speed but never drops below a minimum,
-/// so it always reads as a comet even when the drag pauses.
+/// Comet: a bright, tail-less white-hot head with a soft glow — the original
+/// comet head a touch larger, with the long streaming tail removed (v0.4.1).
+/// The dazzling flare-star variant is now its own [`star_quads`] style.
+/// Velocity is ignored; it's a clean bright point.
 fn comet_quads(
     t: f32,
     intensity: f32,
@@ -586,59 +582,82 @@ fn comet_quads(
     w: f32,
     h: f32,
 ) -> Vec<([f32; 4], [f32; 4])> {
+    let _ = velocity; // tail-less head only
     let intensity = guard_intensity!(intensity);
     let cx = w * 0.5;
     let cy = h * 0.5;
     let s = w.min(h);
-    let mut out = Vec::with_capacity(16);
+    let mut out = Vec::with_capacity(2);
 
-    // Head: index 0, always exactly centered, small and dense.
+    // Head: index 0, always exactly centered — a touch larger than the
+    // original comet head (was s*0.13), tail removed.
     let flicker = 0.92 + 0.08 * (t * 10.0).sin();
-    let head = s * 0.13 * flicker;
+    let head = s * 0.16 * flicker;
     out.push((
         [cx - head * 0.5, cy - head * 0.5, head, head],
         lin_rgba(COMET_HEAD, 0.98 * intensity),
     ));
-    // A slightly larger, dimmer glow around the head for punch.
-    let head_glow = head * 1.8;
+    // A soft glow around the head for punch.
+    let glow = head * 1.9;
     out.push((
-        [
-            cx - head_glow * 0.5,
-            cy - head_glow * 0.5,
-            head_glow,
-            head_glow,
-        ],
-        lin_rgba(COMET_HEAD, 0.25 * intensity),
+        [cx - glow * 0.5, cy - glow * 0.5, glow, glow],
+        lin_rgba(COMET_HEAD, 0.28 * intensity),
     ));
 
-    let speed = (velocity.0 * velocity.0 + velocity.1 * velocity.1).sqrt();
-    // Direction opposite travel; at rest the tail points straight down (a
-    // fixed default) so it never disappears at zero velocity.
-    let (dx, dy) = if speed > 1.0 {
-        let inv = 1.0 / speed;
-        (-velocity.0 * inv, -velocity.1 * inv)
-    } else {
-        (0.0, 1.0)
-    };
-    // Minimum tail length even at rest; grows with speed, capped so it
-    // doesn't run off a small window at very high drag velocities.
-    let tail_len = s * (0.55 + (speed.min(900.0) / 900.0) * 0.55);
-    const TAIL: usize = 12;
-    for i in 1..=TAIL {
-        let f = i as f32 / TAIL as f32;
-        // A little jitter along the tail so it doesn't read as a perfectly
-        // uniform ladder of quads.
-        let jitter = (t * 5.0 + f * 13.0).sin() * s * 0.01;
-        let dist = f * tail_len;
-        let x = cx + dx * dist + (-dy) * jitter;
-        let y = cy + dy * dist + dx * jitter;
-        let size = (head * (1.0 - f * 0.85)).max(s * 0.008);
-        let a = (1.0 - f).powf(1.6) * 0.85 * intensity;
-        out.push((
-            [x - size * 0.5, y - size * 0.5, size, size],
-            lin_rgba(lerp_rgb(COMET_HEAD, COMET_TAIL, f), a),
-        ));
-    }
+    out
+}
+
+/// Star: a dazzling white-hot orb with a soft blue-white bloom and a lens-flare
+/// sparkle — a bright, steady beacon (v0.4.1, promoted from an over-cooked
+/// comet). A dense near-white core, a punchy inner glow, a large low-alpha
+/// blue-white outer halo, and two thin crossing flare arms that pulse.
+/// Velocity is ignored.
+fn star_quads(
+    t: f32,
+    intensity: f32,
+    velocity: (f32, f32),
+    w: f32,
+    h: f32,
+) -> Vec<([f32; 4], [f32; 4])> {
+    let _ = velocity; // steady beacon, no streak
+    let intensity = guard_intensity!(intensity);
+    let cx = w * 0.5;
+    let cy = h * 0.5;
+    let s = w.min(h);
+    let mut out = Vec::with_capacity(5);
+
+    // Head: index 0, always exactly centered. (v0.4.1: trimmed ~20% smaller.)
+    let flicker = 0.94 + 0.06 * (t * 10.0).sin();
+    let head = s * 0.16 * flicker;
+    out.push((
+        [cx - head * 0.5, cy - head * 0.5, head, head],
+        lin_rgba(COMET_HEAD, 0.98 * intensity),
+    ));
+    // Inner glow — near-white, punchy.
+    let inner = head * 1.7;
+    out.push((
+        [cx - inner * 0.5, cy - inner * 0.5, inner, inner],
+        lin_rgba(COMET_HEAD, 0.30 * intensity),
+    ));
+    // Outer halo — large, soft, blue-white bloom.
+    let halo = head * 3.0;
+    out.push((
+        [cx - halo * 0.5, cy - halo * 0.5, halo, halo],
+        lin_rgba(COMET_TAIL, 0.12 * intensity),
+    ));
+    // Lens-flare arms: two thin crossing quads (horizontal + vertical),
+    // blue-white, slowly pulsing — the "brilliant" sparkle.
+    let flare_pulse = 0.5 + 0.5 * (t * 3.0).sin().abs();
+    let arm_len = head * 3.4;
+    let arm_w = head * 0.10;
+    out.push((
+        [cx - arm_len * 0.5, cy - arm_w * 0.5, arm_len, arm_w],
+        lin_rgba(COMET_TAIL, 0.35 * intensity * flare_pulse),
+    ));
+    out.push((
+        [cx - arm_w * 0.5, cy - arm_len * 0.5, arm_w, arm_len],
+        lin_rgba(COMET_TAIL, 0.35 * intensity * flare_pulse),
+    ));
 
     out
 }
@@ -687,22 +706,23 @@ fn goo_quads(
         lin_rgba(GOO_HOT, 0.9 * intensity),
     ));
 
-    // 1-2 slow drips: fall from the underside of the core and fade out,
-    // looping.
-    const DRIPS: usize = 2;
-    for i in 0..DRIPS {
+    // A couple of embers floating UP off the molten body (v0.4.1: was slow
+    // drips falling below; flipped to rising embers), scattering sideways a
+    // little and cooling as they fade, looping.
+    const EMBERS: usize = 2;
+    for i in 0..EMBERS {
         let fi = i as f32;
         let period = 1.6 + fi * 0.4;
         let phase = ((t + fi * 0.8) / period).fract();
         let dist = phase * s * 0.5;
-        let dx = (fi * 12.9898).sin() * s * 0.06;
-        let x = cx + dx;
-        let y = cy + body * 0.35 + dist;
+        let drift = (fi * 12.9898).sin() * s * 0.06 + (t * 1.5 + fi * 2.0).sin() * s * 0.03 * phase;
+        let x = cx + drift;
+        let y = cy - body * 0.35 - dist; // rise instead of fall
         let size = (s * 0.05 * (1.0 - phase * 0.5)).max(s * 0.01);
         let a = (1.0 - phase) * 0.6 * intensity;
         out.push((
             [x - size * 0.5, y - size * 0.5, size, size],
-            lin_rgba(GOO_BODY, a),
+            lin_rgba(lerp_rgb(GOO_HOT, GOO_BODY, phase), a),
         ));
     }
 
@@ -781,6 +801,7 @@ mod tests {
                 WispStyle::WillOWisp => willowisp_quads(0.3, 1.0, (10.0, 0.0), 140.0, 140.0),
                 WispStyle::Comet => comet_quads(0.3, 1.0, (10.0, 0.0), 140.0, 140.0),
                 WispStyle::Goo => goo_quads(0.3, 1.0, (10.0, 0.0), 140.0, 140.0),
+                WispStyle::Star => star_quads(0.3, 1.0, (10.0, 0.0), 140.0, 140.0),
             };
             let dispatched = wisp_quads(style, 0.3, 1.0, (10.0, 0.0), 140.0, 140.0);
             assert_eq!(
@@ -853,20 +874,19 @@ mod tests {
     // --- Coal -----------------------------------------------------------------
 
     #[test]
-    fn coal_has_body_facets_cracks_and_sparks() {
+    fn coal_has_core_glow_and_spark_shower() {
         let q = coal_quads(0.0, 1.0, (0.0, 0.0), 230.0, 230.0);
-        // 1 anchor + 4 facets + 2 cracks + 9 sparks.
-        assert_eq!(q.len(), 16);
+        // 1 centered core glow + 20 spark dots (the solid body is the sprite).
+        assert_eq!(q.len(), 21);
     }
 
     #[test]
     fn coal_sparks_are_not_a_shared_orbit() {
-        // Unlike ember's ring (all sparks at one orbit radius from a shared
-        // angle formula), coal's flung sparks should land at varied
-        // distances from the center at a given instant.
+        // Unlike cinder's single-radius ring, coal's rising sparks land at
+        // varied distances from center at any instant.
         let q = coal_quads(0.7, 1.0, (0.0, 0.0), 230.0, 230.0);
         let (cx, cy) = (115.0, 115.0);
-        let dists: Vec<f32> = q[7..]
+        let dists: Vec<f32> = q[q.len() - 20..]
             .iter()
             .map(|(r, _)| {
                 let (x, y) = (r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
@@ -903,64 +923,74 @@ mod tests {
     // --- Comet ------------------------------------------------------------------
 
     #[test]
-    fn comet_has_head_glow_and_a_long_tail() {
+    fn comet_is_a_tailless_head_and_glow() {
         let q = comet_quads(0.0, 1.0, (0.0, 0.0), 230.0, 230.0);
-        // 1 head + 1 glow + 12 tail segments.
-        assert_eq!(q.len(), 14);
+        // Just the head + a soft glow — no tail, no flare.
+        assert_eq!(q.len(), 2);
     }
 
     #[test]
-    fn comet_tail_has_a_minimum_length_at_rest() {
-        let idle = comet_quads(0.0, 1.0, (0.0, 0.0), 230.0, 230.0);
-        // The last tail quad (tip) should still be meaningfully far from
-        // center even with zero velocity — "always cometary".
-        let tip = idle.last().unwrap();
-        let (cx, cy) = (115.0, 115.0);
-        let (x, y) = (tip.0[0] + tip.0[2] * 0.5, tip.0[1] + tip.0[3] * 0.5);
-        let dist = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
-        assert!(dist > 40.0, "comet tail too short at rest: {dist}px");
+    fn comet_ignores_velocity_no_streaming_tail() {
+        let idle = comet_quads(0.3, 1.0, (0.0, 0.0), 230.0, 230.0);
+        let moving = comet_quads(0.3, 1.0, (900.0, 0.0), 230.0, 230.0);
+        assert_eq!(idle, moving, "comet should be indifferent to velocity now");
     }
 
     #[test]
-    fn comet_tail_grows_with_speed() {
-        let slow = comet_quads(0.0, 1.0, (0.0, 0.0), 230.0, 230.0);
-        let fast = comet_quads(0.0, 1.0, (800.0, 0.0), 230.0, 230.0);
-        let tip_dist = |q: &[([f32; 4], [f32; 4])]| {
-            let tip = q.last().unwrap();
-            let (cx, cy) = (115.0, 115.0);
-            let (x, y) = (tip.0[0] + tip.0[2] * 0.5, tip.0[1] + tip.0[3] * 0.5);
-            ((x - cx).powi(2) + (y - cy).powi(2)).sqrt()
-        };
-        assert!(
-            tip_dist(&fast) > tip_dist(&slow),
-            "tail should lengthen with speed"
-        );
+    fn comet_head_and_glow_read_white() {
+        let q = comet_quads(0.0, 1.0, (0.0, 0.0), 230.0, 230.0);
+        for quad in &q {
+            let c = quad.1; // linear [r, g, b, a]
+            assert!(
+                (c[0] - c[2]).abs() < 0.15,
+                "comet should read white (R~=B): {c:?}"
+            );
+        }
+    }
+
+    // --- Star -------------------------------------------------------------------
+
+    #[test]
+    fn star_is_a_flare_bloom() {
+        let q = star_quads(0.0, 1.0, (0.0, 0.0), 230.0, 230.0);
+        // head + inner glow + outer halo + 2 flare arms.
+        assert_eq!(q.len(), 5);
     }
 
     #[test]
-    fn comet_head_is_near_white_tail_tip_is_bluer() {
-        let q = comet_quads(0.0, 1.0, (500.0, 0.0), 230.0, 230.0);
+    fn star_head_is_white_halo_is_bluer() {
+        let q = star_quads(0.0, 1.0, (0.0, 0.0), 230.0, 230.0);
         let head = q[0].1; // linear [r, g, b, a]
-        let tail = q.last().unwrap().1;
-        // Head reads as (near-)white: R and B are close to each other.
+        let halo = q[2].1; // the large outer blue-white bloom
         assert!(
             (head[0] - head[2]).abs() < 0.15,
-            "head should read white: {head:?}"
+            "star head should read white: {head:?}"
         );
-        // Tail tip is bluer than the head: B/R ratio rises toward the tip.
         assert!(
-            tail[2] / tail[0].max(1e-6) > head[2] / head[0].max(1e-6),
-            "tail should cool toward blue-white: head {head:?}, tail {tail:?}"
+            halo[2] / halo[0].max(1e-6) > head[2] / head[0].max(1e-6),
+            "halo should be bluer than the head: head {head:?}, halo {halo:?}"
         );
     }
 
     // --- Goo --------------------------------------------------------------------
 
     #[test]
-    fn goo_has_two_lobes_hot_center_and_drips() {
+    fn goo_has_two_lobes_hot_center_and_rising_embers() {
         let q = goo_quads(0.0, 1.0, (0.0, 0.0), 230.0, 230.0);
-        // 2 lobes + 1 hot center + 2 drips.
+        // 2 lobes + 1 hot center + 2 rising embers.
         assert_eq!(q.len(), 5);
+    }
+
+    #[test]
+    fn goo_embers_float_up_not_down() {
+        // The embers (last two quads) sit ABOVE the core center — rising,
+        // not dripping below it.
+        let q = goo_quads(0.35, 1.0, (0.0, 0.0), 230.0, 230.0);
+        let cy = 115.0;
+        for e in &q[3..] {
+            let ey = e.0[1] + e.0[3] * 0.5;
+            assert!(ey < cy, "goo ember should rise above center: {ey}");
+        }
     }
 
     #[test]

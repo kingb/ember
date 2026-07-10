@@ -198,9 +198,9 @@ fn adjust_scrim(c: &mut Config, dir: f32) {
     c.background.scrim = (c.background.scrim + 0.05 * dir).clamp(0.0, 1.0);
 }
 
-/// The wisp style dial's six-state cycle: `ember → coal → willowisp →
-/// comet → goo → random → ember`. Direction-agnostic (like the sparks
-/// dial): always steps forward regardless of `dir`.
+/// The wisp style dial's seven-state cycle: `ember → coal → willowisp →
+/// comet → goo → star → random → ember`. Direction-agnostic (like the
+/// sparks dial): always steps forward regardless of `dir`.
 fn fmt_wisp_style(c: &Config) -> String {
     match c.wisp_style {
         WispStyleSelection::Ember => "ember".to_string(),
@@ -208,6 +208,7 @@ fn fmt_wisp_style(c: &Config) -> String {
         WispStyleSelection::WillOWisp => "willowisp".to_string(),
         WispStyleSelection::Comet => "comet".to_string(),
         WispStyleSelection::Goo => "goo".to_string(),
+        WispStyleSelection::Star => "star".to_string(),
         WispStyleSelection::Random => "random".to_string(),
     }
 }
@@ -217,7 +218,8 @@ fn adjust_wisp_style(c: &mut Config, _dir: f32) {
         WispStyleSelection::Coal => WispStyleSelection::WillOWisp,
         WispStyleSelection::WillOWisp => WispStyleSelection::Comet,
         WispStyleSelection::Comet => WispStyleSelection::Goo,
-        WispStyleSelection::Goo => WispStyleSelection::Random,
+        WispStyleSelection::Goo => WispStyleSelection::Star,
+        WispStyleSelection::Star => WispStyleSelection::Random,
         WispStyleSelection::Random => WispStyleSelection::Ember,
     };
 }
@@ -642,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn wisp_style_cycle_visits_all_six_states_and_wraps() {
+    fn wisp_style_cycle_visits_all_seven_states_and_wraps() {
         // `Config::default()` already starts at `Ember` — the cycle's home
         // position.
         let mut c = Config::default();
@@ -652,6 +654,7 @@ mod tests {
             WispStyleSelection::WillOWisp,
             WispStyleSelection::Comet,
             WispStyleSelection::Goo,
+            WispStyleSelection::Star,
             WispStyleSelection::Random,
             WispStyleSelection::Ember,
         ];

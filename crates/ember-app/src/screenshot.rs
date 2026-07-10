@@ -138,8 +138,9 @@ fn parse_wisp_style(s: &str) -> Result<ember_core::WispStyle, String> {
         "willowisp" => Ok(WispStyle::WillOWisp),
         "comet" => Ok(WispStyle::Comet),
         "goo" => Ok(WispStyle::Goo),
+        "star" => Ok(WispStyle::Star),
         other => Err(format!(
-            "--wisp-preview: unknown style {other:?} (expected ember|coal|willowisp|comet|goo)"
+            "--wisp-preview: unknown style {other:?} (expected ember|coal|willowisp|comet|goo|star)"
         )),
     }
 }

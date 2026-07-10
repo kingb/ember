@@ -816,6 +816,15 @@ pub fn capture_wisp_preview(
     // opaque canvas instead of a transparent one.
     let quads = crate::wisp::wisp_quads(style, t, intensity, velocity, phys as f32, phys as f32);
     sparks.prepare(&device, &queue, (phys as f32, phys as f32), &quads);
+    // The `coal` style draws a solid procedural burning-rock body UNDER the
+    // additive spark shower — the additive pass alone can't do solid.
+    let coal = if matches!(style, ember_core::WispStyle::Coal) {
+        let c = crate::coal::CoalRenderer::new(&device, format);
+        c.prepare(&queue, (phys as f32, phys as f32), t, intensity);
+        Some(c)
+    } else {
+        None
+    };
 
     let bpp = 4u32;
     let unpadded = phys * bpp;
@@ -852,6 +861,9 @@ pub fn capture_wisp_preview(
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if let Some(coal) = &coal {
+            coal.draw(&mut pass);
+        }
         sparks.draw(&mut pass);
     }
     encoder.copy_texture_to_buffer(

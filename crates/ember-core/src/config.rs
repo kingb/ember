@@ -66,34 +66,36 @@ pub enum WispStyle {
     /// orbiting ring of sparks, a velocity trail.
     #[default]
     Ember,
-    /// A faceted chunk of hot coal: an angular core with white-hot cracks,
-    /// sparks flung outward from the edges.
+    /// A glowing coal lump throwing a fountain of sparks upward.
     Coal,
     /// The literal will-o'-the-wisp: a soft, cool, breathing orb with a
     /// wispy vapor tail. No hard sparks.
     WillOWisp,
-    /// A brilliant white-hot head with a long dramatic tail streaming
-    /// opposite the direction of travel.
+    /// A bright, tail-less white-hot head with a soft glow.
     Comet,
-    /// A wobbling molten droplet (World of Goo homage) with slow drips.
+    /// A wobbling molten droplet (World of Goo homage), embers floating up.
     Goo,
+    /// A dazzling white-hot star: a bright core, a blue-white bloom, and a
+    /// lens-flare sparkle. (Promoted from an over-cooked comet in v0.4.1.)
+    Star,
 }
 
 impl WispStyle {
-    /// All five concrete styles, in a fixed order — the round-robin
+    /// All six concrete styles, in a fixed order — the round-robin
     /// sequence [`WispStyleSelection::resolve`]'s `Random` case walks, and
     /// the order the `--wisp-preview` tooling and design docs enumerate them
     /// in.
-    pub const ALL: [WispStyle; 5] = [
+    pub const ALL: [WispStyle; 6] = [
         WispStyle::Ember,
         WispStyle::Coal,
         WispStyle::WillOWisp,
         WispStyle::Comet,
         WispStyle::Goo,
+        WispStyle::Star,
     ];
 }
 
-/// The `wisp_style` config knob: one of the five concrete [`WispStyle`]s, or
+/// The `wisp_style` config knob: one of the six concrete [`WispStyle`]s, or
 /// `Random` — a concrete style is picked fresh for each drag (see
 /// [`WispStyleSelection::resolve`]), not once per process. Serializes the
 /// same as [`WispStyle`] (lowercase), plus the extra `"random"` value.
@@ -111,6 +113,8 @@ pub enum WispStyleSelection {
     WillOWisp,
     Comet,
     Goo,
+    /// The dazzling flare-star (v0.4.1).
+    Star,
     /// Pick a concrete style per drag (round-robins [`WispStyle::ALL`] —
     /// see [`Self::resolve`]).
     Random,
@@ -127,6 +131,7 @@ impl<'de> Deserialize<'de> for WispStyleSelection {
             "willowisp" => Self::WillOWisp,
             "comet" => Self::Comet,
             "goo" => Self::Goo,
+            "star" => Self::Star,
             "random" => Self::Random,
             // "ember", plus any typo or unrecognized value (including a
             // style name from a newer Ember this build doesn't know about).
@@ -148,6 +153,7 @@ impl WispStyleSelection {
             Self::WillOWisp => WispStyle::WillOWisp,
             Self::Comet => WispStyle::Comet,
             Self::Goo => WispStyle::Goo,
+            Self::Star => WispStyle::Star,
             Self::Random => WispStyle::ALL[(counter as usize) % WispStyle::ALL.len()],
         }
     }
@@ -358,13 +364,14 @@ mod tests {
     }
 
     #[test]
-    fn wisp_style_accepts_all_five_names_plus_random() {
+    fn wisp_style_accepts_all_six_names_plus_random() {
         for (s, want) in [
             ("ember", WispStyleSelection::Ember),
             ("coal", WispStyleSelection::Coal),
             ("willowisp", WispStyleSelection::WillOWisp),
             ("comet", WispStyleSelection::Comet),
             ("goo", WispStyleSelection::Goo),
+            ("star", WispStyleSelection::Star),
             ("random", WispStyleSelection::Random),
         ] {
             let toml_src = format!("wisp_style = \"{s}\"\n");
@@ -387,6 +394,7 @@ mod tests {
             WispStyleSelection::WillOWisp,
             WispStyleSelection::Comet,
             WispStyleSelection::Goo,
+            WispStyleSelection::Star,
             WispStyleSelection::Random,
         ] {
             let c = Config {
@@ -413,12 +421,12 @@ mod tests {
 
     #[test]
     fn wisp_style_resolve_random_round_robins_and_varies() {
-        let seen: Vec<WispStyle> = (0..5)
+        let seen: Vec<WispStyle> = (0..6)
             .map(|i| WispStyleSelection::Random.resolve(i))
             .collect();
-        // All 5 concrete styles appear exactly once across 5 consecutive draws.
+        // All 6 concrete styles appear exactly once across 6 consecutive draws.
         assert_eq!(seen, WispStyle::ALL.to_vec());
-        // Wraps back to the start on the 6th draw.
-        assert_eq!(WispStyleSelection::Random.resolve(5), WispStyle::Ember);
+        // Wraps back to the start on the 7th draw.
+        assert_eq!(WispStyleSelection::Random.resolve(6), WispStyle::Ember);
     }
 }
