@@ -198,12 +198,12 @@ fn adjust_scrim(c: &mut Config, dir: f32) {
     c.background.scrim = (c.background.scrim + 0.05 * dir).clamp(0.0, 1.0);
 }
 
-/// The wisp style dial's seven-state cycle: `ember → coal → willowisp →
-/// comet → goo → star → random → ember`. Direction-agnostic (like the
+/// The wisp style dial's seven-state cycle: `cinder → coal → willowisp →
+/// comet → goo → star → random → cinder`. Direction-agnostic (like the
 /// sparks dial): always steps forward regardless of `dir`.
 fn fmt_wisp_style(c: &Config) -> String {
     match c.wisp_style {
-        WispStyleSelection::Ember => "ember".to_string(),
+        WispStyleSelection::Cinder => "cinder".to_string(),
         WispStyleSelection::Coal => "coal".to_string(),
         WispStyleSelection::WillOWisp => "willowisp".to_string(),
         WispStyleSelection::Comet => "comet".to_string(),
@@ -214,13 +214,13 @@ fn fmt_wisp_style(c: &Config) -> String {
 }
 fn adjust_wisp_style(c: &mut Config, _dir: f32) {
     c.wisp_style = match c.wisp_style {
-        WispStyleSelection::Ember => WispStyleSelection::Coal,
+        WispStyleSelection::Cinder => WispStyleSelection::Coal,
         WispStyleSelection::Coal => WispStyleSelection::WillOWisp,
         WispStyleSelection::WillOWisp => WispStyleSelection::Comet,
         WispStyleSelection::Comet => WispStyleSelection::Goo,
         WispStyleSelection::Goo => WispStyleSelection::Star,
         WispStyleSelection::Star => WispStyleSelection::Random,
-        WispStyleSelection::Random => WispStyleSelection::Ember,
+        WispStyleSelection::Random => WispStyleSelection::Cinder,
     };
 }
 
@@ -656,7 +656,7 @@ mod tests {
             WispStyleSelection::Goo,
             WispStyleSelection::Star,
             WispStyleSelection::Random,
-            WispStyleSelection::Ember,
+            WispStyleSelection::Cinder,
         ];
         for want in expected {
             adjust(&mut c, 1.0);

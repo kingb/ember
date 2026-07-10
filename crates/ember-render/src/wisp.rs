@@ -25,10 +25,10 @@ use crate::background::SparkRenderer;
 use crate::paint::{lerp_rgb, lin_rgba};
 use crate::renderer::{ACCENT, AMBER};
 
-// --- Per-style palettes (v0.4.1, the wisp's 5 styles) -----------------------
+// --- Per-style palettes (v0.4.1, the wisp's 6 styles) -----------------------
 //
-// `Ember` keeps reusing `AMBER`/`ACCENT` (the renderer's shared campfire
-// palette, unchanged). The other 4 styles get their own small, self-
+// `Cinder` (née ember) keeps reusing `AMBER`/`ACCENT` (the renderer's shared campfire
+// palette, unchanged). The other 5 styles get their own small, self-
 // contained palettes here — they're wisp-only looks, not reused elsewhere,
 // so there's no reason to promote them to `renderer.rs`.
 
@@ -315,9 +315,9 @@ macro_rules! guard_intensity {
     }};
 }
 
-/// Dispatch to one of the wisp's 5 visual styles (v0.4.1 — settings row
+/// Dispatch to one of the wisp's 6 visual styles (v0.4.1 — settings row
 /// "Wisp style", config key `wisp_style`). Every generator shares this exact
-/// signature and the additive-quad contract documented on [`ember_quads`]:
+/// signature and the additive-quad contract documented on [`cinder_quads`]:
 /// `(rect_px, linear_rgba)` quads, `s = w.min(h)`-relative geometry,
 /// `intensity<=0 → empty`. Pure — no stored state, cheap to unit-test.
 pub(crate) fn wisp_quads(
@@ -329,7 +329,7 @@ pub(crate) fn wisp_quads(
     h: f32,
 ) -> Vec<([f32; 4], [f32; 4])> {
     match style {
-        WispStyle::Ember => ember_quads(t, intensity, velocity, w, h),
+        WispStyle::Cinder => cinder_quads(t, intensity, velocity, w, h),
         WispStyle::Coal => coal_quads(t, intensity, velocity, w, h),
         WispStyle::WillOWisp => willowisp_quads(t, intensity, velocity, w, h),
         WispStyle::Comet => comet_quads(t, intensity, velocity, w, h),
@@ -346,9 +346,9 @@ pub(crate) fn wisp_quads(
 /// the pointer); `intensity` (already clamped/ramped by the caller) scales
 /// every alpha. No stored state — same "procedural from `t` alone" shape as
 /// [`crate::paint::spark_quads`], so it's cheap to unit-test. THE ORIGINAL
-/// (pre-v0.4.1) wisp look, unchanged — now one of 5 styles behind
+/// (pre-v0.4.1) wisp look, unchanged — now one of 6 styles behind
 /// [`wisp_quads`]'s dispatch rather than the only one.
-fn ember_quads(
+fn cinder_quads(
     t: f32,
     intensity: f32,
     velocity: (f32, f32),
@@ -737,12 +737,12 @@ mod tests {
 
     #[test]
     fn zero_intensity_yields_no_quads() {
-        assert!(wisp_quads(WispStyle::Ember, 1.0, 0.0, (0.0, 0.0), 140.0, 140.0).is_empty());
+        assert!(wisp_quads(WispStyle::Cinder, 1.0, 0.0, (0.0, 0.0), 140.0, 140.0).is_empty());
     }
 
     #[test]
     fn core_plus_ring_present_at_full_intensity() {
-        let q = wisp_quads(WispStyle::Ember, 0.0, 1.0, (0.0, 0.0), 140.0, 140.0);
+        let q = wisp_quads(WispStyle::Cinder, 0.0, 1.0, (0.0, 0.0), 140.0, 140.0);
         // 1 core + 10 ring sparks, no trail (zero velocity).
         assert_eq!(q.len(), 11);
     }
@@ -751,7 +751,7 @@ mod tests {
     fn cluster_stays_centered_regardless_of_time() {
         for i in 0..20 {
             let t = i as f32 * 0.37;
-            let q = wisp_quads(WispStyle::Ember, t, 1.0, (0.0, 0.0), 140.0, 140.0);
+            let q = wisp_quads(WispStyle::Cinder, t, 1.0, (0.0, 0.0), 140.0, 140.0);
             let core = q[0];
             let (rx, ry, rw, rh) = (core.0[0], core.0[1], core.0[2], core.0[3]);
             let (cx, cy) = (rx + rw * 0.5, ry + rh * 0.5);
@@ -762,15 +762,15 @@ mod tests {
 
     #[test]
     fn fast_drag_adds_a_trail() {
-        let idle = wisp_quads(WispStyle::Ember, 0.0, 1.0, (0.0, 0.0), 140.0, 140.0);
-        let moving = wisp_quads(WispStyle::Ember, 0.0, 1.0, (500.0, 0.0), 140.0, 140.0);
+        let idle = wisp_quads(WispStyle::Cinder, 0.0, 1.0, (0.0, 0.0), 140.0, 140.0);
+        let moving = wisp_quads(WispStyle::Cinder, 0.0, 1.0, (500.0, 0.0), 140.0, 140.0);
         assert!(moving.len() > idle.len());
     }
 
     #[test]
     fn alpha_scales_with_intensity() {
-        let full = wisp_quads(WispStyle::Ember, 0.5, 1.0, (0.0, 0.0), 140.0, 140.0);
-        let half = wisp_quads(WispStyle::Ember, 0.5, 0.5, (0.0, 0.0), 140.0, 140.0);
+        let full = wisp_quads(WispStyle::Cinder, 0.5, 1.0, (0.0, 0.0), 140.0, 140.0);
+        let half = wisp_quads(WispStyle::Cinder, 0.5, 0.5, (0.0, 0.0), 140.0, 140.0);
         // Same particle count/positions; every alpha channel should be ~halved.
         assert_eq!(full.len(), half.len());
         for (f, h) in full.iter().zip(half.iter()) {
@@ -785,8 +785,8 @@ mod tests {
 
     #[test]
     fn intensity_is_clamped() {
-        let over = wisp_quads(WispStyle::Ember, 0.0, 5.0, (0.0, 0.0), 140.0, 140.0);
-        let one = wisp_quads(WispStyle::Ember, 0.0, 1.0, (0.0, 0.0), 140.0, 140.0);
+        let over = wisp_quads(WispStyle::Cinder, 0.0, 5.0, (0.0, 0.0), 140.0, 140.0);
+        let one = wisp_quads(WispStyle::Cinder, 0.0, 1.0, (0.0, 0.0), 140.0, 140.0);
         assert_eq!(over, one);
     }
 
@@ -796,7 +796,7 @@ mod tests {
     fn dispatcher_routes_to_the_right_generator() {
         for style in WispStyle::ALL {
             let direct = match style {
-                WispStyle::Ember => ember_quads(0.3, 1.0, (10.0, 0.0), 140.0, 140.0),
+                WispStyle::Cinder => cinder_quads(0.3, 1.0, (10.0, 0.0), 140.0, 140.0),
                 WispStyle::Coal => coal_quads(0.3, 1.0, (10.0, 0.0), 140.0, 140.0),
                 WispStyle::WillOWisp => willowisp_quads(0.3, 1.0, (10.0, 0.0), 140.0, 140.0),
                 WispStyle::Comet => comet_quads(0.3, 1.0, (10.0, 0.0), 140.0, 140.0),
@@ -835,7 +835,7 @@ mod tests {
     #[test]
     fn every_style_keeps_its_first_quad_exactly_centered() {
         // Every generator's index-0 quad is its anchor shape, centered
-        // regardless of `t`/velocity — the one invariant all 5 styles share
+        // regardless of `t`/velocity — the one invariant all 6 styles share
         // (verified per-style below too, but this sweeps every style at
         // once against varying time).
         for style in WispStyle::ALL {

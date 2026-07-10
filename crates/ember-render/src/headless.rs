@@ -765,7 +765,7 @@ pub fn capture_reusing(
 /// desktop/terminal behind the real wisp window.
 ///
 /// Debug/comparison tooling only (`ember-term --screenshot <path>
-/// --wisp-preview <style>`, v0.4.1's 5-style wisp) — builds its own
+/// --wisp-preview <style>`, v0.4.1's 6-style wisp) — builds its own
 /// throwaway GPU device, same cost tradeoff as [`capture`].
 pub fn capture_wisp_preview(
     style: ember_core::WispStyle,

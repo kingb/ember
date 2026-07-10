@@ -78,12 +78,13 @@ pub struct Opts {
     /// 0..1)` — debug plumbing so the ring's quad geometry can be eyeballed
     /// via a headless screenshot without a live windowed hold.
     pub hold_ring: Option<(f32, f32, f32)>,
-    /// `--wisp-preview <style>` (v0.4.1's 5-style wisp): when set, `run`
+    /// `--wisp-preview <style>` (v0.4.1's 6-style wisp): when set, `run`
     /// skips the whole pane-based scene entirely and instead renders that
     /// style's particle cluster (one animated frame, `t`/`intensity`/
     /// `velocity` fixed for a deterministic, comparable shot) onto an
     /// opaque dark canvas — see [`ember_render::headless::capture_wisp_preview`].
-    /// Accepts `ember`|`coal`|`willowisp`|`comet`|`goo` (case-insensitive);
+    /// Accepts `cinder`|`coal`|`willowisp`|`comet`|`goo`|`star`
+    /// (case-insensitive; `ember` is the pre-v0.4.1 alias for `cinder`);
     /// anything else is a hard parse error (this is debug tooling, not the
     /// forgiving `config.toml` `wisp_style` knob — a typo here should fail
     /// loudly, not silently render the wrong style).
@@ -126,21 +127,22 @@ impl Default for Opts {
 }
 
 /// Parse a `--wisp-preview` style name into a concrete [`ember_core::WispStyle`].
-/// Case-insensitive over the same 5 names `config.toml`'s `wisp_style` accepts
+/// Case-insensitive over the same 6 names `config.toml`'s `wisp_style` accepts
 /// (not `"random"` — a preview names one concrete style). Unlike the config
 /// loader, an unrecognized name is a hard `Err`: this is debug/comparison
 /// tooling, so a typo should fail loudly rather than silently fall back.
 fn parse_wisp_style(s: &str) -> Result<ember_core::WispStyle, String> {
     use ember_core::WispStyle;
     match s.to_ascii_lowercase().as_str() {
-        "ember" => Ok(WispStyle::Ember),
+        "cinder" => Ok(WispStyle::Cinder),
+        "ember" => Ok(WispStyle::Cinder), // pre-v0.4.1 name, kept as an alias
         "coal" => Ok(WispStyle::Coal),
         "willowisp" => Ok(WispStyle::WillOWisp),
         "comet" => Ok(WispStyle::Comet),
         "goo" => Ok(WispStyle::Goo),
         "star" => Ok(WispStyle::Star),
         other => Err(format!(
-            "--wisp-preview: unknown style {other:?} (expected ember|coal|willowisp|comet|goo|star)"
+            "--wisp-preview: unknown style {other:?} (expected cinder|coal|willowisp|comet|goo|star)"
         )),
     }
 }

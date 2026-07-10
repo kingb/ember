@@ -539,7 +539,7 @@ impl WispWindow {
             velocity: (0.0, 0.0),
             since: now,
             last_anim: now,
-            style: WispStyle::Ember,
+            style: WispStyle::Cinder,
             drag_seq: 0,
         })
     }

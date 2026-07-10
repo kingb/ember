@@ -37,7 +37,8 @@ pub struct Config {
     pub wisp: bool,
     /// Which of the wisp's visual styles to draw — see [`WispStyleSelection`].
     /// Orthogonal to `wisp` (the on/off switch): this only matters while
-    /// `wisp` is true. Default `ember` (the original look, unchanged).
+    /// `wisp` is true. Default `cinder` (the original look, unchanged —
+    /// renamed from `ember` in v0.4.1; the old name still parses).
     pub wisp_style: WispStyleSelection,
 }
 
@@ -51,7 +52,7 @@ impl Default for Config {
             option_as_meta: false,
             developer_mode: false,
             wisp: true,
-            wisp_style: WispStyleSelection::Ember,
+            wisp_style: WispStyleSelection::Cinder,
         }
     }
 }
@@ -62,10 +63,11 @@ impl Default for Config {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WispStyle {
-    /// The original look (pre-v0.4.1): pulsing amber/accent core, an
-    /// orbiting ring of sparks, a velocity trail.
+    /// The original look (pre-v0.4.1, then named `ember`): pulsing
+    /// amber/accent core, an orbiting ring of sparks, a velocity trail.
+    /// Renamed to `cinder` in v0.4.1 — a glowing remnant of the fire.
     #[default]
-    Ember,
+    Cinder,
     /// A glowing coal lump throwing a fountain of sparks upward.
     Coal,
     /// The literal will-o'-the-wisp: a soft, cool, breathing orb with a
@@ -86,7 +88,7 @@ impl WispStyle {
     /// the order the `--wisp-preview` tooling and design docs enumerate them
     /// in.
     pub const ALL: [WispStyle; 6] = [
-        WispStyle::Ember,
+        WispStyle::Cinder,
         WispStyle::Coal,
         WispStyle::WillOWisp,
         WispStyle::Comet,
@@ -101,14 +103,14 @@ impl WispStyle {
 /// same as [`WispStyle`] (lowercase), plus the extra `"random"` value.
 ///
 /// **Backcompat:** an unrecognized string — a typo, or a value a *future*
-/// Ember version writes that this build predates — falls back to `Ember`
-/// rather than failing to load the whole config; see
-/// [`deserialize_wisp_style`].
+/// Ember version writes that this build predates — falls back to `Cinder`
+/// rather than failing to load the whole config (and the pre-v0.4.1 name
+/// `"ember"` explicitly parses as `Cinder`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WispStyleSelection {
     #[default]
-    Ember,
+    Cinder,
     Coal,
     WillOWisp,
     Comet,
@@ -133,9 +135,10 @@ impl<'de> Deserialize<'de> for WispStyleSelection {
             "goo" => Self::Goo,
             "star" => Self::Star,
             "random" => Self::Random,
-            // "ember", plus any typo or unrecognized value (including a
-            // style name from a newer Ember this build doesn't know about).
-            _ => Self::Ember,
+            // "cinder", its pre-v0.4.1 name "ember", plus any typo or
+            // unrecognized value (including a style name from a newer Ember
+            // this build doesn't know about).
+            _ => Self::Cinder,
         })
     }
 }
@@ -148,7 +151,7 @@ impl WispStyleSelection {
     /// drags instead of risking the same style twice in a row.
     pub fn resolve(self, counter: u32) -> WispStyle {
         match self {
-            Self::Ember => WispStyle::Ember,
+            Self::Cinder => WispStyle::Cinder,
             Self::Coal => WispStyle::Coal,
             Self::WillOWisp => WispStyle::WillOWisp,
             Self::Comet => WispStyle::Comet,
@@ -290,7 +293,7 @@ mod tests {
         assert_eq!(c.background.ember_fps, 15);
         assert!(c.visual_bell); // visual bell on by default
         assert!(c.wisp); // decorative-only; safe to default on
-        assert_eq!(c.wisp_style, WispStyleSelection::Ember); // today's look, unchanged
+        assert_eq!(c.wisp_style, WispStyleSelection::Cinder); // today's look, unchanged
     }
 
     #[test]
@@ -355,18 +358,19 @@ mod tests {
         assert_eq!(back.background.sparks, SparksMode::Always);
     }
 
-    // --- wisp_style: 5 styles + random, backcompat, resolution --------------
+    // --- wisp_style: 6 styles + random, backcompat, resolution --------------
 
     #[test]
-    fn wisp_style_missing_defaults_to_ember() {
+    fn wisp_style_missing_defaults_to_cinder() {
         let c: Config = toml::from_str("").unwrap();
-        assert_eq!(c.wisp_style, WispStyleSelection::Ember);
+        assert_eq!(c.wisp_style, WispStyleSelection::Cinder);
     }
 
     #[test]
     fn wisp_style_accepts_all_six_names_plus_random() {
         for (s, want) in [
-            ("ember", WispStyleSelection::Ember),
+            ("cinder", WispStyleSelection::Cinder),
+            ("ember", WispStyleSelection::Cinder), // pre-v0.4.1 name, legacy alias
             ("coal", WispStyleSelection::Coal),
             ("willowisp", WispStyleSelection::WillOWisp),
             ("comet", WispStyleSelection::Comet),
@@ -381,15 +385,15 @@ mod tests {
     }
 
     #[test]
-    fn wisp_style_unknown_value_falls_back_to_ember() {
+    fn wisp_style_unknown_value_falls_back_to_cinder() {
         let c: Config = toml::from_str("wisp_style = \"glorbnax\"\n").unwrap();
-        assert_eq!(c.wisp_style, WispStyleSelection::Ember);
+        assert_eq!(c.wisp_style, WispStyleSelection::Cinder);
     }
 
     #[test]
     fn wisp_style_roundtrips_through_toml() {
         for sel in [
-            WispStyleSelection::Ember,
+            WispStyleSelection::Cinder,
             WispStyleSelection::Coal,
             WispStyleSelection::WillOWisp,
             WispStyleSelection::Comet,
@@ -409,7 +413,7 @@ mod tests {
 
     #[test]
     fn wisp_style_resolve_is_identity_for_concrete_styles() {
-        assert_eq!(WispStyleSelection::Ember.resolve(0), WispStyle::Ember);
+        assert_eq!(WispStyleSelection::Cinder.resolve(0), WispStyle::Cinder);
         assert_eq!(WispStyleSelection::Coal.resolve(7), WispStyle::Coal);
         assert_eq!(
             WispStyleSelection::WillOWisp.resolve(99),
@@ -427,6 +431,6 @@ mod tests {
         // All 6 concrete styles appear exactly once across 6 consecutive draws.
         assert_eq!(seen, WispStyle::ALL.to_vec());
         // Wraps back to the start on the 7th draw.
-        assert_eq!(WispStyleSelection::Random.resolve(6), WispStyle::Ember);
+        assert_eq!(WispStyleSelection::Random.resolve(6), WispStyle::Cinder);
     }
 }
