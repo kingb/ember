@@ -6,6 +6,27 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Six selectable wisp styles. The glowing drag token now has a look you
+  can pick in Settings: Cinder (the original amber core and orbiting
+  sparks, renamed from Ember; the old name still parses), Coal (a small
+  charcoal rock rendered by its own procedural shader, with pulsing hot
+  cracks, a breathing core, and a gentle shower of embers rising off its
+  surface), Will-o'-the-wisp (a soft, cool, breathing orb with a wispy
+  vapor tail), Comet (a clean white-hot head with a soft glow), Goo (a
+  wobbling molten droplet shedding embers that float up as they cool),
+  and Star (a dazzling white core with a blue-white bloom and a
+  lens-flare sparkle). A Random option steps to a fresh style on each
+  drag.
+
+### Fixed
+
+- A renamed tab dragged into another tab as a split, then dragged back
+  out to a tab (or a new window), lost its custom name. The name now
+  travels with the pane and is restored when the pane becomes a tab
+  again, surviving any number of round-trips, including across windows.
+
 ## [0.4.0] - 2026-07-08
 
 ### Added

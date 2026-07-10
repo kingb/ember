@@ -755,6 +755,167 @@ pub fn capture_reusing(
     write_png(path, phys_w, phys_h, &pixels)
 }
 
+/// Render one frame of a wisp style's particle cluster to a PNG, on an
+/// OPAQUE dark backdrop rather than the wisp window's real transparent
+/// canvas — the wisp itself only ever draws over a fully transparent clear
+/// (see [`crate::wisp::WispRenderer::render`]), which isn't viewable as a
+/// standalone PNG. This swaps in [`crate::renderer::BG`] (the app's own
+/// dark background) as an opaque base purely so the additive quads show up
+/// against something, exactly the way they'd read floating over a dark
+/// desktop/terminal behind the real wisp window.
+///
+/// Debug/comparison tooling only (`ember-term --screenshot <path>
+/// --wisp-preview <style>`, v0.4.1's 6-style wisp) — builds its own
+/// throwaway GPU device, same cost tradeoff as [`capture`].
+pub fn capture_wisp_preview(
+    style: ember_core::WispStyle,
+    t: f32,
+    intensity: f32,
+    velocity: (f32, f32),
+    logical_size: f32,
+    scale: f32,
+    path: &Path,
+) -> Result<(), CaptureError> {
+    let (device, queue) = pollster::block_on(async {
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                compatible_surface: None,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| CaptureError::Adapter(format!("{e:?}")))?;
+        adapter
+            .request_device(&DeviceDescriptor::default())
+            .await
+            .map_err(|e| CaptureError::Device(format!("{e:?}")))
+    })?;
+
+    let sf = scale.max(0.1);
+    let phys = ((logical_size * sf).ceil() as u32).max(1);
+    let format = TextureFormat::Rgba8UnormSrgb;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ember-wisp-preview"),
+        size: wgpu::Extent3d {
+            width: phys,
+            height: phys,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let mut sparks = SparkRenderer::new(&device, format);
+    // Same generator the live wisp window calls every frame — the preview
+    // is pixel-for-pixel what that style actually draws, just against an
+    // opaque canvas instead of a transparent one.
+    let quads = crate::wisp::wisp_quads(style, t, intensity, velocity, phys as f32, phys as f32);
+    sparks.prepare(&device, &queue, (phys as f32, phys as f32), &quads);
+    // The `coal` style draws a solid procedural burning-rock body UNDER the
+    // additive spark shower — the additive pass alone can't do solid.
+    let coal = if matches!(style, ember_core::WispStyle::Coal) {
+        let c = crate::coal::CoalRenderer::new(&device, format);
+        c.prepare(&queue, (phys as f32, phys as f32), t, intensity);
+        Some(c)
+    } else {
+        None
+    };
+
+    let bpp = 4u32;
+    let unpadded = phys * bpp;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ember-wisp-preview-readback"),
+        size: (padded * phys) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ember-wisp-preview"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: srgb_to_linear(BG.r) as f64,
+                        g: srgb_to_linear(BG.g) as f64,
+                        b: srgb_to_linear(BG.b) as f64,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        if let Some(coal) = &coal {
+            coal.draw(&mut pass);
+        }
+        sparks.draw(&mut pass);
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(phys),
+            },
+        },
+        wgpu::Extent3d {
+            width: phys,
+            height: phys,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .map_err(|e| CaptureError::Map(format!("{e:?}")))?;
+    rx.recv()
+        .map_err(|e| CaptureError::Map(format!("{e}")))?
+        .map_err(|e| CaptureError::Map(format!("{e:?}")))?;
+
+    let data = slice.get_mapped_range();
+    let mut pixels = Vec::with_capacity((unpadded * phys) as usize);
+    for row in 0..phys {
+        let start = (row * padded) as usize;
+        pixels.extend_from_slice(&data[start..start + unpadded as usize]);
+    }
+    drop(data);
+    readback.unmap();
+
+    write_png(path, phys, phys, &pixels)
+}
+
 fn write_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), CaptureError> {
     let file = std::fs::File::create(path)?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);

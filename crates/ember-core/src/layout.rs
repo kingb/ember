@@ -23,12 +23,24 @@ pub enum LayoutNode {
     Pane {
         id: PaneId,
         session: SessionId,
+        /// A custom tab title this pane carries after its named tab was
+        /// dissolved into a split ([`crate::move_surface`], Tab ->
+        /// `SplitInto`). Restored (and consumed) when the pane is promoted
+        /// back out to its own tab, so a user-renamed tab keeps its name
+        /// across a merge/promote round-trip. `None` for panes that never
+        /// were a named tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        carried_title: Option<String>,
     },
 }
 
 impl LayoutNode {
     pub fn pane(id: PaneId, session: SessionId) -> Self {
-        LayoutNode::Pane { id, session }
+        LayoutNode::Pane {
+            id,
+            session,
+            carried_title: None,
+        }
     }
 
     /// Build a split, clamping `ratio` to a sane visible range.
@@ -67,7 +79,7 @@ impl LayoutNode {
 
     fn collect_leaves(&self, out: &mut Vec<(PaneId, SessionId)>) {
         match self {
-            LayoutNode::Pane { id, session } => out.push((*id, session.clone())),
+            LayoutNode::Pane { id, session, .. } => out.push((*id, session.clone())),
             LayoutNode::Split { a, b, .. } => {
                 a.collect_leaves(out);
                 b.collect_leaves(out);
@@ -78,8 +90,52 @@ impl LayoutNode {
     /// The session backing `target`, if present.
     pub fn session_of(&self, target: PaneId) -> Option<&SessionId> {
         match self {
-            LayoutNode::Pane { id, session } => (*id == target).then_some(session),
+            LayoutNode::Pane { id, session, .. } => (*id == target).then_some(session),
             LayoutNode::Split { a, b, .. } => a.session_of(target).or_else(|| b.session_of(target)),
+        }
+    }
+
+    /// The carried tab title on the `target` pane leaf, if any — see the
+    /// field's doc on [`LayoutNode::Pane`].
+    pub fn carried_title_of(&self, target: PaneId) -> Option<&str> {
+        match self {
+            LayoutNode::Pane {
+                id, carried_title, ..
+            } => (*id == target).then_some(carried_title.as_deref()).flatten(),
+            LayoutNode::Split { a, b, .. } => a
+                .carried_title_of(target)
+                .or_else(|| b.carried_title_of(target)),
+        }
+    }
+
+    /// Set (or clear, with `None`) the carried tab title on the `target`
+    /// pane leaf. Returns whether the target was found.
+    pub fn set_carried_title(&mut self, target: PaneId, title: Option<String>) -> bool {
+        match self {
+            LayoutNode::Pane {
+                id, carried_title, ..
+            } if *id == target => {
+                *carried_title = title;
+                true
+            }
+            LayoutNode::Pane { .. } => false,
+            LayoutNode::Split { a, b, .. } => {
+                a.set_carried_title(target, title.clone()) || b.set_carried_title(target, title)
+            }
+        }
+    }
+
+    /// Remove and return the carried tab title from the `target` pane leaf —
+    /// the "restore on promote" half of the round-trip.
+    pub fn take_carried_title(&mut self, target: PaneId) -> Option<String> {
+        match self {
+            LayoutNode::Pane {
+                id, carried_title, ..
+            } if *id == target => carried_title.take(),
+            LayoutNode::Pane { .. } => None,
+            LayoutNode::Split { a, b, .. } => a
+                .take_carried_title(target)
+                .or_else(|| b.take_carried_title(target)),
         }
     }
 
@@ -277,11 +333,22 @@ pub(crate) fn axis_extent(axis: Axis, area: Rect) -> f64 {
 /// the removed pane's session (`None` if `target` was absent). Consumes `node`.
 pub fn remove_pane(node: LayoutNode, target: PaneId) -> (Option<LayoutNode>, Option<SessionId>) {
     match node {
-        LayoutNode::Pane { id, session } => {
+        LayoutNode::Pane {
+            id,
+            session,
+            carried_title,
+        } => {
             if id == target {
                 (None, Some(session))
             } else {
-                (Some(LayoutNode::Pane { id, session }), None)
+                (
+                    Some(LayoutNode::Pane {
+                        id,
+                        session,
+                        carried_title,
+                    }),
+                    None,
+                )
             }
         }
         LayoutNode::Split { axis, ratio, a, b } => {

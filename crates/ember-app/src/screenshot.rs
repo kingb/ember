@@ -78,6 +78,17 @@ pub struct Opts {
     /// 0..1)` — debug plumbing so the ring's quad geometry can be eyeballed
     /// via a headless screenshot without a live windowed hold.
     pub hold_ring: Option<(f32, f32, f32)>,
+    /// `--wisp-preview <style>` (v0.4.1's 6-style wisp): when set, `run`
+    /// skips the whole pane-based scene entirely and instead renders that
+    /// style's particle cluster (one animated frame, `t`/`intensity`/
+    /// `velocity` fixed for a deterministic, comparable shot) onto an
+    /// opaque dark canvas — see [`ember_render::headless::capture_wisp_preview`].
+    /// Accepts `cinder`|`coal`|`willowisp`|`comet`|`goo`|`star`
+    /// (case-insensitive; `ember` is the pre-v0.4.1 alias for `cinder`);
+    /// anything else is a hard parse error (this is debug tooling, not the
+    /// forgiving `config.toml` `wisp_style` knob — a typo here should fail
+    /// loudly, not silently render the wrong style).
+    pub wisp_preview: Option<ember_core::WispStyle>,
 }
 
 impl Default for Opts {
@@ -110,7 +121,29 @@ impl Default for Opts {
             help_overlay: false,
             settings: false,
             hold_ring: None,
+            wisp_preview: None,
         }
+    }
+}
+
+/// Parse a `--wisp-preview` style name into a concrete [`ember_core::WispStyle`].
+/// Case-insensitive over the same 6 names `config.toml`'s `wisp_style` accepts
+/// (not `"random"` — a preview names one concrete style). Unlike the config
+/// loader, an unrecognized name is a hard `Err`: this is debug/comparison
+/// tooling, so a typo should fail loudly rather than silently fall back.
+fn parse_wisp_style(s: &str) -> Result<ember_core::WispStyle, String> {
+    use ember_core::WispStyle;
+    match s.to_ascii_lowercase().as_str() {
+        "cinder" => Ok(WispStyle::Cinder),
+        "ember" => Ok(WispStyle::Cinder), // pre-v0.4.1 name, kept as an alias
+        "coal" => Ok(WispStyle::Coal),
+        "willowisp" => Ok(WispStyle::WillOWisp),
+        "comet" => Ok(WispStyle::Comet),
+        "goo" => Ok(WispStyle::Goo),
+        "star" => Ok(WispStyle::Star),
+        other => Err(format!(
+            "--wisp-preview: unknown style {other:?} (expected cinder|coal|willowisp|comet|goo|star)"
+        )),
     }
 }
 
@@ -155,6 +188,9 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
                     .parse()
                     .map_err(|e| format!("--split-preview ratio: {e}"))?;
                 opts.split_preview = Some((h, ratio));
+            }
+            "--wisp-preview" => {
+                opts.wisp_preview = Some(parse_wisp_style(&next()?)?);
             }
             "--hold-ring" => {
                 let x = next()?.parse().map_err(|e| format!("--hold-ring x: {e}"))?;
@@ -211,6 +247,25 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
 
 /// Build the scene, run it, and write the PNG. Returns the output path.
 pub fn run(opts: Opts) -> Result<String, String> {
+    // `--wisp-preview <style>`: a completely separate, much smaller path —
+    // no pane tree, no shells to spawn/settle, just one style's particle
+    // cluster rendered onto an opaque dark canvas at a fixed, representative
+    // animated frame (some velocity, so the trail/tail geometry is visible
+    // too). The pane-scene machinery below never runs for this case.
+    if let Some(style) = opts.wisp_preview {
+        headless::capture_wisp_preview(
+            style,
+            0.4,             // t: mid-animation, not the (less interesting) t=0 start
+            1.0,             // intensity: full, steady-state (no fade-in/out ramp)
+            (180.0, -120.0), // velocity: up-and-right, exercises trails/tails
+            230.0,           // logical size: matches the live wisp window (WISP_SIZE)
+            opts.scale,
+            Path::new(&opts.path),
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(opts.path);
+    }
+
     let (cw, ch) = headless::cell_metrics_for(opts.font_size, opts.font.as_deref());
     let pad = PAD as f64;
     let chrome = Renderer::chrome_height() as f64;
