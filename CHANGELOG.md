@@ -20,6 +20,13 @@ follow [Semantic Versioning](https://semver.org).
   lens-flare sparkle). A Random option steps to a fresh style on each
   drag.
 
+### Fixed
+
+- A renamed tab dragged into another tab as a split, then dragged back
+  out to a tab (or a new window), lost its custom name. The name now
+  travels with the pane and is restored when the pane becomes a tab
+  again, surviving any number of round-trips, including across windows.
+
 ## [0.4.0] - 2026-07-08
 
 ### Added

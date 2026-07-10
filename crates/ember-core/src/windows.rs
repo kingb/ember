@@ -209,10 +209,18 @@ fn close_source_if_empty(windows: &mut Windows, w: usize, effects: &mut Vec<Move
 /// Split `node` into the tree with `pane` removed (sibling promoted, per
 /// [`remove_pane`]) and the pane's own leaf. `None` if `pane` is absent, or if
 /// `node` is nothing but that one leaf — nothing would remain, so callers use
-/// this to detect "would empty the tab".
+/// this to detect "would empty the tab". A carried tab title on the extracted
+/// pane rides along on the rebuilt leaf.
 fn extract_leaf(node: LayoutNode, pane: PaneId) -> Option<(LayoutNode, LayoutNode)> {
+    let carried = node.carried_title_of(pane).map(str::to_string);
     match remove_pane(node, pane) {
-        (Some(remaining), Some(session)) => Some((remaining, LayoutNode::pane(pane, session))),
+        (Some(remaining), Some(session)) => {
+            let mut leaf = LayoutNode::pane(pane, session);
+            if carried.is_some() {
+                leaf.set_carried_title(pane, carried);
+            }
+            Some((remaining, leaf))
+        }
         _ => None,
     }
 }
@@ -264,8 +272,15 @@ fn move_tab(
             axis,
             before,
         } => {
-            let moved = windows.trees[w].tabs.remove(t);
+            let mut moved = windows.trees[w].tabs.remove(t);
             clamp_active(&mut windows.trees[w], t);
+            // A user-set title would otherwise die with the dissolved Tab:
+            // stamp it onto the tab's focus pane so it travels with the pane
+            // and is restored when that pane is promoted back out to a tab.
+            if !moved.title.is_empty() {
+                let title = std::mem::take(&mut moved.title);
+                moved.root.set_carried_title(moved.focus, Some(title));
+            }
             // Removing tab `t` shifted every later tab in the SAME window's
             // vec down by one; only relevant when the merge target lives in
             // the source window too (dt != t is guaranteed by the no-op check).
@@ -316,7 +331,7 @@ fn move_pane(
     // then re-home the tab's focus if it was pointing at the moved pane.
     let dummy = LayoutNode::pane(PaneId(u64::MAX), SessionId::new(""));
     let root = std::mem::replace(&mut windows.trees[w].tabs[t].root, dummy);
-    let (remaining, leaf) =
+    let (remaining, mut leaf) =
         extract_leaf(root, p).expect("pane existence and non-singleton validated above");
     windows.trees[w].tabs[t].root = remaining;
     if windows.trees[w].tabs[t].focus == p {
@@ -327,9 +342,12 @@ fn move_pane(
 
     match dest {
         SurfaceDest::NewTab { window: dw } => {
+            // Restore (and consume) a carried tab title — the round-trip's
+            // other half: named tab -> merged pane -> named tab again.
+            let title = leaf.take_carried_title(p).unwrap_or_default();
             let new_tab = Tab {
                 id: fresh_tab_id,
-                title: String::new(),
+                title,
                 root: leaf,
                 focus: p,
             };
@@ -345,9 +363,11 @@ fn move_pane(
             Ok(effects)
         }
         SurfaceDest::NewWindow => {
+            // Same restore-and-consume as the NewTab arm above.
+            let title = leaf.take_carried_title(p).unwrap_or_default();
             let new_tab = Tab {
                 id: fresh_tab_id,
-                title: String::new(),
+                title,
                 root: leaf,
                 focus: p,
             };
@@ -1536,5 +1556,159 @@ mod tests {
         assert_eq!(window_under(30.0, 10.0, &one), None); // right edge: outside
         assert_eq!(window_under(10.0, 30.0, &one), None); // bottom edge: outside
         assert_eq!(window_under(29.999, 29.999, &one), Some(0)); // just inside bottom-right
+    }
+
+    // --- Carried titles: a named tab's title travels with its pane ----------
+
+    #[test]
+    fn named_tab_title_survives_merge_then_promote() {
+        // A user-renamed tab, merged into another tab as a split, then its
+        // pane promoted back out to a tab: the custom name must round-trip.
+        let mut named = tab(2, &[20]);
+        named.title = "campfire-logs".to_string();
+        let mut w = Windows {
+            trees: vec![WindowTree {
+                tabs: vec![tab(1, &[10]), named],
+                active: 1,
+            }],
+            focused: 0,
+        };
+        // Merge: tab 1 (the named one) splits into tab 0's pane 10.
+        move_surface(
+            &mut w,
+            SurfaceRef::Tab { window: 0, tab: 1 },
+            SurfaceDest::SplitInto {
+                window: 0,
+                tab: 0,
+                pane: PaneId(10),
+                axis: Axis::Horizontal,
+                before: false,
+            },
+            TabId(900),
+        )
+        .unwrap();
+        assert_eq!(w.trees[0].tabs.len(), 1, "merged into a single tab");
+        // Promote pane 20 back out to its own tab.
+        move_surface(
+            &mut w,
+            SurfaceRef::Pane {
+                window: 0,
+                tab: 0,
+                pane: PaneId(20),
+            },
+            SurfaceDest::NewTab { window: 0 },
+            TabId(901),
+        )
+        .unwrap();
+        assert_eq!(
+            w.trees[0].tabs[1].title, "campfire-logs",
+            "custom tab name should travel with the pane and come back"
+        );
+        // Consumed on restore: the leaf no longer carries a stale copy.
+        assert_eq!(w.trees[0].tabs[1].root.carried_title_of(PaneId(20)), None);
+    }
+
+    #[test]
+    fn carried_title_travels_across_windows_and_restores_on_new_window() {
+        // Named tab merged in window 0, pane then dragged into window 1 as a
+        // split, then promoted to a NEW window: the name still comes back.
+        let mut named = tab(2, &[20]);
+        named.title = "prod-shell".to_string();
+        let mut w = Windows {
+            trees: vec![
+                WindowTree {
+                    tabs: vec![tab(1, &[10]), named],
+                    active: 0,
+                },
+                WindowTree {
+                    tabs: vec![tab(3, &[30])],
+                    active: 0,
+                },
+            ],
+            focused: 0,
+        };
+        move_surface(
+            &mut w,
+            SurfaceRef::Tab { window: 0, tab: 1 },
+            SurfaceDest::SplitInto {
+                window: 0,
+                tab: 0,
+                pane: PaneId(10),
+                axis: Axis::Horizontal,
+                before: false,
+            },
+            TabId(900),
+        )
+        .unwrap();
+        // Carry the pane into window 1 as a split (still a pane, still carrying).
+        move_surface(
+            &mut w,
+            SurfaceRef::Pane {
+                window: 0,
+                tab: 0,
+                pane: PaneId(20),
+            },
+            SurfaceDest::SplitInto {
+                window: 1,
+                tab: 0,
+                pane: PaneId(30),
+                axis: Axis::Vertical,
+                before: false,
+            },
+            TabId(901),
+        )
+        .unwrap();
+        // Promote to a brand-new window: title restored there.
+        move_surface(
+            &mut w,
+            SurfaceRef::Pane {
+                window: 1,
+                tab: 0,
+                pane: PaneId(20),
+            },
+            SurfaceDest::NewWindow,
+            TabId(902),
+        )
+        .unwrap();
+        let new_win = w.trees.last().unwrap();
+        assert_eq!(new_win.tabs[0].title, "prod-shell");
+    }
+
+    #[test]
+    fn unnamed_tab_merge_does_not_invent_a_carried_title() {
+        // Default (index-titled, empty-string) tabs must keep round-tripping
+        // to default titles — no phantom names.
+        let mut w = Windows {
+            trees: vec![WindowTree {
+                tabs: vec![tab(1, &[10]), tab(2, &[20])],
+                active: 1,
+            }],
+            focused: 0,
+        };
+        move_surface(
+            &mut w,
+            SurfaceRef::Tab { window: 0, tab: 1 },
+            SurfaceDest::SplitInto {
+                window: 0,
+                tab: 0,
+                pane: PaneId(10),
+                axis: Axis::Horizontal,
+                before: false,
+            },
+            TabId(900),
+        )
+        .unwrap();
+        move_surface(
+            &mut w,
+            SurfaceRef::Pane {
+                window: 0,
+                tab: 0,
+                pane: PaneId(20),
+            },
+            SurfaceDest::NewTab { window: 0 },
+            TabId(901),
+        )
+        .unwrap();
+        assert_eq!(w.trees[0].tabs[1].title, "");
     }
 }
