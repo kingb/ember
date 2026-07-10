@@ -4,7 +4,9 @@ All notable changes to Ember are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Ember aims to
 follow [Semantic Versioning](https://semver.org).
 
-## [0.4.1] - 2026-07-09
+## [Unreleased]
+
+## [0.4.1] - 2026-07-10
 
 ### Added
 
@@ -246,7 +248,8 @@ this first release:
   created owner-only, use no fixed or predictable paths, and return
   JSON-encoded errors rather than leaking internal state.
 
-[Unreleased]: https://github.com/kingb/ember/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/kingb/ember/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/kingb/ember/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/kingb/ember/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/kingb/ember/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/kingb/ember/compare/v0.2.1...v0.3.0
