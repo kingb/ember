@@ -8,13 +8,17 @@ follow [Semantic Versioning](https://semver.org).
 
 ### Added
 
-- Five selectable wisp styles. The glowing drag token now has a look you
-  can pick in Settings: Ember (the original amber core and orbiting
-  sparks), Coal (a faceted, cracked chunk of hot rock throwing off
-  sparks), Will-o'-the-wisp (a soft, cool, breathing orb with a wispy
-  vapor tail), Comet (a brilliant head with a long tail streaming behind
-  it), and Goo (a wobbling molten droplet with slow drips). A Random
-  option picks a fresh style for each drag.
+- Six selectable wisp styles. The glowing drag token now has a look you
+  can pick in Settings: Cinder (the original amber core and orbiting
+  sparks, renamed from Ember; the old name still parses), Coal (a small
+  charcoal rock rendered by its own procedural shader, with pulsing hot
+  cracks, a breathing core, and a gentle shower of embers rising off its
+  surface), Will-o'-the-wisp (a soft, cool, breathing orb with a wispy
+  vapor tail), Comet (a clean white-hot head with a soft glow), Goo (a
+  wobbling molten droplet shedding embers that float up as they cool),
+  and Star (a dazzling white core with a blue-white bloom and a
+  lens-flare sparkle). A Random option steps to a fresh style on each
+  drag.
 
 ## [0.4.0] - 2026-07-08
 
