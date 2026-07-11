@@ -708,6 +708,7 @@ name = "ember-session"
 version = "0.4.2"
 dependencies = [
  "alacritty_terminal",
+ "arboard",
  "criterion",
  "ember-core",
  "libc",

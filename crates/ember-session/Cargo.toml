@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 ember-core.workspace = true
 alacritty_terminal.workspace = true
+arboard.workspace = true
 portable-pty.workspace = true
 
 [target.'cfg(unix)'.dependencies]

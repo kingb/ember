@@ -37,6 +37,10 @@ pub struct LocalPtyConfig {
     /// and jump-to-prompt work without the user editing their rc. Chains the user's
     /// config, never replaces it.
     pub shell_integration: bool,
+    /// Answer OSC 52 clipboard READ requests with real clipboard contents.
+    /// Off = reply with an empty payload (the safe default; see the config
+    /// knob's doc in ember-core).
+    pub osc52_read: bool,
 }
 
 impl LocalPtyConfig {
@@ -48,6 +52,7 @@ impl LocalPtyConfig {
             args: Vec::new(),
             cwd: None,
             shell_integration: true,
+            osc52_read: false,
         }
     }
 }
@@ -67,6 +72,7 @@ impl SessionBackend for LocalPty {
             args,
             cwd,
             shell_integration,
+            osc52_read,
         } = config;
 
         let pty = native_pty_system();
@@ -186,7 +192,7 @@ impl SessionBackend for LocalPty {
             let event_tx = event_tx.clone();
             let busy = Arc::clone(&busy);
             thread::spawn(move || {
-                emulation_loop(dims, event_tx, frame_tx, irx, wtx, master, child, busy)
+                emulation_loop(dims, event_tx, frame_tx, irx, wtx, master, child, busy, osc52_read)
             });
         }
 
@@ -216,6 +222,8 @@ enum Ev {
 struct EmberListener {
     events: Sender<BackendEvent>,
     outbox: Arc<Mutex<Vec<u8>>>,
+    /// See [`LocalPtyConfig::osc52_read`].
+    osc52_read: bool,
     /// For answering OSC 10/11 color queries (nvim's background detection
     /// blocks on this at startup). Static defaults — good enough for queries.
     palette: crate::palette::Palette,
@@ -241,6 +249,23 @@ impl EventListener for EmberListener {
                 let _ = self
                     .events
                     .send(BackendEvent::Clipboard(ClipboardOp::Set(text)));
+            }
+            // OSC 52 READ: a program asking for the clipboard's contents - a
+            // data-exfiltration surface, so gated (default off = empty reply,
+            // which unblocks well-behaved clients instead of hanging them).
+            AlacEvent::ClipboardLoad(_, format) => {
+                let text = if self.osc52_read {
+                    arboard::Clipboard::new()
+                        .ok()
+                        .and_then(|mut c| c.get_text().ok())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                self.outbox
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(format(&text).as_bytes());
             }
             // OSC 4/10/11 query: answer from the palette, straight to the PTY.
             AlacEvent::ColorRequest(index, format) => {
@@ -281,6 +306,7 @@ fn emulation_loop(
     master: Box<dyn portable_pty::MasterPty + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     busy: Arc<AtomicBool>,
+    osc52_read: bool,
 ) {
     // The shell is its own process-group leader; when a foreground command runs,
     // the PTY's foreground pgrp differs from the shell pid. Recompute after each
@@ -295,6 +321,7 @@ fn emulation_loop(
     let listener = EmberListener {
         events: event_tx.clone(),
         outbox: Arc::clone(&outbox),
+        osc52_read,
         palette: crate::palette::Palette::dark(),
     };
     let mut proj = AlacrittyProjection::new(dims, listener);
@@ -469,6 +496,29 @@ mod tests {
     use ember_core::CellContent;
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn osc52_read_gated_off_replies_empty() {
+        use alacritty_terminal::event::EventListener;
+        use alacritty_terminal::term::ClipboardType;
+        let (tx, _rx) = mpsc::channel();
+        let outbox = Arc::new(Mutex::new(Vec::new()));
+        let l = EmberListener {
+            events: tx,
+            outbox: Arc::clone(&outbox),
+            osc52_read: false,
+            palette: crate::palette::Palette::dark(),
+        };
+        l.send_event(AlacEvent::ClipboardLoad(
+            ClipboardType::Clipboard,
+            std::sync::Arc::new(|s: &str| format!("\x1b]52;c;{s}\x07")),
+        ));
+        let got = String::from_utf8(outbox.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            got, "\x1b]52;c;\x07",
+            "gated-off read must reply with an EMPTY payload (never real contents, never silence)"
+        );
+    }
 
     /// Reconstruct row 0's text from the frame lane until `needle` appears or we
     /// time out. Proves the full path: shell → PTY → engine → projection → lane.
