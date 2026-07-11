@@ -95,6 +95,11 @@ pub struct NeutralCell {
     /// (alacritty's `WRAPLINE`). Lets copy join a wrapped logical line without a
     /// spurious newline. Meaningless on non-last cells.
     pub wrapped: bool,
+    /// Interned OSC 8 hyperlink id (see [`GridDelta::new_links`]), when the
+    /// program explicitly marked this cell as part of a hyperlink. `None`
+    /// for ordinary cells (and for every frame from a pre-OSC-8 producer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<u32>,
     /// This cell's glyph spans 2 columns (CJK, most emoji) — set for wide
     /// `Char` AND wide `Cluster` leaders; the following cell is a
     /// [`CellContent::WideSpacer`]. Defaulted so pre-wide serialized frames
@@ -110,6 +115,7 @@ impl NeutralCell {
             style,
             wrapped: false,
             wide: false,
+            link: None,
         }
     }
 }
@@ -207,6 +213,11 @@ pub struct GridDelta {
     pub cells: Vec<CellPatch>,
     /// Styles first referenced by this delta.
     pub new_styles: Vec<(StyleId, Style)>,
+    /// OSC 8 hyperlink URIs first seen this delta, `(interned id, uri)` —
+    /// same interning discipline as `new_styles`; a reset ships the full
+    /// table. Serde-defaulted so pre-OSC-8 frames still parse.
+    #[serde(default)]
+    pub new_links: Vec<(u32, String)>,
     pub cursor: CursorState,
     /// Snapshot of the engine's bracketed-paste mode (DEC 2004) as of this drain —
     /// terminal state, like `cursor`, not damage. Lets the app wrap pastes in

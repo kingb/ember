@@ -14,6 +14,8 @@ pub struct GridModel {
     pub dims: GridDims,
     cells: Vec<NeutralCell>,
     styles: HashMap<StyleId, Style>,
+    /// OSC 8 hyperlink table: interned id -> URI (from `GridDelta::new_links`).
+    links: HashMap<u32, String>,
     pub cursor: CursorState,
     pub epoch: u64,
     /// Scrollback viewport state, carried from the latest delta.
@@ -61,6 +63,7 @@ impl GridModel {
             dims,
             cells: vec![NeutralCell::default(); dims.cells()],
             styles: HashMap::new(),
+            links: HashMap::new(),
             cursor: CursorState::default(),
             epoch: 0,
             display_offset: 0,
@@ -78,6 +81,12 @@ impl GridModel {
     pub fn apply(&mut self, delta: GridDelta) {
         for (id, style) in &delta.new_styles {
             self.styles.insert(*id, *style);
+        }
+        if delta.reset {
+            self.links.clear();
+        }
+        for (id, uri) in &delta.new_links {
+            self.links.insert(*id, uri.clone());
         }
         if delta.reset || delta.dims != self.dims {
             self.dims = delta.dims;
@@ -307,6 +316,7 @@ impl GridModel {
             reset: true,
             cells,
             new_styles,
+            new_links: self.links.iter().map(|(k, v)| (*k, v.clone())).collect(),
             cursor: self.cursor,
             // Bracketed-paste is session (Shared) state, not part of the grid —
             // the owning session's own tracking is untouched by a window move.
@@ -322,12 +332,14 @@ impl GridModel {
     }
 }
 
-/// Where a link came from. `Explicit` (OSC 8) is added in the follow-up.
+/// Where a link came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LinkSource {
     /// Matched by the plain-text URL scanner.
     Detected,
+    /// Declared by the program via OSC 8 — beats `Detected` on the same cells.
+    Explicit,
 }
 
 /// One row's segment of a clickable link. Multi-row (soft-wrapped) URLs
@@ -353,6 +365,47 @@ impl GridModel {
         let lines = self.dims.screen_lines;
         let mut out = Vec::new();
         let mut link_id = 0u32;
+
+        // Pass 1 — explicit (OSC 8) links: runs of cells sharing an interned
+        // link id become spans. A link spanning several rows keeps ONE
+        // display id (per interned id) so hover lights every row together.
+        // An app that declares its link beats our guess: these cells are
+        // blanked for the detected scanner below.
+        let mut display_of: HashMap<u32, u32> = HashMap::new();
+        for row in 0..lines {
+            let start = row as usize * cols;
+            let end = (start + cols).min(self.cells.len());
+            let mut run: Option<(u32, u16)> = None; // (interned id, start col)
+            for i in 0..=(end - start) {
+                let this = if i < end - start {
+                    self.cells[start + i].link
+                } else {
+                    None // virtual end-of-row closes any open run
+                };
+                match run {
+                    Some((cur, s0)) if this != Some(cur) => {
+                        if let Some(url) = self.links.get(&cur) {
+                            let id = *display_of.entry(cur).or_insert_with(|| {
+                                let id = link_id;
+                                link_id += 1;
+                                id
+                            });
+                            out.push(LinkSpan {
+                                link_id: id,
+                                row,
+                                cols: s0..i as u16,
+                                url: url.clone(),
+                                source: LinkSource::Explicit,
+                            });
+                        }
+                        run = this.map(|l| (l, i as u16));
+                    }
+                    None if this.is_some() => run = this.map(|l| (l, i as u16)),
+                    _ => {}
+                }
+            }
+        }
+
         let mut row = 0u16;
         while row < lines {
             // Join this row with following rows while the wrapped flag is set.
@@ -368,7 +421,8 @@ impl GridModel {
                     let hidden = self
                         .styles
                         .get(&cell.style)
-                        .is_some_and(|s| s.attrs.contains(ember_core::Attrs::HIDDEN));
+                        .is_some_and(|s| s.attrs.contains(ember_core::Attrs::HIDDEN))
+                        || cell.link.is_some(); // explicit link owns these cells
                     match (&cell.content, hidden) {
                         (CellContent::WideSpacer, _) => {} // leader owns the glyph
                         (CellContent::Char(ch), false) => {
@@ -448,6 +502,73 @@ mod tests {
             cells,
             ..Default::default()
         }
+    }
+
+    fn linked_patch(row: u16, col: u16, ch: char, link: u32) -> CellPatch {
+        let mut p = patch(row, col, ch);
+        p.cell.link = Some(link);
+        p
+    }
+
+    #[test]
+    fn osc8_explicit_link_becomes_a_span() {
+        let dims = GridDims::new(10, 2);
+        let mut g = GridModel::new(dims);
+        let mut cells = Vec::new();
+        for (i, ch) in "click here".chars().enumerate() {
+            // Only "click" (cols 0..5) carries the link.
+            if i < 5 {
+                cells.push(linked_patch(0, i as u16, ch, 0));
+            } else {
+                cells.push(patch(0, i as u16, ch));
+            }
+        }
+        let mut d = delta_with(1, dims, cells, true);
+        d.new_links = vec![(0, "https://ember.example/docs".to_string())];
+        g.apply(d);
+        let spans = g.link_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].source, LinkSource::Explicit);
+        assert_eq!(spans[0].url, "https://ember.example/docs");
+        assert_eq!(spans[0].cols, 0..5);
+    }
+
+    #[test]
+    fn explicit_beats_detected_on_the_same_cells() {
+        // The visible text IS a detectable URL, but the app declared a
+        // different target via OSC 8: the declared link wins, no duplicate.
+        let dims = GridDims::new(30, 1);
+        let mut g = GridModel::new(dims);
+        let text = "https://visible.example/";
+        let cells: Vec<CellPatch> = text
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| linked_patch(0, i as u16, ch, 7))
+            .collect();
+        let mut d = delta_with(1, dims, cells, true);
+        d.new_links = vec![(7, "https://declared.example/".to_string())];
+        g.apply(d);
+        let spans = g.link_spans();
+        assert_eq!(spans.len(), 1, "no detected duplicate: {spans:?}");
+        assert_eq!(spans[0].source, LinkSource::Explicit);
+        assert_eq!(spans[0].url, "https://declared.example/");
+    }
+
+    #[test]
+    fn multi_row_explicit_link_shares_one_display_id() {
+        let dims = GridDims::new(4, 2);
+        let mut g = GridModel::new(dims);
+        let mut cells = Vec::new();
+        for col in 0..4 {
+            cells.push(linked_patch(0, col, 'a', 3));
+            cells.push(linked_patch(1, col, 'b', 3));
+        }
+        let mut d = delta_with(1, dims, cells, true);
+        d.new_links = vec![(3, "https://two.rows/".to_string())];
+        g.apply(d);
+        let spans = g.link_spans();
+        assert_eq!(spans.len(), 2, "one span per row");
+        assert_eq!(spans[0].link_id, spans[1].link_id, "hover lights both rows");
     }
 
     fn patch(row: u16, col: u16, ch: char) -> CellPatch {
