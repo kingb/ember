@@ -651,7 +651,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "ember-app"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "ember-core",
  "ember-platform",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "ember-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bitflags 2.13.0",
  "criterion",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "ember-platform"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arboard",
  "ember-core",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "ember-render"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytemuck",
  "ember-core",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "ember-session"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "alacritty_terminal",
  "criterion",

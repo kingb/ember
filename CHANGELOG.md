@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-10
+
 ### Added
 
 - Drop a file from Finder (or a Linux file manager) onto a window and its
@@ -19,6 +21,13 @@ follow [Semantic Versioning](https://semver.org).
   manual terminal launch. Windows also set a stable identity (X11
   WM_CLASS and Wayland app_id, both ember-term), so running windows
   group under the launcher icon.
+
+### Security
+
+- Dropped the menu library's unused GTK backend (pulled in only on Linux,
+  where the menu is an inert stub — Ember's menu is macOS-only). This
+  removes a flagged `glib` transitive dependency, clearing the advisory
+  from the dependency tree.
 
 ## [0.4.1] - 2026-07-10
 
@@ -262,7 +271,8 @@ this first release:
   created owner-only, use no fixed or predictable paths, and return
   JSON-encoded errors rather than leaking internal state.
 
-[Unreleased]: https://github.com/kingb/ember/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/kingb/ember/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/kingb/ember/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/kingb/ember/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/kingb/ember/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/kingb/ember/compare/v0.3.0...v0.3.1
