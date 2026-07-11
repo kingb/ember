@@ -968,6 +968,13 @@ impl ApplicationHandler<EmberEvent> for App {
                 win.renderer.set_hovered_tab(None);
                 win.renderer.set_hovered_link(None);
             }
+            // A file dropped from Finder / a file manager: insert its
+            // shell-escaped path at the focused pane's prompt (iTerm2
+            // parity). Multi-file drops arrive as one event per file; the
+            // per-path trailing space leaves them space-separated.
+            WindowEvent::DroppedFile(path) => {
+                win.drop_file_into_focused(shared, &path.to_string_lossy());
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Notch wheels scroll WHEEL_LINES per notch; trackpads report
                 // pixel-precise deltas that map 1:1 to cells (no multiplier).
@@ -4005,6 +4012,21 @@ fn bracket_paste(text: &str, bracketed: bool) -> Vec<u8> {
     out
 }
 
+/// Shell-escape one dropped-file path for insertion at a prompt (Finder /
+/// file-manager drop — iTerm2 parity): a path made only of clearly-safe
+/// characters passes through untouched; anything else is single-quoted with
+/// embedded `'` escaped as `'\''`, which is bulletproof for POSIX shells.
+pub(crate) fn shell_escape_path(path: &str) -> String {
+    let safe = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '.' | '_' | '/' | '-' | '+' | '@' | '%' | ',' | '=' | ':')
+    };
+    if !path.is_empty() && path.chars().all(safe) {
+        return path.to_string();
+    }
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
 /// The keyboard cheat-sheet, grouped into sections. A row with an empty key is a
 /// **section header** (rendered as an accent heading by `build_help`); the rest are
 /// `(key, description)`. Keep in sync with [`WindowState::handle_shortcut`].
@@ -4235,7 +4257,7 @@ mod tests {
     use super::{
         BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, bell_flash_intensity, bracket_paste,
         encode_key, match_tab_title, match_tab_title_across, next_prev_index, queue_close_this,
-        queue_close_window, resolve_index, tab_display_title, url_is_openable,
+        queue_close_window, resolve_index, shell_escape_path, tab_display_title, url_is_openable,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
@@ -4384,6 +4406,39 @@ mod tests {
         // ESC[201~ is removed so the payload can't escape into command position.
         let got = bracket_paste("a\x1b[201~rm -rf /\n", true);
         assert_eq!(got, b"\x1b[200~arm -rf /\n\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn shell_escape_plain_path_passes_through() {
+        assert_eq!(
+            shell_escape_path("/home/kb/proj/file-2.txt"),
+            "/home/kb/proj/file-2.txt"
+        );
+    }
+
+    #[test]
+    fn shell_escape_quotes_spaces_and_specials() {
+        assert_eq!(
+            shell_escape_path("/tmp/My File (v2).txt"),
+            "'/tmp/My File (v2).txt'"
+        );
+        assert_eq!(shell_escape_path("/tmp/a$b&c;d.txt"), "'/tmp/a$b&c;d.txt'");
+    }
+
+    #[test]
+    fn shell_escape_handles_embedded_single_quotes() {
+        // ' closes the quote, \' re-adds the literal quote, ' reopens.
+        assert_eq!(
+            shell_escape_path("/tmp/it's here.txt"),
+            "'/tmp/it'\\''s here.txt'"
+        );
+    }
+
+    #[test]
+    fn shell_escape_never_returns_empty_or_expandable() {
+        assert_eq!(shell_escape_path(""), "''");
+        // ~ at the start must not survive unquoted (tilde expansion).
+        assert_eq!(shell_escape_path("~/notes.txt"), "'~/notes.txt'");
     }
 
     #[test]

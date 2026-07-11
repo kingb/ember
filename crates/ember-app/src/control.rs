@@ -79,6 +79,10 @@ pub enum ControlMsg {
     Copy,
     /// Paste the given text into the focused pane (as if from the clipboard).
     Paste(String),
+    /// Simulate an OS file drop (Finder drag-in): shell-escape the path and
+    /// insert it at the focused pane's prompt. Test surface for the
+    /// `WindowEvent::DroppedFile` path, which can't be synthesized in-process.
+    DropFile(String),
     /// Toggle the FPS/frame-time debug overlay.
     Fps,
     /// Inject a BEL for a tab's session (visual bell); `None` = the focused pane.
@@ -467,6 +471,14 @@ mod unix {
                 let _ = tx.send(ControlMsg::Paste(text.to_string()));
                 ok()
             }
+            "drop-file" => {
+                let path = v.get("path").and_then(Value::as_str).unwrap_or("");
+                if path.is_empty() {
+                    return err("drop-file needs a path");
+                }
+                let _ = tx.send(ControlMsg::DropFile(path.to_string()));
+                ok()
+            }
             "fps" => {
                 let _ = tx.send(ControlMsg::Fps);
                 ok()
@@ -710,6 +722,13 @@ mod unix {
             }
             "copy" => serde_json::json!({"cmd":"copy"}),
             "paste" => serde_json::json!({"cmd":"paste","text": unescape(arg)}),
+            "drop-file" => {
+                let path = rest
+                    .get(1..)
+                    .map(|r| r.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                serde_json::json!({"cmd":"drop-file","path": path})
+            }
             "fps" => serde_json::json!({"cmd":"fps"}),
             "scroll" => serde_json::json!({"cmd":"scroll","dir": arg}),
             "bell" => match rest.get(1).and_then(|s| s.parse::<u64>().ok()) {
@@ -743,7 +762,7 @@ mod unix {
             }
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window|move-tab|promote-pane|merge-tab|drag)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window|move-tab|promote-pane|merge-tab|drag|drop-file)"
                 ));
             }
         };

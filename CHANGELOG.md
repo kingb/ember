@@ -4,6 +4,16 @@ All notable changes to Ember are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Ember aims to
 follow [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+
+- Drop a file from Finder (or a Linux file manager) onto a window and its
+  shell-escaped path is inserted at the prompt, matching iTerm2: plain
+  paths pass through bare, paths with spaces or special characters are
+  single-quoted, multiple files arrive space-separated, and delivery
+  respects bracketed paste.
+
 ## [0.4.1] - 2026-07-09
 
 ### Added
