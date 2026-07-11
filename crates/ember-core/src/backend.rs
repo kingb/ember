@@ -42,6 +42,12 @@ pub enum BackendControl {
     Scroll(ScrollAmount),
     /// Jump the viewport to the previous (`-1`) / next (`+1`) OSC 133 prompt mark.
     JumpMark(i8),
+    /// Search scrollback + screen for a regex and scroll the display to the
+    /// match. `forward` continues past the previous match toward the bottom;
+    /// `!forward` searches back up. Replies on the event lane with
+    /// [`BackendEvent::SearchResult`]. Wraps around the buffer. Smart-case:
+    /// an all-lowercase pattern matches case-insensitively.
+    Search { pattern: String, forward: bool },
     /// Re-ship everything: a full-reset delta carrying the complete style
     /// table. For consumers with no accumulated state — a rebuilt renderer
     /// (GPU device loss) or a pane re-hosted to a new window — since styles
@@ -117,7 +123,21 @@ pub enum BackendEvent {
     Clipboard(ClipboardOp),
     /// Phase-2 (libghostty-vt) passthrough: Kitty graphics, `tmux -CC`.
     Passthrough(PassthroughEvent),
+    /// Reply to [`BackendControl::Search`]: the match found (display already
+    /// scrolled to show it), or `None` for no match / invalid pattern. The
+    /// coordinates are scrollback-ABSOLUTE `(line, column)` pairs (the same
+    /// space as the render layer's `abs_of_row`), inclusive on both ends, so
+    /// consumers can anchor a highlight without racing the frame lane.
+    SearchResult(Option<SearchHit>),
     Exited(ExitStatus),
+}
+
+/// A search match in scrollback-absolute coordinates — see
+/// [`BackendEvent::SearchResult`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub start: (u32, u16),
+    pub end: (u32, u16),
 }
 
 /// An edge-triggered wake callback: invoked when a delta is published into a

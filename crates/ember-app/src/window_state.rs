@@ -30,8 +30,8 @@ use ember_core::{
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
-    AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode, TabHit, TabLabel,
-    VisiblePane,
+    AbsPoint, AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode, TabHit,
+    TabLabel, VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -453,6 +453,9 @@ pub(crate) struct WindowState {
     pub(crate) sel_snapshot: Option<String>,
     /// Whether a mouse drag is currently extending the selection.
     pub(crate) selecting: bool,
+    /// Scrollback-search bar (Cmd+F): open flag + the live query text.
+    pub(crate) search_open: bool,
+    pub(crate) search_query: String,
     /// Last mouse-down (time, pane, cell), for double/triple-click detection.
     pub(crate) last_click: Option<(Instant, SessionId, u16, u16)>,
     /// Consecutive-click count at the same cell (1 = simple, 2 = word, 3 = line).
@@ -579,6 +582,8 @@ impl WindowState {
             sel: None,
             sel_snapshot: None,
             selecting: false,
+            search_open: false,
+            search_query: String::new(),
             last_click: None,
             click_count: 0,
             tab_drag: None,
@@ -805,6 +810,16 @@ impl WindowState {
         window_id: WindowId,
         msg: ControlMsg,
     ) -> Option<ControlClose> {
+        // Route injected keys into the open search bar (for tests), mirroring
+        // the real keyboard path.
+        if self.search_open {
+            if let ControlMsg::Key(name) = &msg {
+                if let Some(k) = named_key(name) {
+                    self.search_key(shared, &k);
+                }
+                return None;
+            }
+        }
         // Route injected keys into the interactive Settings overlay (for tests),
         // mirroring the real keyboard path.
         if self.settings_open {
@@ -936,6 +951,13 @@ impl WindowState {
                 self.sel = Some((sid, s));
                 self.renderer.set_selection(self.sel.clone());
                 self.sel_snapshot = self.renderer.selected_text();
+            }
+            ControlMsg::Search(pattern, forward) => {
+                if let Some(h) = self.focused_session(shared) {
+                    let _ = h
+                        .control
+                        .send(ember_core::BackendControl::Search { pattern, forward });
+                }
             }
             ControlMsg::Copy => self.copy_selection(shared),
             ControlMsg::Paste(text) => self.paste_into_focused(shared, &text),
@@ -1258,6 +1280,11 @@ impl WindowState {
             // case a layout delivers it.
             Key::Character(s) if s.as_str() == "/" || s.as_str() == "?" => {
                 self.toggle_help();
+                true
+            }
+            // Cmd+F — scrollback search (find bar).
+            Key::Character(s) if s.as_str() == "f" && !mods.shift_key() && !mods.alt_key() => {
+                self.open_search();
                 true
             }
             // Cmd+, — Settings (the macOS Preferences convention; also a menu item).
@@ -3468,6 +3495,94 @@ impl WindowState {
     }
 
     /// Clear any selection.
+    /// A search reply from the backend: highlight the hit by anchoring the
+    /// selection to its absolute coordinates (the display already scrolled to
+    /// show it — the frame shipped before this event). `None` leaves any
+    /// existing selection alone; the search bar reports "no match" itself.
+    pub(crate) fn on_search_result(
+        &mut self,
+        session: &SessionId,
+        hit: Option<ember_core::SearchHit>,
+    ) {
+        let Some(h) = hit else { return };
+        let sel = AnchoredSelection {
+            anchor: AbsPoint {
+                line: h.start.0,
+                col: h.start.1,
+            },
+            active: AbsPoint {
+                line: h.end.0,
+                col: h.end.1,
+            },
+            mode: SelectionMode::Simple,
+        };
+        self.sel = Some((session.clone(), sel));
+        self.sel_snapshot = None;
+        self.renderer.set_selection(self.sel.clone());
+    }
+
+    /// Open the scrollback-search bar (Cmd+F).
+    pub(crate) fn open_search(&mut self) {
+        self.search_open = true;
+        self.refresh_search_bar();
+    }
+
+    /// Close the bar. The current hit's highlight (an anchored selection)
+    /// stays, matching iTerm2 — Escape again / a click clears it.
+    pub(crate) fn close_search(&mut self) {
+        self.search_open = false;
+        self.search_query.clear();
+        self.renderer.set_search_bar(None);
+    }
+
+    /// One keystroke routed to the open search bar: printable chars edit the
+    /// query (searching incrementally), Enter = next match, Shift+Enter =
+    /// previous, Backspace edits, Escape closes.
+    pub(crate) fn search_key(&mut self, shared: &Shared, key: &Key) {
+        match key {
+            Key::Named(NamedKey::Escape) => self.close_search(),
+            Key::Named(NamedKey::Enter) => {
+                let forward = !self.modifiers.shift_key();
+                self.submit_search(shared, forward);
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.search_query.pop();
+                self.refresh_search_bar();
+                if !self.search_query.is_empty() {
+                    self.submit_search(shared, true);
+                }
+            }
+            Key::Named(NamedKey::Space) => {
+                self.search_query.push(' ');
+                self.refresh_search_bar();
+                self.submit_search(shared, true);
+            }
+            Key::Character(text) => {
+                self.search_query.push_str(text);
+                self.refresh_search_bar();
+                self.submit_search(shared, true);
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_search_bar(&mut self) {
+        self.renderer
+            .set_search_bar(Some(format!("search: {}\u{2038}", self.search_query)));
+    }
+
+    fn submit_search(&mut self, shared: &Shared, forward: bool) {
+        if self.search_query.is_empty() {
+            return;
+        }
+        if let Some(h) = self.focused_session(shared) {
+            let _ = h.control.send(ember_core::BackendControl::Search {
+                pattern: self.search_query.clone(),
+                forward,
+            });
+        }
+    }
+
     pub(crate) fn clear_selection(&mut self) {
         if self.sel.is_some() {
             self.sel = None;

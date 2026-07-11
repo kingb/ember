@@ -1142,6 +1142,12 @@ impl ApplicationHandler<EmberEvent> for App {
                     win.settings_key(shared, &key.logical_key);
                     return;
                 }
+                // The search bar captures typing while open, but NOT Cmd
+                // combos (Cmd+W etc. stay shortcuts; Cmd+F reopens/no-ops).
+                if win.search_open && !win.modifiers.super_key() {
+                    win.search_key(shared, &key.logical_key);
+                    return;
+                }
                 // Inline tab rename captures typing, but NOT Cmd combos — those
                 // stay app shortcuts (Cmd+W must not insert "w"), so fall through
                 // to the Super branch below when Cmd is held.
@@ -1523,6 +1529,7 @@ impl ApplicationHandler<EmberEvent> for App {
         let mut new_title: Option<String> = None;
         let mut exited: Vec<SessionId> = Vec::new();
         let mut belled: Vec<SessionId> = Vec::new();
+        let mut search_hits: Vec<(SessionId, Option<ember_core::SearchHit>)> = Vec::new();
         let mut clipboard_set: Option<String> = None;
         let mut title_updates: Vec<(SessionId, String)> = Vec::new();
         // OSC 1337 `CurrentDir=` per session — a new split spawned from this
@@ -1541,6 +1548,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     }
                     BackendEvent::Exited(_) => exited.push(id.clone()),
                     BackendEvent::Bell => belled.push(id.clone()),
+                    BackendEvent::SearchResult(hit) => search_hits.push((id.clone(), hit.clone())),
                     // OSC 52 copy from any pane (tmux/nvim-over-ssh).
                     BackendEvent::Clipboard(ClipboardOp::Set(text)) => {
                         clipboard_set = Some(text);
@@ -1601,6 +1609,16 @@ impl ApplicationHandler<EmberEvent> for App {
                 .unwrap_or(focused_id);
             if let Some(w) = self.windows.get_mut(&wid) {
                 w.on_bell(shared, &session);
+            }
+        }
+        for (session, hit) in search_hits {
+            let wid = shared
+                .session_window
+                .get(&session)
+                .copied()
+                .unwrap_or(focused_id);
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.on_search_result(&session, hit);
             }
         }
         // Neither loop above touches the focused window through `win` (each
