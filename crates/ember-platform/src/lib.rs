@@ -149,10 +149,32 @@ pub fn open_url(target: &str) {
 }
 
 /// Window attributes for the main terminal window, sized in logical pixels.
+///
+/// On Linux this also pins the window's identity — X11 `WM_CLASS` and Wayland
+/// `app_id` — to `ember-term`, matching `extra/linux/ember-term.desktop`'s
+/// basename and `StartupWMClass`, so GNOME/KDE group running windows under
+/// the launcher icon instead of showing a generic one.
 pub fn window_attributes(title: &str, width: f32, height: f32) -> WindowAttributes {
-    Window::default_attributes()
+    let attrs = Window::default_attributes()
         .with_title(title)
-        .with_inner_size(LogicalSize::new(width.max(1.0), height.max(1.0)))
+        .with_inner_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
+    #[cfg(target_os = "linux")]
+    let attrs = {
+        // Both ext traits define `with_name(general, instance)` over one
+        // shared builder field; call each fully qualified (importing both
+        // would make bare `.with_name` ambiguous).
+        let a = winit::platform::x11::WindowAttributesExtX11::with_name(
+            attrs,
+            "ember-term",
+            "ember-term",
+        );
+        winit::platform::wayland::WindowAttributesExtWayland::with_name(
+            a,
+            "ember-term",
+            "ember-term",
+        )
+    };
+    attrs
 }
 
 /// Decode a PNG (RGBA or RGB) into raw RGBA8 bytes + `(width, height)`. The single

@@ -13,6 +13,12 @@ follow [Semantic Versioning](https://semver.org).
   paths pass through bare, paths with spaces or special characters are
   single-quoted, multiple files arrive space-separated, and delivery
   respects bracketed paste.
+- Linux desktop integration. Ember now ships a freedesktop launcher entry
+  and hicolor icons (extra/linux, with install instructions), so it can
+  appear in the GNOME app grid and KDE launcher instead of requiring a
+  manual terminal launch. Windows also set a stable identity (X11
+  WM_CLASS and Wayland app_id, both ember-term), so running windows
+  group under the launcher icon.
 
 ## [0.4.1] - 2026-07-10
 
