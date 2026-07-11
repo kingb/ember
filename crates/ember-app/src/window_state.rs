@@ -42,7 +42,8 @@ use crate::{
     ControlClose, DEFAULT_COLS, DEFAULT_ROWS, DragState, DropHover, MULTI_CLICK, PAD, PendingClose,
     Shared, about_info, bell_flash_intensity, bracket_paste, click_selection_should_clear,
     dims_for_rect, ember_glow, encode_key, help_lines, inset, load_backdrop_image, named_key,
-    parse_chord, resolve_window_index, step_selectable_row, tab_display_title, url_is_openable,
+    parse_chord, resolve_window_index, shell_escape_path, step_selectable_row, tab_display_title,
+    url_is_openable,
 };
 #[cfg(target_os = "linux")]
 use crate::{alt_digit_tab, linux_chord_translate};
@@ -929,6 +930,7 @@ impl WindowState {
             }
             ControlMsg::Copy => self.copy_selection(shared),
             ControlMsg::Paste(text) => self.paste_into_focused(shared, &text),
+            ControlMsg::DropFile(path) => self.drop_file_into_focused(shared, &path),
             ControlMsg::Fps => self.toggle_fps(),
             ControlMsg::Scroll(amount) => self.scroll_focused(shared, amount),
             ControlMsg::Bell(tab) => {
@@ -1215,6 +1217,21 @@ impl WindowState {
             .and_then(|id| shared.bracketed.get(&id).copied())
             .unwrap_or(false);
         self.send_to_focused(shared, bracket_paste(text, bracketed));
+    }
+
+    /// A file dropped from the OS (Finder / file manager) onto this window:
+    /// insert its shell-escaped path plus a trailing space at the focused
+    /// pane's prompt, through the paste path (bracketed-paste aware) —
+    /// iTerm2 parity. Called once per file (multi-file drops arrive as one
+    /// `WindowEvent::DroppedFile` each), so the per-path trailing space
+    /// leaves several drops space-separated.
+    pub(crate) fn drop_file_into_focused(&self, shared: &Shared, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        let mut text = shell_escape_path(path);
+        text.push(' ');
+        self.paste_into_focused(shared, &text);
     }
 
     /// Handle a Super-modified key as a multiplexer command. Returns whether it was
