@@ -1534,6 +1534,48 @@ pub(crate) fn build_fps(
     (x + ipad, y + ipad)
 }
 
+/// Build the scrollback-search bar: a small dark box pinned to the top-right
+/// (under the tab strip) showing the live query, with an ember-accent border
+/// so it reads as an active input. Same non-modal overlay mechanism as
+/// [`build_fps`]; returns the logical `(left, top)` of the text area.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_search_bar(
+    font_system: &mut FontSystem,
+    buf: &mut Buffer,
+    text: &str,
+    cw: f32,
+    logical_w: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) -> (f32, f32) {
+    let ipad = 6.0;
+    let min_w = 18.0 * cw;
+    let w = (text.chars().count() as f32 * cw + 2.0 * ipad).max(min_w);
+    let h = LINE_HEIGHT + 2.0 * ipad;
+    let x = (logical_w - w - 8.0).max(0.0);
+    // Fixed drop below the tab strip (strip height isn't a shared constant;
+    // 44 logical px clears it comfortably at every zoom).
+    let y = 44.0;
+    // Accent border (1px ring) behind the dark input box.
+    out.push((
+        scaled(x - 1.0, y - 1.0, w + 2.0, h + 2.0, sf),
+        lin_rgba(ACCENT, 0.9),
+    ));
+    out.push((scaled(x, y, w, h, sf), lin_rgba(Rgb::new(12, 8, 6), 0.92)));
+    buf.set_size(font_system, Some(w), Some(h));
+    buf.set_text(
+        font_system,
+        text,
+        &Attrs::new()
+            .family(Family::Monospace)
+            .color(Color::rgb(0xf5, 0xf5, 0xdc)),
+        Shaping::Advanced,
+        None,
+    );
+    buf.shape_until_scroll(font_system, false);
+    (x + ipad, y + ipad)
+}
+
 /// Scrollbar width (logical px) and minimum thumb height.
 pub(crate) const SCROLLBAR_W: f32 = 8.0;
 const SCROLLBAR_MIN_THUMB: f32 = 20.0;

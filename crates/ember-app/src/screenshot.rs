@@ -457,6 +457,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
             .and_then(crate::load_backdrop_image),
         image_fit: ember_render::ImageFit::parse(&opts.bg_fit),
         fps_overlay: opts.fps.clone(),
+        search_bar: None,
         bell_flash: opts.bell,
         font_size: opts.font_size,
         font_family: opts.font.clone(),

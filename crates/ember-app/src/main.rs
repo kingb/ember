@@ -1142,6 +1142,12 @@ impl ApplicationHandler<EmberEvent> for App {
                     win.settings_key(shared, &key.logical_key);
                     return;
                 }
+                // The search bar captures typing while open, but NOT Cmd
+                // combos (Cmd+W etc. stay shortcuts; Cmd+F reopens/no-ops).
+                if win.search_open && !win.modifiers.super_key() {
+                    win.search_key(shared, &key.logical_key);
+                    return;
+                }
                 // Inline tab rename captures typing, but NOT Cmd combos — those
                 // stay app shortcuts (Cmd+W must not insert "w"), so fall through
                 // to the Super branch below when Cmd is held.

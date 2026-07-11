@@ -613,6 +613,7 @@ pub struct Renderer {
     morph: Option<MorphState>,
     /// FPS/frame-time debug readout text (bottom-right), or `None` when hidden.
     fps_overlay: Option<String>,
+    search_bar: Option<String>,
     /// Glyph buffer for the FPS overlay.
     fps_buffer: Buffer,
     /// Visual-bell flash intensity (`0..1`); a warm amber wash over the panes that
@@ -798,6 +799,7 @@ impl Renderer {
             ghost_tab: None,
             morph: None,
             fps_overlay: None,
+            search_bar: None,
             fps_buffer,
             bell_flash: 0.0,
             starve_gate: StarveGate::new(),
@@ -968,6 +970,7 @@ impl Renderer {
             image: self.image_rgba.clone(),
             image_fit: self.image_fit,
             fps_overlay: self.fps_overlay.clone(),
+            search_bar: self.search_bar.clone(),
             bell_flash: self.bell_flash,
             font_size: self.font_size,
             font_family: self.family_name.clone(),
@@ -1425,6 +1428,13 @@ impl Renderer {
     pub fn set_selection(&mut self, selection: Option<(SessionId, AnchoredSelection)>) {
         self.scene_dirty = true;
         self.selection = selection;
+        self.window.request_redraw();
+    }
+
+    /// Set or clear the scrollback-search bar text (top-right). `None` = closed.
+    pub fn set_search_bar(&mut self, text: Option<String>) {
+        self.scene_dirty = true;
+        self.search_bar = text;
         self.window.request_redraw();
     }
 

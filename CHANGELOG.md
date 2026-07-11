@@ -6,6 +6,16 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Search in scrollback. Cmd+F opens a find bar: type to search incrementally
+  (regex, smart-case: lowercase queries match case-insensitively), Enter
+  jumps to the next match and Shift+Enter to the previous one, wrapping
+  around the buffer. The view scrolls to each hit and highlights it; the
+  highlight rides the anchored-selection machinery, so it stays glued to
+  the match while output keeps scrolling, and Cmd+C copies it. Escape
+  closes the bar. Also drivable as ctl search / search-back.
+
 ### Fixed
 
 - Selections now stay glued to their text. Selecting text and letting
