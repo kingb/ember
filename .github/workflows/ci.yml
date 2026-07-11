@@ -62,6 +62,51 @@ jobs:
       - name: Bench (compile gate)
         run: cargo bench --all --no-run
 
+  # Real-window smoke: the `check` job runs `cargo test`, which NEVER creates a
+  # window or GPU surface, so a winit/wgpu/X11 regression (or a missing runtime
+  # dep) sails through it. This job launches the actual binary under Xvfb with
+  # software Vulkan (lavapipe) and drives it via the control socket — the same
+  # path release bottles are smoke-tested on. Assertions live in
+  # scripts/smoke/window-smoke.sh (shared with the standalone container harness).
+  smoke:
+    name: real-window smoke (X11)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Build headers PLUS the RUNTIME libs a real window needs but `check`
+      # never installs — libxcursor1 + libxkbcommon-x11-0 (winit dlopens them;
+      # startup panics without) and a system monospace font — plus Xvfb and
+      # mesa's software Vulkan ICD.
+      - name: Install deps (build + runtime + Xvfb + software Vulkan)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev libxi-dev \
+            libxrandr-dev libxcb1-dev libvulkan-dev mesa-vulkan-drivers \
+            libfontconfig1-dev fonts-dejavu-core \
+            xvfb x11-apps imagemagick libxi6 libxcursor1 libxkbcommon-x11-0
+      - name: Build ember-term (release)
+        run: cargo build --release -p ember-app --bin ember-term
+      - name: Smoke under Xvfb + lavapipe
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 &
+          sleep 2
+          export DISPLAY=:99
+          export VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)"
+          export WGPU_BACKEND=vulkan WINIT_UNIX_BACKEND=x11
+          export EMBER_SMOKE_BIN="$PWD/target/release/ember-term"
+          export EMBER_SMOKE_OUT="$PWD/smoke-artifacts"
+          bash scripts/smoke/window-smoke.sh
+      - name: Upload smoke screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: window-smoke-x11
+          path: smoke-artifacts/*.png
+          if-no-files-found: ignore
+
   licenses:
     name: license gate
     runs-on: ubuntu-latest
