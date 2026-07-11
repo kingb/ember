@@ -1154,6 +1154,25 @@ impl ApplicationHandler<EmberEvent> for App {
                     win.settings_key(shared, &key.logical_key);
                     return;
                 }
+                // The command palette captures typing while open; Enter picks
+                // an action whose chord dispatches through the normal path
+                // below (so an action that empties the window still closes it).
+                if win.palette_open && !win.modifiers.super_key() {
+                    if let Some(chord) = win.palette_key(&key.logical_key) {
+                        if let Some((k, m)) = parse_chord(&chord) {
+                            if win.handle_shortcut(shared, &k, m) && win.tree.tabs.is_empty() {
+                                finish_close(
+                                    &mut self.windows,
+                                    shared,
+                                    &mut self.focused_window,
+                                    event_loop,
+                                    id,
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
                 // The search bar captures typing while open, but NOT Cmd
                 // combos (Cmd+W etc. stay shortcuts; Cmd+F reopens/no-ops).
                 if win.search_open && !win.modifiers.super_key() {
@@ -4101,6 +4120,7 @@ pub(crate) fn help_lines() -> Vec<(String, String)> {
             "Copy / paste",
         ),
         r("".into(), "SCROLLBACK"),
+        r(k("Cmd+F", "Ctrl+Shift+F"), "Search scrollback"),
         r("Wheel / Shift+PgUp/Dn".into(), "Scroll history"),
         r("Shift+Home / End".into(), "Jump to top / bottom"),
         r(
@@ -4111,6 +4131,7 @@ pub(crate) fn help_lines() -> Vec<(String, String)> {
         r(k("Cmd+= / Cmd+-", "Ctrl+Shift+= / Ctrl+-"), "Zoom in / out"),
         r(k("Cmd+0", "Ctrl+0"), "Reset zoom"),
         r(k("Cmd+,", "Ctrl+Shift+,"), "Settings"),
+        r(k("Cmd+Shift+P", "Ctrl+Shift+P"), "Command palette"),
         r(k("Cmd+/", "Ctrl+Shift+/"), "This cheat sheet"),
     ]
 }

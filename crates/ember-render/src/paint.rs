@@ -1612,6 +1612,71 @@ pub(crate) fn build_ime_preedit(
     (x, y)
 }
 
+/// Build the command palette: a centered panel with the query line on top
+/// and the filtered actions below (description left, chord right), selected
+/// row highlighted. One shaped buffer; returns `(left, top)` for the text.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_palette(
+    font_system: &mut FontSystem,
+    buf: &mut Buffer,
+    query: &str,
+    rows: &[(String, String)],
+    selected: usize,
+    cw: f32,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) -> (f32, f32) {
+    let ipad = 10.0;
+    let cols = 64usize;
+    let w = (cols as f32 * cw + 2.0 * ipad).min(logical_w - 24.0);
+    let inner_cols = ((w - 2.0 * ipad) / cw) as usize;
+    let shown = rows.len().min(12);
+    let h = (shown as f32 + 1.5) * LINE_HEIGHT + 2.0 * ipad;
+    let x = ((logical_w - w) * 0.5).max(0.0);
+    let y = (logical_h * 0.18).max(44.0);
+    // Accent ring + panel.
+    out.push((
+        scaled(x - 1.0, y - 1.0, w + 2.0, h + 2.0, sf),
+        lin_rgba(ACCENT, 0.9),
+    ));
+    out.push((scaled(x, y, w, h, sf), lin_rgba(Rgb::new(14, 10, 8), 0.97)));
+    // Selected-row highlight (under the text pass).
+    if shown > 0 && selected < shown {
+        let ry = y + ipad + (selected as f32 + 1.5) * LINE_HEIGHT;
+        out.push((
+            scaled(x + 3.0, ry, w - 6.0, LINE_HEIGHT, sf),
+            lin_rgba(ACCENT, 0.28),
+        ));
+    }
+    // Text: query line, blank-ish gap, then rows (desc left, chord right).
+    let mut text = format!("> {query}\u{2038}\n");
+    text.push('\n');
+    for (desc, chord) in rows.iter().take(shown) {
+        let d: String = desc.chars().take(inner_cols.saturating_sub(chord.chars().count() + 2)).collect();
+        let pad = inner_cols
+            .saturating_sub(d.chars().count())
+            .saturating_sub(chord.chars().count());
+        text.push_str(&format!("{d}{}{chord}\n", " ".repeat(pad)));
+    }
+    if rows.is_empty() {
+        text.push_str("(no matching actions)\n");
+    }
+    buf.set_size(font_system, Some(w - 2.0 * ipad), Some(h));
+    buf.set_text(
+        font_system,
+        &text,
+        &Attrs::new()
+            .family(Family::Monospace)
+            .color(Color::rgb(0xf5, 0xf5, 0xdc)),
+        Shaping::Advanced,
+        None,
+    );
+    buf.shape_until_scroll(font_system, false);
+    (x + ipad, y + ipad)
+}
+
 /// Scrollbar width (logical px) and minimum thumb height.
 pub(crate) const SCROLLBAR_W: f32 = 8.0;
 const SCROLLBAR_MIN_THUMB: f32 = 20.0;

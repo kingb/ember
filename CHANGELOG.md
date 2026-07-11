@@ -8,6 +8,11 @@ follow [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Command palette. Cmd+Shift+P opens a fuzzy-searchable list of every
+  keyboard action, with its shortcut shown beside it, so features are
+  discoverable without memorizing chords: type a few letters, arrows to
+  choose, Enter runs it, Escape closes. Picking an action teaches its
+  shortcut for next time.
 - Input methods (IME) work. Composing text through an OS input method,
   Japanese, Chinese, Korean, dead-key accents, the macOS emoji picker,
   now shows the in-progress composition inline at the cursor (with an
