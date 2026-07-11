@@ -38,6 +38,24 @@ cargo install --path crates/ember-app --root "$STAGE/ember/${V}" 2>&1 | tail -1
 BIN="$STAGE/ember/${V}/bin/ember-term"
 "$BIN" --version | head -1 | sed 's/^/  /'
 
+# Freedesktop launcher assets into the bottle's keg layout (share/). The pour
+# extracts the bottle as-is; the formula's `install` share.install only runs on
+# source builds, so bottled Linux users would otherwise miss the launcher.
+# The .desktop keeps its relative Exec=; the formula caveat rewrites it to the
+# absolute prefix path for the no-sudo user-local copy (GNOME does not scan the
+# Homebrew prefix). See extra/linux/README.md.
+if [ -d /src/extra/linux ]; then
+  echo "=== stage freedesktop launcher assets ==="
+  install -Dm644 /src/extra/linux/ember-term.desktop \
+    "$STAGE/ember/${V}/share/applications/ember-term.desktop"
+  # Preserve the hicolor theme dir: freedesktop icon lookup resolves
+  # icons/hicolor/<size>/apps/<name>.png. mkdir the parent first so cp does not
+  # collapse `hicolor` into `icons` (the classic cp-into-missing-dir gotcha).
+  mkdir -p "$STAGE/ember/${V}/share/icons"
+  cp -r /src/extra/linux/icons/hicolor "$STAGE/ember/${V}/share/icons/hicolor"
+  echo "  desktop entry + $(find /src/extra/linux/icons -name '*.png' | wc -l | tr -d ' ') icons staged"
+fi
+
 echo "=== glibc ceiling check (max versioned symbol must be <= 2.35) ==="
 MAX=$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
 echo "  max symbol: ${MAX}"
