@@ -339,6 +339,13 @@ fn emulation_loop(
                 proj.scroll_to_prompt(dir);
                 shipper.push(&mut proj, &frame_tx);
             }
+            Ev::Control(BackendControl::Search { pattern, forward }) => {
+                let hit = proj.search(&pattern, forward);
+                // Ship the scrolled frame BEFORE the event so a consumer
+                // reacting to the hit sees a grid that already shows it.
+                shipper.push(&mut proj, &frame_tx);
+                let _ = event_tx.send(BackendEvent::SearchResult(hit));
+            }
             Ev::Control(BackendControl::Resize(new_dims)) => {
                 let _ = master.resize(PtySize {
                     rows: new_dims.screen_lines,

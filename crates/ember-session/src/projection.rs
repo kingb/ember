@@ -8,9 +8,10 @@ use std::collections::HashMap;
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape as AlacCursorShape, Processor};
 use ember_core::{
@@ -86,6 +87,17 @@ pub struct AlacrittyProjection<L: EventListener> {
     scan_tail_133: Vec<u8>,
     /// Same, for OSC 1337.
     scan_tail_1337: Vec<u8>,
+    /// Live scrollback-search state: the pattern as typed, its compiled DFA,
+    /// and the engine-space range of the last match (the origin the next
+    /// `search` call continues from). Reset when the pattern changes.
+    search: Option<SearchState>,
+}
+
+/// See `AlacrittyProjection::search`.
+struct SearchState {
+    pattern: String,
+    regex: RegexSearch,
+    last: Option<(Point, Point)>,
 }
 
 /// One tracked command (OSC 133) or manual (OSC 1337 `SetMark`) mark: the
@@ -115,6 +127,7 @@ impl<L: EventListener> AlacrittyProjection<L> {
             dims,
             epoch: 0,
             display_offset: 0,
+            search: None,
             marks: Vec::new(),
             resync: false,
             scan_tail_133: Vec::new(),
@@ -270,6 +283,71 @@ impl<L: EventListener> AlacrittyProjection<L> {
             let offset = (bottom_abs - (screen - 1) - t).clamp(0, hist);
             self.scroll(ScrollAmount::To(offset.min(u16::MAX as i64) as u16));
         }
+    }
+
+    /// Search scrollback + screen for `pattern` (regex; smart-case: an
+    /// all-lowercase pattern matches case-insensitively), continuing one cell
+    /// past the previous match (wrapping around the buffer), or starting from
+    /// the viewport top on a fresh pattern. Scrolls the display so the match
+    /// is visible and returns its scrollback-absolute `(line, col)` range.
+    /// `None` for no match, an invalid regex, or an empty pattern (which also
+    /// clears the search state).
+    pub fn search(&mut self, pattern: &str, forward: bool) -> Option<ember_core::SearchHit> {
+        if pattern.is_empty() {
+            self.search = None;
+            return None;
+        }
+        if self.search.as_ref().map(|s| s.pattern.as_str()) != Some(pattern) {
+            let needle = if pattern.chars().any(|c| c.is_uppercase()) {
+                pattern.to_string()
+            } else {
+                format!("(?i){pattern}")
+            };
+            let regex = match RegexSearch::new(&needle) {
+                Ok(r) => r,
+                Err(_) => {
+                    self.search = None;
+                    return None; // invalid regex: report as no match
+                }
+            };
+            self.search = Some(SearchState {
+                pattern: pattern.to_string(),
+                regex,
+                last: None,
+            });
+        }
+        let screen = self.dims.screen_lines as i32;
+        let hist = self.term.grid().history_size();
+        let last_col = self.dims.columns.saturating_sub(1) as usize;
+        let display_offset = self.term.grid().display_offset() as i32;
+
+        let state = self.search.as_mut().expect("set above");
+        // One cell past the previous match's start (so next/prev advance),
+        // else the current viewport top. `search_next` wraps the buffer.
+        let origin = match (&state.last, forward) {
+            (Some((start, _)), true) => step_cell(*start, 1, last_col, screen, hist),
+            (Some((start, _)), false) => step_cell(*start, -1, last_col, screen, hist),
+            (None, _) => Point::new(Line(-display_offset), Column(0)),
+        };
+        let (direction, side) = if forward {
+            (Direction::Right, Side::Left)
+        } else {
+            (Direction::Left, Side::Right)
+        };
+        let m = self
+            .term
+            .search_next(&mut state.regex, origin, direction, side, None)?;
+        let (start, end) = (*m.start(), *m.end());
+        state.last = Some((start, end));
+        // Bring the match into view: a history match goes to the viewport
+        // top; a screen match means offset 0 (the live view already has it).
+        let offset = (-start.line.0).clamp(0, hist as i32);
+        self.scroll(ScrollAmount::To(offset.min(u16::MAX as i32) as u16));
+        let abs = |p: Point| ((hist as i64 + p.line.0 as i64).max(0) as u32, p.column.0 as u16);
+        Some(ember_core::SearchHit {
+            start: abs(start),
+            end: abs(end),
+        })
     }
 
     /// Scroll the display through scrollback history. **No-op on the alternate
@@ -526,6 +604,27 @@ fn neutral_of(
     (content, style, wrapped, wide)
 }
 
+/// Step one cell right (`+1`) or left (`-1`) from `p`, wrapping across line
+/// ends, clamped to the buffer (`-hist..screen`): the "advance past the last
+/// match" origin for continued searches.
+fn step_cell(p: Point, dir: i8, last_col: usize, screen: i32, hist: usize) -> Point {
+    if dir > 0 {
+        if p.column.0 < last_col {
+            Point::new(p.line, Column(p.column.0 + 1))
+        } else if p.line.0 < screen - 1 {
+            Point::new(Line(p.line.0 + 1), Column(0))
+        } else {
+            p // buffer bottom-right: stay (wrap-around search still works)
+        }
+    } else if p.column.0 > 0 {
+        Point::new(p.line, Column(p.column.0 - 1))
+    } else if p.line.0 > -(hist as i32) {
+        Point::new(Line(p.line.0 - 1), Column(last_col))
+    } else {
+        p // top of history: stay
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +859,57 @@ mod tests {
             s.push_str(&format!("L{i}\r\n"));
         }
         p.advance(s.as_bytes());
+    }
+
+    #[test]
+    fn search_finds_scrollback_text_and_scrolls_to_it() {
+        let mut p = proj();
+        p.advance(b"needle-here\r\n");
+        feed_lines(&mut p, 60); // push the needle deep into history
+        let hit = p.search("needle-here", true).expect("found");
+        // Line 1 of the session: absolute line 1 (prompt-less test feed).
+        assert_eq!(hit.start.0, hit.end.0, "single-line match");
+        assert_eq!(hit.start.1, 0, "starts at column 0");
+        assert_eq!(hit.end.1 - hit.start.1, 10, "11 columns wide");
+        let mut d = GridDelta::default();
+        p.drain_damage_into(&mut d);
+        assert!(d.display_offset > 0, "display scrolled up to show the match");
+        // The absolute position projects into the now-scrolled viewport.
+        let row0_abs = d.history_len as u32 - d.display_offset as u32;
+        assert!(hit.start.0 >= row0_abs && hit.start.0 < row0_abs + 24);
+    }
+
+    #[test]
+    fn search_next_advances_between_matches_and_wraps() {
+        let mut p = proj();
+        p.advance(b"target one\r\n");
+        feed_lines(&mut p, 10);
+        p.advance(b"target two\r\n");
+        feed_lines(&mut p, 10);
+        let first = p.search("target", true).expect("first");
+        let second = p.search("target", true).expect("second");
+        assert_ne!(first.start, second.start, "advanced to the other match");
+        let third = p.search("target", true).expect("wrapped");
+        assert_eq!(third.start, first.start, "wrapped back around");
+        let back = p.search("target", false).expect("prev");
+        assert_eq!(back.start, second.start, "prev goes back");
+    }
+
+    #[test]
+    fn search_smart_case_and_invalid_patterns() {
+        let mut p = proj();
+        p.advance(b"MixedCase word\r\n");
+        feed_lines(&mut p, 5);
+        assert!(
+            p.search("mixedcase", true).is_some(),
+            "lowercase pattern matches case-insensitively"
+        );
+        assert!(
+            p.search("MIXEDCASE", true).is_none(),
+            "uppercase pattern is exact"
+        );
+        assert!(p.search("[invalid(", true).is_none(), "bad regex = no match");
+        assert!(p.search("", true).is_none(), "empty clears");
     }
 
     #[test]

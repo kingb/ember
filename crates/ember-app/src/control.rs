@@ -79,6 +79,10 @@ pub enum ControlMsg {
     Copy,
     /// Paste the given text into the focused pane (as if from the clipboard).
     Paste(String),
+    /// Search the focused pane's scrollback (regex, smart-case). `true` =
+    /// forward/next, `false` = backward/previous. The hit is highlighted by
+    /// anchoring the selection to it, and the view scrolls to show it.
+    Search(String, bool),
     /// Simulate an OS file drop (Finder drag-in): shell-escape the path and
     /// insert it at the focused pane's prompt. Test surface for the
     /// `WindowEvent::DroppedFile` path, which can't be synthesized in-process.
@@ -479,6 +483,15 @@ mod unix {
                 let _ = tx.send(ControlMsg::DropFile(path.to_string()));
                 ok()
             }
+            "search" => {
+                let pattern = v.get("pattern").and_then(Value::as_str).unwrap_or("");
+                if pattern.is_empty() {
+                    return err("search needs a pattern");
+                }
+                let forward = v.get("forward").and_then(Value::as_bool).unwrap_or(true);
+                let _ = tx.send(ControlMsg::Search(pattern.to_string(), forward));
+                ok()
+            }
             "fps" => {
                 let _ = tx.send(ControlMsg::Fps);
                 ok()
@@ -729,6 +742,13 @@ mod unix {
                     .unwrap_or_default();
                 serde_json::json!({"cmd":"drop-file","path": path})
             }
+            "search" | "search-back" => {
+                let pattern = rest
+                    .get(1..)
+                    .map(|r| r.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                serde_json::json!({"cmd":"search","pattern": pattern,"forward": cmd == "search"})
+            }
             "fps" => serde_json::json!({"cmd":"fps"}),
             "scroll" => serde_json::json!({"cmd":"scroll","dir": arg}),
             "bell" => match rest.get(1).and_then(|s| s.parse::<u64>().ok()) {
@@ -762,7 +782,7 @@ mod unix {
             }
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window|move-tab|promote-pane|merge-tab|drag|drop-file)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window|move-tab|promote-pane|merge-tab|drag|drop-file|search|search-back)"
                 ));
             }
         };

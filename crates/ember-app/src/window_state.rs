@@ -30,8 +30,8 @@ use ember_core::{
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
-    AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode, TabHit, TabLabel,
-    VisiblePane,
+    AbsPoint, AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode, TabHit,
+    TabLabel, VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -937,6 +937,13 @@ impl WindowState {
                 self.sel = Some((sid, s));
                 self.renderer.set_selection(self.sel.clone());
                 self.sel_snapshot = self.renderer.selected_text();
+            }
+            ControlMsg::Search(pattern, forward) => {
+                if let Some(h) = self.focused_session(shared) {
+                    let _ = h
+                        .control
+                        .send(ember_core::BackendControl::Search { pattern, forward });
+                }
             }
             ControlMsg::Copy => self.copy_selection(shared),
             ControlMsg::Paste(text) => self.paste_into_focused(shared, &text),
@@ -3469,6 +3476,32 @@ impl WindowState {
     }
 
     /// Clear any selection.
+    /// A search reply from the backend: highlight the hit by anchoring the
+    /// selection to its absolute coordinates (the display already scrolled to
+    /// show it — the frame shipped before this event). `None` leaves any
+    /// existing selection alone; the search bar reports "no match" itself.
+    pub(crate) fn on_search_result(
+        &mut self,
+        session: &SessionId,
+        hit: Option<ember_core::SearchHit>,
+    ) {
+        let Some(h) = hit else { return };
+        let sel = AnchoredSelection {
+            anchor: AbsPoint {
+                line: h.start.0,
+                col: h.start.1,
+            },
+            active: AbsPoint {
+                line: h.end.0,
+                col: h.end.1,
+            },
+            mode: SelectionMode::Simple,
+        };
+        self.sel = Some((session.clone(), sel));
+        self.sel_snapshot = None;
+        self.renderer.set_selection(self.sel.clone());
+    }
+
     pub(crate) fn clear_selection(&mut self) {
         if self.sel.is_some() {
             self.sel = None;
