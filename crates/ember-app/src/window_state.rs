@@ -756,6 +756,7 @@ impl WindowState {
     ) -> bool {
         let mut cfg = LocalPtyConfig::new(id.clone(), dims);
         cfg.shell_integration = shared.config.shell_integration;
+        cfg.osc52_read = shared.config.osc52_read;
         cfg.cwd = cwd.map(std::path::PathBuf::from);
         let handle = match LocalPty::spawn(cfg) {
             Ok(h) => h,

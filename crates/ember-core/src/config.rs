@@ -35,6 +35,12 @@ pub struct Config {
     /// it needs (feature-detected on first use, degrading silently for the
     /// rest of the session). On by default.
     pub wisp: bool,
+    /// OSC 52 clipboard READ: allow programs (tmux/nvim over ssh) to ask for
+    /// the clipboard's CONTENTS. A data-exfiltration surface (any program in
+    /// the terminal can quietly read what you copied), so OFF by default -
+    /// the request is answered with an empty payload. Copy direction (OSC 52
+    /// write) is always on. config.toml only.
+    pub osc52_read: bool,
     /// Which of the wisp's visual styles to draw — see [`WispStyleSelection`].
     /// Orthogonal to `wisp` (the on/off switch): this only matters while
     /// `wisp` is true. Default `cinder` (the original look, unchanged —
@@ -52,6 +58,7 @@ impl Default for Config {
             option_as_meta: false,
             developer_mode: false,
             wisp: true,
+            osc52_read: false,
             wisp_style: WispStyleSelection::Cinder,
         }
     }

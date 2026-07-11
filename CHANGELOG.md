@@ -8,6 +8,12 @@ follow [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- OSC 52 clipboard read, gated. Programs could always COPY through Ember
+  (tmux and nvim over ssh); they can now also ASK for the clipboard's
+  contents, but only when osc52_read = true is set in config.toml. It is
+  off by default because any program in the terminal could quietly read
+  what you last copied; when off, requests get an empty answer instead
+  of hanging the program.
 - Explicit hyperlinks (OSC 8). Programs that mark text as a link (ls
   --hyperlink, modern compilers and package managers) now get real
   clickable links: the marked text is underlined and clickable even when
