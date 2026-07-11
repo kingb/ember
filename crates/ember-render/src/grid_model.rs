@@ -106,6 +106,30 @@ impl GridModel {
         self.display_offset > 0
     }
 
+    /// Absolute line index of viewport row 0, in "lines below the top of
+    /// retained history" space (`history_len - display_offset`). Grows as
+    /// output rotates lines into history and shrinks as the user scrolls up,
+    /// which is exactly what lets an anchored selection stay glued to its
+    /// text. Caveat: once the scrollback ring saturates and starts evicting
+    /// its oldest lines, this space slides relative to the text (the engine
+    /// exposes no monotonic total-scrolled counter), so anchored positions
+    /// drift only in that regime.
+    pub fn abs_of_row0(&self) -> u32 {
+        (self.history_len as u32).saturating_sub(self.display_offset as u32)
+    }
+
+    /// Absolute line index of viewport `row` — see [`Self::abs_of_row0`].
+    pub fn abs_of_row(&self, row: u16) -> u32 {
+        self.abs_of_row0() + row as u32
+    }
+
+    /// Project an absolute line back into the current viewport. `None` when
+    /// the line is scrolled out of view (above or below).
+    pub fn row_of_abs(&self, line: u32) -> Option<u16> {
+        let off = line.checked_sub(self.abs_of_row0())?;
+        (off < self.dims.screen_lines as u32).then_some(off as u16)
+    }
+
     pub fn style_of(&self, id: StyleId) -> Style {
         self.styles.get(&id).copied().unwrap_or_default()
     }

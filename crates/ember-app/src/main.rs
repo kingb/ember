@@ -34,7 +34,7 @@ use ember_core::{
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
-    BackdropParams, CELL_HEIGHT, CELL_WIDTH, RenderOutcome, Renderer, Selection, SelectionMode,
+    BackdropParams, CELL_HEIGHT, CELL_WIDTH, RenderOutcome, Renderer,
     TabHit, WispRenderer, WispUnsupported,
 };
 use winit::application::ApplicationHandler;
@@ -3984,16 +3984,6 @@ fn linux_chord_translate(key: &Key, mods: ModifiersState) -> Option<(Key, Modifi
     None
 }
 
-/// Whether releasing the left button should CLEAR the selection instead of
-/// keeping it: a plain click (press+release, no drag) leaves a degenerate
-/// single-cell Simple selection, and terminals treat that as "clear what was
-/// selected", not "select this cell". A real drag (active moved off the
-/// anchor) survives, as do word/line click-selections (mode != Simple
-/// expands at copy time even while anchor == active).
-fn click_selection_should_clear(sel: Option<&Selection>) -> bool {
-    sel.is_some_and(|s| s.mode == SelectionMode::Simple && s.anchor == s.active)
-}
-
 /// The keyboard cheat-sheet shown by the Cmd+/ overlay. Keep in sync with
 /// [`WindowState::handle_shortcut`].
 /// Prepare paste bytes. When `bracketed`, wrap the text in the bracketed-paste
@@ -4527,47 +4517,7 @@ mod tests {
         assert_eq!(tr(&ch("t"), cs | ModifiersState::SUPER), None);
     }
 
-    #[test]
-    fn plain_click_clears_but_drag_word_and_line_selections_survive() {
-        use super::click_selection_should_clear as should_clear;
-        use ember_render::{Point, Selection, SelectionMode};
-        let sel = |anchor: (u16, u16), active: (u16, u16), mode| Selection {
-            anchor: Point::new(anchor.0, anchor.1),
-            active: Point::new(active.0, active.1),
-            mode,
-        };
-        // Plain click: collapsed simple selection -> clear.
-        assert!(should_clear(Some(&sel(
-            (2, 3),
-            (2, 3),
-            SelectionMode::Simple
-        ))));
-        // Dragged even one cell -> keep.
-        assert!(!should_clear(Some(&sel(
-            (2, 3),
-            (2, 4),
-            SelectionMode::Simple
-        ))));
-        assert!(!should_clear(Some(&sel(
-            (2, 3),
-            (5, 1),
-            SelectionMode::Simple
-        ))));
-        // Double/triple click: collapsed anchor but word/line mode -> keep.
-        assert!(!should_clear(Some(&sel(
-            (2, 3),
-            (2, 3),
-            SelectionMode::Word
-        ))));
-        assert!(!should_clear(Some(&sel(
-            (2, 3),
-            (2, 3),
-            SelectionMode::Line
-        ))));
-        // No selection at all -> nothing to clear.
-        assert!(!should_clear(None));
-    }
-
+    
     #[test]
     fn tab_title_matching_is_case_insensitive_substring_first_match() {
         let titles: Vec<String> = ["Agent Alpha", "build", "agent beta"]

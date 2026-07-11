@@ -34,7 +34,7 @@ use crate::paint::{
     morph_quads, push_backdrop, scrollbar, scrollbar_geometry, selection_quads, shape_grid,
     spark_quads, split_preview,
 };
-use crate::selection::Selection;
+use crate::selection::AnchoredSelection;
 
 pub(crate) const FONT_SIZE: f32 = 12.0;
 pub(crate) const LINE_HEIGHT: f32 = 15.0;
@@ -587,7 +587,7 @@ pub struct Renderer {
     /// replay it through the headless path (the GPU texture isn't readable here).
     image_rgba: Option<(Vec<u8>, u32, u32)>,
     /// The active text selection and the session whose pane it belongs to.
-    selection: Option<(SessionId, Selection)>,
+    selection: Option<(SessionId, AnchoredSelection)>,
     /// Split drop-zone preview: `(hovered session, horizontal, ratio, before)`.
     /// `before` is `true` when the NEW pane lands on the left/top sibling
     /// (surface-drag `DropZone::Edge`'s `before` bit — release 2); the
@@ -940,7 +940,7 @@ impl Renderer {
                             .selection
                             .as_ref()
                             .filter(|(sid, _)| *sid == vp.session)
-                            .map(|(_, sel)| *sel),
+                            .and_then(|(_, sel)| sel.project(&p.grid)),
                         split_preview: self
                             .split_preview
                             .as_ref()
@@ -1419,8 +1419,10 @@ impl Renderer {
     }
 
     /// Set or clear the active text selection (and the session it belongs to).
+    /// Anchored to absolute scrollback lines; projected into the viewport at
+    /// paint time so the highlight travels with its text as output scrolls.
     /// Requests a redraw so the highlight updates.
-    pub fn set_selection(&mut self, selection: Option<(SessionId, Selection)>) {
+    pub fn set_selection(&mut self, selection: Option<(SessionId, AnchoredSelection)>) {
         self.scene_dirty = true;
         self.selection = selection;
         self.window.request_redraw();
@@ -1440,11 +1442,15 @@ impl Renderer {
         self.window.request_redraw();
     }
 
-    /// The currently selected text, if any (read from the owning pane's grid).
+    /// The currently selected text, if any (read from the owning pane's grid,
+    /// after projecting the anchored selection into the current viewport —
+    /// only the visible portion is readable here; the copy path prefers the
+    /// snapshot captured at selection time).
     pub fn selected_text(&self) -> Option<String> {
         let (sid, sel) = self.selection.as_ref()?;
         let p = self.panes.get(sid)?;
-        let text = sel.text(&p.grid);
+        let view = sel.project(&p.grid)?;
+        let text = view.text(&p.grid);
         (!text.is_empty()).then_some(text)
     }
 
@@ -1739,7 +1745,11 @@ impl Renderer {
                         );
                         if let Some((sid, sel)) = &self.selection {
                             if *sid == vp.session {
-                                selection_quads(&p.grid, sel, vp.rect, cw, ch, sf, &mut rects);
+                                // Absolute -> current-viewport projection: the
+                                // highlight follows its text (or is off-screen).
+                                if let Some(view) = sel.project(&p.grid) {
+                                    selection_quads(&p.grid, &view, vp.rect, cw, ch, sf, &mut rects);
+                                }
                             }
                         }
                         // Split drop-zone preview over the hovered pane (Ctrl+Opt
