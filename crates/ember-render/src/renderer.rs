@@ -614,6 +614,7 @@ pub struct Renderer {
     /// FPS/frame-time debug readout text (bottom-right), or `None` when hidden.
     fps_overlay: Option<String>,
     search_bar: Option<String>,
+    ime_preedit: Option<String>,
     /// Glyph buffer for the FPS overlay.
     fps_buffer: Buffer,
     /// Visual-bell flash intensity (`0..1`); a warm amber wash over the panes that
@@ -800,6 +801,7 @@ impl Renderer {
             morph: None,
             fps_overlay: None,
             search_bar: None,
+            ime_preedit: None,
             fps_buffer,
             bell_flash: 0.0,
             starve_gate: StarveGate::new(),
@@ -971,6 +973,7 @@ impl Renderer {
             image_fit: self.image_fit,
             fps_overlay: self.fps_overlay.clone(),
             search_bar: self.search_bar.clone(),
+            ime_preedit: self.ime_preedit.clone(),
             bell_flash: self.bell_flash,
             font_size: self.font_size,
             font_family: self.family_name.clone(),
@@ -1429,6 +1432,19 @@ impl Renderer {
         self.scene_dirty = true;
         self.selection = selection;
         self.window.request_redraw();
+    }
+
+    /// Set or clear the IME composition (preedit) overlay at the cursor.
+    pub fn set_ime_preedit(&mut self, text: Option<String>) {
+        self.scene_dirty = true;
+        self.ime_preedit = text;
+        self.window.request_redraw();
+    }
+
+    /// Current terminal cell metrics `(cell_w, line_height)` in logical px —
+    /// for callers positioning OS UI (the IME candidate window) at a cell.
+    pub fn cell_metrics(&self) -> (f32, f32) {
+        (self.cell_w, self.line_height)
     }
 
     /// Set or clear the scrollback-search bar text (top-right). `None` = closed.

@@ -456,6 +456,9 @@ pub(crate) struct WindowState {
     /// Scrollback-search bar (Cmd+F): open flag + the live query text.
     pub(crate) search_open: bool,
     pub(crate) search_query: String,
+    /// IME composition in progress (preedit text); non-empty = composing,
+    /// during which raw key events are suppressed (they belong to the IME).
+    pub(crate) ime_preedit: String,
     /// Last mouse-down (time, pane, cell), for double/triple-click detection.
     pub(crate) last_click: Option<(Instant, SessionId, u16, u16)>,
     /// Consecutive-click count at the same cell (1 = simple, 2 = word, 3 = line).
@@ -584,6 +587,7 @@ impl WindowState {
             selecting: false,
             search_open: false,
             search_query: String::new(),
+            ime_preedit: String::new(),
             last_click: None,
             click_count: 0,
             tab_drag: None,
@@ -952,6 +956,8 @@ impl WindowState {
                 self.renderer.set_selection(self.sel.clone());
                 self.sel_snapshot = self.renderer.selected_text();
             }
+            ControlMsg::ImePreedit(text) => self.set_ime_preedit(text),
+            ControlMsg::ImeCommit(text) => self.ime_commit(shared, &text),
             ControlMsg::Search(pattern, forward) => {
                 if let Some(h) = self.focused_session(shared) {
                     let _ = h
@@ -3519,6 +3525,39 @@ impl WindowState {
         self.sel = Some((session.clone(), sel));
         self.sel_snapshot = None;
         self.renderer.set_selection(self.sel.clone());
+    }
+
+    /// IME preedit update: track + draw the in-progress composition at the
+    /// cursor, and position the OS candidate window there.
+    pub(crate) fn set_ime_preedit(&mut self, text: String) {
+        self.ime_preedit = text.clone();
+        self.renderer
+            .set_ime_preedit((!text.is_empty()).then_some(text));
+        // Put the IME candidate window at the focused pane's cursor.
+        if let Some(sid) = self.focused_session_id() {
+            if let Some((_, rect)) = self.pane_rects.iter().find(|(s, _)| *s == sid) {
+                if let Some(grid) = self.renderer.grid(&sid) {
+                    let (cw, ch) = self.renderer.cell_metrics();
+                    let cur = grid.cursor;
+                    let x = rect.x as f32 + cur.col as f32 * cw;
+                    let y = rect.y as f32 + (cur.row + 1) as f32 * ch;
+                    self.renderer.window().set_ime_cursor_area(
+                        winit::dpi::LogicalPosition::new(x, y),
+                        winit::dpi::LogicalSize::new(cw, ch),
+                    );
+                }
+            }
+        }
+    }
+
+    /// IME commit: the composition is final — clear the overlay and send the
+    /// committed text to the focused pane's PTY.
+    pub(crate) fn ime_commit(&mut self, shared: &Shared, text: &str) {
+        self.ime_preedit.clear();
+        self.renderer.set_ime_preedit(None);
+        if !text.is_empty() {
+            self.send_to_focused(shared, text.as_bytes().to_vec());
+        }
     }
 
     /// Open the scrollback-search bar (Cmd+F).

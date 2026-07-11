@@ -83,6 +83,11 @@ pub enum ControlMsg {
     /// forward/next, `false` = backward/previous. The hit is highlighted by
     /// anchoring the selection to it, and the view scrolls to show it.
     Search(String, bool),
+    /// Test surface for the IME path (a real OS input method can't be
+    /// synthesized in-process): set the in-progress composition text.
+    ImePreedit(String),
+    /// Test surface: commit composition text to the focused pane.
+    ImeCommit(String),
     /// Simulate an OS file drop (Finder drag-in): shell-escape the path and
     /// insert it at the focused pane's prompt. Test surface for the
     /// `WindowEvent::DroppedFile` path, which can't be synthesized in-process.
@@ -492,6 +497,16 @@ mod unix {
                 let _ = tx.send(ControlMsg::Search(pattern.to_string(), forward));
                 ok()
             }
+            "ime-preedit" => {
+                let text = v.get("text").and_then(Value::as_str).unwrap_or("");
+                let _ = tx.send(ControlMsg::ImePreedit(text.to_string()));
+                ok()
+            }
+            "ime-commit" => {
+                let text = v.get("text").and_then(Value::as_str).unwrap_or("");
+                let _ = tx.send(ControlMsg::ImeCommit(text.to_string()));
+                ok()
+            }
             "fps" => {
                 let _ = tx.send(ControlMsg::Fps);
                 ok()
@@ -742,6 +757,13 @@ mod unix {
                     .unwrap_or_default();
                 serde_json::json!({"cmd":"drop-file","path": path})
             }
+            "ime-preedit" | "ime-commit" => {
+                let text = rest
+                    .get(1..)
+                    .map(|r| r.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                serde_json::json!({"cmd": cmd, "text": text})
+            }
             "search" | "search-back" => {
                 let pattern = rest
                     .get(1..)
@@ -782,7 +804,7 @@ mod unix {
             }
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window|move-tab|promote-pane|merge-tab|drag|drop-file|search|search-back)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window|move-tab|promote-pane|merge-tab|drag|drop-file|search|search-back|ime-preedit|ime-commit)"
                 ));
             }
         };

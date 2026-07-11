@@ -1576,6 +1576,42 @@ pub(crate) fn build_search_bar(
     (x + ipad, y + ipad)
 }
 
+/// Build the IME composition (preedit) overlay: the in-progress text drawn in
+/// a small box at the focused pane's cursor, with an accent underline (the
+/// universal "still composing" cue). Same non-modal mechanism as
+/// [`build_fps`]; returns the logical `(left, top)` of the text area.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_ime_preedit(
+    font_system: &mut FontSystem,
+    buf: &mut Buffer,
+    text: &str,
+    x: f32,
+    y: f32,
+    cw: f32,
+    ch: f32,
+    logical_w: f32,
+    sf: f32,
+    out: &mut Vec<([f32; 4], [f32; 4])>,
+) -> (f32, f32) {
+    let w = (text.chars().count() as f32 * cw * 2.0).max(cw); // CJK cells are wide
+    let x = x.min((logical_w - w).max(0.0));
+    out.push((scaled(x, y, w, ch, sf), lin_rgba(Rgb::new(30, 20, 14), 0.95)));
+    // Accent composition underline.
+    out.push((scaled(x, y + ch - 2.0, w, 2.0, sf), lin_rgba(ACCENT, 0.95)));
+    buf.set_size(font_system, Some(w), Some(ch));
+    buf.set_text(
+        font_system,
+        text,
+        &Attrs::new()
+            .family(Family::Monospace)
+            .color(Color::rgb(0xf5, 0xf5, 0xdc)),
+        Shaping::Advanced,
+        None,
+    );
+    buf.shape_until_scroll(font_system, false);
+    (x, y)
+}
+
 /// Scrollbar width (logical px) and minimum thumb height.
 pub(crate) const SCROLLBAR_W: f32 = 8.0;
 const SCROLLBAR_MIN_THUMB: f32 = 20.0;
