@@ -6,9 +6,9 @@
 
 mod background;
 pub(crate) mod boxdraw;
-mod coal;
 mod boxpaint;
 mod canvas;
+mod coal;
 pub mod grid_model;
 pub mod headless;
 mod paint;

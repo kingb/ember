@@ -101,7 +101,9 @@ impl LayoutNode {
         match self {
             LayoutNode::Pane {
                 id, carried_title, ..
-            } => (*id == target).then_some(carried_title.as_deref()).flatten(),
+            } => (*id == target)
+                .then_some(carried_title.as_deref())
+                .flatten(),
             LayoutNode::Split { a, b, .. } => a
                 .carried_title_of(target)
                 .or_else(|| b.carried_title_of(target)),

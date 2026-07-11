@@ -1748,7 +1748,9 @@ impl Renderer {
                                 // Absolute -> current-viewport projection: the
                                 // highlight follows its text (or is off-screen).
                                 if let Some(view) = sel.project(&p.grid) {
-                                    selection_quads(&p.grid, &view, vp.rect, cw, ch, sf, &mut rects);
+                                    selection_quads(
+                                        &p.grid, &view, vp.rect, cw, ch, sf, &mut rects,
+                                    );
                                 }
                             }
                         }

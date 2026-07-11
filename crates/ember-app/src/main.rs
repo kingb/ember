@@ -34,8 +34,8 @@ use ember_core::{
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
-    BackdropParams, CELL_HEIGHT, CELL_WIDTH, RenderOutcome, Renderer,
-    TabHit, WispRenderer, WispUnsupported,
+    BackdropParams, CELL_HEIGHT, CELL_WIDTH, RenderOutcome, Renderer, TabHit, WispRenderer,
+    WispUnsupported,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -4517,7 +4517,6 @@ mod tests {
         assert_eq!(tr(&ch("t"), cs | ModifiersState::SUPER), None);
     }
 
-    
     #[test]
     fn tab_title_matching_is_case_insensitive_substring_first_match() {
         let titles: Vec<String> = ["Agent Alpha", "build", "agent beta"]

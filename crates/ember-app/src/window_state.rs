@@ -41,10 +41,9 @@ use crate::config;
 use crate::control::ControlMsg;
 use crate::{
     ControlClose, DEFAULT_COLS, DEFAULT_ROWS, DragState, DropHover, MULTI_CLICK, PAD, PendingClose,
-    Shared, about_info, bell_flash_intensity, bracket_paste,
-    dims_for_rect, ember_glow, encode_key, help_lines, inset, load_backdrop_image, named_key,
-    parse_chord, resolve_window_index, shell_escape_path, step_selectable_row, tab_display_title,
-    url_is_openable,
+    Shared, about_info, bell_flash_intensity, bracket_paste, dims_for_rect, ember_glow, encode_key,
+    help_lines, inset, load_backdrop_image, named_key, parse_chord, resolve_window_index,
+    shell_escape_path, step_selectable_row, tab_display_title, url_is_openable,
 };
 #[cfg(target_os = "linux")]
 use crate::{alt_digit_tab, linux_chord_translate};
