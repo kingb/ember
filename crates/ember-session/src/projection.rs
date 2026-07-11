@@ -10,8 +10,8 @@ use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::search::RegexSearch;
+use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape as AlacCursorShape, Processor};
 use ember_core::{
@@ -343,7 +343,12 @@ impl<L: EventListener> AlacrittyProjection<L> {
         // top; a screen match means offset 0 (the live view already has it).
         let offset = (-start.line.0).clamp(0, hist as i32);
         self.scroll(ScrollAmount::To(offset.min(u16::MAX as i32) as u16));
-        let abs = |p: Point| ((hist as i64 + p.line.0 as i64).max(0) as u32, p.column.0 as u16);
+        let abs = |p: Point| {
+            (
+                (hist as i64 + p.line.0 as i64).max(0) as u32,
+                p.column.0 as u16,
+            )
+        };
         Some(ember_core::SearchHit {
             start: abs(start),
             end: abs(end),
@@ -873,7 +878,10 @@ mod tests {
         assert_eq!(hit.end.1 - hit.start.1, 10, "11 columns wide");
         let mut d = GridDelta::default();
         p.drain_damage_into(&mut d);
-        assert!(d.display_offset > 0, "display scrolled up to show the match");
+        assert!(
+            d.display_offset > 0,
+            "display scrolled up to show the match"
+        );
         // The absolute position projects into the now-scrolled viewport.
         let row0_abs = d.history_len as u32 - d.display_offset as u32;
         assert!(hit.start.0 >= row0_abs && hit.start.0 < row0_abs + 24);
@@ -908,7 +916,10 @@ mod tests {
             p.search("MIXEDCASE", true).is_none(),
             "uppercase pattern is exact"
         );
-        assert!(p.search("[invalid(", true).is_none(), "bad regex = no match");
+        assert!(
+            p.search("[invalid(", true).is_none(),
+            "bad regex = no match"
+        );
         assert!(p.search("", true).is_none(), "empty clears");
     }
 

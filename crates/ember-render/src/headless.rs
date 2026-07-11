@@ -21,10 +21,9 @@ use wgpu::{
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help,
-    build_search_bar, build_settings,
-    build_tabs, grid_quads, hold_ring_quads, link_quads, measure_cell_width, morph_quads,
-    push_backdrop, scrollbar, selection_quads, shape_grid, spark_quads, split_preview,
+    AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help, build_search_bar,
+    build_settings, build_tabs, grid_quads, hold_ring_quads, link_quads, measure_cell_width,
+    morph_quads, push_backdrop, scrollbar, selection_quads, shape_grid, spark_quads, split_preview,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
