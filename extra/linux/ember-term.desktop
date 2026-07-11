@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=Ember
+GenericName=Terminal Emulator
+Comment=The campfire-lit terminal
+TryExec=ember-term
+Exec=ember-term
+Icon=ember-term
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;prompt;command;commandline;cmd;console;
+StartupNotify=true
+StartupWMClass=ember-term
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=ember-term
