@@ -22,7 +22,7 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help,
-    build_search_bar, build_settings,
+    build_ime_preedit, build_search_bar, build_settings,
     build_tabs, grid_quads, hold_ring_quads, link_quads, measure_cell_width, morph_quads,
     push_backdrop, scrollbar, selection_quads, shape_grid, spark_quads, split_preview,
 };
@@ -75,6 +75,8 @@ pub struct Shot<'a> {
     pub fps_overlay: Option<String>,
     /// Scrollback-search bar text (top-right), or `None` when search is closed.
     pub search_bar: Option<String>,
+    /// IME composition (preedit) text, drawn at the focused pane's cursor.
+    pub ime_preedit: Option<String>,
     /// Visual-bell flash intensity (`0..1`) — a warm amber wash over the panes.
     pub bell_flash: f32,
     /// Terminal font point size (matches the live renderer's current zoom).
@@ -278,6 +280,8 @@ pub fn capture_reusing(
     let mut fps_origin: Option<(f32, f32)> = None;
     let mut search_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut search_origin: Option<(f32, f32)> = None;
+    let mut preedit_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut preedit_origin: Option<(f32, f32)> = None;
     // Center-x of the hovered tab's "✕" (pill left cap), when a tab is hovered.
     let mut close_cx: Option<f32> = None;
 
@@ -463,6 +467,25 @@ pub fn capture_reusing(
                 &mut rects,
             ));
         }
+        if let Some(text) = &shot.ime_preedit {
+            if let Some(pane) = shot.panes.iter().find(|p| p.focused) {
+                let cur = pane.grid.cursor;
+                let px = pane.rect.x as f32 + cur.col as f32 * cw;
+                let py = pane.rect.y as f32 + cur.row as f32 * line_height;
+                preedit_origin = Some(build_ime_preedit(
+                    font_system,
+                    &mut preedit_buf,
+                    text,
+                    px,
+                    py,
+                    cw,
+                    line_height,
+                    shot.logical_w,
+                    sf,
+                    &mut rects,
+                ));
+            }
+        }
         if let Some(text) = &shot.search_bar {
             search_origin = Some(build_search_bar(
                 font_system,
@@ -621,6 +644,17 @@ pub fn capture_reusing(
                 scale: sf,
                 bounds: full_bounds,
                 default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((left, top)) = preedit_origin {
+            areas.push(TextArea {
+                buffer: &preedit_buf,
+                left: left * sf,
+                top: top * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(0xf5, 0xf5, 0xdc),
                 custom_glyphs: &[],
             });
         }

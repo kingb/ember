@@ -458,6 +458,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
         image_fit: ember_render::ImageFit::parse(&opts.bg_fit),
         fps_overlay: opts.fps.clone(),
         search_bar: None,
+        ime_preedit: None,
         bell_flash: opts.bell,
         font_size: opts.font_size,
         font_family: opts.font.clone(),

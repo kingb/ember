@@ -797,6 +797,7 @@ impl ApplicationHandler<EmberEvent> for App {
         let attrs = ember_platform::window_attributes("Ember", w, h);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         ember_platform::set_app_icon(&window, ICON_PNG);
+        window.set_ime_allowed(true); // CJK/dead-key composition (winit Ime events)
         let window_id = window.id();
 
         let size = window.inner_size();
@@ -1122,8 +1123,19 @@ impl ApplicationHandler<EmberEvent> for App {
                     }
                 }
             }
+            WindowEvent::Ime(ime) => match ime {
+                winit::event::Ime::Preedit(text, _) => win.set_ime_preedit(text),
+                winit::event::Ime::Commit(text) => win.ime_commit(shared, &text),
+                winit::event::Ime::Enabled | winit::event::Ime::Disabled => {}
+            },
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
+                    return;
+                }
+                // Mid-composition, every key belongs to the IME (winit still
+                // delivers raw KeyboardInput alongside Ime events on some
+                // platforms) — swallow them so composing doesn't also type.
+                if !win.ime_preedit.is_empty() {
                     return;
                 }
                 // A torn-off surface drag captures input: Escape cancels it
@@ -2420,6 +2432,7 @@ fn open_window(
     }
     let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
     ember_platform::set_app_icon(&window, ICON_PNG);
+    window.set_ime_allowed(true); // CJK/dead-key composition (winit Ime events)
     let window_id = window.id();
     let size = window.inner_size();
     let px = (size.width.max(1), size.height.max(1));
