@@ -83,6 +83,7 @@ fn main() {
         fps_overlay: None,
         search_bar: None,
         ime_preedit: None,
+        palette: None,
         bell_flash: 0.0,
         font_size: 12.0,
         font_family: None,

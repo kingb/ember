@@ -615,6 +615,7 @@ pub struct Renderer {
     fps_overlay: Option<String>,
     search_bar: Option<String>,
     ime_preedit: Option<String>,
+    palette: Option<(String, Vec<(String, String)>, usize)>,
     /// Glyph buffer for the FPS overlay.
     fps_buffer: Buffer,
     /// Visual-bell flash intensity (`0..1`); a warm amber wash over the panes that
@@ -802,6 +803,7 @@ impl Renderer {
             fps_overlay: None,
             search_bar: None,
             ime_preedit: None,
+            palette: None,
             fps_buffer,
             bell_flash: 0.0,
             starve_gate: StarveGate::new(),
@@ -974,6 +976,7 @@ impl Renderer {
             fps_overlay: self.fps_overlay.clone(),
             search_bar: self.search_bar.clone(),
             ime_preedit: self.ime_preedit.clone(),
+            palette: self.palette.clone(),
             bell_flash: self.bell_flash,
             font_size: self.font_size,
             font_family: self.family_name.clone(),
@@ -1431,6 +1434,13 @@ impl Renderer {
     pub fn set_selection(&mut self, selection: Option<(SessionId, AnchoredSelection)>) {
         self.scene_dirty = true;
         self.selection = selection;
+        self.window.request_redraw();
+    }
+
+    /// Set or clear the command palette overlay: `(query, rows, selected)`.
+    pub fn set_palette(&mut self, view: Option<(String, Vec<(String, String)>, usize)>) {
+        self.scene_dirty = true;
+        self.palette = view;
         self.window.request_redraw();
     }
 

@@ -21,7 +21,8 @@ use wgpu::{
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help, build_ime_preedit,
+    AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help,
+    build_ime_preedit, build_palette,
     build_search_bar, build_settings, build_tabs, grid_quads, hold_ring_quads, link_quads,
     measure_cell_width, morph_quads, push_backdrop, scrollbar, selection_quads, shape_grid,
     spark_quads, split_preview,
@@ -77,6 +78,8 @@ pub struct Shot<'a> {
     pub search_bar: Option<String>,
     /// IME composition (preedit) text, drawn at the focused pane's cursor.
     pub ime_preedit: Option<String>,
+    /// Command palette: `(query, filtered rows (desc, chord), selected)`.
+    pub palette: Option<(String, Vec<(String, String)>, usize)>,
     /// Visual-bell flash intensity (`0..1`) — a warm amber wash over the panes.
     pub bell_flash: f32,
     /// Terminal font point size (matches the live renderer's current zoom).
@@ -282,6 +285,8 @@ pub fn capture_reusing(
     let mut search_origin: Option<(f32, f32)> = None;
     let mut preedit_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut preedit_origin: Option<(f32, f32)> = None;
+    let mut palette_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut palette_origin: Option<(f32, f32)> = None;
     // Center-x of the hovered tab's "✕" (pill left cap), when a tab is hovered.
     let mut close_cx: Option<f32> = None;
 
@@ -486,6 +491,20 @@ pub fn capture_reusing(
                 ));
             }
         }
+        if let Some((query, rows, selected)) = &shot.palette {
+            palette_origin = Some(build_palette(
+                font_system,
+                &mut palette_buf,
+                query,
+                rows,
+                *selected,
+                cw,
+                shot.logical_w,
+                shot.logical_h,
+                sf,
+                &mut rects,
+            ));
+        }
         if let Some(text) = &shot.search_bar {
             search_origin = Some(build_search_bar(
                 font_system,
@@ -644,6 +663,17 @@ pub fn capture_reusing(
                 scale: sf,
                 bounds: full_bounds,
                 default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((left, top)) = palette_origin {
+            areas.push(TextArea {
+                buffer: &palette_buf,
+                left: left * sf,
+                top: top * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(0xf5, 0xf5, 0xdc),
                 custom_glyphs: &[],
             });
         }

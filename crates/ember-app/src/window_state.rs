@@ -459,6 +459,11 @@ pub(crate) struct WindowState {
     /// IME composition in progress (preedit text); non-empty = composing,
     /// during which raw key events are suppressed (they belong to the IME).
     pub(crate) ime_preedit: String,
+    /// Command palette (Cmd+Shift+P): open flag, query, selected row index
+    /// (into the CURRENT filtered list).
+    pub(crate) palette_open: bool,
+    pub(crate) palette_query: String,
+    pub(crate) palette_sel: usize,
     /// Last mouse-down (time, pane, cell), for double/triple-click detection.
     pub(crate) last_click: Option<(Instant, SessionId, u16, u16)>,
     /// Consecutive-click count at the same cell (1 = simple, 2 = word, 3 = line).
@@ -588,6 +593,9 @@ impl WindowState {
             search_open: false,
             search_query: String::new(),
             ime_preedit: String::new(),
+            palette_open: false,
+            palette_query: String::new(),
+            palette_sel: 0,
             last_click: None,
             click_count: 0,
             tab_drag: None,
@@ -814,6 +822,18 @@ impl WindowState {
         window_id: WindowId,
         msg: ControlMsg,
     ) -> Option<ControlClose> {
+        // Route injected keys into the open palette (for tests). A picked
+        // chord dispatches through the same ControlMsg::Chord path below.
+        if self.palette_open {
+            if let ControlMsg::Key(name) = &msg {
+                if let Some(k) = named_key(name) {
+                    if let Some(chord) = self.palette_key(&k) {
+                        return self.handle_control(shared, window_id, ControlMsg::Chord(chord));
+                    }
+                }
+                return None;
+            }
+        }
         // Route injected keys into the open search bar (for tests), mirroring
         // the real keyboard path.
         if self.search_open {
@@ -1286,6 +1306,11 @@ impl WindowState {
             // case a layout delivers it.
             Key::Character(s) if s.as_str() == "/" || s.as_str() == "?" => {
                 self.toggle_help();
+                true
+            }
+            // Cmd+Shift+P — the command palette (every action, fuzzy-searchable).
+            Key::Character(s) if s.eq_ignore_ascii_case("p") && mods.shift_key() => {
+                self.open_palette();
                 true
             }
             // Cmd+F — scrollback search (find bar).
@@ -3558,6 +3583,98 @@ impl WindowState {
         if !text.is_empty() {
             self.send_to_focused(shared, text.as_bytes().to_vec());
         }
+    }
+
+    /// The palette's action list: every chord-bound entry of the shortcut
+    /// cheat sheet (`help_lines`), fuzzy-filtered by `query` (case-insensitive
+    /// subsequence). Returns `(description, chord)` rows.
+    fn palette_rows(&self) -> Vec<(String, String)> {
+        let q: Vec<char> = self.palette_query.to_lowercase().chars().collect();
+        let fuzzy = |hay: &str| -> bool {
+            if q.is_empty() {
+                return true;
+            }
+            let mut it = q.iter();
+            let mut want = it.next();
+            for c in hay.to_lowercase().chars() {
+                if Some(&c) == want {
+                    want = it.next();
+                    if want.is_none() {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        help_lines()
+            .into_iter()
+            .filter(|(k, _)| !k.is_empty() && parse_chord(&k.to_lowercase()).is_some())
+            .filter(|(k, d)| fuzzy(d) || fuzzy(k))
+            .map(|(k, d)| (d, k))
+            .collect()
+    }
+
+    /// Open the command palette (Cmd+Shift+P).
+    pub(crate) fn open_palette(&mut self) {
+        self.palette_open = true;
+        self.palette_query.clear();
+        self.palette_sel = 0;
+        self.refresh_palette();
+    }
+
+    pub(crate) fn close_palette(&mut self) {
+        self.palette_open = false;
+        self.renderer.set_palette(None);
+    }
+
+    fn refresh_palette(&mut self) {
+        let rows = self.palette_rows();
+        self.palette_sel = self.palette_sel.min(rows.len().saturating_sub(1));
+        self.renderer
+            .set_palette(Some((self.palette_query.clone(), rows, self.palette_sel)));
+    }
+
+    /// One keystroke routed to the open palette. Returns `Some(chord)` when
+    /// Enter picks an action - the CALLER dispatches it through the normal
+    /// shortcut path (so follow-ups like closing an emptied window happen).
+    pub(crate) fn palette_key(&mut self, key: &Key) -> Option<String> {
+        match key {
+            Key::Named(NamedKey::Escape) => self.close_palette(),
+            Key::Named(NamedKey::ArrowDown) => {
+                self.palette_sel += 1;
+                self.refresh_palette();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.palette_sel = self.palette_sel.saturating_sub(1);
+                self.refresh_palette();
+            }
+            Key::Named(NamedKey::Enter) => {
+                let rows = self.palette_rows();
+                if let Some((_, chord)) = rows.get(self.palette_sel) {
+                    let chord = chord.to_lowercase();
+                    self.close_palette();
+                    return Some(chord);
+                }
+                self.close_palette();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.palette_query.pop();
+                self.palette_sel = 0;
+                self.refresh_palette();
+            }
+            Key::Named(NamedKey::Space) => {
+                self.palette_query.push(' ');
+                self.palette_sel = 0;
+                self.refresh_palette();
+            }
+            Key::Character(text) => {
+                self.palette_query.push_str(text);
+                self.palette_sel = 0;
+                self.refresh_palette();
+            }
+            _ => {}
+        }
+        None
     }
 
     /// Open the scrollback-search bar (Cmd+F).
