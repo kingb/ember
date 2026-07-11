@@ -24,7 +24,7 @@ pub use renderer::{
     AboutInfo, BackdropParams, CELL_HEIGHT, CELL_WIDTH, ConfirmView, ImageFit, PaneModes,
     PaneSnapshot, RenderOutcome, Renderer, StripSlot, TabHit, TabLabel, VisiblePane,
 };
-pub use selection::{Point, Selection, SelectionMode};
+pub use selection::{AbsPoint, AnchoredSelection, Point, Selection, SelectionMode};
 pub use wisp::{WispRenderer, WispUnsupported};
 
 /// Returns the `ember-core` version this render layer is built against.

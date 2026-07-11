@@ -30,7 +30,8 @@ use ember_core::{
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
-    ConfirmView, ImageFit, Point, Renderer, Selection, SelectionMode, TabHit, TabLabel, VisiblePane,
+    AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode, TabHit, TabLabel,
+    VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -40,7 +41,7 @@ use crate::config;
 use crate::control::ControlMsg;
 use crate::{
     ControlClose, DEFAULT_COLS, DEFAULT_ROWS, DragState, DropHover, MULTI_CLICK, PAD, PendingClose,
-    Shared, about_info, bell_flash_intensity, bracket_paste, click_selection_should_clear,
+    Shared, about_info, bell_flash_intensity, bracket_paste,
     dims_for_rect, ember_glow, encode_key, help_lines, inset, load_backdrop_image, named_key,
     parse_chord, resolve_window_index, shell_escape_path, step_selectable_row, tab_display_title,
     url_is_openable,
@@ -443,8 +444,14 @@ pub(crate) struct WindowState {
     pub(crate) cursor: (f64, f64),
     /// Visible panes' inner rects (logical px), for mouse→cell hit-testing.
     pub(crate) pane_rects: Vec<(SessionId, Rect)>,
-    /// Active text selection + the session (pane) it belongs to.
-    pub(crate) sel: Option<(SessionId, Selection)>,
+    /// Active text selection + the session (pane) it belongs to. Anchored to
+    /// absolute scrollback lines so it stays glued to its text as output
+    /// scrolls (projected into the viewport at paint time).
+    pub(crate) sel: Option<(SessionId, AnchoredSelection)>,
+    /// The selected text captured at the last selection change (its rows were
+    /// visible then). Copy uses this, so it stays correct even after the
+    /// selected text scrolls out of the viewport.
+    pub(crate) sel_snapshot: Option<String>,
     /// Whether a mouse drag is currently extending the selection.
     pub(crate) selecting: bool,
     /// Last mouse-down (time, pane, cell), for double/triple-click detection.
@@ -571,6 +578,7 @@ impl WindowState {
             cursor: (0.0, 0.0),
             pane_rects: Vec::new(),
             sel: None,
+            sel_snapshot: None,
             selecting: false,
             last_click: None,
             click_count: 0,
@@ -923,10 +931,12 @@ impl WindowState {
                     "line" => SelectionMode::Line,
                     _ => SelectionMode::Simple,
                 };
-                let mut s = Selection::new(Point::new(r1, c1), mode);
-                s.update(Point::new(r2, c2));
+                let grid = self.renderer.grid(&sid)?;
+                let mut s = AnchoredSelection::new(grid, Point::new(r1, c1), mode);
+                s.update(grid, Point::new(r2, c2));
                 self.sel = Some((sid, s));
                 self.renderer.set_selection(self.sel.clone());
+                self.sel_snapshot = self.renderer.selected_text();
             }
             ControlMsg::Copy => self.copy_selection(shared),
             ControlMsg::Paste(text) => self.paste_into_focused(shared, &text),
@@ -1794,12 +1804,12 @@ impl WindowState {
         self.scrollbar_drag = None;
         self.divider_drag = None;
         // A plain click (no drag) clears the selection rather than leaving a
-        // one-cell one — see click_selection_should_clear.
+        // one-cell one — see AnchoredSelection::is_empty_click.
         if was_selecting {
             if ended == DragEnded::None {
                 ended = DragEnded::Selection;
             }
-            if click_selection_should_clear(self.sel.as_ref().map(|(_, s)| s)) {
+            if self.sel.as_ref().is_some_and(|(_, s)| s.is_empty_click()) {
                 self.clear_selection();
             }
         }
@@ -3426,10 +3436,15 @@ impl WindowState {
             3 => SelectionMode::Line,
             _ => SelectionMode::Simple,
         };
-        let selection = Selection::new(Point::new(row, col), mode);
+        let Some(grid) = self.renderer.grid(&sid) else {
+            return;
+        };
+        let selection = AnchoredSelection::new(grid, Point::new(row, col), mode);
         self.sel = Some((sid, selection));
         self.selecting = true;
         self.renderer.set_selection(self.sel.clone());
+        // Word/line clicks select immediately; capture their text right away.
+        self.sel_snapshot = self.renderer.selected_text();
     }
 
     /// Extend the in-progress selection to a logical-px point (drag).
@@ -3437,11 +3452,19 @@ impl WindowState {
         let Some((sid, row, col)) = self.pixel_to_cell(x, y) else {
             return;
         };
+        let mut changed = false;
         if let Some((ssid, selection)) = self.sel.as_mut() {
             if *ssid == sid {
-                selection.update(Point::new(row, col));
-                self.renderer.set_selection(self.sel.clone());
+                if let Some(grid) = self.renderer.grid(&sid) {
+                    selection.update(grid, Point::new(row, col));
+                    changed = true;
+                }
             }
+        }
+        if changed {
+            self.renderer.set_selection(self.sel.clone());
+            // Refresh the copy snapshot while the rows are still on screen.
+            self.sel_snapshot = self.renderer.selected_text();
         }
     }
 
@@ -3449,6 +3472,7 @@ impl WindowState {
     pub(crate) fn clear_selection(&mut self) {
         if self.sel.is_some() {
             self.sel = None;
+            self.sel_snapshot = None;
             self.selecting = false;
             self.renderer.set_selection(None);
         }
@@ -3456,7 +3480,15 @@ impl WindowState {
 
     /// Copy the current selection's text to the OS clipboard (Cmd+C).
     pub(crate) fn copy_selection(&mut self, shared: &mut Shared) {
-        if let Some(text) = self.renderer.selected_text() {
+        // The snapshot (captured while the selection's rows were visible) is
+        // authoritative: it stays correct even after the text scrolls out of
+        // the viewport. Live read is the fallback for stale-snapshot edges.
+        let text = self
+            .sel_snapshot
+            .clone()
+            .filter(|t| !t.is_empty())
+            .or_else(|| self.renderer.selected_text());
+        if let Some(text) = text {
             shared.platform.set_clipboard(&text);
         }
     }

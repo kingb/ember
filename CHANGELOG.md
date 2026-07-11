@@ -6,6 +6,16 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Selections now stay glued to their text. Selecting text and letting
+  output scroll (or paging through scrollback) used to leave the
+  highlight parked at fixed screen rows while different text slid
+  through it, and Copy would grab whatever text sat there now. The
+  selection is anchored to the text itself: the highlight travels with
+  it, scrolls out of view and back in with it, and Copy always returns
+  the text that was actually selected.
+
 ### Added
 
 - Drop a file from Finder (or a Linux file manager) onto a window and its

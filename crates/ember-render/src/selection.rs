@@ -35,12 +35,106 @@ impl Point {
     }
 }
 
-/// An in-progress or finalized selection.
+/// An in-progress or finalized selection, in CURRENT-VIEWPORT coordinates —
+/// the projection [`AnchoredSelection::project`] produces each frame, and the
+/// space all the query fns below ([`Selection::row_span`], [`Selection::text`])
+/// operate in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
     pub anchor: Point,
     pub active: Point,
     pub mode: SelectionMode,
+}
+
+/// A cell position anchored to a scrollback-ABSOLUTE line (the
+/// [`crate::grid_model::GridModel::abs_of_row`] space), so it stays glued to
+/// its text as output scrolls by or the user pages through history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AbsPoint {
+    pub line: u32,
+    pub col: u16,
+}
+
+/// The selection the app actually stores: endpoints anchored to absolute
+/// lines. Scrolling (new output rotating lines into history, or the user
+/// moving the display offset) leaves these untouched — the per-frame
+/// [`Self::project`] maps them into whatever the viewport currently shows,
+/// so the highlight travels WITH its text (iTerm2 behavior) instead of
+/// sitting at fixed screen rows while different text slides through it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnchoredSelection {
+    pub anchor: AbsPoint,
+    pub active: AbsPoint,
+    pub mode: SelectionMode,
+}
+
+impl AnchoredSelection {
+    /// Start a selection at viewport cell `p` (anchor = active), capturing
+    /// the absolute line under it right now.
+    pub fn new(grid: &GridModel, p: Point, mode: SelectionMode) -> Self {
+        let a = AbsPoint {
+            line: grid.abs_of_row(p.row),
+            col: p.col,
+        };
+        Self {
+            anchor: a,
+            active: a,
+            mode,
+        }
+    }
+
+    /// Move the active end to viewport cell `p` (during a drag).
+    pub fn update(&mut self, grid: &GridModel, p: Point) {
+        self.active = AbsPoint {
+            line: grid.abs_of_row(p.row),
+            col: p.col,
+        };
+    }
+
+    /// Whether this is an un-dragged single Simple click (the "clear the
+    /// previous selection" gesture, not a selection of its own).
+    pub fn is_empty_click(&self) -> bool {
+        self.mode == SelectionMode::Simple && self.anchor == self.active
+    }
+
+    /// Project into the current viewport as a [`Selection`], clamped to the
+    /// visible intersection: an endpoint scrolled above the view clamps to
+    /// row 0 col 0 (the visible part is a continuation), one below clamps to
+    /// the last row's last column. `None` when the whole selection is out of
+    /// view — scrolled away (and it comes back when scrolled back to).
+    pub fn project(&self, grid: &GridModel) -> Option<Selection> {
+        let (s, e) = if self.anchor <= self.active {
+            (self.anchor, self.active)
+        } else {
+            (self.active, self.anchor)
+        };
+        let rows = grid.dims.screen_lines;
+        if rows == 0 {
+            return None;
+        }
+        let base = grid.abs_of_row0();
+        let top = base;
+        let bottom = base + (rows as u32 - 1);
+        if e.line < top || s.line > bottom {
+            return None; // fully scrolled out (above or below)
+        }
+        let last_col = grid.dims.columns.saturating_sub(1);
+        let start = if s.line < top {
+            Point::new(0, 0)
+        } else {
+            Point::new((s.line - base) as u16, s.col)
+        };
+        let end = if e.line > bottom {
+            Point::new(rows - 1, last_col)
+        } else {
+            Point::new((e.line - base) as u16, e.col)
+        };
+        Some(Selection {
+            anchor: start,
+            active: end,
+            mode: self.mode,
+        })
+    }
 }
 
 /// Character class for word-boundary detection (Alacritty-style): word chars vs
@@ -388,5 +482,60 @@ mod tests {
         assert_eq!(s.row_span(&g, 0), Some((2, 3))); // from col2 to end
         assert_eq!(s.row_span(&g, 1), Some((0, 3))); // full middle row
         assert_eq!(s.row_span(&g, 2), Some((0, 1))); // to col1
+    }
+
+    // --- Anchored selections: glued to text, not to viewport rows -----------
+
+    #[test]
+    fn anchored_selection_moves_up_as_output_scrolls() {
+        let mut g = grid_from(&["aaaa", "bbbb", "cccc", "dddd"]);
+        // Select viewport rows 2..3 at the live bottom (history 0).
+        let a = AnchoredSelection::new(&g, Point::new(2, 1), SelectionMode::Simple);
+        let mut a = a;
+        a.update(&g, Point::new(3, 2));
+        // One new output line rotates into history: same text is now one row up.
+        g.history_len = 1;
+        let v = a.project(&g).expect("still visible");
+        assert_eq!((v.anchor.row, v.active.row), (1, 2), "rows shifted up by 1");
+        assert_eq!((v.anchor.col, v.active.col), (1, 2), "cols untouched");
+    }
+
+    #[test]
+    fn anchored_selection_scrolls_out_and_comes_back() {
+        let mut g = grid_from(&["aaaa", "bbbb", "cccc", "dddd"]);
+        let mut a = AnchoredSelection::new(&g, Point::new(0, 0), SelectionMode::Simple);
+        a.update(&g, Point::new(1, 3));
+        // Enough output that the selected text is fully above the viewport.
+        g.history_len = 6;
+        assert_eq!(a.project(&g), None, "scrolled away, not stuck on screen");
+        // The user scrolls back up to it: it reappears at the same text.
+        g.display_offset = 6;
+        let v = a.project(&g).expect("scrolled back into view");
+        assert_eq!((v.anchor.row, v.active.row), (0, 1));
+    }
+
+    #[test]
+    fn anchored_selection_clamps_partially_visible_ends() {
+        let mut g = grid_from(&["aaaa", "bbbb", "cccc", "dddd"]);
+        let mut a = AnchoredSelection::new(&g, Point::new(0, 2), SelectionMode::Simple);
+        a.update(&g, Point::new(3, 1));
+        // Two lines rotate away: the start is above the view now.
+        g.history_len = 2;
+        let v = a.project(&g).expect("tail still visible");
+        // Continuation semantics: visible part starts at row 0 col 0.
+        assert_eq!((v.anchor.row, v.anchor.col), (0, 0));
+        assert_eq!((v.active.row, v.active.col), (1, 1));
+    }
+
+    #[test]
+    fn anchored_empty_click_detection_matches_simple_unmoved() {
+        let g = grid_from(&["aaaa"]);
+        let a = AnchoredSelection::new(&g, Point::new(0, 1), SelectionMode::Simple);
+        assert!(a.is_empty_click());
+        let w = AnchoredSelection::new(&g, Point::new(0, 1), SelectionMode::Word);
+        assert!(!w.is_empty_click(), "word click is a real selection");
+        let mut d = a;
+        d.update(&g, Point::new(0, 2));
+        assert!(!d.is_empty_click(), "a drag is a real selection");
     }
 }
