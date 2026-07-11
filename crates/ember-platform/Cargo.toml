@@ -15,7 +15,11 @@ arboard.workspace = true
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder", "NSWorkspace"] }
 objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSProcessInfo"] }
-muda = "0.19.3"
+# default features pull muda's Linux GTK backend (gtk3 → glib), which Ember
+# never uses — the menu is macOS-only (NSMenu via objc2); other platforms get
+# an inert stub. Dropping them keeps the vulnerable glib (RUSTSEC-2024-0429)
+# out of Cargo.lock entirely and trims the Linux build.
+muda = { version = "0.19.3", default-features = false }
 
 [lints]
 workspace = true
