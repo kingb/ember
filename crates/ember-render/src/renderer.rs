@@ -30,7 +30,7 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, CLOSE_COLS, bell_wash, build_about, build_confirm, build_fps, build_help,
-    build_settings, build_tabs, debug_emit, grid_quads, hold_ring_quads, measure_cell_width,
+    build_ime_preedit, build_palette, build_search_bar, build_settings, build_tabs, debug_emit, grid_quads, hold_ring_quads, measure_cell_width,
     morph_quads, push_backdrop, scrollbar, scrollbar_geometry, selection_quads, shape_grid,
     spark_quads, split_preview,
 };
@@ -618,6 +618,9 @@ pub struct Renderer {
     palette: Option<(String, Vec<(String, String)>, usize)>,
     /// Glyph buffer for the FPS overlay.
     fps_buffer: Buffer,
+    search_buffer: Buffer,
+    palette_buffer: Buffer,
+    preedit_buffer: Buffer,
     /// Visual-bell flash intensity (`0..1`); a warm amber wash over the panes that
     /// the app decays to 0 after a BEL. `0.0` = no flash.
     bell_flash: f32,
@@ -729,6 +732,9 @@ impl Renderer {
         let confirm_cancel = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let confirm_ok = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let fps_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let search_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let palette_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let preedit_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
 
         // Runtime font state (Cmd +/-/0 mutate size at runtime; family from cfg).
         let family_name = font.family.clone();
@@ -805,6 +811,9 @@ impl Renderer {
             ime_preedit: None,
             palette: None,
             fps_buffer,
+            search_buffer,
+            palette_buffer,
+            preedit_buffer,
             bell_flash: 0.0,
             starve_gate: StarveGate::new(),
             lost_bound: LostSurfaceBound::new(),
@@ -1932,6 +1941,89 @@ impl Renderer {
                         default_color: Color::rgb(AMBER.r, AMBER.g, AMBER.b),
                         custom_glyphs: &[],
                     });
+                }
+                // Scrollback-search bar (top-right), over the panes. These three
+                // overlays MUST mirror the headless path (capture_to_png promises
+                // pixel-identity with the window) — an overlay added to only one
+                // path renders in screenshots but never on screen, or vice versa.
+                if let Some(query) = self.search_bar.clone() {
+                    let (left, top) = build_search_bar(
+                        &mut self.font_system,
+                        &mut self.search_buffer,
+                        &query,
+                        cw,
+                        logical_w,
+                        sf,
+                        &mut rects,
+                    );
+                    areas.push(TextArea {
+                        buffer: &self.search_buffer,
+                        left: left * sf,
+                        top: top * sf,
+                        scale: sf,
+                        bounds: full_bounds,
+                        default_color: Color::rgb(0xf5, 0xf5, 0xdc),
+                        custom_glyphs: &[],
+                    });
+                }
+                // Command palette (centered), over the panes.
+                if let Some((query, rows, selected)) = self.palette.clone() {
+                    let (left, top) = build_palette(
+                        &mut self.font_system,
+                        &mut self.palette_buffer,
+                        &query,
+                        &rows,
+                        selected,
+                        cw,
+                        logical_w,
+                        logical_h,
+                        sf,
+                        &mut rects,
+                    );
+                    areas.push(TextArea {
+                        buffer: &self.palette_buffer,
+                        left: left * sf,
+                        top: top * sf,
+                        scale: sf,
+                        bounds: full_bounds,
+                        default_color: Color::rgb(0xf5, 0xf5, 0xdc),
+                        custom_glyphs: &[],
+                    });
+                }
+                // IME composition (preedit) at the focused pane's cursor.
+                if let Some(text) = self.ime_preedit.clone() {
+                    let focused_vp = self
+                        .visible
+                        .iter()
+                        .find(|vp| Some(&vp.session) == self.focused.as_ref());
+                    if let Some(vp) = focused_vp {
+                        if let Some(pane) = self.panes.get(&vp.session) {
+                            let cur = pane.grid.cursor;
+                            let px = vp.rect.x as f32 + cur.col as f32 * cw;
+                            let py = vp.rect.y as f32 + cur.row as f32 * self.line_height;
+                            let (left, top) = build_ime_preedit(
+                                &mut self.font_system,
+                                &mut self.preedit_buffer,
+                                &text,
+                                px,
+                                py,
+                                cw,
+                                self.line_height,
+                                logical_w,
+                                sf,
+                                &mut rects,
+                            );
+                            areas.push(TextArea {
+                                buffer: &self.preedit_buffer,
+                                left: left * sf,
+                                top: top * sf,
+                                scale: sf,
+                                bounds: full_bounds,
+                                default_color: Color::rgb(0xf5, 0xf5, 0xdc),
+                                custom_glyphs: &[],
+                            });
+                        }
+                    }
                 }
                 // Visual-bell flash: a warm amber wash over everything (under the text).
                 bell_wash(&mut rects, self.bell_flash, logical_w, logical_h, sf);
