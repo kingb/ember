@@ -54,6 +54,19 @@ follow [Semantic Versioning](https://semver.org).
   it, scrolls out of view and back in with it, and Copy always returns
   the text that was actually selected.
 
+### Security
+
+- Removed input logging from the `EMBER_DEBUG` diagnostic flag. When
+  Ember ran with `EMBER_DEBUG=1`, it wrote each key press to its
+  diagnostic output (stderr). That normally just prints to the terminal,
+  but if you were capturing it to a file, the usual way you'd collect a
+  debug log, your key presses could be recorded there, potentially
+  including sensitive input like passwords. It is removed so that can't
+  happen by accident. This only applied if you set `EMBER_DEBUG`
+  yourself (a diagnostic flag, separate from Developer Mode), so in
+  practice almost no one is likely to have hit it. Rendering and frame
+  diagnostics under the same flag are unchanged.
+
 ## [0.4.2] - 2026-07-10
 
 ### Added

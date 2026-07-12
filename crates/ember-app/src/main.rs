@@ -1259,16 +1259,6 @@ impl ApplicationHandler<EmberEvent> for App {
                     // else: fall through and process this key normally.
                 }
                 let mods = win.modifiers;
-                if std::env::var_os("EMBER_DEBUG").is_some() {
-                    eprintln!(
-                        "[ember-key] {:?} super={} shift={} alt={} ctrl={}",
-                        key.logical_key,
-                        mods.super_key(),
-                        mods.shift_key(),
-                        mods.alt_key(),
-                        mods.control_key()
-                    );
-                }
                 // Super (Cmd/Win) combos are multiplexer shortcuts — consumed, never
                 // forwarded to the shell.
                 if mods.super_key() {
