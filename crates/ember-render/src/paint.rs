@@ -1542,30 +1542,36 @@ pub(crate) fn build_fps(
 pub(crate) fn build_search_bar(
     font_system: &mut FontSystem,
     buf: &mut Buffer,
-    text: &str,
+    query: &str,
     cw: f32,
     logical_w: f32,
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
 ) -> (f32, f32) {
-    let ipad = 6.0;
-    let min_w = 18.0 * cw;
-    let w = (text.chars().count() as f32 * cw + 2.0 * ipad).max(min_w);
-    let h = LINE_HEIGHT + 2.0 * ipad;
+    // Two lines: the live query (placeholder when empty) + the key hints, so
+    // the bar TELLS you what you are typing into and how to drive it.
+    let line1 = if query.is_empty() {
+        "find: type to search".to_string()
+    } else {
+        format!("find: {query}\u{2038}")
+    };
+    let line2 = "enter next / shift+enter prev / esc close";
+    let ipad = 8.0;
+    let cols = line1.chars().count().max(line2.chars().count());
+    let w = (cols as f32 * cw + 2.0 * ipad).min(logical_w - 16.0);
+    let h = 2.0 * LINE_HEIGHT + 2.0 * ipad;
     let x = (logical_w - w - 8.0).max(0.0);
-    // Fixed drop below the tab strip (strip height isn't a shared constant;
-    // 44 logical px clears it comfortably at every zoom).
     let y = 44.0;
-    // Accent border (1px ring) behind the dark input box.
+    // Accent border (2px ring) behind the dark input box.
     out.push((
-        scaled(x - 1.0, y - 1.0, w + 2.0, h + 2.0, sf),
-        lin_rgba(ACCENT, 0.9),
+        scaled(x - 2.0, y - 2.0, w + 4.0, h + 4.0, sf),
+        lin_rgba(ACCENT, 0.95),
     ));
-    out.push((scaled(x, y, w, h, sf), lin_rgba(Rgb::new(12, 8, 6), 0.92)));
+    out.push((scaled(x, y, w, h, sf), lin_rgba(Rgb::new(12, 8, 6), 0.95)));
     buf.set_size(font_system, Some(w), Some(h));
     buf.set_text(
         font_system,
-        text,
+        &format!("{line1}\n{line2}"),
         &Attrs::new()
             .family(Family::Monospace)
             .color(Color::rgb(0xf5, 0xf5, 0xdc)),
