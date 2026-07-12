@@ -1542,19 +1542,15 @@ pub(crate) fn build_fps(
 pub(crate) fn build_search_bar(
     font_system: &mut FontSystem,
     buf: &mut Buffer,
-    query: &str,
+    line1: &str,
     cw: f32,
     logical_w: f32,
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
 ) -> (f32, f32) {
-    // Two lines: the live query (placeholder when empty) + the key hints, so
-    // the bar TELLS you what you are typing into and how to drive it.
-    let line1 = if query.is_empty() {
-        "find: type to search".to_string()
-    } else {
-        format!("find: {query}\u{2038}")
-    };
+    // `line1` is the caller-formatted status line ("find: <query>  3/12", a
+    // placeholder, or "no matches"); line 2 is the fixed key hints. Two lines
+    // + a bold accent ring so the bar says what it is and how to drive it.
     let line2 = "enter next / shift+enter prev / esc close";
     let ipad = 8.0;
     let cols = line1.chars().count().max(line2.chars().count());
@@ -1562,7 +1558,6 @@ pub(crate) fn build_search_bar(
     let h = 2.0 * LINE_HEIGHT + 2.0 * ipad;
     let x = (logical_w - w - 8.0).max(0.0);
     let y = 44.0;
-    // Accent border (2px ring) behind the dark input box.
     out.push((
         scaled(x - 2.0, y - 2.0, w + 4.0, h + 4.0, sf),
         lin_rgba(ACCENT, 0.95),

@@ -138,6 +138,11 @@ pub enum BackendEvent {
 pub struct SearchHit {
     pub start: (u32, u16),
     pub end: (u32, u16),
+    /// 1-based position of this match among all matches for the query, and the
+    /// total count — drives the find bar's "i / N" readout. `total` is capped
+    /// (see the projection's enumeration cap); a capped count reads as "N+".
+    pub ordinal: u32,
+    pub total: u32,
 }
 
 /// An edge-triggered wake callback: invoked when a delta is published into a

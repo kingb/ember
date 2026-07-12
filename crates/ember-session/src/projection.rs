@@ -98,9 +98,17 @@ pub struct AlacrittyProjection<L: EventListener> {
 /// See `AlacrittyProjection::search`.
 struct SearchState {
     pattern: String,
-    regex: RegexSearch,
-    last: Option<(Point, Point)>,
+    /// All matches for `pattern`, in buffer order (oldest history -> newest),
+    /// capped at [`SEARCH_MATCH_CAP`]. Empty = the pattern matched nothing.
+    matches: Vec<(Point, Point)>,
+    /// Currently selected match (index into `matches`), if any.
+    idx: Option<usize>,
 }
+
+/// Upper bound on matches enumerated per query — bounds the cost of the full
+/// scan on a huge scrollback with a pathologically common pattern (e.g. "e").
+/// Beyond this the count reads as "CAP+"; the normal case is well under it.
+const SEARCH_MATCH_CAP: usize = 2000;
 
 /// One tracked command (OSC 133) or manual (OSC 1337 `SetMark`) mark: the
 /// prompt/mark's absolute history line, and — for a command — its exit code.
@@ -300,50 +308,66 @@ impl<L: EventListener> AlacrittyProjection<L> {
             self.search = None;
             return None;
         }
+        let hist = self.term.grid().history_size();
+        let screen = self.dims.screen_lines as i32;
+        let last_col = self.dims.columns.saturating_sub(1) as usize;
+        let display_offset = self.term.grid().display_offset() as i32;
+
         if self.search.as_ref().map(|s| s.pattern.as_str()) != Some(pattern) {
+            // New pattern: compile + enumerate every match once. Smart-case:
+            // an all-lowercase pattern matches case-insensitively.
             let needle = if pattern.chars().any(|c| c.is_uppercase()) {
                 pattern.to_string()
             } else {
                 format!("(?i){pattern}")
             };
-            let regex = match RegexSearch::new(&needle) {
+            let mut regex = match RegexSearch::new(&needle) {
                 Ok(r) => r,
                 Err(_) => {
                     self.search = None;
                     return None; // invalid regex: report as no match
                 }
             };
+            let matches = self.enumerate_matches(&mut regex, last_col, screen, hist);
+            // Start on the first match at or below the current viewport top, so
+            // a fresh search lands near what you're looking at; else the first.
+            let idx = if matches.is_empty() {
+                None
+            } else {
+                let top = -display_offset;
+                Some(matches.iter().position(|(s, _)| s.line.0 >= top).unwrap_or(0))
+            };
             self.search = Some(SearchState {
                 pattern: pattern.to_string(),
-                regex,
-                last: None,
+                matches,
+                idx,
             });
+        } else if let Some(st) = self.search.as_mut() {
+            // Same pattern: step the selection (wrapping), no re-scan.
+            let n = st.matches.len();
+            if n > 0 {
+                st.idx = Some(match st.idx {
+                    Some(i) if forward => (i + 1) % n,
+                    Some(i) => (i + n - 1) % n,
+                    None if forward => 0,
+                    None => n - 1,
+                });
+            }
         }
-        let screen = self.dims.screen_lines as i32;
-        let hist = self.term.grid().history_size();
-        let last_col = self.dims.columns.saturating_sub(1) as usize;
-        let display_offset = self.term.grid().display_offset() as i32;
 
-        let state = self.search.as_mut().expect("set above");
-        // One cell past the previous match's start (so next/prev advance),
-        // else the current viewport top. `search_next` wraps the buffer.
-        let origin = match (&state.last, forward) {
-            (Some((start, _)), true) => step_cell(*start, 1, last_col, screen, hist),
-            (Some((start, _)), false) => step_cell(*start, -1, last_col, screen, hist),
-            (None, _) => Point::new(Line(-display_offset), Column(0)),
+        // Copy out before scrolling (which borrows self mutably).
+        let (start, end, idx, total) = {
+            let st = self.search.as_ref()?;
+            let idx = st.idx?;
+            (
+                st.matches[idx].0,
+                st.matches[idx].1,
+                idx,
+                st.matches.len() as u32,
+            )
         };
-        let (direction, side) = if forward {
-            (Direction::Right, Side::Left)
-        } else {
-            (Direction::Left, Side::Right)
-        };
-        let m = self
-            .term
-            .search_next(&mut state.regex, origin, direction, side, None)?;
-        let (start, end) = (*m.start(), *m.end());
-        state.last = Some((start, end));
-        // Bring the match into view: a history match goes to the viewport
-        // top; a screen match means offset 0 (the live view already has it).
+        // Bring the match into view: history match -> viewport top; a screen
+        // match means offset 0 (already visible).
         let offset = (-start.line.0).clamp(0, hist as i32);
         self.scroll(ScrollAmount::To(offset.min(u16::MAX as i32) as u16));
         let abs = |p: Point| {
@@ -355,9 +379,46 @@ impl<L: EventListener> AlacrittyProjection<L> {
         Some(ember_core::SearchHit {
             start: abs(start),
             end: abs(end),
+            ordinal: idx as u32 + 1,
+            total,
         })
     }
 
+    /// Enumerate every match for `regex` in buffer order (top of history down),
+    /// capped at [`SEARCH_MATCH_CAP`]. Stops when a scan wraps or stalls.
+    fn enumerate_matches(
+        &self,
+        regex: &mut RegexSearch,
+        last_col: usize,
+        screen: i32,
+        hist: usize,
+    ) -> Vec<(Point, Point)> {
+        let mut out: Vec<(Point, Point)> = Vec::new();
+        let mut origin = Point::new(Line(-(hist as i32)), Column(0));
+        loop {
+            let m = match self
+                .term
+                .search_next(regex, origin, Direction::Right, Side::Left, None)
+            {
+                Some(m) => m,
+                None => break,
+            };
+            let (s, e) = (*m.start(), *m.end());
+            // Matches come out strictly increasing; anything not past the last
+            // means the scan wrapped the buffer or stalled at the end.
+            if let Some((ls, _)) = out.last() {
+                if (s.line.0, s.column.0) <= (ls.line.0, ls.column.0) {
+                    break;
+                }
+            }
+            out.push((s, e));
+            if out.len() >= SEARCH_MATCH_CAP {
+                break;
+            }
+            origin = step_cell(s, 1, last_col, screen, hist);
+        }
+        out
+    }
     /// Scroll the display through scrollback history. **No-op on the alternate
     /// screen** (vim/less/htop have no scrollback) — the classic scrollback bug is
     /// scrolling primary history while a full-screen app is up, so we gate it at the
@@ -926,6 +987,24 @@ mod tests {
         assert_eq!(third.start, first.start, "wrapped back around");
         let back = p.search("target", false).expect("prev");
         assert_eq!(back.start, second.start, "prev goes back");
+    }
+
+    #[test]
+    fn search_reports_ordinal_and_total_and_advances() {
+        let mut p = proj();
+        for _ in 0..3 {
+            p.advance(b"target\r\n");
+        }
+        feed_lines(&mut p, 5); // push all 3 up into history
+        let a = p.search("target", true).expect("found");
+        assert_eq!(a.total, 3, "counts every match");
+        assert_eq!(a.ordinal, 1, "starts on the first (all are above the view)");
+        let b = p.search("target", true).expect("next");
+        assert_eq!((b.total, b.ordinal), (3, 2), "next advances the ordinal");
+        let c = p.search("target", false).expect("prev");
+        assert_eq!(c.ordinal, 1, "prev retreats");
+        let none = p.search("no-such-text-anywhere", true);
+        assert!(none.is_none(), "a miss reports no hit");
     }
 
     #[test]

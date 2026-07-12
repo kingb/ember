@@ -456,6 +456,9 @@ pub(crate) struct WindowState {
     /// Scrollback-search bar (Cmd+F): open flag + the live query text.
     pub(crate) search_open: bool,
     pub(crate) search_query: String,
+    /// Latest match position for the bar's "i / N" readout: `Some((i, n))`
+    /// (n == 0 means "no matches"), or `None` while a search is in flight.
+    pub(crate) search_count: Option<(u32, u32)>,
     /// IME composition in progress (preedit text); non-empty = composing,
     /// during which raw key events are suppressed (they belong to the IME).
     pub(crate) ime_preedit: String,
@@ -592,6 +595,7 @@ impl WindowState {
             selecting: false,
             search_open: false,
             search_query: String::new(),
+            search_count: None,
             ime_preedit: String::new(),
             palette_open: false,
             palette_query: String::new(),
@@ -3531,6 +3535,16 @@ impl WindowState {
         session: &SessionId,
         hit: Option<ember_core::SearchHit>,
     ) {
+        // Update the bar's "i / N" readout. A non-empty query with no hit =
+        // no matches; ignore stale replies once the bar is closed.
+        if self.search_open {
+            self.search_count = match &hit {
+                Some(h) => Some((h.ordinal, h.total)),
+                None if !self.search_query.is_empty() => Some((0, 0)),
+                None => None,
+            };
+            self.refresh_search_bar();
+        }
         let Some(h) = hit else { return };
         let sel = AnchoredSelection {
             anchor: AbsPoint {
@@ -3690,6 +3704,7 @@ impl WindowState {
     pub(crate) fn close_search(&mut self) {
         self.search_open = false;
         self.search_query.clear();
+        self.search_count = None;
         self.renderer.set_search_bar(None);
     }
 
@@ -3705,6 +3720,7 @@ impl WindowState {
             }
             Key::Named(NamedKey::Backspace) => {
                 self.search_query.pop();
+                self.search_count = None;
                 self.refresh_search_bar();
                 if !self.search_query.is_empty() {
                     self.submit_search(shared, true);
@@ -3712,11 +3728,13 @@ impl WindowState {
             }
             Key::Named(NamedKey::Space) => {
                 self.search_query.push(' ');
+                self.search_count = None;
                 self.refresh_search_bar();
                 self.submit_search(shared, true);
             }
             Key::Character(text) => {
                 self.search_query.push_str(text);
+                self.search_count = None;
                 self.refresh_search_bar();
                 self.submit_search(shared, true);
             }
@@ -3725,7 +3743,17 @@ impl WindowState {
     }
 
     fn refresh_search_bar(&mut self) {
-        self.renderer.set_search_bar(Some(self.search_query.clone()));
+        let line = if self.search_query.is_empty() {
+            "find: type to search".to_string()
+        } else {
+            let count = match self.search_count {
+                Some((_, 0)) => "  no matches".to_string(),
+                Some((i, n)) => format!("  {i}/{n}"),
+                None => String::new(), // searching…
+            };
+            format!("find: {}\u{2038}{}", self.search_query, count)
+        };
+        self.renderer.set_search_bar(Some(line));
     }
 
     fn submit_search(&mut self, shared: &Shared, forward: bool) {
