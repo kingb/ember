@@ -25,12 +25,6 @@ follow [Semantic Versioning](https://semver.org).
   discoverable without memorizing chords: type a few letters, arrows to
   choose, Enter runs it, Escape closes. Picking an action teaches its
   shortcut for next time.
-- Input methods (IME) work. Composing text through an OS input method,
-  Japanese, Chinese, Korean, dead-key accents, the macOS emoji picker,
-  now shows the in-progress composition inline at the cursor (with an
-  accent underline) and commits it to the shell when you pick a
-  candidate. The candidate window follows the cursor. Previously such
-  input was dropped entirely.
 - Search in scrollback. Cmd+F opens a find bar: type to search incrementally
   (regex, smart-case: lowercase queries match case-insensitively), Enter
   jumps to the next match and Shift+Enter to the previous one, wrapping
