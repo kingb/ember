@@ -1632,7 +1632,10 @@ pub(crate) fn build_palette(
     let cols = 64usize;
     let w = (cols as f32 * cw + 2.0 * ipad).min(logical_w - 24.0);
     let inner_cols = ((w - 2.0 * ipad) / cw) as usize;
-    let shown = rows.len().min(12);
+    // At least one row of height so the "(no matching actions)" line stays
+    // visible when a query matches nothing (an invisible captured overlay
+    // reads as "the terminal stopped responding").
+    let shown = rows.len().min(12).max(1);
     let h = (shown as f32 + 1.5) * LINE_HEIGHT + 2.0 * ipad;
     let x = ((logical_w - w) * 0.5).max(0.0);
     let y = (logical_h * 0.18).max(44.0);
