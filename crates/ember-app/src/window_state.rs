@@ -1333,11 +1333,6 @@ impl WindowState {
                 self.jump_prompt(shared, 1);
                 true
             }
-            // Cmd+Shift+P — toggle the FPS / frame-time debug overlay.
-            Key::Character(s) if s.eq_ignore_ascii_case("p") && mods.shift_key() => {
-                self.toggle_fps();
-                true
-            }
             // Cmd+C — copy the current selection (macOS clipboard convention;
             // Ctrl+C remains SIGINT to the shell). Cmd+V — paste.
             Key::Character(s) if s.eq_ignore_ascii_case("c") => {
@@ -3730,8 +3725,7 @@ impl WindowState {
     }
 
     fn refresh_search_bar(&mut self) {
-        self.renderer
-            .set_search_bar(Some(format!("search: {}\u{2038}", self.search_query)));
+        self.renderer.set_search_bar(Some(self.search_query.clone()));
     }
 
     fn submit_search(&mut self, shared: &Shared, forward: bool) {

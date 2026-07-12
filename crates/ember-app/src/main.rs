@@ -1123,11 +1123,13 @@ impl ApplicationHandler<EmberEvent> for App {
                     }
                 }
             }
-            WindowEvent::Ime(ime) => match ime {
+            WindowEvent::Ime(ime) => {
+                match ime {
                 winit::event::Ime::Preedit(text, _) => win.set_ime_preedit(text),
                 winit::event::Ime::Commit(text) => win.ime_commit(shared, &text),
                 winit::event::Ime::Enabled | winit::event::Ime::Disabled => {}
-            },
+                }
+            }
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
                     return;
