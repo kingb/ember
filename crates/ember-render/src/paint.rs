@@ -1642,7 +1642,10 @@ pub(crate) fn build_palette(
     // visible when a query matches nothing (an invisible captured overlay
     // reads as "the terminal stopped responding").
     let shown = rows.len().min(12).max(1);
-    let h = (shown as f32 + 1.5) * LINE_HEIGHT + 2.0 * ipad;
+    // Text layout is: query line, a blank spacer line, then the rows — so the
+    // panel needs (shown + 2) lines and row `i` sits at line (2 + i). The
+    // highlight below uses the same arithmetic; keep them in lockstep.
+    let h = (shown as f32 + 2.0) * LINE_HEIGHT + 2.0 * ipad;
     let x = ((logical_w - w) * 0.5).max(0.0);
     let y = (logical_h * 0.18).max(44.0);
     // Accent ring + panel.
@@ -1653,7 +1656,7 @@ pub(crate) fn build_palette(
     out.push((scaled(x, y, w, h, sf), lin_rgba(Rgb::new(14, 10, 8), 0.97)));
     // Selected-row highlight (under the text pass).
     if shown > 0 && selected < shown {
-        let ry = y + ipad + (selected as f32 + 1.5) * LINE_HEIGHT;
+        let ry = y + ipad + (selected as f32 + 2.0) * LINE_HEIGHT;
         out.push((
             scaled(x + 3.0, ry, w - 6.0, LINE_HEIGHT, sf),
             lin_rgba(ACCENT, 0.28),
