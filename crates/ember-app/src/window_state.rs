@@ -3615,8 +3615,12 @@ impl WindowState {
             .collect()
     }
 
-    /// Open the command palette (Cmd+Shift+P).
+    /// Open the command palette (Cmd+Shift+P). Typing-capture overlays are
+    /// mutually exclusive: opening one closes the other, so keystrokes always
+    /// have exactly one unambiguous destination (stacked capture overlays are
+    /// how a terminal "stops responding to typing").
     pub(crate) fn open_palette(&mut self) {
+        self.close_search();
         self.palette_open = true;
         self.palette_query.clear();
         self.palette_sel = 0;
@@ -3678,8 +3682,10 @@ impl WindowState {
         None
     }
 
-    /// Open the scrollback-search bar (Cmd+F).
+    /// Open the scrollback-search bar (Cmd+F). Closes the palette first —
+    /// see [`Self::open_palette`] on capture-overlay exclusivity.
     pub(crate) fn open_search(&mut self) {
+        self.close_palette();
         self.search_open = true;
         self.refresh_search_bar();
     }

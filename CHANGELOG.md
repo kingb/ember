@@ -41,6 +41,11 @@ follow [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- The search bar and command palette can no longer be open at the same
+  time: opening one closes the other. Stacked, both silently captured
+  typing, which read as the terminal not responding to input. The
+  palette also keeps its "no matching actions" line visible instead of
+  collapsing to a sliver when a query matches nothing.
 - Selections now stay glued to their text. Selecting text and letting
   output scroll (or paging through scrollback) used to leave the
   highlight parked at fixed screen rows while different text slid
