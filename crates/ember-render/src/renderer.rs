@@ -1942,54 +1942,10 @@ impl Renderer {
                         custom_glyphs: &[],
                     });
                 }
-                // Scrollback-search bar (top-right), over the panes. These three
-                // overlays MUST mirror the headless path (capture_to_png promises
-                // pixel-identity with the window) — an overlay added to only one
-                // path renders in screenshots but never on screen, or vice versa.
-                if let Some(query) = self.search_bar.clone() {
-                    let (left, top) = build_search_bar(
-                        &mut self.font_system,
-                        &mut self.search_buffer,
-                        &query,
-                        cw,
-                        logical_w,
-                        sf,
-                        &mut rects,
-                    );
-                    areas.push(TextArea {
-                        buffer: &self.search_buffer,
-                        left: left * sf,
-                        top: top * sf,
-                        scale: sf,
-                        bounds: full_bounds,
-                        default_color: Color::rgb(0xf5, 0xf5, 0xdc),
-                        custom_glyphs: &[],
-                    });
-                }
-                // Command palette (centered), over the panes.
-                if let Some((query, rows, selected)) = self.palette.clone() {
-                    let (left, top) = build_palette(
-                        &mut self.font_system,
-                        &mut self.palette_buffer,
-                        &query,
-                        &rows,
-                        selected,
-                        cw,
-                        logical_w,
-                        logical_h,
-                        sf,
-                        &mut rects,
-                    );
-                    areas.push(TextArea {
-                        buffer: &self.palette_buffer,
-                        left: left * sf,
-                        top: top * sf,
-                        scale: sf,
-                        bounds: full_bounds,
-                        default_color: Color::rgb(0xf5, 0xf5, 0xdc),
-                        custom_glyphs: &[],
-                    });
-                }
+                // NOTE: the scrollback-search bar and command palette render in
+                // the OVERLAY pass (past `rounded_pre_confirm`, below) so their
+                // opaque panels cover pane glyphs instead of htop/top text bleeding
+                // through. Kept in lockstep with the headless path.
                 // IME composition (preedit) at the focused pane's cursor.
                 if let Some(text) = self.ime_preedit.clone() {
                     let focused_vp = self
@@ -2034,6 +1990,59 @@ impl Renderer {
             // point, so this boundary splits base rounded quads (tab pills, drawn
             // before the pane text) from the confirm quads (drawn after it).
             let rounded_pre_confirm = rounded.len() as u32;
+            // Scrollback-search bar + command palette: panels appended to `rounded`
+            // AFTER the boundary (drawn post-pane-text so the opaque panel covers
+            // pane glyphs), text in `overlay_areas` (drawn over the panel). MUST
+            // mirror the headless path — an overlay in only one renders in captures
+            // but never on screen, or vice versa.
+            {
+                let logical_w = self.config.width as f32 / sf;
+                let logical_h = self.config.height as f32 / sf;
+                let cw = self.cell_w;
+                if let Some(query) = self.search_bar.clone() {
+                    let (left, top) = build_search_bar(
+                        &mut self.font_system,
+                        &mut self.search_buffer,
+                        &query,
+                        cw,
+                        logical_w,
+                        sf,
+                        &mut rounded,
+                    );
+                    overlay_areas.push(TextArea {
+                        buffer: &self.search_buffer,
+                        left: left * sf,
+                        top: top * sf,
+                        scale: sf,
+                        bounds: full_bounds,
+                        default_color: Color::rgb(0xf5, 0xf5, 0xdc),
+                        custom_glyphs: &[],
+                    });
+                }
+                if let Some((query, rows, selected)) = self.palette.clone() {
+                    let (left, top) = build_palette(
+                        &mut self.font_system,
+                        &mut self.palette_buffer,
+                        &query,
+                        &rows,
+                        selected,
+                        cw,
+                        logical_w,
+                        logical_h,
+                        sf,
+                        &mut rounded,
+                    );
+                    overlay_areas.push(TextArea {
+                        buffer: &self.palette_buffer,
+                        left: left * sf,
+                        top: top * sf,
+                        scale: sf,
+                        bounds: full_bounds,
+                        default_color: Color::rgb(0xf5, 0xf5, 0xdc),
+                        custom_glyphs: &[],
+                    });
+                }
+            }
             self.confirm_buttons.clear();
             if let Some(view) = self.confirm.clone() {
                 let lw = self.config.width as f32 / sf;

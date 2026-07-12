@@ -1546,7 +1546,7 @@ pub(crate) fn build_search_bar(
     cw: f32,
     logical_w: f32,
     sf: f32,
-    out: &mut Vec<([f32; 4], [f32; 4])>,
+    rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
 ) -> (f32, f32) {
     // `line1` is the caller-formatted status line ("find: <query>  3/12", a
     // placeholder, or "no matches"); line 2 is the fixed key hints. Two lines
@@ -1558,11 +1558,17 @@ pub(crate) fn build_search_bar(
     let h = 2.0 * LINE_HEIGHT + 2.0 * ipad;
     let x = (logical_w - w - 8.0).max(0.0);
     let y = 44.0;
-    out.push((
+    // Overlay (post-pane-text) pass — opaque panel so text behind can't bleed in.
+    rounded.push((
         scaled(x - 2.0, y - 2.0, w + 4.0, h + 4.0, sf),
         lin_rgba(ACCENT, 0.95),
+        0.0,
     ));
-    out.push((scaled(x, y, w, h, sf), lin_rgba(Rgb::new(12, 8, 6), 0.95)));
+    rounded.push((
+        scaled(x, y, w, h, sf),
+        lin_rgba(Rgb::new(12, 8, 6), 1.0),
+        0.0,
+    ));
     buf.set_size(font_system, Some(w), Some(h));
     buf.set_text(
         font_system,
@@ -1627,7 +1633,7 @@ pub(crate) fn build_palette(
     logical_w: f32,
     logical_h: f32,
     sf: f32,
-    out: &mut Vec<([f32; 4], [f32; 4])>,
+    rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
 ) -> (f32, f32) {
     let ipad = 10.0;
     let cols = 64usize;
@@ -1643,18 +1649,34 @@ pub(crate) fn build_palette(
     let h = (shown as f32 + 2.0) * LINE_HEIGHT + 2.0 * ipad;
     let x = ((logical_w - w) * 0.5).max(0.0);
     let y = (logical_h * 0.18).max(44.0);
-    // Accent ring + panel.
-    out.push((
+    // These quads ride the OVERLAY (post-pane-text) pass, so the panel occludes
+    // pane glyphs instead of htop/top text bleeding through it.
+    // Dim the whole window behind the palette so the busy ember shower doesn't
+    // bleed through and fight the text — a modal palette should read as a
+    // distinct layer, not a translucent film over live output.
+    rounded.push((
+        scaled(0.0, 0.0, logical_w, logical_h, sf),
+        lin_rgba(Rgb::new(0, 0, 0), 0.45),
+        0.0,
+    ));
+    // Accent ring + panel — panel is fully opaque so nothing bleeds under the text.
+    rounded.push((
         scaled(x - 1.0, y - 1.0, w + 2.0, h + 2.0, sf),
         lin_rgba(ACCENT, 0.9),
+        0.0,
     ));
-    out.push((scaled(x, y, w, h, sf), lin_rgba(Rgb::new(14, 10, 8), 0.97)));
+    rounded.push((
+        scaled(x, y, w, h, sf),
+        lin_rgba(Rgb::new(14, 10, 8), 1.0),
+        0.0,
+    ));
     // Selected-row highlight (under the text pass).
     if shown > 0 && selected < shown {
         let ry = y + ipad + (selected as f32 + 2.0) * LINE_HEIGHT;
-        out.push((
+        rounded.push((
             scaled(x + 3.0, ry, w - 6.0, LINE_HEIGHT, sf),
             lin_rgba(ACCENT, 0.28),
+            0.0,
         ));
     }
     // Text: query line, blank-ish gap, then rows (desc left, chord right).

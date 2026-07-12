@@ -491,31 +491,9 @@ pub fn capture_reusing(
                 ));
             }
         }
-        if let Some((query, rows, selected)) = &shot.palette {
-            palette_origin = Some(build_palette(
-                font_system,
-                &mut palette_buf,
-                query,
-                rows,
-                *selected,
-                cw,
-                shot.logical_w,
-                shot.logical_h,
-                sf,
-                &mut rects,
-            ));
-        }
-        if let Some(text) = &shot.search_bar {
-            search_origin = Some(build_search_bar(
-                font_system,
-                &mut search_buf,
-                text,
-                cw,
-                shot.logical_w,
-                sf,
-                &mut rects,
-            ));
-        }
+        // NOTE: the command palette + search bar build LATER (past
+        // `rounded_pre_confirm`), into the overlay pass, mirroring the live
+        // renderer so their opaque panels cover pane glyphs.
         bell_wash(
             &mut rects,
             shot.bell_flash,
@@ -527,6 +505,33 @@ pub fn capture_reusing(
     // Boundary between base rounded quads (tab pills) and the confirm modal's
     // scrim+panel+buttons, appended next — so the panel draws after pane text.
     let rounded_pre_confirm = rounded.len() as u32;
+    // Command palette + search bar: panels into `rounded` (drawn after pane text)
+    // and text into the overlay pass — mirrors the live renderer so captures match.
+    if let Some((query, rows, selected)) = &shot.palette {
+        palette_origin = Some(build_palette(
+            font_system,
+            &mut palette_buf,
+            query,
+            rows,
+            *selected,
+            cw,
+            shot.logical_w,
+            shot.logical_h,
+            sf,
+            &mut rounded,
+        ));
+    }
+    if let Some(text) = &shot.search_bar {
+        search_origin = Some(build_search_bar(
+            font_system,
+            &mut search_buf,
+            text,
+            cw,
+            shot.logical_w,
+            sf,
+            &mut rounded,
+        ));
+    }
     if let Some(view) = &shot.confirm {
         confirm_layout = Some(build_confirm(
             font_system,
@@ -666,17 +671,6 @@ pub fn capture_reusing(
                 custom_glyphs: &[],
             });
         }
-        if let Some((left, top)) = palette_origin {
-            areas.push(TextArea {
-                buffer: &palette_buf,
-                left: left * sf,
-                top: top * sf,
-                scale: sf,
-                bounds: full_bounds,
-                default_color: Color::rgb(0xf5, 0xf5, 0xdc),
-                custom_glyphs: &[],
-            });
-        }
         if let Some((left, top)) = preedit_origin {
             areas.push(TextArea {
                 buffer: &preedit_buf,
@@ -688,20 +682,32 @@ pub fn capture_reusing(
                 custom_glyphs: &[],
             });
         }
-        if let Some((left, top)) = search_origin {
-            areas.push(TextArea {
-                buffer: &search_buf,
-                left: left * sf,
-                top: top * sf,
-                scale: sf,
-                bounds: full_bounds,
-                default_color: Color::rgb(0xf5, 0xf5, 0xdc),
-                custom_glyphs: &[],
-            });
-        }
     }
-    // Confirm dialog text goes to the overlay pass (drawn after its opaque panel).
+    // Command palette + search bar text + confirm dialog text: the overlay pass,
+    // drawn after their opaque panels (mirrors the live renderer).
     let mut overlay_areas: Vec<TextArea> = Vec::new();
+    if let Some((left, top)) = palette_origin {
+        overlay_areas.push(TextArea {
+            buffer: &palette_buf,
+            left: left * sf,
+            top: top * sf,
+            scale: sf,
+            bounds: full_bounds,
+            default_color: Color::rgb(0xf5, 0xf5, 0xdc),
+            custom_glyphs: &[],
+        });
+    }
+    if let Some((left, top)) = search_origin {
+        overlay_areas.push(TextArea {
+            buffer: &search_buf,
+            left: left * sf,
+            top: top * sf,
+            scale: sf,
+            bounds: full_bounds,
+            default_color: Color::rgb(0xf5, 0xf5, 0xdc),
+            custom_glyphs: &[],
+        });
+    }
     if let Some(cl) = &confirm_layout {
         for (buf, (ox, oy)) in [
             (&cf_title, cl.title_origin),
