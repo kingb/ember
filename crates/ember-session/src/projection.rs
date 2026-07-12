@@ -571,10 +571,20 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
             let hist = self.term.grid().history_size() as i64;
             let screen = self.dims.screen_lines as i64;
             let bottom_abs = hist + screen - 1;
+            // Marks whose prompt line was erased *in place* — `clear`/Ctrl+L emit ED
+            // (`ESC [ J`) without scrolling to history, so the cells go blank but the
+            // mark, pinned to an absolute line, would otherwise keep painting on the
+            // now-empty row. Detect the blanked line and drop the stale mark for good.
+            let mut stale: Vec<i64> = Vec::new();
             for m in &self.marks {
                 // visible row r: abs = bottom_abs - (screen-1) + r - display_offset
                 let r = m.abs_line - bottom_abs + (screen - 1) + self.display_offset as i64;
                 if (0..screen).contains(&r) {
+                    let engine_line = r as i32 - self.display_offset as i32;
+                    if line_is_blank(&self.term, engine_line, cols) {
+                        stale.push(m.abs_line);
+                        continue;
+                    }
                     let status = if m.manual {
                         MarkStatus::Manual
                     } else {
@@ -586,6 +596,9 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
                     };
                     out.marks.push((r as u16, status));
                 }
+            }
+            if !stale.is_empty() {
+                self.marks.retain(|m| !stale.contains(&m.abs_line));
             }
         }
     }
@@ -636,6 +649,15 @@ impl<L: EventListener> AlacrittyProjection<L> {
 
 /// Resolve one alacritty cell into neutral content + style + soft-wrap + wide.
 /// `colors` overlays runtime OSC 4/10/11 palette changes over our defaults.
+/// Whether an engine line (`0..screen` = visible, negative = history) holds only
+/// blank cells — used to detect a prompt line erased in place by ED (`clear` /
+/// Ctrl+L), so its now-stale OSC 133 gutter mark can be dropped. A real prompt
+/// line always carries at least the prompt string, so all-spaces == erased.
+fn line_is_blank<L: EventListener>(term: &Term<L>, line: i32, cols: usize) -> bool {
+    let grid = term.grid();
+    (0..cols).all(|col| grid[Point::new(Line(line), Column(col))].c == ' ')
+}
+
 fn neutral_of(
     cell: &Cell,
     palette: &Palette,
