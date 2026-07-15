@@ -87,8 +87,6 @@ pub struct AlacrittyProjection<L: EventListener> {
     scan_tail_133: Vec<u8>,
     /// Same, for OSC 1337.
     scan_tail_1337: Vec<u8>,
-    /// OSC 8 hyperlink interner: uri -> stable id for this session's frames.
-    link_ids: std::collections::HashMap<String, u32>,
     /// Live scrollback-search state: the pattern as typed, its compiled DFA,
     /// and the engine-space range of the last match (the origin the next
     /// `search` call continues from). Reset when the pattern changes.
@@ -137,7 +135,6 @@ impl<L: EventListener> AlacrittyProjection<L> {
             dims,
             epoch: 0,
             display_offset: 0,
-            link_ids: HashMap::new(),
             search: None,
             marks: Vec::new(),
             resync: false,
@@ -516,21 +513,18 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
         let full = full || std::mem::take(&mut self.resync);
 
         let mut first_seen = Vec::new();
-        let mut first_links = Vec::new();
         if full {
             out.reset = true;
             out.cells.clear();
             for line in 0..lines {
                 for col in 0..cols {
-                    out.cells
-                        .push(self.patch(line, col, &mut first_seen, &mut first_links));
+                    out.cells.push(self.patch(line, col, &mut first_seen));
                 }
             }
         } else {
             for (line, left, right) in ranges {
                 for col in left..=right {
-                    out.cells
-                        .push(self.patch(line, col, &mut first_seen, &mut first_links));
+                    out.cells.push(self.patch(line, col, &mut first_seen));
                 }
             }
         }
@@ -538,15 +532,9 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
         // assigning here would clobber styles from a superseded drain and
         // re-open the black-on-black coalescing bug fixed in GridDelta::merge.
         out.new_styles.extend(first_seen);
-        out.new_links.extend(first_links);
         if out.reset {
             // A resync consumer has no style cache at all: ship the full table.
             out.new_styles = self.interner.all();
-            out.new_links = self
-                .link_ids
-                .iter()
-                .map(|(uri, id)| (*id, uri.clone()))
-                .collect();
         }
         out.cursor = self.cursor_state();
         let mode = self.term.mode();
@@ -610,29 +598,17 @@ impl<L: EventListener> AlacrittyProjection<L> {
         line: usize,
         col: usize,
         first_seen: &mut Vec<(StyleId, Style)>,
-        first_links: &mut Vec<(u32, String)>,
     ) -> CellPatch {
         // Map a visible row to the engine's line index accounting for scroll: when
         // scrolled up by `display_offset`, visible row `v` shows engine line
         // `v - display_offset` (history lines are negative). At the bottom
         // (`display_offset == 0`) this is just `Line(v)`.
         let engine_line = line as i32 - self.display_offset as i32;
-        let (content, style, wrapped, wide, link_uri) = {
+        let (content, style, wrapped, wide) = {
             let cell = &self.term.grid()[Point::new(Line(engine_line), Column(col))];
-            let (c, st, wr, wi) = neutral_of(cell, &self.palette, self.term.colors());
-            (c, st, wr, wi, cell.hyperlink().map(|h| h.uri().to_string()))
+            neutral_of(cell, &self.palette, self.term.colors())
         };
         let id = self.interner.intern(style, first_seen);
-        let link = link_uri.map(|uri| {
-            if let Some(&lid) = self.link_ids.get(&uri) {
-                lid
-            } else {
-                let lid = self.link_ids.len() as u32;
-                self.link_ids.insert(uri.clone(), lid);
-                first_links.push((lid, uri));
-                lid
-            }
-        });
         CellPatch {
             row: line as u16,
             col: col as u16,
@@ -641,7 +617,6 @@ impl<L: EventListener> AlacrittyProjection<L> {
                 style: id,
                 wrapped,
                 wide,
-                link,
             },
         }
     }

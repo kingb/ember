@@ -14,12 +14,6 @@ follow [Semantic Versioning](https://semver.org).
   off by default because any program in the terminal could quietly read
   what you last copied; when off, requests get an empty answer instead
   of hanging the program.
-- Explicit hyperlinks (OSC 8). Programs that mark text as a link (ls
-  --hyperlink, modern compilers and package managers) now get real
-  clickable links: the marked text is underlined and clickable even when
-  it does not look like a URL, and an app-declared link wins over the
-  automatic URL detector on the same text. Opening still allows http and
-  https only.
 - Command palette. Cmd+Shift+P opens a fuzzy-searchable list of every
   keyboard action, with its shortcut shown beside it, so features are
   discoverable without memorizing chords: type a few letters, arrows to
