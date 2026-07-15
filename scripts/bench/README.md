@@ -24,12 +24,48 @@ protocol below exists because ad-hoc numbers on a busy machine swing wildly
 |---|---|---|
 | `idle-cpu.sh` | Process CPU% while idling: flat vs gradient vs sparks | a release build |
 | `gpu-idle.sh` | GPU power (mW) + residency, per-process GPU ms/s, same scenarios plus a no-Ember baseline | `sudo` (powermetrics) |
+| `throughput.sh` | VT parse throughput of a candidate vs the last release (criterion `vt_throughput`), PASS/FAIL gate | git refs to compare |
+| `throughput-windowed.sh` | Real windowed `cat`-throughput (parse + render + PTY) of candidate vs baseline | a visible display |
 
 ```sh
 cargo build --release -p ember-app
 scripts/bench/idle-cpu.sh
 sudo scripts/bench/gpu-idle.sh
 ```
+
+## Throughput (release gate)
+
+Does a release candidate parse/render a flood of output as fast as the last
+release? `throughput.sh` builds both commits and compares them; it's the
+`⛔ GATE` in `RELEASING.md`.
+
+```sh
+scripts/bench/throughput.sh              # v0.4.2 (default baseline) vs working tree
+scripts/bench/throughput.sh v0.5.0       # v0.4.2 vs the v0.5.0 tag
+scripts/bench/throughput.sh v0.4.2 HEAD --windowed   # + the real-terminal check
+```
+
+The throughput signal is **single-digit %**, an order of magnitude smaller than
+the idle numbers, so it needs everything in the Protocol above **plus**:
+
+- **High Power Mode or AC power.** On battery, macOS throttles the CPU clock and
+  the wobble alone is ±10–25% — bigger than the signal. High Power Mode on
+  battery is enough; the script warns if you're on battery.
+- **Don't build during the run.** XProtect (`xprotectd`) scans every freshly
+  built binary and pins a core; the script builds *first*, then measures.
+- **Balanced order.** The script alternates which build runs first each round —
+  a fixed A-then-B order lets "the second run is on a hotter machine" masquerade
+  as a regression. It reports the median across both orderings.
+- **Absolute medians, never criterion's verdict.** Criterion's change%/"regressed"
+  detector mislabels an *identical* binary as "+10.8% regressed" under these
+  outliers. The script reads only the point-estimate time.
+
+**Criterion vs windowed.** `throughput.sh` measures parse+drain only (no GPU) —
+fast and deterministic, good for catching hot-path regressions. But a real
+`cat` is render-bound: on this machine 229MB is ~8s headless but ~60s on screen,
+so render dominates ~8:1 and the criterion bench can miss a render-path cost
+entirely. When a change touches the render/grid-model path, confirm with
+`--windowed` (or `throughput-windowed.sh`) — that's what a user actually feels.
 
 ## Reference results
 
