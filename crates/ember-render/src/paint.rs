@@ -5,7 +5,7 @@
 //! `Renderer` struct + GPU plumbing live in `renderer.rs`.
 
 use ember_core::{MarkStatus, Rect, Rgb, RowKind, SettingsRowView};
-use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
+use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Wrap};
 
 use crate::grid_model::GridModel;
 use crate::quads::srgb_to_linear;
@@ -1088,6 +1088,15 @@ pub(crate) fn build_tabs(
     let (lw_bits, cw_bits) = (logical_w.to_bits(), cw.to_bits());
     if cache.is_dirty(&spans, lw_bits, cw_bits) {
         chrome.set_size(font_system, Some(logical_w), Some(LINE_HEIGHT));
+        // The strip is one line by construction: its columns are partitioned to
+        // sum to exactly `total_cols`, and the trailing +/?/⚙ buttons occupy the
+        // final columns. But the shaped advance can edge a hair past `logical_w`
+        // (a fallback glyph like ⚙/⌘ advancing fractionally wider than its cell,
+        // or stale cw/logical_w during a resize/DPI settle), and cosmic-text's
+        // default `WordOrGlyph` wrap then spills those trailing buttons onto a
+        // second line at the LEFT edge. Pin the strip to a single line so metric
+        // jitter can never wrap the controls off to the left.
+        chrome.set_wrap(font_system, Wrap::None);
         chrome.set_rich_text(
             font_system,
             spans
@@ -2085,6 +2094,62 @@ mod tests {
         assert!(cache.is_dirty(&spans(&[("tab 1", 1), ("+", 2)]), lw, 9f32.to_bits()));
         // Tab count change → dirty.
         assert!(cache.is_dirty(&spans(&[("tab 1", 1)]), lw, cw));
+    }
+
+    /// Regression: the strip must never wrap. Its columns sum to exactly
+    /// `total_cols` and the +/?/⚙ buttons sit in the final columns, but a
+    /// shaped advance that edges a hair past `logical_w` (fallback-glyph
+    /// metrics, resize/DPI settle) used to let cosmic-text's default
+    /// `WordOrGlyph` wrap spill those trailing buttons onto a second line at
+    /// the LEFT edge. `build_tabs` pins the buffer to `Wrap::None`, so however
+    /// tight the fit, the strip stays a single visual line.
+    #[test]
+    fn strip_never_wraps_to_a_second_line() {
+        use super::{TabsCache, build_tabs};
+        use crate::renderer::{FONT_SIZE, LINE_HEIGHT, TabLabel};
+
+        let mut fs = super::new_font_system();
+        let mut chrome = glyphon::Buffer::new(&mut fs, glyphon::Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let mut close_buf =
+            glyphon::Buffer::new(&mut fs, glyphon::Metrics::new(FONT_SIZE, LINE_HEIGHT));
+
+        // Five tabs with long titles. Crucially, `cw` is passed *smaller* than
+        // the font's true monospace advance — the exact "under-measured /
+        // stale cell width" condition (a resize/DPI settle) that makes the
+        // column-packed string shape wider than `logical_w`. With the default
+        // `WordOrGlyph` wrap this spilled the trailing +/?/⚙ onto a second line;
+        // `Wrap::None` keeps it a single visual line regardless.
+        let tabs: Vec<TabLabel> = (0..5)
+            .map(|i| TabLabel {
+                title: format!("a-long-tab-title-{i}"),
+                active: i == 4,
+                editing: false,
+                bell: false,
+            })
+            .collect();
+        let mut cache = TabsCache::default();
+        let (mut out, mut rounded) = (Vec::new(), Vec::new());
+        build_tabs(
+            &mut fs,
+            &mut chrome,
+            &mut close_buf,
+            &mut cache,
+            &tabs,
+            None,
+            None,
+            None,
+            4.0, // under-measured cell width → packed string shapes wider than logical_w
+            900.0,
+            2.0,
+            &mut out,
+            &mut rounded,
+        );
+        assert_eq!(
+            chrome.layout_runs().count(),
+            1,
+            "tab strip wrapped onto {} lines — the +/?/⚙ controls spilled to the left edge",
+            chrome.layout_runs().count()
+        );
     }
 
     use super::link_quads;
