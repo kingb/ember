@@ -1,14 +1,14 @@
 cask "ember" do
-  version "0.4.2"
+  version "0.5.0"
 
   on_arm do
-    sha256 "0c1f0f8134d0afeb351e0993515283336c615327bac66c583839057742e3ad9c"
+    sha256 "49400c9b846c9b7be152a635ac7c089e145530a1d680896a42d1707e238d0279"
 
     url "https://github.com/kingb/ember/releases/download/v#{version}/Ember-#{version}-macos-arm64.zip",
         verified: "github.com/kingb/ember/"
   end
   on_intel do
-    sha256 "e58ca69bcb4abebcbc8902af32c20753536635aec9129dd02c8f44d218f93d3f"
+    sha256 "6872ef37bded46d022ca9ad29b049354817bae0749bf51f2d57aeefc8952f89f"
 
     url "https://github.com/kingb/ember/releases/download/v#{version}/Ember-#{version}-macos-x86_64.zip",
         verified: "github.com/kingb/ember/"
