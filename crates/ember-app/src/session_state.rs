@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,32 @@ pub struct PaneSnap {
     pub last_cmd: Option<String>,
     pub was_running: bool,
 }
+
+/// Outcome of attempting to load a session snapshot from disk.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoadOutcome {
+    /// File does not exist.
+    None,
+    /// File exists but is corrupt (not valid JSON, or unparseable); it has
+    /// been renamed to `session.json.corrupt`.
+    Corrupt,
+    /// File was successfully loaded and parsed.
+    Loaded(SessionSnapshot),
+}
+
+/// One entry from `list_archives`: a snapshot file, its timestamp from the
+/// filename, and metadata (window/tab counts) extracted during listing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArchiveEntry {
+    pub path: PathBuf,
+    pub stamp: String,
+    pub windows: usize,
+    pub tabs: usize,
+}
+
+/// Maximum number of archived snapshots to keep. Older archives are pruned
+/// when this limit is exceeded.
+pub const MAX_ARCHIVES: usize = 10;
 
 /// Truncate `s` to at most 1024 bytes, backing off to the nearest earlier
 /// char boundary so a multi-byte UTF-8 character is never split. The single
@@ -292,6 +318,208 @@ pub fn strip_commands(path: &Path) -> io::Result<()> {
         }
     }
     write_atomic(path, &snap)
+}
+
+/// Load and parse a session snapshot from `path`. Returns:
+/// - `LoadOutcome::None` if the file does not exist or has an unsupported version.
+/// - `LoadOutcome::Corrupt` if the file exists but is not valid JSON; the
+///   file is renamed to `session.json.corrupt` (overwriting any older
+///   corrupt file).
+/// - `LoadOutcome::Loaded(snap)` if the file was successfully parsed.
+pub fn load(path: &Path) -> LoadOutcome {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return LoadOutcome::None,
+        Err(_) => return LoadOutcome::None,
+    };
+
+    match serde_json::from_str::<SessionSnapshot>(&text) {
+        Ok(snap) => {
+            if snap.version != 1 {
+                // Unknown version: leave the file alone (it might be from a
+                // future version we can't parse yet).
+                return LoadOutcome::None;
+            }
+            LoadOutcome::Loaded(snap)
+        }
+        Err(_) => {
+            // Corrupt JSON: rename to quarantine and return Corrupt.
+            let corrupt_path = path.with_extension("json.corrupt");
+            let _ = std::fs::rename(path, &corrupt_path);
+            LoadOutcome::Corrupt
+        }
+    }
+}
+
+/// Format a timestamp as YYYYMMDD-HHMMSS from the given SystemTime.
+/// Returns an empty string if the time cannot be formatted.
+fn format_timestamp(time: SystemTime) -> String {
+    let duration = match time.duration_since(UNIX_EPOCH) {
+        Ok(d) => d,
+        Err(_) => return String::new(),
+    };
+    let secs = duration.as_secs();
+
+    // Compute YYYYMMDD-HHMMSS from seconds since epoch.
+    // This is a simplified calculation that doesn't account for leap seconds.
+    const SECS_PER_DAY: u64 = 86400;
+    const SECS_PER_HOUR: u64 = 3600;
+    const SECS_PER_MINUTE: u64 = 60;
+
+    // Convert seconds to days, hours, minutes, seconds
+    let days_since_epoch = secs / SECS_PER_DAY;
+    let secs_in_day = secs % SECS_PER_DAY;
+    let hours = secs_in_day / SECS_PER_HOUR;
+    let secs_in_hour = secs_in_day % SECS_PER_HOUR;
+    let minutes = secs_in_hour / SECS_PER_MINUTE;
+    let seconds = secs_in_hour % SECS_PER_MINUTE;
+
+    // Days since Jan 1, 1970 to a calendar date (simplified).
+    // This is approximate but sufficient for archive timestamps.
+    let mut year = 1970;
+    let mut days = days_since_epoch;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+
+    let mut month = 1;
+    let mut day = days + 1;
+    for m in 1..=12 {
+        let days_in_month = match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => if is_leap_year(year) { 29 } else { 28 },
+            _ => 0,
+        };
+        if day <= days_in_month {
+            month = m;
+            break;
+        }
+        day -= days_in_month;
+    }
+
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        year, month, day, hours, minutes, seconds
+    )
+}
+
+fn is_leap_year(year: u64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+/// Archive the snapshot at `path` by renaming it to
+/// `session.json.prev-<YYYYMMDD-HHMMSS>`. Then prune old archives, keeping
+/// only the `MAX_ARCHIVES` newest by filename (which sorts by timestamp).
+pub fn archive(path: &Path) -> io::Result<()> {
+    let stamp = format_timestamp(SystemTime::now());
+    archive_with_stamp(path, &stamp)
+}
+
+/// Archive with an explicit stamp (for testing). Renames `path` to
+/// `session.json.prev-<stamp>`, then prunes old archives to keep only
+/// the `MAX_ARCHIVES` newest by timestamp.
+pub fn archive_with_stamp(path: &Path, stamp: &str) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    // Rename to archive
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    let archive_path = dir.join(format!("session.json.prev-{}", stamp));
+    std::fs::rename(path, archive_path)?;
+
+    // Prune old archives
+    prune_archives(dir)?;
+    Ok(())
+}
+
+/// Prune archived snapshots in `dir` to keep only the `MAX_ARCHIVES` newest.
+fn prune_archives(dir: &Path) -> io::Result<()> {
+    let mut archives = match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut found: Vec<PathBuf> = entries
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if path
+                        .file_name()?
+                        .to_string_lossy()
+                        .starts_with("session.json.prev-")
+                    {
+                        Some(path)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            found.sort_by(|a, b| b.cmp(a)); // Sort newest first
+            found
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    // Remove oldest archives beyond MAX_ARCHIVES
+    while archives.len() > MAX_ARCHIVES {
+        if let Some(path) = archives.pop() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+/// List all archived snapshots in `dir`, returning the newest first.
+/// Each entry contains the path, extracted timestamp, window count, and tab count.
+/// Unparseable files are skipped.
+pub fn list_archives(dir: &Path) -> Vec<ArchiveEntry> {
+    let mut entries: Vec<ArchiveEntry> = match std::fs::read_dir(dir) {
+        Ok(dir_entries) => {
+            dir_entries
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let file_name = path.file_name()?.to_string_lossy().to_string();
+                    if !file_name.starts_with("session.json.prev-") {
+                        return None;
+                    }
+
+                    // Extract stamp from filename
+                    let stamp = file_name
+                        .strip_prefix("session.json.prev-")
+                        .unwrap_or("")
+                        .to_string();
+
+                    // Read and parse the file to count windows and tabs
+                    let text = std::fs::read_to_string(&path).ok()?;
+                    let snap: SessionSnapshot = serde_json::from_str(&text).ok()?;
+
+                    let mut total_tabs = 0;
+                    for window in &snap.windows {
+                        total_tabs += window.tabs.len();
+                    }
+
+                    Some(ArchiveEntry {
+                        path,
+                        stamp,
+                        windows: snap.windows.len(),
+                        tabs: total_tabs,
+                    })
+                })
+                .collect()
+        }
+        Err(_) => return Vec::new(),
+    };
+
+    entries.sort_by(|a, b| b.stamp.cmp(&a.stamp)); // Sort newest first
+    entries
 }
 
 static WRITE_FAILURE_LOGGED: Once = Once::new();
@@ -676,5 +904,45 @@ mod tests {
             assert_eq!(saved_state_count(), 0);
             assert_eq!(delete_all_state(), 0);
         });
+    }
+
+    // --- load / archive / list_archives tests -----
+
+    #[test]
+    fn load_missing_is_none_and_corrupt_is_quarantined() {
+        let p = tmp("load");
+        assert!(matches!(load(&p), LoadOutcome::None));
+        std::fs::write(&p, b"{not json").unwrap();
+        assert!(matches!(load(&p), LoadOutcome::Corrupt));
+        assert!(!p.exists());
+        assert!(p.with_extension("json.corrupt").exists());
+    }
+
+    #[test]
+    fn unknown_version_is_treated_as_none() {
+        let p = tmp("ver");
+        std::fs::write(&p, r#"{"version": 99, "saved_at": "x", "windows": []}"#).unwrap();
+        assert!(matches!(load(&p), LoadOutcome::None));
+        // File must remain untouched for a future version to potentially recover it
+        assert!(p.exists());
+    }
+
+    #[test]
+    fn archive_prunes_to_ten() {
+        let p = tmp("arch");
+        let parent = p.parent().unwrap();
+
+        // Create 12 archives with distinct stamps
+        for i in 0..12 {
+            write_atomic(&p, &snap(&format!("s{i}"))).unwrap();
+            let stamp = format!("20260801-0000{:02}", i);
+            archive_with_stamp(&p, &stamp).unwrap();
+        }
+
+        let list = list_archives(parent);
+        assert_eq!(list.len(), 10, "Expected 10 archives, got {}", list.len());
+        // Verify newest first: stamps are lexicographically ordered, so newest
+        // has the highest last digits
+        assert!(list[0].stamp > list[9].stamp, "Archives not sorted newest first");
     }
 }
