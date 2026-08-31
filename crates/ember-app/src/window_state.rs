@@ -566,6 +566,72 @@ pub(crate) struct WindowState {
     /// time. Never pruned when a tab closes: a `TabId` is never reused
     /// within a window's lifetime, so a stale entry is inert.
     pub(crate) named_tabs: std::collections::HashSet<TabId>,
+    /// The restore-on-launch modal (Task 8), if this window's the one
+    /// showing it — set once at startup (`restore.mode == Ask` + a loaded
+    /// snapshot), never re-armed later in the session. `None` on every
+    /// window opened after startup, and on this one too the instant the
+    /// prompt resolves.
+    pub(crate) restore_prompt: Option<RestorePrompt>,
+}
+
+/// The restore-on-launch modal's own state machine (Task 8) — mirrors
+/// `PendingClose`'s "app-level enum, `WindowState` owns an `Option` of it"
+/// shape. `Main` is the first screen shown; `Older` is reached via its
+/// third button and, on `Esc`, returns to a freshly reloaded `Main` (see
+/// `WindowState::restore_key`'s doc for why `Older` doesn't itself carry the
+/// original `snap` back).
+#[derive(Clone, Debug)]
+pub(crate) enum RestorePrompt {
+    /// `focus`: which of the 3 buttons (`Restore` / `Start fresh` /
+    /// `Older…`, in that order) is highlighted; `u8` (not `usize`) because
+    /// it only ever cycles through 3 fixed values via `%`.
+    Main {
+        snap: session_state::SessionSnapshot,
+        focus: u8,
+    },
+    /// `list`: up to 10 archives, newest first (`session_state::
+    /// list_archives`'s own cap). `sel`: the highlighted row.
+    Older {
+        list: Vec<session_state::ArchiveEntry>,
+        sel: usize,
+    },
+}
+
+/// What the restore modal wants done, once a choice is made — returned by
+/// [`WindowState::restore_key`] for `main.rs`'s keyboard handler to actually
+/// perform (spawning windows and touching the filesystem both need
+/// `event_loop`/paths this method doesn't have, same reasoning as
+/// `PendingClose::Quit` needing its caller to call `event_loop.exit()`).
+#[derive(Debug)]
+pub(crate) enum RestoreAction {
+    /// Rebuild every window from `snapshot`. `archive_current`: whether the
+    /// CURRENT live session file must also be archived first — true only
+    /// for an `Older…` pick (the live file would otherwise still be sitting
+    /// there, about to be silently overwritten by the restored session's
+    /// own first snapshot); false for the Main "Restore" button, where the
+    /// live file IS the snapshot just restored (nothing to archive away).
+    Restore {
+        snapshot: session_state::SessionSnapshot,
+        archive_current: bool,
+    },
+    /// "Start fresh": archive the current live session file and proceed
+    /// with the normal (already-created) empty default window.
+    StartFresh,
+}
+
+/// The restore modal's header line: `"Restore N windows, M tabs (from
+/// <age>)?"`, singular-aware (`1 window`/`1 tab`) — shared by `Main` (built
+/// straight from its own `snap`) and `Older` (re-derived from the reloaded
+/// live file, see `RestorePrompt`'s doc).
+fn restore_header(snap: &session_state::SessionSnapshot, now: std::time::SystemTime) -> String {
+    let windows = snap.windows.len();
+    let tabs: usize = snap.windows.iter().map(|w| w.tabs.len()).sum();
+    format!(
+        "Restore {windows} window{}, {tabs} tab{} (from {})?",
+        if windows == 1 { "" } else { "s" },
+        if tabs == 1 { "" } else { "s" },
+        session_state::humanize_age(&snap.saved_at, now),
+    )
 }
 
 /// What a key press does while the Settings overlay is open, given the
@@ -707,6 +773,7 @@ impl WindowState {
             exclusion_applied: false,
             hidden_for_carry: false,
             named_tabs: std::collections::HashSet::new(),
+            restore_prompt: None,
         }
     }
 
@@ -941,6 +1008,19 @@ impl WindowState {
                 }
                 return None;
             }
+        }
+        // Mirror the keyboard: the restore-on-launch modal captures input
+        // (Left/Right/Tab/Up/Down navigate, Enter activates, Esc backs out).
+        if self.restore_prompt.is_some() {
+            if let ControlMsg::Key(name) = &msg {
+                if let Some(k) = named_key(name) {
+                    if let Some(action) = self.restore_key(&k) {
+                        return Some(ControlClose::Restore(action));
+                    }
+                    self.renderer.window().request_redraw();
+                }
+            }
+            return None;
         }
         // Mirror the keyboard: the close-confirm modal captures input (arrows/Tab
         // move focus, Enter activates, Esc cancels).
@@ -1529,8 +1609,6 @@ impl WindowState {
         axis: Axis,
         ratio: f64,
     ) {
-        let new_pane = PaneId(shared.next_pane);
-        let new_session = SessionId::new(format!("s{}", shared.next_session));
         // Cwd-inheriting split (design §8.1): the new pane starts where the
         // split's parent pane last reported itself (OSC 1337 `CurrentDir`).
         let inherited_cwd = self
@@ -1539,6 +1617,27 @@ impl WindowState {
             .session_of(target)
             .and_then(|sid| shared.cwd_by_session.get(sid))
             .cloned();
+        self.split_pane_with_cwd(shared, target, axis, ratio, inherited_cwd);
+    }
+
+    /// Same as [`Self::split_pane`], but with an EXPLICIT cwd for the new
+    /// pane instead of inheriting `target`'s live-reported OSC 1337 dir —
+    /// used by the session-restore rebuild path (`main.rs`'s
+    /// `spawn_restored`), where `target`'s shell was JUST spawned and has
+    /// had no chance to report a cwd yet (`shared.cwd_by_session` has
+    /// nothing to inherit there); the caller resolves the real cwd (or a
+    /// `$HOME` fallback) from the saved snapshot instead and passes it here
+    /// directly.
+    pub(crate) fn split_pane_with_cwd(
+        &mut self,
+        shared: &mut Shared,
+        target: PaneId,
+        axis: Axis,
+        ratio: f64,
+        cwd: Option<String>,
+    ) {
+        let new_pane = PaneId(shared.next_pane);
+        let new_session = SessionId::new(format!("s{}", shared.next_session));
         let vp = self.viewport();
         let min_px = self.min_px(axis);
         // Spawn only if the split is actually accepted (min-size may refuse it),
@@ -1565,7 +1664,7 @@ impl WindowState {
             shared,
             new_session,
             GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
-            inherited_cwd,
+            cwd,
         ) {
             // Spawn failed after the tree accepted the split: roll the pane back
             // out so we don't render a dead pane.
@@ -1691,21 +1790,34 @@ impl WindowState {
     }
 
     pub(crate) fn new_tab(&mut self, shared: &mut Shared) {
+        // Design §8.1 scopes cwd inheritance to splits, not new tabs — a new
+        // tab starts at the shell's own default, same as today.
+        self.new_tab_with_cwd(shared, None);
+    }
+
+    /// Same as [`Self::new_tab`], but the fresh tab's seed pane spawns in
+    /// `cwd` instead of the shell's own default — used by the
+    /// session-restore rebuild path (`main.rs`'s `spawn_restored`) to seed
+    /// each restored tab in its saved directory. Returns whether the tab
+    /// was actually created (`false` only if the shell failed to spawn, in
+    /// which case nothing was added — mirrors `new_tab`'s existing
+    /// early-return-on-spawn-failure, just surfaced to the caller instead of
+    /// silently swallowed, since the rebuild path needs to know whether to
+    /// keep going with this tab's titling/splits or skip it).
+    pub(crate) fn new_tab_with_cwd(&mut self, shared: &mut Shared, cwd: Option<String>) -> bool {
         let id = TabId(shared.next_tab);
         shared.next_tab += 1;
         let pane = PaneId(shared.next_pane);
         shared.next_pane += 1;
         let session = SessionId::new(format!("s{}", shared.next_session));
         shared.next_session += 1;
-        // Design §8.1 scopes cwd inheritance to splits, not new tabs — a new
-        // tab starts at the shell's own default, same as today.
         if !self.spawn_session(
             shared,
             session.clone(),
             GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
-            None,
+            cwd,
         ) {
-            return;
+            return false;
         }
         let vp = self.viewport();
         let effects = apply(
@@ -1716,6 +1828,7 @@ impl WindowState {
         self.apply_effects(shared, effects);
         self.sync_layout(shared);
         shared.snapshot_dirty = true;
+        true
     }
 
     /// Keyboard resize of the focused pane: `dir` (±1) grows/shrinks it by a few
@@ -4038,6 +4151,164 @@ impl WindowState {
         } else {
             false
         }
+    }
+
+    /// Show the restore-on-launch modal (startup only — see `main.rs`'s
+    /// `resumed`). Exclusive with the close-confirm modal in practice, but
+    /// there's nothing to hide here: at the point this is called, nothing
+    /// else has had a chance to show yet.
+    pub(crate) fn show_restore_prompt(&mut self, snap: session_state::SessionSnapshot) {
+        self.restore_prompt = Some(RestorePrompt::Main { snap, focus: 0 });
+        self.update_restore_view();
+    }
+
+    /// (Re)build the renderer's `RestoreView` from `self.restore_prompt`.
+    /// No-op-safe to call with `restore_prompt == None` (clears the view).
+    pub(crate) fn update_restore_view(&mut self) {
+        let now = std::time::SystemTime::now();
+        let view = match &self.restore_prompt {
+            None => None,
+            Some(RestorePrompt::Main { snap, focus }) => Some(ember_render::RestoreView::Main {
+                header: restore_header(snap, now),
+                focused: *focus as usize,
+            }),
+            Some(RestorePrompt::Older { list, sel }) => {
+                // The header stays the same restore question throughout —
+                // re-derive it from the CURRENT live file rather than
+                // threading the original `snap` through `Older` (see
+                // `RestorePrompt`'s doc for why `Older` doesn't carry one).
+                let header = session_state::state_path()
+                    .map(|p| session_state::load(&p))
+                    .and_then(|o| match o {
+                        session_state::LoadOutcome::Loaded(s) => Some(restore_header(&s, now)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "Restore session?".to_string());
+                Some(ember_render::RestoreView::Older {
+                    header,
+                    rows: list
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "{} · {} window{}, {} tab{}",
+                                session_state::humanize_stamp(&e.stamp, now),
+                                e.windows,
+                                if e.windows == 1 { "" } else { "s" },
+                                e.tabs,
+                                if e.tabs == 1 { "" } else { "s" },
+                            )
+                        })
+                        .collect(),
+                    selected: *sel,
+                })
+            }
+        };
+        self.renderer.set_restore(view);
+    }
+
+    /// Handle one key while the restore modal is open. Pure navigation is
+    /// resolved entirely here (including reading `list_archives`/re-loading
+    /// the live file off disk, both cheap local I/O); an actual choice
+    /// (Restore / Start fresh) is returned as a [`RestoreAction`] for the
+    /// caller (`main.rs`'s keyboard handler) to carry out — spawning
+    /// windows and archiving files both need state (`Shared`, `event_loop`)
+    /// this method doesn't have.
+    ///
+    /// `Older`'s `Esc` returns to `Main` by RE-READING the live session file
+    /// rather than restoring a stashed copy: `RestorePrompt::Older` (per its
+    /// own doc) doesn't carry the original `snap`, and the live file is
+    /// guaranteed untouched while any window's `restore_prompt.is_some()`
+    /// (`main.rs`'s `session_dirty` guard) — so the reload always reproduces
+    /// exactly what `Main` showed before.
+    pub(crate) fn restore_key(&mut self, key: &Key) -> Option<RestoreAction> {
+        let prompt = self.restore_prompt.as_mut()?;
+        match prompt {
+            RestorePrompt::Main { snap, focus } => match key {
+                Key::Named(NamedKey::Escape) => {
+                    self.restore_prompt = None;
+                    self.update_restore_view();
+                    Some(RestoreAction::StartFresh)
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    *focus = (*focus + 2) % 3; // -1 mod 3
+                    self.update_restore_view();
+                    None
+                }
+                Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Tab) => {
+                    *focus = (*focus + 1) % 3;
+                    self.update_restore_view();
+                    None
+                }
+                Key::Named(NamedKey::Enter) => match *focus {
+                    0 => {
+                        let snapshot = snap.clone();
+                        self.restore_prompt = None;
+                        self.update_restore_view();
+                        Some(RestoreAction::Restore {
+                            snapshot,
+                            archive_current: false,
+                        })
+                    }
+                    1 => {
+                        self.restore_prompt = None;
+                        self.update_restore_view();
+                        Some(RestoreAction::StartFresh)
+                    }
+                    _ => {
+                        let list = session_state::state_path()
+                            .and_then(|p| p.parent().map(session_state::list_archives))
+                            .unwrap_or_default();
+                        self.restore_prompt = Some(RestorePrompt::Older { list, sel: 0 });
+                        self.update_restore_view();
+                        None
+                    }
+                },
+                _ => None,
+            },
+            RestorePrompt::Older { list, sel } => match key {
+                Key::Named(NamedKey::Escape) => {
+                    self.reload_restore_main(2);
+                    None
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    *sel = sel.saturating_sub(1);
+                    self.update_restore_view();
+                    None
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    if *sel + 1 < list.len() {
+                        *sel += 1;
+                    }
+                    self.update_restore_view();
+                    None
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let entry = list.get(*sel).cloned()?;
+                    let snapshot = session_state::load_archive(&entry.path)?;
+                    self.restore_prompt = None;
+                    self.update_restore_view();
+                    Some(RestoreAction::Restore {
+                        snapshot,
+                        archive_current: true,
+                    })
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// `Older…`'s `Esc`: reload the live session file and return to `Main`,
+    /// focused on the button (`focus`) that led here — see `restore_key`'s
+    /// doc for why this reloads rather than stashing/restoring `snap`.
+    fn reload_restore_main(&mut self, focus: u8) {
+        let snap = session_state::state_path()
+            .map(|p| session_state::load(&p))
+            .and_then(|o| match o {
+                session_state::LoadOutcome::Loaded(s) => Some(s),
+                _ => None,
+            });
+        self.restore_prompt = snap.map(|snap| RestorePrompt::Main { snap, focus });
+        self.update_restore_view();
     }
 
     /// Dismiss whichever modal overlay is open; returns whether one was showing.

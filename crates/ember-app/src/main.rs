@@ -28,10 +28,10 @@ use std::time::{Duration, Instant};
 use control::{ControlMsg, MoveTabTarget, PromotePaneTarget};
 
 use ember_core::{
-    Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims, LayoutNode,
-    MoveEffect, MoveError, OscEvent, PaneId, Rect, RowKind, ScrollAmount, SessionId,
-    SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, WispStyle,
-    WispStyleSelection, resolve_rows,
+    Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims,
+    LayoutCommand, LayoutNode, MoveEffect, MoveError, OscEvent, PaneId, Rect, RowKind,
+    ScrollAmount, SessionId, SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabId,
+    WispStyle, WispStyleSelection, apply, resolve_rows,
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
@@ -416,6 +416,27 @@ pub(crate) struct Shared {
     /// can't reach it); dropped — which is what actually closes the OS
     /// window — the tick its morph self-terminates.
     pub(crate) dying_windows: Vec<WindowState>,
+    /// Restored panes awaiting their saved command being pre-typed (not
+    /// executed) into the shell once it's ready (Task 8 arms this; Task 9
+    /// consumes/clears it). A pane whose saved cwd no longer existed on
+    /// disk gets NO entry here (see `resolve_restore_cwd`'s doc) — never
+    /// pre-type a command into a directory it wasn't actually saved from.
+    pub(crate) pretype: HashMap<SessionId, Pretype>,
+}
+
+/// One restored pane's pending pre-type (Task 8 arms it; Task 9 consumes
+/// it). `armed_at` lets a future consumer expire a stale entry (e.g. if the
+/// shell never becomes ready) rather than pre-typing into an arbitrary
+/// later prompt.
+///
+/// `#[allow(dead_code)]`: both fields are written at restore time but not
+/// yet READ anywhere — Task 9 is the consumer. Never add a debug print of
+/// `cmd` to silence this instead; the "no logging of command text" rule
+/// applies here same as everywhere else a shell command string is held.
+#[allow(dead_code)]
+pub(crate) struct Pretype {
+    pub(crate) cmd: String,
+    pub(crate) armed_at: Instant,
 }
 
 /// State for an in-flight paced `ctl drag`. Never advanced by a blocking
@@ -792,6 +813,11 @@ pub(crate) enum ControlClose {
     /// Close just this window, unless it turns out to be the last one (then
     /// quit) — see [`finish_close`].
     CloseWindow,
+    /// The restore modal resolved to an action (Task 8) — carries it back up
+    /// for the caller to actually perform (spawn windows, archive files):
+    /// same reasoning as `ExitApp`/`CloseWindow` needing `event_loop`/
+    /// `self.windows`, neither reachable from `WindowState::handle_control`.
+    Restore(window_state::RestoreAction),
 }
 
 /// Inset a rect by `p` on every side (clamped to stay positive).
@@ -828,37 +854,29 @@ impl ApplicationHandler<EmberEvent> for App {
         if self.shared.is_some() {
             return;
         }
-        let w = DEFAULT_COLS as f32 * CELL_WIDTH + 2.0 * PAD;
-        let h = DEFAULT_ROWS as f32 * CELL_HEIGHT + 2.0 * PAD;
-        let attrs = ember_platform::window_attributes("Ember", w, h);
-        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        ember_platform::set_app_icon(&window, ICON_PNG);
-        window.set_ime_allowed(true); // CJK/dead-key composition (winit Ime events)
-        let window_id = window.id();
-
-        let size = window.inner_size();
-        let px = (size.width.max(1), size.height.max(1));
         let config = config::load();
         let restore_on = config.restore.mode != ember_core::RestoreMode::Off;
-        let renderer = Renderer::new(Arc::clone(&window), &config.font);
-
-        // The seed tab: one pane backed by one shell.
-        let pane = PaneId(1);
-        let session = SessionId::new("s1");
-        let tree = ember_core::WindowTree {
-            tabs: vec![Tab {
-                id: TabId(1),
-                title: String::new(),
-                root: LayoutNode::pane(pane, session.clone()),
-                focus: pane,
-            }],
-            active: 0,
+        // Session-restore (Task 8): what happens to the very first window
+        // depends on `restore.mode` + whether a snapshot actually loaded.
+        // `Off`, a missing file (`LoadOutcome::None`), and a
+        // quarantined-corrupt file (`LoadOutcome::Corrupt` — `load` already
+        // renamed it aside) all fall through to today's unconditional
+        // default-window behavior below, since `restore_outcome` stays
+        // `None` for all three.
+        let restore_outcome = if restore_on {
+            session_state::state_path().map(|p| session_state::load(&p))
+        } else {
+            None
         };
 
         let mut shared = Shared {
             sessions: HashMap::new(),
             session_window: HashMap::new(),
-            window_order: vec![window_id],
+            // Seeded empty (not with a default window's id, as before): every
+            // window-creation path — the default window below AND
+            // `spawn_restored`'s `open_window` calls — now pushes its own id,
+            // so this stays correct whichever path actually runs.
+            window_order: Vec::new(),
             next_pane: 2,
             next_session: 2,
             next_tab: 2,
@@ -886,31 +904,96 @@ impl ApplicationHandler<EmberEvent> for App {
             wisp: WispSlot::Uninit,
             paced_drag: None,
             dying_windows: Vec::new(),
+            pretype: HashMap::new(),
         };
-        let mut win = WindowState::new(renderer, tree);
-        win.px = px;
-        if !win.spawn_session(
-            &mut shared,
-            session,
-            GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
-            None,
-        ) {
-            // No shell at startup means nothing to show; exit with the message
-            // spawn_session already printed instead of presenting a dead window.
-            std::process::exit(1);
+
+        // Always: skip the default window entirely — the snapshot's windows
+        // ARE the session, there's nothing to ask about.
+        let mut restored_any = false;
+        if shared.config.restore.mode == ember_core::RestoreMode::Always {
+            if let Some(session_state::LoadOutcome::Loaded(snap)) = restore_outcome.clone() {
+                spawn_restored(
+                    &mut self.windows,
+                    &mut shared,
+                    &mut self.focused_window,
+                    event_loop,
+                    snap,
+                );
+                restored_any = !self.windows.is_empty();
+                // Best-effort initial focus order (real `Focused` events
+                // reorder this properly once the OS actually focuses one) —
+                // otherwise-empty `focus_history` would leave every
+                // window-management helper that reads it with nothing.
+                for id in self.windows.keys() {
+                    self.focus_history.push(*id);
+                }
+            }
         }
-        win.sync_layout(&shared);
-        win.apply_appearance(&shared);
+
+        if !restored_any {
+            let w = DEFAULT_COLS as f32 * CELL_WIDTH + 2.0 * PAD;
+            let h = DEFAULT_ROWS as f32 * CELL_HEIGHT + 2.0 * PAD;
+            let attrs = ember_platform::window_attributes("Ember", w, h);
+            let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+            ember_platform::set_app_icon(&window, ICON_PNG);
+            window.set_ime_allowed(true); // CJK/dead-key composition (winit Ime events)
+            let window_id = window.id();
+
+            let size = window.inner_size();
+            let px = (size.width.max(1), size.height.max(1));
+            let renderer = Renderer::new(Arc::clone(&window), &shared.config.font);
+
+            // The seed tab: one pane backed by one shell.
+            let pane = PaneId(1);
+            let session = SessionId::new("s1");
+            let tree = ember_core::WindowTree {
+                tabs: vec![Tab {
+                    id: TabId(1),
+                    title: String::new(),
+                    root: LayoutNode::pane(pane, session.clone()),
+                    focus: pane,
+                }],
+                active: 0,
+            };
+
+            let mut win = WindowState::new(renderer, tree);
+            win.px = px;
+            if !win.spawn_session(
+                &mut shared,
+                session,
+                GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
+                None,
+            ) {
+                // No shell at startup means nothing to show; exit with the message
+                // spawn_session already printed instead of presenting a dead window.
+                std::process::exit(1);
+            }
+            win.sync_layout(&shared);
+            win.apply_appearance(&shared);
+            shared.window_order.push(window_id);
+            // Ask + a loaded snapshot: show the restore prompt over this
+            // otherwise-normal default window — the snapshot rides in the
+            // prompt state (Task 8). Declining ("Start fresh") or confirming
+            // ("Restore") both resolve through `WindowState::restore_key` /
+            // `resolve_restore_action` from here on, same as any other
+            // in-session modal choice.
+            if shared.config.restore.mode == ember_core::RestoreMode::Ask {
+                if let Some(session_state::LoadOutcome::Loaded(snap)) = restore_outcome {
+                    win.show_restore_prompt(snap);
+                }
+            }
+            // Paint once now: with ControlFlow::Wait the loop won't run again
+            // until an event or a frame-lane wake, and the very first frame
+            // may have been published before the waker was registered.
+            win.renderer.window().request_redraw();
+            self.windows.insert(window_id, win);
+            self.focused_window = Some(window_id);
+            self.focus_history.push(window_id);
+        }
+
         if shared.config.developer_mode && shared.control_server.is_none() {
             shared.set_developer_mode(true);
         }
-        // Paint once now: with ControlFlow::Wait the loop won't run again until
-        // an event or a frame-lane wake, and the very first frame may have been
-        // published before the waker was registered.
-        win.renderer.window().request_redraw();
-        self.windows.insert(window_id, win);
-        self.focused_window = Some(window_id);
-        self.focus_history.push(window_id);
         self.shared = Some(shared);
     }
 
@@ -1045,9 +1128,14 @@ impl ApplicationHandler<EmberEvent> for App {
             } => match button {
                 MouseButton::Left => {
                     let (x, y) = win.cursor;
-                    // A blocking confirm modal captures the click: a button
-                    // resolves it, elsewhere is a no-op (stays modal).
-                    if win.pending_close.is_some() {
+                    // The restore modal is keyboard-only (Task 8: no mouse
+                    // hit-testing for its buttons/rows) — swallow a click
+                    // rather than let it fall through to the panes/tabs
+                    // underneath, same "stays modal" intent as the
+                    // confirm-modal click guard just below.
+                    if win.restore_prompt.is_some() {
+                        // no-op: click doesn't resolve or dismiss the modal
+                    } else if win.pending_close.is_some() {
                         if let Some(idx) = win.renderer.confirm_button_at(x as f32, y as f32) {
                             let kind = win.pending_close;
                             if win.resolve_confirm(shared, idx == 1) {
@@ -1235,6 +1323,25 @@ impl ApplicationHandler<EmberEvent> for App {
                 // to the Super branch below when Cmd is held.
                 if win.editing_tab.is_some() && !win.modifiers.super_key() {
                     win.rename_key(shared, &key.logical_key);
+                    return;
+                }
+                // The restore-on-launch modal (Task 8): Left/Right/Tab/Up/Down
+                // navigate, Enter activates, Esc backs out. Auto-repeat ignored
+                // so a held key can't fire an action twice.
+                if win.restore_prompt.is_some() {
+                    if !key.repeat {
+                        if let Some(action) = win.restore_key(&key.logical_key) {
+                            resolve_restore_action(
+                                &mut self.windows,
+                                shared,
+                                &mut self.focused_window,
+                                event_loop,
+                                action,
+                            );
+                        } else {
+                            win.renderer.window().request_redraw();
+                        }
+                    }
                     return;
                 }
                 // A running-process close confirmation (modal): Left/Right/Tab
@@ -1899,6 +2006,9 @@ impl ApplicationHandler<EmberEvent> for App {
                 Some(ControlClose::CloseWindow) => {
                     queue_close_this(&mut deferred_windows);
                 }
+                Some(ControlClose::Restore(action)) => {
+                    deferred_windows.push(DeferredWindowAction::Restore(action));
+                }
                 None => {}
             }
         }
@@ -2329,6 +2439,15 @@ impl ApplicationHandler<EmberEvent> for App {
                         (Err(e), None) => eprintln!("[ember] move failed: {e}"),
                     }
                 }
+                DeferredWindowAction::Restore(action) => {
+                    resolve_restore_action(
+                        &mut self.windows,
+                        shared,
+                        &mut self.focused_window,
+                        event_loop,
+                        action,
+                    );
+                }
                 DeferredWindowAction::State(reply) => {
                     let json = build_state_json(shared, &self.windows, self.focused_window);
                     let _ = reply.send(json);
@@ -2403,6 +2522,12 @@ impl ApplicationHandler<EmberEvent> for App {
 enum DeferredWindowAction {
     OpenNew(Option<String>),
     CloseThis,
+    /// The restore modal (Task 8) resolved to an action from a `ctl`
+    /// command — deferred for the same reason every other window-structural
+    /// discovery site here is: `spawn_restored` needs `&mut self.windows`/
+    /// `&ActiveEventLoop`, neither available while `win` still borrows
+    /// `self.windows` for the rest of the ctl-commands loop.
+    Restore(window_state::RestoreAction),
     /// Close a specific, possibly NON-focused window whose tree just emptied
     /// (a background window's last shell exited via the exited-shell drain).
     /// `CloseThis` always targets `focused_id` captured at the top of
@@ -2624,6 +2749,306 @@ fn open_new_window(
     *focused_window = Some(window_id);
     win.renderer.window().request_redraw();
     window_id
+}
+
+// --- Session restore: skeleton rebuild (Task 8) ----------------------------
+
+/// Carry out a resolved [`window_state::RestoreAction`]: archive the current
+/// live session file when required, then either rebuild every window from
+/// the chosen snapshot ("Restore" / an `Older…` pick) or just leave the
+/// already-created default window in place ("Start fresh").
+fn resolve_restore_action(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    focused_window: &mut Option<WindowId>,
+    event_loop: &ActiveEventLoop,
+    action: window_state::RestoreAction,
+) {
+    match action {
+        window_state::RestoreAction::StartFresh => {
+            if let Some(path) = session_state::state_path() {
+                if let Err(e) = session_state::archive(&path) {
+                    eprintln!("[ember] archive on start-fresh failed: {e}");
+                }
+            }
+        }
+        window_state::RestoreAction::Restore {
+            snapshot,
+            archive_current,
+        } => {
+            if archive_current {
+                // An `Older…` pick: the live file is still sitting there and
+                // would otherwise simply be overwritten by the restored
+                // session's own first snapshot — archive it first so it
+                // isn't silently lost.
+                if let Some(path) = session_state::state_path() {
+                    if let Err(e) = session_state::archive(&path) {
+                        eprintln!("[ember] archive before restoring an older session failed: {e}");
+                    }
+                }
+            }
+            spawn_restored(windows, shared, focused_window, event_loop, snapshot);
+        }
+    }
+}
+
+/// Resolve a saved pane's spawn cwd + an optional pre-type command. A saved
+/// cwd that still exists on disk is used as-is, with its `last_cmd` (if any)
+/// eligible for pre-type; a missing/absent cwd falls back to `$HOME` with NO
+/// pre-type — the saved command's working-directory context is gone, so
+/// blindly retyping it there would be actively misleading, not helpful.
+fn resolve_restore_cwd(pane: &session_state::PaneSnap) -> (Option<String>, Option<String>) {
+    if let Some(dir) = pane.cwd.as_deref() {
+        if std::path::Path::new(dir).is_dir() {
+            return (Some(dir.to_string()), pane.last_cmd.clone());
+        }
+    }
+    let home = std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned());
+    (home, None)
+}
+
+/// Clamp a saved window position onto a visible monitor: if `pos`'s origin
+/// already lies within some monitor's rect, it's left untouched; otherwise
+/// it's repositioned onto the NEAREST visible monitor (by center-to-center
+/// distance), clamped so the window's own `size` stays fully on that
+/// monitor wherever the monitor is large enough for it. `monitors`:
+/// `(x, y, w, h)` physical-px rects, extracted by the caller from
+/// `event_loop.available_monitors()` — pure geometry, no `ActiveEventLoop`
+/// needed here, so it's unit-testable on its own. An empty `monitors` list
+/// (can't happen on a real event loop, but never assume) leaves `pos`
+/// unchanged rather than panicking.
+fn clamp_to_visible_monitor(
+    pos: (i32, i32),
+    size: (u32, u32),
+    monitors: &[(i32, i32, u32, u32)],
+) -> (i32, i32) {
+    if monitors.is_empty() {
+        return pos;
+    }
+    let on_screen = monitors.iter().any(|&(mx, my, mw, mh)| {
+        pos.0 >= mx && pos.0 < mx + mw as i32 && pos.1 >= my && pos.1 < my + mh as i32
+    });
+    if on_screen {
+        return pos;
+    }
+    let (px, py) = (pos.0 as f64, pos.1 as f64);
+    let dist2 = |m: &(i32, i32, u32, u32)| {
+        let cx = m.0 as f64 + m.2 as f64 / 2.0;
+        let cy = m.1 as f64 + m.3 as f64 / 2.0;
+        (px - cx).powi(2) + (py - cy).powi(2)
+    };
+    let &(mx, my, mw, mh) = monitors
+        .iter()
+        .min_by(|a, b| {
+            dist2(a)
+                .partial_cmp(&dist2(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("monitors is non-empty (checked above)");
+    let x = pos
+        .0
+        .clamp(mx, (mx + mw as i32).saturating_sub(size.0 as i32).max(mx));
+    let y = pos
+        .1
+        .clamp(my, (my + mh as i32).saturating_sub(size.1 as i32).max(my));
+    (x, y)
+}
+
+/// Rebuild every window from a loaded [`session_state::SessionSnapshot`]
+/// (Task 8): each window via [`spawn_restored_window`], positioned onto a
+/// visible monitor via [`clamp_to_visible_monitor`]. Sets `*focused_window`
+/// to the first window actually created (if any) and requests its first
+/// paint — same "paint once now" reasoning as `resumed`'s own default
+/// window, since the loop won't run again until an event or frame-lane wake.
+fn spawn_restored(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    focused_window: &mut Option<WindowId>,
+    event_loop: &ActiveEventLoop,
+    snapshot: session_state::SessionSnapshot,
+) {
+    let monitors: Vec<(i32, i32, u32, u32)> = event_loop
+        .available_monitors()
+        .map(|m| {
+            let p = m.position();
+            let s = m.size();
+            (p.x, p.y, s.width, s.height)
+        })
+        .collect();
+    let mut first_window: Option<WindowId> = None;
+    for win_snap in &snapshot.windows {
+        let position = win_snap.pos.map(|(x, y)| {
+            let (cx, cy) = clamp_to_visible_monitor((x, y), win_snap.size, &monitors);
+            winit::dpi::PhysicalPosition::new(cx, cy)
+        });
+        if let Some(window_id) = spawn_restored_window(
+            windows,
+            shared,
+            focused_window,
+            event_loop,
+            win_snap,
+            position,
+        ) {
+            first_window.get_or_insert(window_id);
+        }
+    }
+    if let Some(id) = first_window {
+        *focused_window = Some(id);
+        if let Some(win) = windows.get_mut(&id) {
+            win.renderer.window().request_redraw();
+        }
+    }
+}
+
+/// Build ONE restored window from its `WindowSnap`: created via
+/// [`open_window`] (the same low-level path every other window-creation
+/// site uses — `set_ime_allowed`, app-icon, replay-seeding all included),
+/// resized to its saved size, its first tab spawned directly, remaining
+/// tabs via `new_tab_with_cwd`, each tab's split tree replayed via
+/// `session_state::split_ops` through `split_pane_with_cwd` (WITH an
+/// explicit cwd every time — the normal `split_pane` cwd-inheritance has
+/// nothing to inherit from a shell that was only just spawned), titles +
+/// `named_tabs` for `named_by_user` tabs, and the saved active tab. Every
+/// pane with a saved `last_cmd` and a cwd that still exists gets a
+/// `Shared::pretype` entry (Task 9 consumes it); a cwd-fallback pane gets
+/// none (see `resolve_restore_cwd`'s doc).
+///
+/// Returns the new window's id, or `None` if even its very first pane's
+/// shell failed to spawn — the window is torn back down rather than left
+/// showing a dead pane, mirroring `open_new_window`'s own failure handling.
+/// A LATER tab's shell failing is not fatal to the window: that one tab is
+/// simply skipped (`continue`) and the rest of the window still builds.
+fn spawn_restored_window(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    focused_window: &mut Option<WindowId>,
+    event_loop: &ActiveEventLoop,
+    win_snap: &session_state::WindowSnap,
+    position: Option<winit::dpi::PhysicalPosition<i32>>,
+) -> Option<WindowId> {
+    let pane = PaneId(shared.next_pane);
+    shared.next_pane += 1;
+    let session = SessionId::new(format!("s{}", shared.next_session));
+    shared.next_session += 1;
+    let tab_id = TabId(shared.next_tab);
+    shared.next_tab += 1;
+    let tree = ember_core::WindowTree {
+        tabs: vec![Tab {
+            id: tab_id,
+            title: String::new(),
+            root: LayoutNode::pane(pane, session.clone()),
+            focus: pane,
+        }],
+        active: 0,
+    };
+    let window_id = open_window(windows, shared, event_loop, tree, position);
+    let win = windows.get_mut(&window_id)?;
+    if win_snap.size.0 > 0 && win_snap.size.1 > 0 {
+        let _ = win
+            .renderer
+            .window()
+            .request_inner_size(winit::dpi::PhysicalSize::new(
+                win_snap.size.0,
+                win_snap.size.1,
+            ));
+    }
+
+    for (i, tab_snap) in win_snap.tabs.iter().enumerate() {
+        let (first_pane, ops) = session_state::split_ops(&tab_snap.splits);
+        let (cwd, pretype_cmd) = resolve_restore_cwd(&first_pane);
+        let ok = if i == 0 {
+            win.spawn_session(
+                shared,
+                session.clone(),
+                GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
+                cwd,
+            )
+        } else {
+            win.new_tab_with_cwd(shared, cwd)
+        };
+        if !ok {
+            if i == 0 {
+                // The window's very first pane failed to spawn: nothing to
+                // show for this window at all.
+                close_window(windows, shared, focused_window, window_id);
+                return None;
+            }
+            continue; // this tab's shell failed; skip it, keep the rest of the window
+        }
+        let tab_idx = win.tree.active; // `NewTab` sets this; tab 0 keeps its initial 0.
+        let seed_pane = win.tree.tabs[tab_idx].focus;
+        if let Some(cmd) = pretype_cmd {
+            if let Some(sid) = win.tree.tabs[tab_idx].root.session_of(seed_pane) {
+                shared.pretype.insert(
+                    sid.clone(),
+                    Pretype {
+                        cmd,
+                        armed_at: Instant::now(),
+                    },
+                );
+            }
+        }
+        let tid = win.tree.tabs[tab_idx].id;
+        if !tab_snap.name.is_empty() {
+            let vp = win.viewport();
+            apply(
+                &mut win.tree,
+                LayoutCommand::RenameTab {
+                    tab: tid,
+                    title: tab_snap.name.clone(),
+                },
+                vp,
+            );
+        }
+        if tab_snap.named_by_user {
+            win.named_tabs.insert(tid);
+        }
+        // Splits: replay `ops` (pre-order, parent-index-addressed — see
+        // `split_ops`'s doc) through `split_pane_with_cwd`, tracking each
+        // new pane's id by creation order so later ops can address it.
+        let mut pane_by_index = vec![seed_pane];
+        for (parent_idx, dir, ratio, pane_snap) in &ops {
+            let Some(&parent_pane) = pane_by_index.get(*parent_idx) else {
+                continue; // a prior op in this tab was refused; nothing to attach to
+            };
+            let axis = if *dir == 'h' {
+                Axis::Horizontal
+            } else {
+                Axis::Vertical
+            };
+            let (op_cwd, op_pretype) = resolve_restore_cwd(pane_snap);
+            let before_focus = win.tree.tabs[tab_idx].focus;
+            win.split_pane_with_cwd(shared, parent_pane, axis, *ratio as f64, op_cwd);
+            let after_focus = win.tree.tabs[tab_idx].focus;
+            if after_focus == before_focus {
+                // Refused (the window's default size can't fit the min
+                // pane extent along this axis) — degrade: later ops that
+                // wanted to attach here instead attach to the still-intact
+                // parent, so the rest of the tree still builds as best it can.
+                pane_by_index.push(parent_pane);
+                continue;
+            }
+            pane_by_index.push(after_focus);
+            if let Some(cmd) = op_pretype {
+                if let Some(sid) = win.tree.tabs[tab_idx].root.session_of(after_focus) {
+                    shared.pretype.insert(
+                        sid.clone(),
+                        Pretype {
+                            cmd,
+                            armed_at: Instant::now(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    if !win.tree.tabs.is_empty() {
+        win.tree.active = win_snap.focused_tab.min(win.tree.tabs.len() - 1);
+    }
+    win.sync_layout(shared);
+    win.apply_appearance(shared);
+    Some(window_id)
 }
 
 /// Clear `shared.drag` if window `id` was its source, so a source window
@@ -3127,6 +3552,16 @@ fn session_dirty(shared: &mut Shared, windows: &HashMap<WindowId, WindowState>) 
     let Some(handle) = shared.snapshots.as_ref() else {
         return;
     };
+    // While the restore-on-launch modal is up (`restore.mode == Ask`), the
+    // on-disk session file must stay untouched: it's the very thing the
+    // modal is offering to restore, and `Older…`'s `Esc` reloads it
+    // verbatim to rebuild the `Main` screen (`WindowState::restore_key`'s
+    // doc) — a background PTY delta (a resize, a cwd report) marking
+    // `snapshot_dirty` while the prompt is still up must not silently
+    // overwrite it out from under the user before they've answered.
+    if windows.values().any(|w| w.restore_prompt.is_some()) {
+        return;
+    }
     // `named_by_user` has to be an owned `Vec<bool>` per window (nothing to
     // borrow it from — `WindowState::named_tabs` is a `HashSet<TabId>`, not
     // a slice), so this builds the owned flags first, then a second pass of
@@ -4526,14 +4961,102 @@ fn encode_key(
 mod tests {
     use super::{
         BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, TabId, bell_flash_intensity,
-        bracket_paste, encode_key, match_tab_title, match_tab_title_across, next_prev_index,
-        queue_close_this, queue_close_window, resolve_index, shell_escape_path,
-        tab_display_title, url_is_openable, window_owning_tab,
+        bracket_paste, clamp_to_visible_monitor, encode_key, match_tab_title,
+        match_tab_title_across, next_prev_index, queue_close_this, queue_close_window,
+        resolve_index, resolve_restore_cwd, shell_escape_path, tab_display_title, url_is_openable,
+        window_owning_tab,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
     fn enc(key: Key, mods: ModifiersState) -> Option<Vec<u8>> {
         encode_key(&key, mods, false, false)
+    }
+
+    // --- clamp_to_visible_monitor (Task 8: restore-position clamp) -----
+
+    #[test]
+    fn clamp_leaves_a_position_already_on_a_monitor_untouched() {
+        let monitors = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
+        assert_eq!(
+            clamp_to_visible_monitor((100, 100), (800, 600), &monitors),
+            (100, 100)
+        );
+        // On the second monitor too.
+        assert_eq!(
+            clamp_to_visible_monitor((2000, 50), (800, 600), &monitors),
+            (2000, 50)
+        );
+    }
+
+    #[test]
+    fn clamp_moves_an_offscreen_position_onto_the_nearest_monitor() {
+        let monitors = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
+        // Saved way off to the right of a monitor setup that's since shrunk
+        // to just the first display: lands on the nearest (only) monitor,
+        // clamped so the window stays fully on it.
+        let (x, y) = clamp_to_visible_monitor((5000, 5000), (800, 600), &monitors[..1]);
+        assert!(x >= 0 && x + 800 <= 1920);
+        assert!(y >= 0 && y + 600 <= 1080);
+    }
+
+    #[test]
+    fn clamp_picks_the_nearer_of_two_monitors() {
+        let monitors = [(0, 0, 1920, 1080), (10_000, 0, 1920, 1080)];
+        // Far off past the SECOND monitor: nearer to it than to the first.
+        let (x, _y) = clamp_to_visible_monitor((15_000, 0), (800, 600), &monitors);
+        assert!((10_000..=11_120).contains(&x));
+    }
+
+    #[test]
+    fn clamp_with_no_monitors_leaves_position_unchanged() {
+        assert_eq!(
+            clamp_to_visible_monitor((999, 999), (800, 600), &[]),
+            (999, 999)
+        );
+    }
+
+    // --- resolve_restore_cwd (Task 8: cwd-fallback + pretype eligibility) -
+
+    #[test]
+    fn resolve_restore_cwd_uses_the_saved_dir_and_command_when_it_still_exists() {
+        let pane = crate::session_state::PaneSnap {
+            cwd: Some("/tmp".to_string()),
+            last_cmd: Some("echo hi".to_string()),
+            was_running: false,
+        };
+        let (cwd, pretype) = resolve_restore_cwd(&pane);
+        assert_eq!(cwd.as_deref(), Some("/tmp"));
+        assert_eq!(pretype.as_deref(), Some("echo hi"));
+    }
+
+    #[test]
+    fn resolve_restore_cwd_falls_back_to_home_with_no_pretype_when_the_dir_is_gone() {
+        let pane = crate::session_state::PaneSnap {
+            cwd: Some("/this/path/almost-certainly/does-not-exist-12345".to_string()),
+            last_cmd: Some("echo hi".to_string()),
+            was_running: false,
+        };
+        let (cwd, pretype) = resolve_restore_cwd(&pane);
+        assert_eq!(
+            cwd,
+            std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
+        );
+        assert_eq!(pretype, None);
+    }
+
+    #[test]
+    fn resolve_restore_cwd_falls_back_to_home_with_no_pretype_when_no_cwd_was_saved() {
+        let pane = crate::session_state::PaneSnap {
+            cwd: None,
+            last_cmd: Some("echo hi".to_string()),
+            was_running: false,
+        };
+        let (cwd, pretype) = resolve_restore_cwd(&pane);
+        assert_eq!(
+            cwd,
+            std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
+        );
+        assert_eq!(pretype, None);
     }
 
     #[test]
