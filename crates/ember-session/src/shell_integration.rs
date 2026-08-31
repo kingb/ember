@@ -52,7 +52,17 @@ _ember_precmd() {
   print -n "\e]133;A\e\\"
   print -n "\e]1337;CurrentDir=$PWD\e\\"
 }
-_ember_preexec() { print -n "\e]133;C\e\\" }
+_ember_escape_cmd() {
+  local s=$1
+  s=${s//$'\\'/\\\\}
+  s=${s//;/\\x3b}
+  s=${s//$'\n'/\\x0a}
+  print -rn -- "$s"
+}
+_ember_preexec() {
+  print -n "\e]633;E;$(_ember_escape_cmd "$1")\e\\"
+  print -n "\e]133;C\e\\"
+}
 autoload -Uz add-zsh-hook 2>/dev/null
 if whence add-zsh-hook >/dev/null 2>&1; then
   add-zsh-hook precmd _ember_precmd
@@ -122,11 +132,18 @@ _ember_precmd() {
   printf '\e]133;A\e\\'
   printf '\e]1337;CurrentDir=%s\e\\' "$PWD"
 }
+_ember_escape_cmd() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//;/\\x3b}
+  s=${s//$'\n'/\\x0a}
+  printf '%s' "$s"
+}
 case "$PROMPT_COMMAND" in
   *_ember_precmd*) ;;
   *) PROMPT_COMMAND="_ember_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}" ;;
 esac
-trap 'printf "\e]133;C\e\\"' DEBUG
+trap '[[ "$BASH_COMMAND" != "$PROMPT_COMMAND" ]] && printf "\e]633;E;%s\e\\" "$(_ember_escape_cmd "$BASH_COMMAND")"; printf "\e]133;C\e\\"' DEBUG
 "#;
 
 fn prepare_bash(dir: &Path) -> std::io::Result<Injection> {
@@ -225,6 +242,62 @@ mod tests {
     fn unsupported_shell_is_noop() {
         let inj = prepare("fish", &std::env::temp_dir());
         assert!(inj.env.is_empty() && inj.args.is_empty());
+    }
+
+    #[test]
+    fn zsh_hooks_emit_command_line() {
+        let dir = std::env::temp_dir().join(format!("ember-si-633z-{}", std::process::id()));
+        prepare("zsh", &dir);
+        let rc = std::fs::read_to_string(dir.join(".zshrc")).unwrap(); // match the actual file name used by prepare_zsh
+        assert!(rc.contains("633;E;"));
+        assert!(rc.contains("_ember_escape_cmd"));
+    }
+
+    #[test]
+    fn bash_rcfile_emits_command_line() {
+        let dir = std::env::temp_dir().join(format!("ember-si-633b-{}", std::process::id()));
+        prepare("bash", &dir);
+        let rc = std::fs::read_to_string(dir.join("ember-bash-rc")).unwrap();
+        assert!(rc.contains("633;E;"));
+        assert!(rc.contains("BASH_COMMAND"));
+    }
+
+    #[test]
+    fn zsh_smoke_test_hook_setup() {
+        if !std::path::Path::new("/bin/zsh").exists() {
+            return; // no zsh on this runner — skip
+        }
+        let dir = std::env::temp_dir().join(format!("ember-si-smoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inj = prepare("zsh", &dir);
+
+        // Verify that the hooks are correctly installed in the generated rc files
+        let rc = std::fs::read_to_string(dir.join(".zshrc")).unwrap();
+        assert!(rc.contains("633;E;"), "OSC 633;E not in .zshrc");
+        assert!(rc.contains("_ember_escape_cmd"), "Escape function not in .zshrc");
+        assert!(rc.contains("_ember_preexec"), "Preexec hook not in .zshrc");
+
+        // Verify that the escape function has the correct escaping logic
+        assert!(rc.contains(r#"s=${s//$'\\'/\\\\}"#), "Backslash escaping not found");
+        assert!(rc.contains(r#"s=${s//;/\\x3b}"#), "Semicolon escaping not found");
+        assert!(rc.contains(r#"s=${s//$'\n'/\\x0a}"#), "Newline escaping not found");
+
+        // Run zsh to verify the hooks are syntactically valid and load
+        let mut cmd = std::process::Command::new("/bin/zsh");
+        cmd.args(["-ic", "whence _ember_escape_cmd >/dev/null && echo HOOKS_OK"]);
+        for (k, v) in &inj.env {
+            cmd.env(k, v);
+        }
+
+        let output = cmd.output().unwrap();
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout_str.contains("HOOKS_OK"),
+            "Hooks failed to load in zsh: {}",
+            stdout_str
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Drive a REAL zsh through the injection and prove (a) ember's hooks
