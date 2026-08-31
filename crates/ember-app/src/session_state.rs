@@ -204,6 +204,96 @@ pub fn write_atomic(path: &Path, snap: &SessionSnapshot) -> io::Result<()> {
     Ok(())
 }
 
+/// The filesystem footprint the Settings "Delete saved sessions" action
+/// covers, colocated next to `path` (`state_path()`'s result): the live
+/// snapshot itself, its quarantined-corrupt sibling (`session.json.corrupt`
+/// — Task 7's quarantine path writes it), and every archived
+/// `session.json.prev-*` snapshot (Task 7's `archive`). Only entries that
+/// actually exist are returned. Shared by the read-only `saved_state_count`
+/// (the Settings row's live count) and the destructive `delete_all_state`,
+/// so the two can never disagree about what's there.
+fn state_footprint(path: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if path.is_file() {
+        found.push(path.to_path_buf());
+    }
+    let corrupt = path.with_extension("json.corrupt");
+    if corrupt.is_file() {
+        found.push(corrupt);
+    }
+    if let Some(dir) = path.parent() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("session.json.prev-")
+                {
+                    found.push(entry.path());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Count of files the "Delete saved sessions" Settings action would remove,
+/// without touching the disk — what the row's `(N)` label and its
+/// hidden-when-`0` visibility read. `0` when no state path can be resolved.
+pub fn saved_state_count() -> usize {
+    state_path().map(|p| state_footprint(&p).len()).unwrap_or(0)
+}
+
+/// Delete every on-disk session-state file (see `state_footprint`): the
+/// live snapshot, its quarantined-corrupt sibling, and every
+/// `session.json.prev-*` archive. Best-effort — a removal failure for one
+/// file doesn't stop the others. Returns the count actually removed (`0`
+/// when no state path can be resolved or nothing exists), which the
+/// Settings row uses to refresh its own count immediately after.
+pub fn delete_all_state() -> usize {
+    let Some(path) = state_path() else {
+        return 0;
+    };
+    state_footprint(&path)
+        .into_iter()
+        .filter(|p| std::fs::remove_file(p).is_ok())
+        .count()
+}
+
+/// Clear every pane's `last_cmd` to `None` in the split tree, in place.
+fn strip_node_commands(node: &mut NodeSnap) {
+    match node {
+        NodeSnap::Pane(p) => p.last_cmd = None,
+        NodeSnap::Split { a, b, .. } => {
+            strip_node_commands(a);
+            strip_node_commands(b);
+        }
+    }
+}
+
+/// Immediately rewrite the state file at `path` with every pane's
+/// `last_cmd` cleared — the "Capture commands" off-switch's immediate-strip
+/// ruling (privacy: turning capture off also scrubs what's already on
+/// disk, not just what gets written next). Load, map, `write_atomic`; a
+/// missing file is a no-op (nothing to strip), and an unparseable one is
+/// left alone (Task 7's quarantine path owns corrupt files, not this one).
+pub fn strip_commands(path: &Path) -> io::Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let Ok(mut snap) = serde_json::from_str::<SessionSnapshot>(&text) else {
+        return Ok(());
+    };
+    for w in &mut snap.windows {
+        for t in &mut w.tabs {
+            strip_node_commands(&mut t.splits);
+        }
+    }
+    write_atomic(path, &snap)
+}
+
 static WRITE_FAILURE_LOGGED: Once = Once::new();
 
 /// Log a write failure exactly once for the process lifetime, then swallow
@@ -434,5 +524,157 @@ mod tests {
         assert!(long.starts_with(capped));
         // Must land ON a char boundary, not mid-character.
         assert!(long.is_char_boundary(capped.len()));
+    }
+
+    // --- strip_commands: the "Capture commands" off immediate-strip -------
+
+    fn snap_with_commands() -> SessionSnapshot {
+        SessionSnapshot {
+            version: 1,
+            saved_at: "t1".into(),
+            windows: vec![WindowSnap {
+                pos: Some((1, 2)),
+                size: (80, 24),
+                focused_tab: 0,
+                tabs: vec![TabSnap {
+                    name: "tab".into(),
+                    named_by_user: true,
+                    splits: NodeSnap::Split {
+                        dir: 'h',
+                        ratio: 0.5,
+                        a: Box::new(NodeSnap::Pane(PaneSnap {
+                            cwd: Some("/a".into()),
+                            last_cmd: Some("echo left".into()),
+                            was_running: true,
+                        })),
+                        b: Box::new(NodeSnap::Pane(PaneSnap {
+                            cwd: Some("/b".into()),
+                            last_cmd: Some("echo right".into()),
+                            was_running: false,
+                        })),
+                    },
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn strip_commands_clears_last_cmd_but_keeps_everything_else() {
+        let p = tmp("strip");
+        write_atomic(&p, &snap_with_commands()).unwrap();
+        strip_commands(&p).unwrap();
+        let loaded: SessionSnapshot =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let NodeSnap::Split { a, b, dir, ratio } = &loaded.windows[0].tabs[0].splits else {
+            panic!("expected split")
+        };
+        let NodeSnap::Pane(pa) = a.as_ref() else {
+            panic!("expected pane")
+        };
+        let NodeSnap::Pane(pb) = b.as_ref() else {
+            panic!("expected pane")
+        };
+        assert_eq!(pa.last_cmd, None);
+        assert_eq!(pb.last_cmd, None);
+        // Everything else survives untouched.
+        assert_eq!(*dir, 'h');
+        assert_eq!(*ratio, 0.5);
+        assert_eq!(pa.cwd.as_deref(), Some("/a"));
+        assert!(pa.was_running);
+        assert_eq!(pb.cwd.as_deref(), Some("/b"));
+        assert!(!pb.was_running);
+        assert!(loaded.windows[0].tabs[0].named_by_user);
+    }
+
+    #[test]
+    fn strip_commands_is_a_noop_when_file_is_missing() {
+        let p = tmp("strip-missing").with_file_name("does-not-exist.json");
+        strip_commands(&p).unwrap();
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn strip_commands_leaves_a_corrupt_file_alone() {
+        let p = tmp("strip-corrupt");
+        std::fs::write(&p, b"not json").unwrap();
+        strip_commands(&p).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"not json");
+    }
+
+    // --- delete_all_state / saved_state_count: env-gated by XDG_STATE_HOME -
+
+    /// `state_path()` reads process-wide env vars and `cargo test` runs
+    /// multiple tests concurrently on threads within the same process —
+    /// serialize every test that points `XDG_STATE_HOME` somewhere so they
+    /// can't stomp on each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Point `XDG_STATE_HOME` at a fresh scratch dir for the duration of
+    /// `f`, restoring the prior value (or unsetting it) afterward. Holds
+    /// `ENV_LOCK` for the whole call so no other env-touching test can
+    /// interleave.
+    fn with_scratch_state_home<R>(name: &str, f: impl FnOnce(&std::path::Path) -> R) -> R {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("ember-ss-xdg-{}-{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prior = std::env::var_os("XDG_STATE_HOME");
+        // Safe: serialized by `ENV_LOCK` above, so no other thread reads or
+        // writes process env vars while this is set.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &dir);
+        }
+        let result = f(&dir);
+        #[allow(unsafe_code)]
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn saved_state_count_and_delete_cover_the_live_file_corrupt_sibling_and_archives() {
+        with_scratch_state_home("full", |dir| {
+            let path = dir.join("ember/session.json");
+            write_atomic(&path, &snap("live")).unwrap();
+            std::fs::write(path.with_extension("json.corrupt"), b"garbage").unwrap();
+            std::fs::write(
+                path.with_file_name("session.json.prev-20260101-000000"),
+                b"{}",
+            )
+            .unwrap();
+            std::fs::write(
+                path.with_file_name("session.json.prev-20260102-000000"),
+                b"{}",
+            )
+            .unwrap();
+            // An unrelated file in the same directory must survive untouched.
+            std::fs::write(path.with_file_name("unrelated.txt"), b"keep me").unwrap();
+
+            assert_eq!(saved_state_count(), 4);
+            let removed = delete_all_state();
+            assert_eq!(removed, 4);
+            assert_eq!(saved_state_count(), 0);
+            assert!(!path.exists());
+            assert!(!path.with_extension("json.corrupt").exists());
+            assert!(
+                !path
+                    .with_file_name("session.json.prev-20260101-000000")
+                    .exists()
+            );
+            assert!(path.with_file_name("unrelated.txt").exists());
+        });
+    }
+
+    #[test]
+    fn saved_state_count_is_zero_when_nothing_saved() {
+        with_scratch_state_home("empty", |_dir| {
+            assert_eq!(saved_state_count(), 0);
+            assert_eq!(delete_all_state(), 0);
+        });
     }
 }

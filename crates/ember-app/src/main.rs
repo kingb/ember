@@ -839,6 +839,7 @@ impl ApplicationHandler<EmberEvent> for App {
         let size = window.inner_size();
         let px = (size.width.max(1), size.height.max(1));
         let config = config::load();
+        let restore_on = config.restore.mode != ember_core::RestoreMode::Off;
         let renderer = Renderer::new(Arc::clone(&window), &config.font);
 
         // The seed tab: one pane backed by one shell.
@@ -875,7 +876,9 @@ impl ApplicationHandler<EmberEvent> for App {
             titles: std::collections::HashMap::new(),
             cwd_by_session: std::collections::HashMap::new(),
             pane_meta: std::collections::HashMap::new(),
-            snapshots: session_state::state_path().map(session_state::SnapshotWriter::spawn),
+            snapshots: restore_on
+                .then(|| session_state::state_path().map(session_state::SnapshotWriter::spawn))
+                .flatten(),
             snapshot_dirty: false,
             wake: self.wake.clone(),
             drag: None,
@@ -1633,8 +1636,7 @@ impl ApplicationHandler<EmberEvent> for App {
                         cwd_updates.push((id.clone(), path));
                     }
                     BackendEvent::Osc(OscEvent::CommandLine(cmd)) => {
-                        // TODO(restore-config): replace with config gate
-                        if true {
+                        if shared.config.restore.capture_commands {
                             cmd_updates.push((id.clone(), cmd));
                         }
                     }
@@ -3853,9 +3855,11 @@ impl Shared {
 
     /// The Settings overlay's rows, resolved against the live config. The row
     /// *table* (labels, kinds, formatters, mutators) lives in `ember-core`;
-    /// this just asks it to format itself against `self.config`.
+    /// this just asks it to format itself against `self.config`, plus the
+    /// live on-disk saved-session count for the "Delete saved sessions (N)…"
+    /// row's label and hidden-when-zero visibility.
     pub(crate) fn settings_rows(&self) -> Vec<SettingsRowView> {
-        resolve_rows(&self.config)
+        resolve_rows(&self.config, session_state::saved_state_count())
     }
 
     /// The backdrop params for the current config at animation time `t` seconds.

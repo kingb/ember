@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 
 use ember_core::{
     Axis, BackendControl, BackendHandle, Direction, DropZone, GridDims, LayoutCommand,
-    LayoutEffect, PaneId, Rect, RowKind, ScrollAmount, SessionBackend, SessionId, SettingsRowView,
-    SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, apply, drop_zone_for, layout, remove_pane,
-    setting_rows,
+    LayoutEffect, PaneId, Rect, RestoreMode, RowKind, ScrollAmount, SessionBackend, SessionId,
+    SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, apply, drop_zone_for, layout,
+    remove_pane, setting_rows,
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
@@ -39,6 +39,7 @@ use winit::window::{CursorIcon, WindowId};
 
 use crate::config;
 use crate::control::ControlMsg;
+use crate::session_state;
 use crate::{
     ControlClose, DEFAULT_COLS, DEFAULT_ROWS, DragState, DropHover, MULTI_CLICK, PAD, PendingClose,
     Shared, about_info, bell_flash_intensity, bracket_paste, dims_for_rect, ember_glow, encode_key,
@@ -4046,27 +4047,89 @@ impl WindowState {
             Key::Named(NamedKey::ArrowDown) => {
                 self.settings_sel = step_selectable_row(&rows, self.settings_sel, 1);
             }
-            Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Space) => {
-                self.adjust_setting(shared, 1.0)
+            Key::Named(NamedKey::ArrowRight)
+            | Key::Named(NamedKey::Space)
+            | Key::Named(NamedKey::Enter) => {
+                self.activate_setting(shared, &rows, 1.0);
             }
-            Key::Named(NamedKey::ArrowLeft) => self.adjust_setting(shared, -1.0),
+            Key::Named(NamedKey::ArrowLeft) => self.activate_setting(shared, &rows, -1.0),
             _ => {}
         }
+        // Rows can appear/disappear as a result of the activation above (the
+        // Capture-commands and Delete-saved-sessions rows both depend on
+        // live state, not just table position) — re-resolve and make sure
+        // the selection didn't land on a header or fall off the end before
+        // pushing the refreshed rows to the renderer.
+        let rows = shared.settings_rows();
+        self.ensure_settings_sel_selectable(&rows);
         self.refresh_settings(shared);
     }
 
+    /// Act on the currently selected Settings row for Left/Right/Space/Enter.
+    /// The "Delete saved sessions" row (`RowKind::Action`) isn't a `Config`
+    /// field — deleting files has no `SettingRow::adjust` to call — so it's
+    /// handled here directly; every other row goes through `adjust_setting`,
+    /// after which the session-restore-specific side effects (spawning or
+    /// dropping the snapshot writer, the immediate command-strip) are
+    /// applied by diffing `restore` before and after.
+    fn activate_setting(&mut self, shared: &mut Shared, rows: &[SettingsRowView], dir: f32) {
+        let Some(selected) = rows.get(self.settings_sel) else {
+            return;
+        };
+        if selected.kind == RowKind::Action {
+            let removed = session_state::delete_all_state();
+            eprintln!("[ember] deleted {removed} saved session file(s)");
+            return;
+        }
+        let before = shared.config.restore.clone();
+        self.adjust_setting(shared, dir);
+        let after = shared.config.restore.clone();
+
+        if before.mode != after.mode {
+            match after.mode {
+                RestoreMode::Off => {
+                    // Drop flushes any pending snapshot; existing files on
+                    // disk are left alone (ruling) — only the explicit
+                    // Delete action removes them.
+                    shared.snapshots = None;
+                }
+                RestoreMode::Ask | RestoreMode::Always => {
+                    if shared.snapshots.is_none() {
+                        shared.snapshots =
+                            session_state::state_path().map(session_state::SnapshotWriter::spawn);
+                    }
+                }
+            }
+        }
+
+        if before.capture_commands && !after.capture_commands {
+            if let Some(path) = session_state::state_path() {
+                if let Err(e) = session_state::strip_commands(&path) {
+                    eprintln!("[ember] session command strip failed: {e}");
+                }
+            }
+        }
+    }
+
     /// Change the selected setting by `dir` (+1 / -1) via its own row's
-    /// `adjust` fn — the row table *is* the dispatch, there is no positional
-    /// match here to drift out of sync with it. Persists the config, then
-    /// re-applies every live side effect unconditionally: backdrop
+    /// `adjust` fn. Looks the row up in `ember_core`'s static table by
+    /// label rather than by `self.settings_sel`'s position: the resolved
+    /// view `shared.settings_rows()` returns can hide or synthesize rows
+    /// (session-restore's Capture-commands/Delete-saved-sessions rows), so
+    /// its indices no longer line up 1:1 with the static table's — the
+    /// label is the one thing both sides agree on. Persists the config,
+    /// then re-applies every live side effect unconditionally: backdrop
     /// appearance, font size, font family, and the developer-mode control
     /// socket. Each is already a cheap no-op when its target value hasn't
     /// changed (matching `zoom_to`'s existing no-op-if-unchanged pattern),
     /// so this never needs to know which row actually fired.
     pub(crate) fn adjust_setting(&mut self, shared: &mut Shared, dir: f32) {
-        if let Some(row) = setting_rows().get(self.settings_sel) {
-            if let Some(adjust) = row.adjust {
-                adjust(&mut shared.config, dir);
+        let rows = shared.settings_rows();
+        if let Some(selected) = rows.get(self.settings_sel) {
+            if let Some(row) = setting_rows().iter().find(|r| r.label == selected.label) {
+                if let Some(adjust) = row.adjust {
+                    adjust(&mut shared.config, dir);
+                }
             }
         }
         if let Err(e) = config::save(&shared.config) {

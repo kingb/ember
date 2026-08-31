@@ -424,7 +424,9 @@ pub fn run(opts: Opts) -> Result<String, String> {
             let mut config = ember_core::Config::default();
             config.font.family = opts.font.clone();
             config.font.size = opts.font_size;
-            let rows = ember_core::resolve_rows(&config);
+            // A headless doc/preview shot has no live session-state dir to
+            // count, so the "Delete saved sessions" row never appears here.
+            let rows = ember_core::resolve_rows(&config, 0);
             let sel = rows
                 .iter()
                 .position(|r| r.label == "Font family")

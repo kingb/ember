@@ -24,7 +24,9 @@ pub use backend::{
     frame_channel,
 };
 pub use command::{LayoutCommand, LayoutEffect, apply};
-pub use config::{Background, Config, Font, SparksMode, WispStyle, WispStyleSelection};
+pub use config::{
+    Background, Config, Font, RestoreConfig, RestoreMode, SparksMode, WispStyle, WispStyleSelection,
+};
 pub use focus::{Direction, focus_dir};
 pub use geom::Rect;
 pub use grid::{
