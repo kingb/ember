@@ -422,6 +422,13 @@ pub(crate) struct Shared {
     /// disk gets NO entry here (see `resolve_restore_cwd`'s doc) — never
     /// pre-type a command into a directory it wasn't actually saved from.
     pub(crate) pretype: HashMap<SessionId, Pretype>,
+    /// A restored window whose split-tree replay is waiting on its
+    /// `Resized` event (async-resize platforms — see
+    /// `spawn_restored_window`'s doc for why the replay can't run against
+    /// the window's still-default size). Drained by the matching
+    /// `WindowEvent::Resized` handler, or removed without replaying if the
+    /// window closes first (`close_window`/`close_window_shell_only`).
+    pub(crate) pending_restore_replay: HashMap<WindowId, PendingRestore>,
 }
 
 /// One restored pane's pending pre-type (Task 8 arms it; Task 9 consumes
@@ -437,6 +444,14 @@ pub(crate) struct Shared {
 pub(crate) struct Pretype {
     pub(crate) cmd: String,
     pub(crate) armed_at: Instant,
+}
+
+/// A restored window's still-pending tab/split replay — see
+/// `Shared::pending_restore_replay`'s doc for when this is used instead of
+/// replaying immediately.
+pub(crate) struct PendingRestore {
+    win_snap: session_state::WindowSnap,
+    session: SessionId,
 }
 
 /// State for an in-flight paced `ctl drag`. Never advanced by a blocking
@@ -905,6 +920,7 @@ impl ApplicationHandler<EmberEvent> for App {
             paced_drag: None,
             dying_windows: Vec::new(),
             pretype: HashMap::new(),
+            pending_restore_replay: HashMap::new(),
         };
 
         // Always: skip the default window entirely — the snapshot's windows
@@ -912,14 +928,13 @@ impl ApplicationHandler<EmberEvent> for App {
         let mut restored_any = false;
         if shared.config.restore.mode == ember_core::RestoreMode::Always {
             if let Some(session_state::LoadOutcome::Loaded(snap)) = restore_outcome.clone() {
-                spawn_restored(
+                restored_any = spawn_restored(
                     &mut self.windows,
                     &mut shared,
                     &mut self.focused_window,
                     event_loop,
                     snap,
                 );
-                restored_any = !self.windows.is_empty();
                 // Best-effort initial focus order (real `Focused` events
                 // reorder this properly once the OS actually focuses one) —
                 // otherwise-empty `focus_history` would leave every
@@ -1031,6 +1046,21 @@ impl ApplicationHandler<EmberEvent> for App {
             WindowEvent::Resized(size) => {
                 win.px = (size.width.max(1), size.height.max(1));
                 win.renderer.resize(win.px.0, win.px.1);
+                // A restored window whose split-tree replay was deferred
+                // here (an async-resize platform — see
+                // `spawn_restored_window`'s doc): the real size is now
+                // known, so replay against it before the ordinary
+                // `sync_layout` below, which must see the fully rebuilt
+                // tree rather than just the still-bare seed tab.
+                if let Some(pending) = shared.pending_restore_replay.remove(&id) {
+                    if !replay_restored_window(win, shared, &pending.win_snap, pending.session) {
+                        // Tab 0's shell failed to spawn: nothing to show.
+                        // `win` isn't referenced again in this arm, so
+                        // `close_window` can freely reborrow `self.windows`.
+                        close_window(&mut self.windows, shared, &mut self.focused_window, id);
+                        return;
+                    }
+                }
                 win.sync_layout(shared);
                 shared.snapshot_dirty = true;
             }
@@ -1336,6 +1366,7 @@ impl ApplicationHandler<EmberEvent> for App {
                                 shared,
                                 &mut self.focused_window,
                                 event_loop,
+                                id,
                                 action,
                             );
                         } else {
@@ -2007,7 +2038,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     queue_close_this(&mut deferred_windows);
                 }
                 Some(ControlClose::Restore(action)) => {
-                    deferred_windows.push(DeferredWindowAction::Restore(action));
+                    deferred_windows.push(DeferredWindowAction::Restore(focused_id, action));
                 }
                 None => {}
             }
@@ -2439,12 +2470,13 @@ impl ApplicationHandler<EmberEvent> for App {
                         (Err(e), None) => eprintln!("[ember] move failed: {e}"),
                     }
                 }
-                DeferredWindowAction::Restore(action) => {
+                DeferredWindowAction::Restore(prompting_window, action) => {
                     resolve_restore_action(
                         &mut self.windows,
                         shared,
                         &mut self.focused_window,
                         event_loop,
+                        prompting_window,
                         action,
                     );
                 }
@@ -2504,9 +2536,19 @@ impl ApplicationHandler<EmberEvent> for App {
         // `session_dirty`. Gated on the flag so a tick with nothing new to
         // save doesn't pay for a tree walk (this function runs on every
         // event-loop wake, not just ones a mutation caused).
+        //
+        // The clear is gated on the SAME "no restore prompt is up" check
+        // `session_dirty` itself applies internally — not just deferred to
+        // it — so a Moved/Resized delta that arrives while the modal is
+        // still up doesn't get its dirty bit silently thrown away with
+        // nothing ever written: the flag stays `true` and this same block
+        // flushes it for real on the first tick after the modal resolves.
         if shared.snapshot_dirty {
-            session_dirty(shared, &self.windows);
-            shared.snapshot_dirty = false;
+            let restore_prompt_open = self.windows.values().any(|w| w.restore_prompt.is_some());
+            if !restore_prompt_open {
+                session_dirty(shared, &self.windows);
+                shared.snapshot_dirty = false;
+            }
         }
     }
 }
@@ -2526,8 +2568,10 @@ enum DeferredWindowAction {
     /// command — deferred for the same reason every other window-structural
     /// discovery site here is: `spawn_restored` needs `&mut self.windows`/
     /// `&ActiveEventLoop`, neither available while `win` still borrows
-    /// `self.windows` for the rest of the ctl-commands loop.
-    Restore(window_state::RestoreAction),
+    /// `self.windows` for the rest of the ctl-commands loop. Carries the
+    /// PROMPTING window's id (captured as `focused_id` at enqueue time) so
+    /// `resolve_restore_action` can close it once the restore actually lands.
+    Restore(WindowId, window_state::RestoreAction),
     /// Close a specific, possibly NON-focused window whose tree just emptied
     /// (a background window's last shell exited via the exited-shell drain).
     /// `CloseThis` always targets `focused_id` captured at the top of
@@ -2762,6 +2806,7 @@ fn resolve_restore_action(
     shared: &mut Shared,
     focused_window: &mut Option<WindowId>,
     event_loop: &ActiveEventLoop,
+    prompting_window: WindowId,
     action: window_state::RestoreAction,
 ) {
     match action {
@@ -2787,7 +2832,32 @@ fn resolve_restore_action(
                     }
                 }
             }
-            spawn_restored(windows, shared, focused_window, event_loop, snapshot);
+            let restored_any =
+                spawn_restored(windows, shared, focused_window, event_loop, snapshot);
+            // The prompt's own window (a brand-new, still-idle default
+            // window created solely to host the Ask-mode prompt) is now
+            // redundant — the restored windows ARE the session, matching
+            // `Always` mode, and leaving it open would both show a stray
+            // empty extra window and get it swept into the very next
+            // snapshot (compounding: "Restore 3 windows…" on the next
+            // launch). Only close it once at least one window actually
+            // restored — a degenerate/all-failed snapshot keeps the
+            // prompting window as the fallback, so the app never ends up
+            // with zero windows. `close_window` (not `finish_close`) is the
+            // right primitive here: it never checks "is this the last
+            // window" / calls `event_loop.exit()`, and by this point the
+            // restored windows already exist in `windows` (spawn_restored
+            // ran first) and `*focused_window` already points at one of
+            // them (spawn_restored's own tail sets it), so closing the
+            // prompting window can't trip app-exit logic and focus stays on
+            // a restored window (its own `if *focused_window == Some(id)`
+            // check is already false). The prompting window's seed shell is
+            // brand new and definitionally idle, so no confirm is needed —
+            // same "unconditional, no confirm" reasoning `open_new_window`'s
+            // own failure-path close already uses.
+            if restored_any {
+                close_window(windows, shared, focused_window, prompting_window);
+            }
         }
     }
 }
@@ -2860,13 +2930,17 @@ fn clamp_to_visible_monitor(
 /// to the first window actually created (if any) and requests its first
 /// paint — same "paint once now" reasoning as `resumed`'s own default
 /// window, since the loop won't run again until an event or frame-lane wake.
+/// Returns whether at least one window was actually created — callers use
+/// this to decide whether a fallback default window is still needed
+/// (`resumed`'s `Always` path) or whether a now-redundant prompting window
+/// should be closed (`resolve_restore_action`'s `Ask` path).
 fn spawn_restored(
     windows: &mut HashMap<WindowId, WindowState>,
     shared: &mut Shared,
     focused_window: &mut Option<WindowId>,
     event_loop: &ActiveEventLoop,
     snapshot: session_state::SessionSnapshot,
-) {
+) -> bool {
     let monitors: Vec<(i32, i32, u32, u32)> = event_loop
         .available_monitors()
         .map(|m| {
@@ -2898,26 +2972,37 @@ fn spawn_restored(
             win.renderer.window().request_redraw();
         }
     }
+    first_window.is_some()
 }
 
 /// Build ONE restored window from its `WindowSnap`: created via
 /// [`open_window`] (the same low-level path every other window-creation
 /// site uses — `set_ime_allowed`, app-icon, replay-seeding all included),
-/// resized to its saved size, its first tab spawned directly, remaining
-/// tabs via `new_tab_with_cwd`, each tab's split tree replayed via
-/// `session_state::split_ops` through `split_pane_with_cwd` (WITH an
-/// explicit cwd every time — the normal `split_pane` cwd-inheritance has
-/// nothing to inherit from a shell that was only just spawned), titles +
-/// `named_tabs` for `named_by_user` tabs, and the saved active tab. Every
-/// pane with a saved `last_cmd` and a cwd that still exists gets a
-/// `Shared::pretype` entry (Task 9 consumes it); a cwd-fallback pane gets
-/// none (see `resolve_restore_cwd`'s doc).
+/// resized to its saved size, then its tabs/splits replayed via
+/// [`replay_restored_window`].
 ///
-/// Returns the new window's id, or `None` if even its very first pane's
-/// shell failed to spawn — the window is torn back down rather than left
-/// showing a dead pane, mirroring `open_new_window`'s own failure handling.
-/// A LATER tab's shell failing is not fatal to the window: that one tab is
-/// simply skipped (`continue`) and the rest of the window still builds.
+/// The resize matters for correctness, not just cosmetics:
+/// `split_pane_with_cwd`'s min-size acceptance check reads the window's
+/// CURRENT `px`, and a freshly created window starts at the app's default
+/// size — replaying a dense saved split tree against that default (rather
+/// than the saved, possibly much larger, size) can silently refuse splits
+/// that would fit fine once actually resized. `Window::request_inner_size`
+/// is synchronous on some platforms (macOS, Windows, X11) and returns
+/// `Some(actual_size)` immediately, in which case the replay runs right
+/// here against the corrected size; on others (Wayland) it's only a
+/// request — returns `None` — and the real size arrives later as a
+/// `WindowEvent::Resized`, so the whole tab/split replay is deferred via
+/// `Shared::pending_restore_replay` until `window_event`'s `Resized` arm
+/// drains it. Either way `replay_restored_window` is the one place that
+/// actually builds the tabs/splits, so the two paths can't drift apart.
+///
+/// Returns the new window's id (which exists either way — with a live
+/// first pane if replayed synchronously, or still just the bare seed pane
+/// if deferred), or `None` if the synchronous replay's very first pane
+/// failed to spawn — that failure tears the window back down immediately
+/// (mirroring `open_new_window`'s own failure handling) rather than
+/// deferring anything. The async/deferred path's own first-pane failure is
+/// handled later, by the `Resized` handler, the same way.
 fn spawn_restored_window(
     windows: &mut HashMap<WindowId, WindowState>,
     shared: &mut Shared,
@@ -2943,16 +3028,68 @@ fn spawn_restored_window(
     };
     let window_id = open_window(windows, shared, event_loop, tree, position);
     let win = windows.get_mut(&window_id)?;
-    if win_snap.size.0 > 0 && win_snap.size.1 > 0 {
-        let _ = win
-            .renderer
+
+    let applied_synchronously = if win_snap.size.0 > 0 && win_snap.size.1 > 0 {
+        win.renderer
             .window()
             .request_inner_size(winit::dpi::PhysicalSize::new(
                 win_snap.size.0,
                 win_snap.size.1,
-            ));
+            ))
+    } else {
+        None
+    };
+    match applied_synchronously {
+        Some(new_size) => {
+            // Synchronous platform: the resize already landed — mirror
+            // `WindowEvent::Resized`'s own bookkeeping right here so the
+            // replay below sees the corrected size, not the stale default.
+            win.px = (new_size.width.max(1), new_size.height.max(1));
+            win.renderer.resize(win.px.0, win.px.1);
+            if !replay_restored_window(win, shared, win_snap, session) {
+                close_window(windows, shared, focused_window, window_id);
+                return None;
+            }
+        }
+        None => {
+            // Async platform: only a request went out. Defer the whole
+            // replay until the matching `Resized` event tells us the real
+            // size (`window_event`'s `Resized` arm drains this).
+            shared.pending_restore_replay.insert(
+                window_id,
+                PendingRestore {
+                    win_snap: win_snap.clone(),
+                    session,
+                },
+            );
+        }
     }
+    Some(window_id)
+}
 
+/// Replay one restored window's tabs + split trees onto an already-created,
+/// correctly-sized `WindowState` — see [`spawn_restored_window`]'s doc for
+/// why this sometimes runs immediately and sometimes waits for a `Resized`
+/// event first. First tab spawned directly, remaining tabs via
+/// `new_tab_with_cwd`, each tab's split tree replayed via
+/// `session_state::split_ops` through `split_pane_with_cwd` (WITH an
+/// explicit cwd every time — the normal `split_pane` cwd-inheritance has
+/// nothing to inherit from a shell that was only just spawned), titles +
+/// `named_tabs` for `named_by_user` tabs, and the saved active tab. Every
+/// pane with a saved `last_cmd` and a cwd that still exists gets a
+/// `Shared::pretype` entry (Task 9 consumes it); a cwd-fallback pane gets
+/// none (see `resolve_restore_cwd`'s doc).
+///
+/// Returns `false` only if the window's very first pane's shell failed to
+/// spawn — the caller tears the window down in that case. A LATER tab's
+/// shell failing is not fatal to the window: that one tab is simply
+/// skipped (`continue`) and the rest of the window still builds.
+fn replay_restored_window(
+    win: &mut WindowState,
+    shared: &mut Shared,
+    win_snap: &session_state::WindowSnap,
+    session: SessionId,
+) -> bool {
     for (i, tab_snap) in win_snap.tabs.iter().enumerate() {
         let (first_pane, ops) = session_state::split_ops(&tab_snap.splits);
         let (cwd, pretype_cmd) = resolve_restore_cwd(&first_pane);
@@ -2970,8 +3107,7 @@ fn spawn_restored_window(
             if i == 0 {
                 // The window's very first pane failed to spawn: nothing to
                 // show for this window at all.
-                close_window(windows, shared, focused_window, window_id);
-                return None;
+                return false;
             }
             continue; // this tab's shell failed; skip it, keep the rest of the window
         }
@@ -3021,8 +3157,10 @@ fn spawn_restored_window(
             win.split_pane_with_cwd(shared, parent_pane, axis, *ratio as f64, op_cwd);
             let after_focus = win.tree.tabs[tab_idx].focus;
             if after_focus == before_focus {
-                // Refused (the window's default size can't fit the min
-                // pane extent along this axis) — degrade: later ops that
+                // Refused (the window's ACTUAL size — already corrected
+                // before this runs, see `spawn_restored_window`'s doc —
+                // still can't fit the min pane extent along this axis, a
+                // genuinely tiny saved window) — degrade: later ops that
                 // wanted to attach here instead attach to the still-intact
                 // parent, so the rest of the tree still builds as best it can.
                 pane_by_index.push(parent_pane);
@@ -3048,7 +3186,7 @@ fn spawn_restored_window(
     }
     win.sync_layout(shared);
     win.apply_appearance(shared);
-    Some(window_id)
+    true
 }
 
 /// Clear `shared.drag` if window `id` was its source, so a source window
@@ -3477,6 +3615,12 @@ fn close_window(
     id: WindowId,
 ) {
     clear_drag_on_window_close(windows, shared, id);
+    // A restored window can close (spawn failure, or the user quitting)
+    // before its deferred split-tree replay ever got its `Resized` event —
+    // drop the pending replay rather than leave a stale entry that would
+    // otherwise sit in the map forever (or, worse, replay onto a reused
+    // `WindowId` the OS hands out later).
+    shared.pending_restore_replay.remove(&id);
     if let Some(win) = windows.remove(&id) {
         for sid in win.window_session_ids() {
             if let Some(h) = shared.sessions.remove(&sid) {
@@ -3508,6 +3652,9 @@ fn close_window_shell_only(
     id: WindowId,
 ) {
     clear_drag_on_window_close(windows, shared, id);
+    // See `close_window`'s matching comment: never leave a stale pending
+    // replay behind for a window that's gone.
+    shared.pending_restore_replay.remove(&id);
     let removed = windows.remove(&id);
     shared.window_order.retain(|w| *w != id);
     if *focused_window == Some(id) {
@@ -5057,6 +5204,88 @@ mod tests {
             std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
         );
         assert_eq!(pretype, None);
+    }
+
+    // --- split-replay acceptance is viewport-size-dependent (Task 8 fix) --
+
+    /// The pure seam behind `spawn_restored_window`'s size-before-replay
+    /// fix: `ember_core::apply`'s `SplitPane` acceptance check
+    /// (`extent >= 2*min_px`) reads the CURRENT viewport, so the exact same
+    /// sequence of split operations can be refused at one window size and
+    /// accepted at another. Replaying a saved split tree against the
+    /// freshly-created window's DEFAULT size (rather than its saved,
+    /// possibly much larger, size) can therefore silently drop panes that
+    /// would fit fine once the window is actually resized — which is
+    /// exactly what `spawn_restored_window` now avoids by applying (or, on
+    /// async-resize platforms, waiting for) the real size FIRST.
+    ///
+    /// This doesn't exercise `WindowState`/`Renderer` at all (both need a
+    /// live GPU context this test harness doesn't provide — see
+    /// `settings_action_for_key`'s doc for the same reasoning) — it drives
+    /// `ember_core::apply` directly with two viewports sized like
+    /// `WindowState::viewport()` would report for a default-sized window
+    /// vs. a much larger saved one, using the same MIN_COLS=8 floor
+    /// `WindowState::min_px` uses.
+    #[test]
+    fn split_replay_that_default_window_size_refuses_succeeds_at_the_saved_size() {
+        use ember_core::{
+            Axis, LayoutCommand, LayoutNode, PaneId, Rect, SessionId, Tab, TabId, WindowTree, apply,
+        };
+
+        let chrome = ember_render::Renderer::chrome_height() as f64;
+        let min_px = 8.0 * ember_render::CELL_WIDTH as f64 + 2.0 * crate::PAD as f64;
+        let default_w =
+            crate::DEFAULT_COLS as f64 * ember_render::CELL_WIDTH as f64 + 2.0 * crate::PAD as f64;
+        let default_vp = Rect::new(0.0, chrome, default_w, 400.0 - chrome);
+        // A saved window several times wider — representative of a maximized
+        // window on a real monitor, not the app's own small startup default.
+        let saved_vp = Rect::new(0.0, chrome, 1800.0, 1100.0 - chrome);
+
+        // Four sequential horizontal splits, all targeting the SAME original
+        // pane (mirrors how `split_ops`' replay can address the same parent
+        // index repeatedly) — each keeps the original pane at `ratio=0.5` of
+        // its own current extent, so it roughly halves every time. Returns
+        // whether all four were accepted.
+        let run_four_splits = |vp: Rect| -> bool {
+            let p0 = PaneId(1);
+            let mut tree = WindowTree {
+                tabs: vec![Tab {
+                    id: TabId(1),
+                    title: String::new(),
+                    root: LayoutNode::pane(p0, SessionId::new("s0")),
+                    focus: p0,
+                }],
+                active: 0,
+            };
+            let mut all_accepted = true;
+            for i in 0..4u64 {
+                let effects = apply(
+                    &mut tree,
+                    LayoutCommand::SplitPane {
+                        target: p0,
+                        axis: Axis::Horizontal,
+                        ratio: 0.5,
+                        new_pane: PaneId(100 + i),
+                        new_session: SessionId::new(format!("s{}", 100 + i)),
+                        min_px,
+                    },
+                    vp,
+                );
+                if effects.is_empty() {
+                    all_accepted = false;
+                }
+            }
+            all_accepted
+        };
+
+        assert!(
+            !run_four_splits(default_vp),
+            "expected at least one of the 4 splits to be refused at the default window size"
+        );
+        assert!(
+            run_four_splits(saved_vp),
+            "the SAME 4 splits must all succeed once replayed against the saved (larger) size"
+        );
     }
 
     #[test]
