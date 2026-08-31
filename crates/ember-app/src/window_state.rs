@@ -568,6 +568,81 @@ pub(crate) struct WindowState {
     pub(crate) named_tabs: std::collections::HashSet<TabId>,
 }
 
+/// What a key press does while the Settings overlay is open, given the
+/// currently selected row's `kind` (`None` when nothing is selected, e.g.
+/// an empty row list). Pure and independent of `WindowState`/`Shared` —
+/// unit-tested directly (see `settings_action_for_key`'s tests) rather than
+/// through a live overlay, since `Renderer` needs a GPU context this crate's
+/// test harness doesn't provide.
+///
+/// The critical bit this type exists to make impossible to get wrong again:
+/// `Activate` (which fires a `RowKind::Action` row, e.g. "Delete saved
+/// sessions") is only ever produced for Enter/Space, never for
+/// Left/Right — so routine navigation on an action row can never trigger
+/// it, even though Left/Right/Space/Enter all drive ordinary rows via the
+/// same `Adjust` variant.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SettingsAction {
+    Close,
+    MoveUp,
+    MoveDown,
+    /// Adjust the selected row's value by this direction (+1.0 / -1.0) —
+    /// meaningless for `RowKind::Action` rows, which never produce this.
+    Adjust(f32),
+    /// Fire the selected `RowKind::Action` row. Only ever produced when the
+    /// selected row's kind is `RowKind::Action` and the key was Enter or
+    /// Space.
+    Activate,
+    None,
+}
+
+/// Map a key press onto a [`SettingsAction`], given the currently selected
+/// row's `kind`. See [`SettingsAction`]'s docs for the invariant this
+/// exists to enforce.
+fn settings_action_for_key(key: &Key, selected_kind: Option<RowKind>) -> SettingsAction {
+    let is_action_row = selected_kind == Some(RowKind::Action);
+    match key {
+        Key::Named(NamedKey::Escape) => SettingsAction::Close,
+        Key::Named(NamedKey::ArrowUp) => SettingsAction::MoveUp,
+        Key::Named(NamedKey::ArrowDown) => SettingsAction::MoveDown,
+        Key::Named(NamedKey::ArrowRight) => {
+            if is_action_row {
+                SettingsAction::None
+            } else {
+                SettingsAction::Adjust(1.0)
+            }
+        }
+        Key::Named(NamedKey::ArrowLeft) => {
+            if is_action_row {
+                SettingsAction::None
+            } else {
+                SettingsAction::Adjust(-1.0)
+            }
+        }
+        Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter) => {
+            if is_action_row {
+                SettingsAction::Activate
+            } else {
+                SettingsAction::Adjust(1.0)
+            }
+        }
+        _ => SettingsAction::None,
+    }
+}
+
+/// Find the `SettingRow` in `ember_core`'s static table whose label matches
+/// `label` exactly — what `adjust_setting` looks up to call the row's own
+/// `adjust` fn. Pure (no `Shared`/`WindowState`), so the label-matching
+/// itself — the fix for the resolved-view/static-table index mismatch
+/// `resolve_rows` introduced once it could hide/synthesize rows — is
+/// unit-testable on its own. Returns `None` for a label that isn't in the
+/// static table at all, e.g. the synthesized "Delete saved sessions (N)…"
+/// row, which is intentional: that row has no `Config`-mutating `adjust`,
+/// so a miss here just means "nothing to adjust," not a bug.
+fn find_setting_row_by_label(label: &str) -> Option<&'static ember_core::SettingRow> {
+    setting_rows().iter().find(|r| r.label == label)
+}
+
 impl WindowState {
     /// Build a fresh per-window state around an already-created `renderer` +
     /// seeded `tree`; every other field starts at its "nothing in progress"
@@ -4036,26 +4111,25 @@ impl WindowState {
     /// Handle a key while the Settings overlay is open: navigate + change values.
     pub(crate) fn settings_key(&mut self, shared: &mut Shared, key: &Key) {
         let rows = shared.settings_rows();
-        match key {
-            Key::Named(NamedKey::Escape) => {
+        let selected_kind = rows.get(self.settings_sel).map(|r| r.kind);
+        match settings_action_for_key(key, selected_kind) {
+            SettingsAction::Close => {
                 self.hide_settings();
                 return;
             }
-            Key::Named(NamedKey::ArrowUp) => {
+            SettingsAction::MoveUp => {
                 self.settings_sel = step_selectable_row(&rows, self.settings_sel, -1);
             }
-            Key::Named(NamedKey::ArrowDown) => {
+            SettingsAction::MoveDown => {
                 self.settings_sel = step_selectable_row(&rows, self.settings_sel, 1);
             }
-            Key::Named(NamedKey::ArrowRight)
-            | Key::Named(NamedKey::Space)
-            | Key::Named(NamedKey::Enter) => {
-                self.activate_setting(shared, &rows, 1.0);
+            SettingsAction::Adjust(dir) => {
+                self.adjust_setting_and_apply_restore_effects(shared, dir)
             }
-            Key::Named(NamedKey::ArrowLeft) => self.activate_setting(shared, &rows, -1.0),
-            _ => {}
+            SettingsAction::Activate => self.activate_action_row(),
+            SettingsAction::None => {}
         }
-        // Rows can appear/disappear as a result of the activation above (the
+        // Rows can appear/disappear as a result of the action above (the
         // Capture-commands and Delete-saved-sessions rows both depend on
         // live state, not just table position) — re-resolve and make sure
         // the selection didn't land on a header or fall off the end before
@@ -4065,22 +4139,24 @@ impl WindowState {
         self.refresh_settings(shared);
     }
 
-    /// Act on the currently selected Settings row for Left/Right/Space/Enter.
-    /// The "Delete saved sessions" row (`RowKind::Action`) isn't a `Config`
-    /// field — deleting files has no `SettingRow::adjust` to call — so it's
-    /// handled here directly; every other row goes through `adjust_setting`,
-    /// after which the session-restore-specific side effects (spawning or
-    /// dropping the snapshot writer, the immediate command-strip) are
-    /// applied by diffing `restore` before and after.
-    fn activate_setting(&mut self, shared: &mut Shared, rows: &[SettingsRowView], dir: f32) {
-        let Some(selected) = rows.get(self.settings_sel) else {
-            return;
-        };
-        if selected.kind == RowKind::Action {
-            let removed = session_state::delete_all_state();
-            eprintln!("[ember] deleted {removed} saved session file(s)");
-            return;
-        }
+    /// Fire the currently selected `RowKind::Action` row. Only "Delete
+    /// saved sessions" exists today, so there's nothing to dispatch on by
+    /// label yet. Safe to call unconditionally: the only caller is
+    /// `settings_key`, which only ever produces `SettingsAction::Activate`
+    /// (routed here) when `settings_action_for_key` has already confirmed
+    /// the selected row is `RowKind::Action` — and that function gates
+    /// `Activate` to Enter/Space only, never Left/Right, so routine
+    /// navigation can never delete anything.
+    fn activate_action_row(&mut self) {
+        let removed = session_state::delete_all_state();
+        eprintln!("[ember] deleted {removed} saved session file(s)");
+    }
+
+    /// Adjust the selected setting by `dir`, then apply the session-restore
+    /// side effects `config.restore` can trigger — spawning/dropping the
+    /// snapshot writer, the immediate command-strip — by diffing `restore`
+    /// before and after `adjust_setting`.
+    fn adjust_setting_and_apply_restore_effects(&mut self, shared: &mut Shared, dir: f32) {
         let before = shared.config.restore.clone();
         self.adjust_setting(shared, dir);
         let after = shared.config.restore.clone();
@@ -4126,7 +4202,7 @@ impl WindowState {
     pub(crate) fn adjust_setting(&mut self, shared: &mut Shared, dir: f32) {
         let rows = shared.settings_rows();
         if let Some(selected) = rows.get(self.settings_sel) {
-            if let Some(row) = setting_rows().iter().find(|r| r.label == selected.label) {
+            if let Some(row) = find_setting_row_by_label(&selected.label) {
                 if let Some(adjust) = row.adjust {
                     adjust(&mut shared.config, dir);
                 }
@@ -4560,5 +4636,150 @@ mod tests {
             pane_drag_source(4, 0, PaneId(7), 0),
             SurfaceRef::Tab { window: 4, tab: 0 }
         );
+    }
+
+    // --- settings_action_for_key: the arrows-must-never-delete fix ---------
+    //
+    // Building a live `WindowState`/`Shared` here isn't practical (the
+    // `Renderer` needs a real GPU context this crate's test harness doesn't
+    // provide), so the key -> action decision was extracted into a pure
+    // function and is tested directly here, independent of the overlay.
+
+    #[test]
+    fn action_row_arrow_keys_do_nothing() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for key in [
+            Key::Named(NamedKey::ArrowLeft),
+            Key::Named(NamedKey::ArrowRight),
+        ] {
+            assert_eq!(
+                settings_action_for_key(&key, Some(RowKind::Action)),
+                SettingsAction::None,
+                "{key:?} on an Action row must not delete anything"
+            );
+        }
+    }
+
+    #[test]
+    fn action_row_enter_or_space_activates() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for key in [Key::Named(NamedKey::Enter), Key::Named(NamedKey::Space)] {
+            assert_eq!(
+                settings_action_for_key(&key, Some(RowKind::Action)),
+                SettingsAction::Activate,
+                "{key:?} on an Action row must activate it"
+            );
+        }
+    }
+
+    #[test]
+    fn non_action_row_arrow_keys_adjust_in_the_matching_direction() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for kind in [RowKind::Toggle, RowKind::Cycle, RowKind::Number] {
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::ArrowRight), Some(kind)),
+                SettingsAction::Adjust(1.0)
+            );
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::ArrowLeft), Some(kind)),
+                SettingsAction::Adjust(-1.0)
+            );
+        }
+    }
+
+    #[test]
+    fn non_action_row_enter_and_space_adjust_forward() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for key in [Key::Named(NamedKey::Enter), Key::Named(NamedKey::Space)] {
+            assert_eq!(
+                settings_action_for_key(&key, Some(RowKind::Toggle)),
+                SettingsAction::Adjust(1.0)
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_and_escape_are_unaffected_by_row_kind() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for kind in [None, Some(RowKind::Action), Some(RowKind::Toggle)] {
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::Escape), kind),
+                SettingsAction::Close
+            );
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::ArrowUp), kind),
+                SettingsAction::MoveUp
+            );
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::ArrowDown), kind),
+                SettingsAction::MoveDown
+            );
+        }
+    }
+
+    #[test]
+    fn an_unhandled_key_is_a_no_op_regardless_of_row_kind() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for kind in [None, Some(RowKind::Action), Some(RowKind::Toggle)] {
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::Tab), kind),
+                SettingsAction::None
+            );
+        }
+    }
+
+    // --- find_setting_row_by_label: the resolved-view/static-table lookup --
+
+    #[test]
+    fn find_setting_row_by_label_locates_and_adjusts_a_representative_cycle_row() {
+        use super::find_setting_row_by_label;
+        use ember_core::{Config, RestoreMode, RowKind};
+
+        let row = find_setting_row_by_label("Session restore").expect("row must be found");
+        assert_eq!(row.kind, RowKind::Cycle);
+        let mut c = Config::default();
+        assert_eq!(c.restore.mode, RestoreMode::Ask); // starting point
+        (row.adjust.expect("cycle row has an adjust fn"))(&mut c, 1.0);
+        assert_eq!(c.restore.mode, RestoreMode::Always);
+    }
+
+    #[test]
+    fn find_setting_row_by_label_locates_and_adjusts_a_representative_toggle_row() {
+        use super::find_setting_row_by_label;
+        use ember_core::Config;
+
+        let row = find_setting_row_by_label("Capture commands").expect("row must be found");
+        let mut c = Config::default();
+        assert!(c.restore.capture_commands);
+        (row.adjust.expect("toggle row has an adjust fn"))(&mut c, 1.0);
+        assert!(!c.restore.capture_commands);
+    }
+
+    #[test]
+    fn find_setting_row_by_label_misses_cleanly_on_a_synthesized_label() {
+        use super::find_setting_row_by_label;
+
+        // "Delete saved sessions (N)…" is synthesized by `resolve_rows`,
+        // never a static-table label — the lookup must return `None`, not
+        // panic, so `adjust_setting` just skips mutation for it.
+        assert!(find_setting_row_by_label("Delete saved sessions (4)…").is_none());
     }
 }

@@ -1482,10 +1482,16 @@ pub(crate) fn build_settings(
         };
         spans.push((text, color));
     }
-    spans.push((
-        "\n↑/↓ select   ←/→ change   esc close".to_string(),
-        Color::rgb(0x80, 0x80, 0x80),
-    ));
+    // The action row ("Delete saved sessions…") only fires on Enter/Space,
+    // never Left/Right (see `settings_action_for_key` in `ember-app`) — the
+    // footer hint reflects that instead of advertising a "change" arrows
+    // hint that would do nothing on that row.
+    let hint = if rows.get(selected).map(|r| r.kind) == Some(RowKind::Action) {
+        "\n↑/↓ select   enter/space activate   esc close"
+    } else {
+        "\n↑/↓ select   ←/→ change   esc close"
+    };
+    spans.push((hint.to_string(), Color::rgb(0x80, 0x80, 0x80)));
     buf.set_rich_text(
         font_system,
         spans
