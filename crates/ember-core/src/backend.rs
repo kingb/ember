@@ -87,6 +87,9 @@ pub enum OscEvent {
     CommandStart,
     OutputStart,
     CommandEnd(Option<i32>),
+    /// OSC 633;E (VS Code shell integration) — the literal command line the
+    /// shell is about to run. Emitted by Ember's own injected hooks.
+    CommandLine(String),
     // iTerm2 OSC 1337 subset.
     CurrentDir(String),
     RemoteHost(String),
