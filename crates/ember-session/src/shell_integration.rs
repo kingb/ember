@@ -144,7 +144,7 @@ case "$PROMPT_COMMAND" in
   *_ember_precmd*) ;;
   *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_ember_precmd" ;;
 esac
-trap 'if [ "$_ember_interactive" = "on" ] && [ -z "$COMP_LINE" ]; then printf "\e]633;E;%s\e\\" "$(_ember_escape_cmd "$BASH_COMMAND")"; _ember_interactive=; fi; printf "\e]133;C\e\\"' DEBUG
+trap 'if [ "$_ember_interactive" = "on" ] && [ -z "$COMP_LINE" ]; then _ember_interactive=; _ember_hist_line=$(HISTTIMEFORMAT= history 1); if [ -n "$_ember_hist_line" ] && [ "$_ember_hist_line" != "$_ember_last_hist" ]; then _ember_last_hist=$_ember_hist_line; _ember_cmd=$(printf "%s\n" "$_ember_hist_line" | sed "s/^[[:space:]]*[0-9]*[[:space:]]*//"); printf "\e]633;E;%s\e\\" "$(_ember_escape_cmd "$_ember_cmd")"; fi; fi; printf "\e]133;C\e\\"' DEBUG
 "#;
 
 fn prepare_bash(dir: &Path) -> std::io::Result<Injection> {
@@ -260,7 +260,7 @@ mod tests {
         prepare("bash", &dir);
         let rc = std::fs::read_to_string(dir.join("ember-bash-rc")).unwrap();
         assert!(rc.contains("633;E;"));
-        assert!(rc.contains("BASH_COMMAND"));
+        assert!(rc.contains("_ember_hist_line")); // History dedup mechanism
     }
 
     #[test]
@@ -396,6 +396,7 @@ mod tests {
 
         // Run bash interactively with stdin, redirecting output to a file
         // The user's PROMPT_COMMAND has a marker that we can detect in the output
+        // Use /dev/null for HISTFILE to avoid polluting real history
         let mut cmd = std::process::Command::new("/bin/bash");
         cmd.args([
             "--rcfile",
@@ -403,6 +404,7 @@ mod tests {
             "-i",
         ]);
         cmd.env("PROMPT_COMMAND", "echo USER-PROMPT-MARKER");
+        cmd.env("HISTFILE", "/dev/null");
         cmd.stdin(std::process::Stdio::piped());
         // Redirect stdout to file to capture it
         let file = std::fs::File::create(&output_file).unwrap();
@@ -412,7 +414,8 @@ mod tests {
         {
             let stdin = child.stdin.as_mut().unwrap();
             use std::io::Write;
-            stdin.write_all(b"echo TESTCMD\nexit\n").unwrap();
+            // Coordinator's repro: two bare Enters, then a typed command
+            stdin.write_all(b"\n\necho TESTCMD\nexit\n").unwrap();
         }
 
         let _ = child.wait().unwrap();
@@ -421,26 +424,35 @@ mod tests {
         let stdout_str = std::fs::read_to_string(&output_file).unwrap_or_default();
         eprintln!("Bash latch test output:\n{}", stdout_str);
 
-        // Verify that 633;E is emitted for the user's typed command
-        assert!(
-            stdout_str.contains("633;E;echo TESTCMD"),
-            "Expected 633;E for 'echo TESTCMD' in output, got: {:?}",
-            stdout_str
+        // Count how many times each pattern appears
+        let testcmd_count = stdout_str.matches("633;E;echo TESTCMD").count();
+        let marker_count = stdout_str.matches("633;E;echo USER-PROMPT-MARKER").count();
+        let precmd_count = stdout_str.matches("633;E;_ember_precmd").count();
+
+        eprintln!("633;E;echo TESTCMD count: {}", testcmd_count);
+        eprintln!("633;E;USER-PROMPT-MARKER count: {}", marker_count);
+        eprintln!("633;E;_ember_precmd count: {}", precmd_count);
+
+        // Verify that 633;E is emitted exactly once for the user's typed command
+        assert_eq!(
+            testcmd_count, 1,
+            "Expected exactly one 633;E for 'echo TESTCMD', got {}: {:?}",
+            testcmd_count, stdout_str
         );
 
         // Verify that 633;E is NOT emitted for the user's PROMPT_COMMAND
-        // (it should only fire for the first DEBUG after the prompt is shown)
-        assert!(
-            !stdout_str.contains("633;E;echo USER-PROMPT-MARKER"),
-            "Spurious 633;E emitted for user's PROMPT_COMMAND: {:?}",
-            stdout_str
+        // (history dedup prevents stale latch from firing during bare Enter cycles)
+        assert_eq!(
+            marker_count, 0,
+            "Spurious 633;E emitted for user's PROMPT_COMMAND {} times: {:?}",
+            marker_count, stdout_str
         );
 
         // Verify that 633;E is NOT emitted for _ember_precmd
-        assert!(
-            !stdout_str.contains("633;E;_ember_precmd"),
-            "Spurious 633;E emitted for _ember_precmd: {:?}",
-            stdout_str
+        assert_eq!(
+            precmd_count, 0,
+            "Spurious 633;E emitted for _ember_precmd {} times: {:?}",
+            precmd_count, stdout_str
         );
 
         let _ = std::fs::remove_dir_all(&dir);
