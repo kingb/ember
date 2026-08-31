@@ -1608,6 +1608,7 @@ impl WindowState {
         let vp = self.viewport();
         let effects = apply(&mut self.tree, LayoutCommand::ClosePane { target }, vp);
         self.apply_effects(shared, effects);
+        shared.snapshot_dirty = true;
         if !self.tree.tabs.is_empty() {
             self.sync_layout(shared);
         }
@@ -3224,6 +3225,12 @@ impl WindowState {
                             LayoutCommand::MoveTab { from: src_tab, to },
                             vp,
                         );
+                        // Same-window tear-off-and-redrop reorder: unlike the
+                        // in-strip live reorder (`drag_tab_to` + `left_release`)
+                        // and the cross-window path (`apply_move`), this arm
+                        // mutates `self.tree` directly and never goes through
+                        // either funnel.
+                        shared.snapshot_dirty = true;
                     }
                     self.tree.active = to;
                     self.sync_layout(shared);
@@ -4266,6 +4273,7 @@ impl WindowState {
             vp,
         );
         self.apply_effects(shared, effects);
+        shared.snapshot_dirty = true;
         if self.tree.tabs.is_empty() {
             return true;
         }

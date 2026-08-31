@@ -2569,6 +2569,14 @@ fn open_window(
     win.renderer.window().request_redraw();
     windows.insert(window_id, win);
     shared.window_order.push(window_id);
+    // A brand-new window (Cmd+N, ctl new-window, or a promote/move that
+    // mints one) is itself a structural change the snapshot must pick up —
+    // without this, a window that never sees a further mutation (no split,
+    // no rename, nothing) would simply never reach disk. Both callers
+    // already hold `shared`/`windows` with no borrow conflict, so this is a
+    // direct funnel call, not just a flag (matching `finish_close`/
+    // `apply_move`'s pattern).
+    session_dirty(shared, windows);
     window_id
 }
 
@@ -3247,6 +3255,31 @@ fn apply_move(
     shared.next_tab += 1;
     let final_focused = model.focused;
 
+    // Task 5 fix: a whole-tab move (SurfaceRef::Tab) preserves the tab's
+    // TabId across the move (core's own doc: "Tab-sourced moves carry their
+    // existing Tab, id included, wholesale") -- EXCEPT a merge (SplitInto),
+    // which dissolves the tab into a pane of another tab, so there is no
+    // destination tab id to carry into. Snapshot which tab (if any) was
+    // user-renamed BEFORE the move touches `windows`, so the carry below
+    // (after the move lands) knows whether to follow it.
+    let renamed_move = if let SurfaceRef::Tab {
+        window: sw_idx,
+        tab: st_idx,
+    } = src
+    {
+        orig_order.get(sw_idx).and_then(|src_wid| {
+            let src_wid = *src_wid;
+            let moved_tab_id = windows.get(&src_wid)?.tree.tabs.get(st_idx)?.id;
+            windows
+                .get(&src_wid)?
+                .named_tabs
+                .contains(&moved_tab_id)
+                .then_some((src_wid, moved_tab_id))
+        })
+    } else {
+        None
+    };
+
     // Stable-sort so any `WindowClosed` always processes LAST, regardless of
     // where `move_surface` put it in the returned `Vec`. The rest of this
     // function (the `SessionsRehomed`-before-`WindowClosed` re-homing dance)
@@ -3368,6 +3401,29 @@ fn apply_move(
             w.renderer.window().request_redraw();
         }
     }
+    // Carry a moved tab's `named_by_user` membership across the window
+    // boundary: `renamed_move` (captured before the move, above) names the
+    // source window + TabId only when that tab was actually user-renamed.
+    // The destination is whichever window's tree now holds that same
+    // TabId -- found by `window_owning_tab` rather than threaded through
+    // `new_order`, since it's the one thing true for every dest kind that
+    // preserves the id (NewTab, NewWindow) and simply absent for one that
+    // doesn't (SplitInto/merge dissolves the tab, so no window will match
+    // and this is correctly a no-op).
+    if let Some((src_wid, moved_tab_id)) = renamed_move {
+        if let Some(src_w) = windows.get_mut(&src_wid) {
+            src_w.named_tabs.remove(&moved_tab_id);
+        }
+        let tabs_by_window: Vec<(WindowId, Vec<TabId>)> = windows
+            .iter()
+            .map(|(wid, w)| (*wid, w.tree.tabs.iter().map(|t| t.id).collect()))
+            .collect();
+        if let Some(dest_wid) = window_owning_tab(&tabs_by_window, moved_tab_id) {
+            if let Some(dest_w) = windows.get_mut(&dest_wid) {
+                dest_w.named_tabs.insert(moved_tab_id);
+            }
+        }
+    }
     // Every surface-mobility gesture (move-tab/promote-pane/merge-tab, a
     // real drag-drop) lowers onto this function, so this one call covers
     // all of them for the session snapshot.
@@ -3415,6 +3471,19 @@ pub(crate) fn resolve_window_index(shared: &Shared, id: WindowId) -> Option<usiz
 /// (see `resolve_index`'s doc for why real ids don't work in a test fixture).
 fn next_prev_index(w: usize, n: usize, next: bool) -> usize {
     if next { (w + 1) % n } else { (w + n - 1) % n }
+}
+
+/// The window (if any) whose tab list contains `tab_id` -- the search half
+/// of `apply_move`'s cross-window `named_tabs` carry (Task 5 fix #4: a
+/// user-renamed tab dragged to another window was silently losing
+/// `named_by_user`). Generic over the window-id type, same reason as
+/// `resolve_index`: a real multi-entry `WindowId` fixture can't be built in
+/// a test, so this is exercised with plain integers standing in for ids.
+fn window_owning_tab<W: Copy>(tabs_by_window: &[(W, Vec<TabId>)], tab_id: TabId) -> Option<W> {
+    tabs_by_window
+        .iter()
+        .find(|(_, tabs)| tabs.contains(&tab_id))
+        .map(|(wid, _)| *wid)
 }
 
 /// Build the `SurfaceRef`/`SurfaceDest` pair for a "move tab" op (keyboard,
@@ -4452,9 +4521,10 @@ fn encode_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, bell_flash_intensity, bracket_paste,
-        encode_key, match_tab_title, match_tab_title_across, next_prev_index, queue_close_this,
-        queue_close_window, resolve_index, shell_escape_path, tab_display_title, url_is_openable,
+        BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, TabId, bell_flash_intensity,
+        bracket_paste, encode_key, match_tab_title, match_tab_title_across, next_prev_index,
+        queue_close_this, queue_close_window, resolve_index, shell_escape_path,
+        tab_display_title, url_is_openable, window_owning_tab,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
@@ -4901,5 +4971,33 @@ mod tests {
         );
         assert_eq!(next_prev_index(1, n, false), 0);
         assert_eq!(next_prev_index(2, n, false), 1);
+    }
+
+    /// `window_owning_tab` (the search half of the cross-window
+    /// `named_tabs` carry, Task 5 fix #4): finds the window whose tab list
+    /// contains the moved id, ignores windows that don't, and returns
+    /// `None` when nothing does (the merge/`SplitInto` case, where the
+    /// tab id was dissolved rather than carried into a destination tree).
+    #[test]
+    fn window_owning_tab_finds_the_window_holding_the_id() {
+        let by_window: Vec<(u32, Vec<TabId>)> = vec![
+            (10, vec![TabId(1), TabId(2)]),
+            (20, vec![TabId(3)]),
+            (30, vec![]),
+        ];
+        assert_eq!(window_owning_tab(&by_window, TabId(1)), Some(10));
+        assert_eq!(window_owning_tab(&by_window, TabId(2)), Some(10));
+        assert_eq!(window_owning_tab(&by_window, TabId(3)), Some(20));
+    }
+
+    #[test]
+    fn window_owning_tab_is_none_when_the_id_was_dissolved() {
+        // Mirrors a merge (`SplitInto`) move: the tab id no longer exists
+        // as a TAB anywhere (it became a pane inside another tab), so no
+        // window's tab list contains it -- the carry must be a no-op, not
+        // a panic or a wrong guess.
+        let by_window: Vec<(u32, Vec<TabId>)> =
+            vec![(10, vec![TabId(1)]), (20, vec![TabId(2)])];
+        assert_eq!(window_owning_tab(&by_window, TabId(99)), None);
     }
 }
