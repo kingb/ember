@@ -30,7 +30,8 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, CLOSE_COLS, bell_wash, build_about, build_confirm, build_fps, build_help,
-    build_ime_preedit, build_palette, build_search_bar, build_settings, build_tabs, debug_emit, grid_quads, hold_ring_quads, measure_cell_width,
+    build_ime_preedit, build_palette, build_restore_list, build_restore_main, build_search_bar,
+    build_settings, build_tabs, debug_emit, grid_quads, hold_ring_quads, measure_cell_width,
     morph_quads, push_backdrop, scrollbar, scrollbar_geometry, selection_quads, shape_grid,
     spark_quads, split_preview,
 };
@@ -96,6 +97,28 @@ pub struct ConfirmView {
     pub cancel_label: String,
     pub confirm_label: String,
     pub focused: usize,
+}
+
+/// The restore-on-launch modal (Task 8): either the Main screen's
+/// Restore/Start fresh/Older… choice, or the Older… archive list.
+/// Render-ready (owns its own pre-formatted, humanized strings) so the
+/// renderer never has to reach into `session_state` types directly —
+/// `WindowState` builds this from its `RestorePrompt` + humanized ages.
+#[derive(Clone, Debug)]
+pub enum RestoreView {
+    /// `header`: e.g. `"Restore 2 windows, 3 tabs (from 2h ago)?"`.
+    /// `focused`: which of the 3 fixed buttons (`RESTORE_MAIN_LABELS`
+    /// order: Restore / Start fresh / Older…) is highlighted.
+    Main { header: String, focused: usize },
+    /// `header`: the same restore question, kept on screen while browsing.
+    /// `rows`: one already-formatted `"<age> · N windows, M tabs"` string
+    /// per archive, newest first (at most 10 — the list is capped there
+    /// well before this type is built). `selected`: the highlighted row.
+    Older {
+        header: String,
+        rows: Vec<String>,
+        selected: usize,
+    },
 }
 
 /// Static content for the About overlay (the animated glow is separate).
@@ -567,6 +590,19 @@ pub struct Renderer {
     /// The confirm modal's `[cancel, confirm]` button rects (logical px), for
     /// hit-testing clicks. Empty when the modal is hidden.
     confirm_buttons: Vec<([f32; 4], usize)>,
+    /// When `Some`, the restore-on-launch modal is shown (Task 8) — mutually
+    /// exclusive with `confirm` in practice (never set both), but not
+    /// enforced structurally, same as `settings`/`about`/`help` aren't
+    /// enforced against each other either; the draw order below picks one.
+    restore: Option<RestoreView>,
+    /// Header buffer, shared by both restore screens (Main's question line
+    /// and Older…'s kept-on-screen header).
+    restore_header: Buffer,
+    /// Main screen's 3 fixed button-label buffers (Restore/Start fresh/Older…).
+    restore_buttons: [Buffer; 3],
+    /// Older… screen's single multi-line buffer (header + up to 10 rows),
+    /// same one-buffer-per-panel shape as the command palette.
+    restore_list: Buffer,
     /// Measured monospace advance (px) — keeps bg quads aligned with glyphs.
     cell_w: f32,
     /// Current terminal font point size (mutated by live zoom).
@@ -731,6 +767,13 @@ impl Renderer {
         let confirm_msg = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let confirm_cancel = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let confirm_ok = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let restore_header = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let restore_buttons = [
+            Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT)),
+            Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT)),
+            Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT)),
+        ];
+        let restore_list = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let fps_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let search_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let palette_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
@@ -792,6 +835,10 @@ impl Renderer {
             confirm_cancel,
             confirm_ok,
             confirm_buttons: Vec::new(),
+            restore: None,
+            restore_header,
+            restore_buttons,
+            restore_list,
             cell_w,
             font_size,
             line_height,
@@ -990,6 +1037,7 @@ impl Renderer {
             font_size: self.font_size,
             font_family: self.family_name.clone(),
             confirm: self.confirm.clone(),
+            restore: self.restore.clone(),
             hold_ring: self.hold_ring,
             ghost_tab: self
                 .ghost_tab
@@ -1364,6 +1412,16 @@ impl Renderer {
         self.confirm_buttons.iter().find_map(|(r, idx)| {
             (x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]).then_some(*idx)
         })
+    }
+
+    /// Show/hide the restore-on-launch modal (Task 8).
+    pub fn set_restore(&mut self, view: Option<RestoreView>) {
+        self.scene_dirty = true;
+        self.restore = view;
+    }
+
+    pub fn restore_shown(&self) -> bool {
+        self.restore.is_some()
     }
 
     pub fn set_about(&mut self, info: Option<AboutInfo>) {
@@ -2079,6 +2137,80 @@ impl Renderer {
                         default_color: Color::rgb(FG.r, FG.g, FG.b),
                         custom_glyphs: &[],
                     });
+                }
+            }
+
+            // Restore-on-launch modal (Task 8) — same overlay-pass layering
+            // as the confirm modal just above (opaque panel into `rounded`,
+            // text into `overlay_areas` so it can't be overpainted by pane
+            // glyphs underneath). Mutually exclusive with `confirm` in
+            // practice.
+            if let Some(view) = self.restore.clone() {
+                let lw = self.config.width as f32 / sf;
+                let lh = self.config.height as f32 / sf;
+                let cw = self.cell_w;
+                match view {
+                    RestoreView::Main { header, focused } => {
+                        let rl = build_restore_main(
+                            &mut self.font_system,
+                            &mut self.restore_header,
+                            &mut self.restore_buttons,
+                            &header,
+                            focused,
+                            cw,
+                            lw,
+                            lh,
+                            sf,
+                            &mut rounded,
+                        );
+                        overlay_areas.push(TextArea {
+                            buffer: &self.restore_header,
+                            left: rl.header_origin.0 * sf,
+                            top: rl.header_origin.1 * sf,
+                            scale: sf,
+                            bounds: full_bounds,
+                            default_color: Color::rgb(FG.r, FG.g, FG.b),
+                            custom_glyphs: &[],
+                        });
+                        for (buf, (ox, oy)) in self.restore_buttons.iter().zip(rl.button_origins) {
+                            overlay_areas.push(TextArea {
+                                buffer: buf,
+                                left: ox * sf,
+                                top: oy * sf,
+                                scale: sf,
+                                bounds: full_bounds,
+                                default_color: Color::rgb(FG.r, FG.g, FG.b),
+                                custom_glyphs: &[],
+                            });
+                        }
+                    }
+                    RestoreView::Older {
+                        header,
+                        rows,
+                        selected,
+                    } => {
+                        let (left, top) = build_restore_list(
+                            &mut self.font_system,
+                            &mut self.restore_list,
+                            &header,
+                            &rows,
+                            selected,
+                            cw,
+                            lw,
+                            lh,
+                            sf,
+                            &mut rounded,
+                        );
+                        overlay_areas.push(TextArea {
+                            buffer: &self.restore_list,
+                            left: left * sf,
+                            top: top * sf,
+                            scale: sf,
+                            bounds: full_bounds,
+                            default_color: Color::rgb(0xf5, 0xf5, 0xdc),
+                            custom_glyphs: &[],
+                        });
+                    }
                 }
             }
 
