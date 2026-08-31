@@ -131,6 +131,7 @@ _ember_precmd() {
   printf '\e]133;D;%s\e\\' "$ret"
   printf '\e]133;A\e\\'
   printf '\e]1337;CurrentDir=%s\e\\' "$PWD"
+  _ember_interactive=on
 }
 _ember_escape_cmd() {
   local s=$1
@@ -141,9 +142,9 @@ _ember_escape_cmd() {
 }
 case "$PROMPT_COMMAND" in
   *_ember_precmd*) ;;
-  *) PROMPT_COMMAND="_ember_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}" ;;
+  *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_ember_precmd" ;;
 esac
-trap '[[ "$BASH_COMMAND" != "$PROMPT_COMMAND" ]] && printf "\e]633;E;%s\e\\" "$(_ember_escape_cmd "$BASH_COMMAND")"; printf "\e]133;C\e\\"' DEBUG
+trap 'if [ "$_ember_interactive" = "on" ] && [ -z "$COMP_LINE" ]; then printf "\e]633;E;%s\e\\" "$(_ember_escape_cmd "$BASH_COMMAND")"; _ember_interactive=; fi; printf "\e]133;C\e\\"' DEBUG
 "#;
 
 fn prepare_bash(dir: &Path) -> std::io::Result<Injection> {
@@ -378,5 +379,70 @@ mod tests {
             out.contains("HOOKS-OK"),
             "ember hooks not installed: {out:?}"
         );
+    }
+
+    #[test]
+    fn bash_debug_trap_latch_guards_against_prompt_command() {
+        if !std::path::Path::new("/bin/bash").exists() {
+            return; // no bash on this runner — skip
+        }
+        let dir = std::env::temp_dir().join(format!("ember-si-bash-latch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = prepare("bash", &dir);
+
+        // Get the path to the ember-bash-rc that was created
+        let rcfile = dir.join("ember-bash-rc");
+        let output_file = dir.join("output.txt");
+
+        // Run bash interactively with stdin, redirecting output to a file
+        // The user's PROMPT_COMMAND has a marker that we can detect in the output
+        let mut cmd = std::process::Command::new("/bin/bash");
+        cmd.args([
+            "--rcfile",
+            rcfile.to_string_lossy().as_ref(),
+            "-i",
+        ]);
+        cmd.env("PROMPT_COMMAND", "echo USER-PROMPT-MARKER");
+        cmd.stdin(std::process::Stdio::piped());
+        // Redirect stdout to file to capture it
+        let file = std::fs::File::create(&output_file).unwrap();
+        cmd.stdout(file);
+
+        let mut child = cmd.spawn().unwrap();
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            use std::io::Write;
+            stdin.write_all(b"echo TESTCMD\nexit\n").unwrap();
+        }
+
+        let _ = child.wait().unwrap();
+
+        // Read the captured output
+        let stdout_str = std::fs::read_to_string(&output_file).unwrap_or_default();
+        eprintln!("Bash latch test output:\n{}", stdout_str);
+
+        // Verify that 633;E is emitted for the user's typed command
+        assert!(
+            stdout_str.contains("633;E;echo TESTCMD"),
+            "Expected 633;E for 'echo TESTCMD' in output, got: {:?}",
+            stdout_str
+        );
+
+        // Verify that 633;E is NOT emitted for the user's PROMPT_COMMAND
+        // (it should only fire for the first DEBUG after the prompt is shown)
+        assert!(
+            !stdout_str.contains("633;E;echo USER-PROMPT-MARKER"),
+            "Spurious 633;E emitted for user's PROMPT_COMMAND: {:?}",
+            stdout_str
+        );
+
+        // Verify that 633;E is NOT emitted for _ember_precmd
+        assert!(
+            !stdout_str.contains("633;E;_ember_precmd"),
+            "Spurious 633;E emitted for _ember_precmd: {:?}",
+            stdout_str
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
