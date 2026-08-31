@@ -262,6 +262,19 @@ struct App {
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
 }
 
+/// Per-session live metadata captured from shell-integration OSC events
+/// (design's session-restore feature): the pane's last reported working
+/// directory, the last command line the shell announced (OSC 633;E), and
+/// whether that command is still running (no matching `CommandEnd` yet).
+/// Feeds `session_state::assemble`'s `meta` closure — never logged, never
+/// read back out except into a `PaneSnap` for the on-disk snapshot.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct PaneMeta {
+    cwd: Option<String>,
+    last_cmd: Option<String>,
+    was_running: bool,
+}
+
 /// Process-wide state that is not tied to any one window: the running sessions,
 /// user config, OS effect seam, control socket, and per-session bookkeeping.
 pub(crate) struct Shared {
@@ -336,6 +349,28 @@ pub(crate) struct Shared {
     /// pane inherits its cwd (design §8.1). Not removed on exit; only read
     /// while spawning, and a dead `SessionId` is never reused.
     pub(crate) cwd_by_session: std::collections::HashMap<SessionId, String>,
+    /// Live per-session cwd/last-command/running-state, mirrored from the
+    /// same OSC events as `cwd_by_session` plus OSC 633;E — feeds the
+    /// session snapshot (`session_dirty`/`session_state::assemble`). Same
+    /// never-pruned-on-exit convention as `cwd_by_session`: a dead
+    /// `SessionId` is never reused, and `assemble` only ever looks one up
+    /// for a pane that's still a live leaf in some window's tree.
+    pub(crate) pane_meta: std::collections::HashMap<SessionId, PaneMeta>,
+    /// The debounced session-snapshot writer thread's handle, or `None` when
+    /// no state path resolved at startup (`session_state::state_path()`) —
+    /// every dirty-marking site and `session_dirty` itself must treat that
+    /// as a silent no-op, never a panic.
+    pub(crate) snapshots: Option<session_state::SnapshotHandle>,
+    /// Set by every structural or content mutation that should land in the
+    /// next session snapshot (new/close/rename/split/move a tab or pane,
+    /// window move/resize/close, a command line or cwd report). A plain
+    /// bool rather than a direct call at each mutation site: most of those
+    /// sites are `WindowState` methods with only `&mut Shared` in scope,
+    /// not the full `windows` map `session_state::assemble` needs to build
+    /// a snapshot across every window — so marking just flags the need, and
+    /// `about_to_wait` (which always has both) is the one place that
+    /// actually flushes it, via the `session_dirty` free function below.
+    pub(crate) snapshot_dirty: bool,
     /// Wakes the event loop when a session publishes a frame; registered on
     /// every session's pixel lane so the loop can idle on `ControlFlow::Wait`.
     pub(crate) wake: std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -839,6 +874,9 @@ impl ApplicationHandler<EmberEvent> for App {
             last_mouse_cell: None,
             titles: std::collections::HashMap::new(),
             cwd_by_session: std::collections::HashMap::new(),
+            pane_meta: std::collections::HashMap::new(),
+            snapshots: session_state::state_path().map(session_state::SnapshotWriter::spawn),
+            snapshot_dirty: false,
             wake: self.wake.clone(),
             drag: None,
             new_window_position_hint: None,
@@ -908,6 +946,13 @@ impl ApplicationHandler<EmberEvent> for App {
                 win.px = (size.width.max(1), size.height.max(1));
                 win.renderer.resize(win.px.0, win.px.1);
                 win.sync_layout(shared);
+                shared.snapshot_dirty = true;
+            }
+            // No per-window bookkeeping needed here (`session_dirty` reads
+            // the live position straight from winit) — just mark the
+            // snapshot dirty so the moved position gets picked up.
+            WindowEvent::Moved(_) => {
+                shared.snapshot_dirty = true;
             }
             WindowEvent::Focused(focused) => {
                 win.window_focused = focused;
@@ -1561,6 +1606,13 @@ impl ApplicationHandler<EmberEvent> for App {
         // (no UI surfaces it); tracked here anyway so the protocol is complete
         // and a future feature (tab title, triggers) can read it.
         let mut cwd_updates: Vec<(SessionId, String)> = Vec::new();
+        // OSC 633;E command-line reports and their matching `CommandEnd`, for
+        // the session snapshot's `last_cmd`/`was_running` (never logged —
+        // stored only in `Shared::pane_meta` and, capped, in the on-disk
+        // snapshot). Collected here rather than applied in-loop for the same
+        // reason `cwd_updates` is: this loop borrows `shared.sessions`.
+        let mut cmd_updates: Vec<(SessionId, String)> = Vec::new();
+        let mut cmd_ends: Vec<SessionId> = Vec::new();
         for (id, handle) in &shared.sessions {
             while let Ok(event) = handle.events.try_recv() {
                 match event {
@@ -1580,6 +1632,15 @@ impl ApplicationHandler<EmberEvent> for App {
                     BackendEvent::Osc(OscEvent::CurrentDir(path)) => {
                         cwd_updates.push((id.clone(), path));
                     }
+                    BackendEvent::Osc(OscEvent::CommandLine(cmd)) => {
+                        // TODO(restore-config): replace with config gate
+                        if true {
+                            cmd_updates.push((id.clone(), cmd));
+                        }
+                    }
+                    BackendEvent::Osc(OscEvent::CommandEnd(_)) => {
+                        cmd_ends.push(id.clone());
+                    }
                     _ => {}
                 }
             }
@@ -1591,12 +1652,35 @@ impl ApplicationHandler<EmberEvent> for App {
         shared
             .titles
             .retain(|id, _| shared.sessions.contains_key(id));
+        // Session-snapshot metadata (design's session-restore feature): a
+        // command-line/end report or a cwd report mutates `pane_meta` and
+        // marks the snapshot dirty. The actual assemble+queue happens once,
+        // in `about_to_wait`'s tail, via `session_dirty` — never here, since
+        // this function doesn't have `self.windows` in scope.
+        let mut meta_dirty = false;
         for (id, cwd) in cwd_updates {
-            shared.cwd_by_session.insert(id, cwd);
+            shared.cwd_by_session.insert(id.clone(), cwd.clone());
+            shared.pane_meta.entry(id).or_default().cwd = Some(cwd);
+            meta_dirty = true;
         }
         shared
             .cwd_by_session
             .retain(|id, _| shared.sessions.contains_key(id));
+        for (id, cmd) in cmd_updates {
+            let meta = shared.pane_meta.entry(id).or_default();
+            meta.last_cmd = Some(cmd);
+            meta.was_running = true;
+            meta_dirty = true;
+        }
+        for id in cmd_ends {
+            if let Some(meta) = shared.pane_meta.get_mut(&id) {
+                meta.was_running = false;
+                meta_dirty = true;
+            }
+        }
+        if meta_dirty {
+            shared.snapshot_dirty = true;
+        }
         if let Some(text) = clipboard_set {
             shared.platform.set_clipboard(&text);
         }
@@ -2291,6 +2375,17 @@ impl ApplicationHandler<EmberEvent> for App {
                     );
                 }
             }
+        }
+
+        // Session-snapshot flush: every deferred window action above has run,
+        // so `self.windows` is fully available again (no outstanding `win`
+        // borrow) — the one point in this function that can actually call
+        // `session_dirty`. Gated on the flag so a tick with nothing new to
+        // save doesn't pay for a tree walk (this function runs on every
+        // event-loop wake, not just ones a mutation caused).
+        if shared.snapshot_dirty {
+            session_dirty(shared, &self.windows);
+            shared.snapshot_dirty = false;
         }
     }
 }
@@ -3005,6 +3100,64 @@ fn close_window_shell_only(
     }
 }
 
+/// The single funnel between a pending session-snapshot mutation
+/// (`shared.snapshot_dirty`) and the debounced on-disk writer: assembles the
+/// live window/tab/split/pane state (`session_state::assemble`) from every
+/// window in `shared.window_order` and every session's `shared.pane_meta`,
+/// then hands it to the snapshot writer thread. A no-op — cheap, no tree
+/// walk — when `shared.snapshots` is `None` (no state path resolved, or a
+/// future config gate turned restore off).
+///
+/// Called from `about_to_wait`'s tail (gated on the dirty flag) and directly
+/// from the couple of sites that already hold both `shared` and `windows`
+/// with no outstanding borrow conflict: `finish_close` (a window closing
+/// changes the window list itself) and `apply_move` (cross-window tab/pane
+/// moves).
+fn session_dirty(shared: &mut Shared, windows: &HashMap<WindowId, WindowState>) {
+    let Some(handle) = shared.snapshots.as_ref() else {
+        return;
+    };
+    // `named_by_user` has to be an owned `Vec<bool>` per window (nothing to
+    // borrow it from — `WindowState::named_tabs` is a `HashSet<TabId>`, not
+    // a slice), so this builds the owned flags first, then a second pass of
+    // `session_state::WindowInput` tuples borrowing both that and each
+    // window's `tree`.
+    let per_window = shared
+        .window_order
+        .iter()
+        .filter_map(|wid| windows.get(wid))
+        .map(|w| {
+            let pos = w
+                .renderer
+                .window()
+                .outer_position()
+                .ok()
+                .map(|p| (p.x, p.y));
+            let named_by_user: Vec<bool> = w
+                .tree
+                .tabs
+                .iter()
+                .map(|t| w.named_tabs.contains(&t.id))
+                .collect();
+            (pos, w.px, &w.tree, named_by_user)
+        })
+        .collect::<Vec<_>>();
+    let refs: Vec<session_state::WindowInput> = per_window
+        .iter()
+        .map(|(pos, px, tree, named)| (*pos, *px, *tree, named.as_slice()))
+        .collect();
+    let pane_meta = &shared.pane_meta;
+    let snap = session_state::assemble(&refs, &|sid: &SessionId| {
+        let m = pane_meta.get(sid);
+        session_state::PaneSnap {
+            cwd: m.and_then(|m| m.cwd.clone()),
+            last_cmd: m.and_then(|m| m.last_cmd.clone()),
+            was_running: m.map(|m| m.was_running).unwrap_or(false),
+        }
+    });
+    handle.update(snap);
+}
+
 /// The shared tail of every "this close/quit was confirmed (or needed no
 /// confirmation)" path: if `id` is the only window left, closing it is
 /// indistinguishable from quitting the app, so do the full app-wide shutdown;
@@ -3033,6 +3186,11 @@ fn finish_close(
         event_loop.exit();
     } else {
         close_window(windows, shared, focused_window, id);
+        // The window list itself just changed — the next snapshot must drop
+        // the closed window. (On the full-shutdown branch above there's no
+        // point: the process is exiting and nothing will read the file
+        // until next launch.)
+        session_dirty(shared, windows);
     }
 }
 
@@ -3210,6 +3368,10 @@ fn apply_move(
             w.renderer.window().request_redraw();
         }
     }
+    // Every surface-mobility gesture (move-tab/promote-pane/merge-tab, a
+    // real drag-drop) lowers onto this function, so this one call covers
+    // all of them for the session snapshot.
+    session_dirty(shared, windows);
     Ok(())
 }
 

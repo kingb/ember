@@ -559,6 +559,12 @@ pub(crate) struct WindowState {
     /// drag resolves to a `Move` might be about to be DESTROYED by that
     /// same move, in which case it must never re-appear first.
     hidden_for_carry: bool,
+    /// Tabs the user has explicitly renamed via the inline editor (double-
+    /// click + commit) — core's `Tab` has no such field, so it's tracked
+    /// here as a side set and fed into `TabSnap::named_by_user` at snapshot
+    /// time. Never pruned when a tab closes: a `TabId` is never reused
+    /// within a window's lifetime, so a stale entry is inert.
+    pub(crate) named_tabs: std::collections::HashSet<TabId>,
 }
 
 impl WindowState {
@@ -624,6 +630,7 @@ impl WindowState {
             carried_exclusion: None,
             exclusion_applied: false,
             hidden_for_carry: false,
+            named_tabs: std::collections::HashSet::new(),
         }
     }
 
@@ -1013,6 +1020,7 @@ impl WindowState {
                 let vp = self.viewport();
                 apply(&mut self.tree, LayoutCommand::MoveTab { from, to }, vp);
                 self.sync_layout(shared);
+                shared.snapshot_dirty = true;
             }
             ControlMsg::RenameTab(i, name) => {
                 if let Some(t) = self.tree.tabs.get(i) {
@@ -1027,6 +1035,7 @@ impl WindowState {
                         vp,
                     );
                     self.sync_layout(shared);
+                    shared.snapshot_dirty = true;
                 }
             }
             ControlMsg::EditTab(i) => self.start_rename(shared, i),
@@ -1496,6 +1505,7 @@ impl WindowState {
         }
         self.apply_effects(shared, effects);
         self.sync_layout(shared);
+        shared.snapshot_dirty = true;
     }
 
     /// Whether Ctrl+Opt is currently held (the visual-split modifier).
@@ -1628,6 +1638,7 @@ impl WindowState {
         );
         self.apply_effects(shared, effects);
         self.sync_layout(shared);
+        shared.snapshot_dirty = true;
     }
 
     /// Keyboard resize of the focused pane: `dir` (±1) grows/shrinks it by a few
@@ -1851,6 +1862,11 @@ impl WindowState {
         } else if let Some(d) = self.tab_drag.take() {
             self.renderer.set_tab_drag(None);
             ended = if d.active {
+                // The strip live-reorders `self.tree` as the drag crosses
+                // slot boundaries (`drag_tab_to`, which only has `&Shared`)
+                // — this release is the first point with `&mut Shared` to
+                // mark the result dirty.
+                shared.snapshot_dirty = true;
                 DragEnded::Reorder
             } else {
                 DragEnded::None
@@ -3353,8 +3369,10 @@ impl WindowState {
         self.sync_layout(shared);
     }
 
-    /// Commit the in-progress rename (Enter / click away) → sets the tab title.
-    pub(crate) fn commit_rename(&mut self, shared: &Shared) {
+    /// Commit the in-progress rename (Enter / click away) → sets the tab title
+    /// and, since this is the interactive "user typed a name" path, marks the
+    /// tab as user-named for the session snapshot (`named_tabs`).
+    pub(crate) fn commit_rename(&mut self, shared: &mut Shared) {
         let Some(i) = self.editing_tab.take() else {
             return;
         };
@@ -3367,6 +3385,8 @@ impl WindowState {
                 LayoutCommand::RenameTab { tab: id, title },
                 vp,
             );
+            self.named_tabs.insert(id);
+            shared.snapshot_dirty = true;
         }
         self.edit_buffer.clear();
         self.sync_layout(shared);
@@ -3381,7 +3401,7 @@ impl WindowState {
     }
 
     /// Route a key into the inline tab-rename editor.
-    pub(crate) fn rename_key(&mut self, shared: &Shared, key: &Key) {
+    pub(crate) fn rename_key(&mut self, shared: &mut Shared, key: &Key) {
         match key {
             Key::Named(NamedKey::Enter) => self.commit_rename(shared),
             Key::Named(NamedKey::Escape) => self.cancel_rename(shared),
@@ -4271,6 +4291,7 @@ impl WindowState {
         let vp = self.viewport();
         let effects = apply(&mut self.tree, LayoutCommand::CloseTab { tab }, vp);
         self.apply_effects(shared, effects);
+        shared.snapshot_dirty = true;
         if self.tree.tabs.is_empty() {
             return true;
         }

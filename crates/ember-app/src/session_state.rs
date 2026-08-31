@@ -3,17 +3,14 @@
 //! Lives at `$XDG_STATE_HOME/ember/session.json` (else `~/.local/state/ember/session.json`).
 //! Defines its own plain serde structs, decoupled from `ember_core`'s in-memory
 //! layout types, so the on-disk schema is stable independent of internal
-//! refactors. Later tasks feed this a snapshot of the live window/tab/split
-//! state on every change; `SnapshotWriter` debounces those updates (300ms
-//! quiet, 1s max defer) and writes them atomically so a crash never leaves a
-//! corrupt or partial file on disk.
+//! refactors. `assemble` maps the live window/tab/split/pane state into that
+//! schema; `main.rs`'s `session_dirty` calls it on every structural or
+//! content mutation and feeds the result to `SnapshotWriter`, which
+//! debounces (300ms quiet, 1s max defer) and writes it atomically so a
+//! crash never leaves a corrupt or partial file on disk.
 //!
-//! This module is a leaf: nothing in `main.rs` builds a `SessionSnapshot` or
-//! spawns a `SnapshotWriter` yet. That wiring lands in later tasks (capture,
-//! restore-on-launch), so every public item here is temporarily unreferenced
-//! from the binary's perspective even though it is exercised by this file's
-//! own tests.
-#![allow(dead_code)]
+//! Restore-on-launch (reading this file back at startup) is a later task —
+//! this module only ever writes it.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -65,6 +62,109 @@ pub struct PaneSnap {
     pub cwd: Option<String>,
     pub last_cmd: Option<String>,
     pub was_running: bool,
+}
+
+/// Truncate `s` to at most 1024 bytes, backing off to the nearest earlier
+/// char boundary so a multi-byte UTF-8 character is never split. The single
+/// enforcement point for the on-disk `last_cmd` size cap — everything else
+/// that stores a command string (`Shared::pane_meta`, `PaneSnap`) is
+/// unbounded, and relies on `assemble` calling this on the way out.
+fn cap_cmd(s: String) -> String {
+    if s.len() <= 1024 {
+        return s;
+    }
+    let mut end = 1024;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Map one `LayoutNode` subtree into its on-disk `NodeSnap` shape, filling
+/// each leaf's live pane data via `meta` (a session id -> `PaneSnap` lookup
+/// the caller closes over its own live state with). `last_cmd` is capped
+/// here (see `cap_cmd`) so every path that can produce a `PaneSnap` — real
+/// wiring and this recursive walk alike — goes through the one truncation
+/// point.
+fn assemble_node(
+    node: &ember_core::layout::LayoutNode,
+    meta: &dyn Fn(&ember_core::ids::SessionId) -> PaneSnap,
+) -> NodeSnap {
+    use ember_core::layout::LayoutNode;
+    match node {
+        LayoutNode::Pane { session, .. } => {
+            let mut pane = meta(session);
+            pane.last_cmd = pane.last_cmd.map(cap_cmd);
+            NodeSnap::Pane(pane)
+        }
+        LayoutNode::Split { axis, ratio, a, b } => NodeSnap::Split {
+            dir: match axis {
+                ember_core::layout::Axis::Horizontal => 'h',
+                ember_core::layout::Axis::Vertical => 'v',
+            },
+            ratio: *ratio as f32,
+            a: Box::new(assemble_node(a, meta)),
+            b: Box::new(assemble_node(b, meta)),
+        },
+    }
+}
+
+/// One window's live geometry + tree + per-tab `named_by_user` flags, as
+/// `assemble` wants them: `(outer position, inner size, tree, named-by-user
+/// flags parallel to `tree.tabs`)`. A named alias purely so the tuple isn't
+/// spelled out (and clippy's `type_complexity` tripped) at every use site —
+/// the tuple shape itself is the real, documented interface.
+pub type WindowInput<'a> = (
+    Option<(i32, i32)>,
+    (u32, u32),
+    &'a ember_core::layout::WindowTree,
+    &'a [bool],
+);
+
+/// Pure assembly: map the live per-window `WindowTree`s (plus each window's
+/// `(pos, size)` and per-tab `named_by_user` flags, all already extracted by
+/// the caller from winit/`WindowState`) and each pane's live metadata
+/// (`meta`, which the wiring layer closes over `Shared::pane_meta`) into the
+/// on-disk `SessionSnapshot` shape. No I/O and no dependency on `Shared` or
+/// `WindowState`, so it's exhaustively unit-testable here; the impure half
+/// (reading winit/`Shared` state, deciding when to call this) lives in
+/// `main.rs`'s `session_dirty`.
+///
+/// `windows[i].3` (the `named_by_user` slice) is indexed in parallel with
+/// `windows[i].2.tabs` — a short slice (fewer entries than tabs) treats the
+/// missing tail as `false` rather than panicking, so a caller can never
+/// crash the app by passing a stale-length flags slice.
+pub fn assemble(
+    windows: &[WindowInput],
+    meta: &dyn Fn(&ember_core::ids::SessionId) -> PaneSnap,
+) -> SessionSnapshot {
+    let windows = windows
+        .iter()
+        .map(|(pos, size, tree, named_by_user)| WindowSnap {
+            pos: *pos,
+            size: *size,
+            focused_tab: tree.active,
+            tabs: tree
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, tab)| TabSnap {
+                    name: tab.title.clone(),
+                    named_by_user: named_by_user.get(i).copied().unwrap_or(false),
+                    splits: assemble_node(&tab.root, meta),
+                })
+                .collect(),
+        })
+        .collect();
+    let saved_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+    SessionSnapshot {
+        version: 1,
+        saved_at,
+        windows,
+    }
 }
 
 /// The session-state file path, if a home/state dir can be determined.
@@ -260,5 +360,79 @@ mod tests {
         let loaded: SessionSnapshot =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(loaded.saved_at, "final");
+    }
+
+    #[test]
+    fn assemble_maps_tree_and_meta() {
+        use ember_core::{
+            ids::{PaneId, SessionId, TabId},
+            layout::{Axis, LayoutNode, Tab, WindowTree},
+        };
+        let tree = WindowTree {
+            active: 0,
+            tabs: vec![Tab {
+                id: TabId(1),
+                title: "EA".into(),
+                focus: PaneId(1),
+                root: LayoutNode::split(
+                    Axis::Horizontal,
+                    0.5,
+                    LayoutNode::pane(PaneId(1), SessionId::new("s1")),
+                    LayoutNode::pane(PaneId(2), SessionId::new("s2")),
+                ),
+            }],
+        };
+        let snap = assemble(
+            &[(Some((10, 20)), (800, 600), &tree, &[true])],
+            &|sid: &SessionId| PaneSnap {
+                cwd: Some(format!("/d/{}", sid.0)),
+                last_cmd: (sid.0 == "s1").then(|| "gt crew at skippy".into()),
+                was_running: sid.0 == "s1",
+            },
+        );
+        assert_eq!(snap.windows.len(), 1);
+        assert_eq!(snap.windows[0].pos, Some((10, 20)));
+        assert_eq!(snap.windows[0].size, (800, 600));
+        let tab = &snap.windows[0].tabs[0];
+        assert!(tab.named_by_user);
+        let NodeSnap::Split { dir, a, .. } = &tab.splits else {
+            panic!("expected split")
+        };
+        assert_eq!(*dir, 'h');
+        let NodeSnap::Pane(p) = a.as_ref() else {
+            panic!("expected pane")
+        };
+        assert_eq!(p.last_cmd.as_deref(), Some("gt crew at skippy"));
+    }
+
+    #[test]
+    fn assemble_caps_last_cmd_at_1024_on_a_char_boundary() {
+        use ember_core::ids::{PaneId, SessionId, TabId};
+        use ember_core::layout::{LayoutNode, Tab, WindowTree};
+        // A multi-byte char (3 bytes each) straddling the 1024 cutoff so a
+        // byte-oblivious truncation would split it.
+        let long: String = "€".repeat(400); // 1200 bytes
+        let tree = WindowTree {
+            active: 0,
+            tabs: vec![Tab {
+                id: TabId(1),
+                title: String::new(),
+                focus: PaneId(1),
+                root: LayoutNode::pane(PaneId(1), SessionId::new("s1")),
+            }],
+        };
+        let snap = assemble(&[(None, (100, 100), &tree, &[false])], &|_sid| PaneSnap {
+            cwd: None,
+            last_cmd: Some(long.clone()),
+            was_running: false,
+        });
+        let NodeSnap::Pane(p) = &snap.windows[0].tabs[0].splits else {
+            panic!("expected pane")
+        };
+        let capped = p.last_cmd.as_deref().unwrap();
+        assert!(capped.len() <= 1024);
+        assert!(long.starts_with(capped));
+        // Must land ON a char boundary, not mid-character.
+        assert!(long.is_char_boundary(capped.len()));
     }
 }
