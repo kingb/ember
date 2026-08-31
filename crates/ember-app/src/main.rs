@@ -431,16 +431,17 @@ pub(crate) struct Shared {
     pub(crate) pending_restore_replay: HashMap<WindowId, PendingRestore>,
 }
 
-/// One restored pane's pending pre-type (Task 8 arms it; Task 9 consumes
-/// it). `armed_at` lets a future consumer expire a stale entry (e.g. if the
-/// shell never becomes ready) rather than pre-typing into an arbitrary
-/// later prompt.
+/// One restored pane's pending pre-type: armed by `replay_restored_window`
+/// (Task 8), consumed one-shot (`.remove()`) by the `OscEvent::PromptStart`
+/// latch in `about_to_wait` (Task 9) once that pane's own shell reports its
+/// first real prompt. `armed_at` lets the latch expire a stale entry (the
+/// shell never becomes ready, or an integration signal arrives too late to
+/// trust) rather than pre-typing into an arbitrary later prompt — see the
+/// 5-second check at the latch's consumption site.
 ///
-/// `#[allow(dead_code)]`: both fields are written at restore time but not
-/// yet READ anywhere — Task 9 is the consumer. Never add a debug print of
-/// `cmd` to silence this instead; the "no logging of command text" rule
-/// applies here same as everywhere else a shell command string is held.
-#[allow(dead_code)]
+/// Never add a debug print of `cmd` anywhere near this type; the "no
+/// logging of command text" rule applies here same as everywhere else a
+/// shell command string is held.
 pub(crate) struct Pretype {
     pub(crate) cmd: String,
     pub(crate) armed_at: Instant,
@@ -1754,6 +1755,12 @@ impl ApplicationHandler<EmberEvent> for App {
         // reason `cwd_updates` is: this loop borrows `shared.sessions`.
         let mut cmd_updates: Vec<(SessionId, String)> = Vec::new();
         let mut cmd_ends: Vec<SessionId> = Vec::new();
+        // OSC 133;A prompt-start reports — the latch a restored pane's
+        // `Shared::pretype` entry (Task 8) waits on before it's safe to type
+        // its saved command. Collected here (not applied in-loop) for the
+        // same reason `cwd_updates`/`cmd_updates` are: this loop borrows
+        // `shared.sessions`.
+        let mut prompt_starts: Vec<SessionId> = Vec::new();
         for (id, handle) in &shared.sessions {
             while let Ok(event) = handle.events.try_recv() {
                 match event {
@@ -1780,6 +1787,9 @@ impl ApplicationHandler<EmberEvent> for App {
                     }
                     BackendEvent::Osc(OscEvent::CommandEnd(_)) => {
                         cmd_ends.push(id.clone());
+                    }
+                    BackendEvent::Osc(OscEvent::PromptStart) => {
+                        prompt_starts.push(id.clone());
                     }
                     _ => {}
                 }
@@ -1817,6 +1827,28 @@ impl ApplicationHandler<EmberEvent> for App {
                 meta.was_running = false;
                 meta_dirty = true;
             }
+        }
+        // Pre-type latch (Task 9): a restored pane's saved command types
+        // itself into the shell's edit buffer, unsent, the moment that
+        // pane's OWN shell reports its first real prompt — never before
+        // (nothing is ready to receive it) and only once (`.remove()` makes
+        // this one-shot by construction; a shell that reports a second
+        // `PromptStart` before restart finds nothing left armed). A pane
+        // with no shell-integration hook installed never fires
+        // `PromptStart` at all, so it never pre-types — matches the spec.
+        for id in prompt_starts {
+            let Some(p) = shared.pretype.remove(&id) else {
+                continue;
+            };
+            if p.armed_at.elapsed() > Duration::from_secs(5) {
+                // The integration signal arrived too late to trust — the
+                // shell may have already processed unrelated input by now.
+                // Drop silently rather than typing into a stale context.
+                continue;
+            }
+            let bracketed = shared.bracketed.get(&id).copied().unwrap_or(false);
+            let bytes = pretype_bytes(&p.cmd, bracketed);
+            window_state::send_to_pane(shared, &id, bytes);
         }
         if meta_dirty {
             shared.snapshot_dirty = true;
@@ -4862,6 +4894,26 @@ fn bracket_paste(text: &str, bracketed: bool) -> Vec<u8> {
     out
 }
 
+/// Shape a restored pane's saved command for pre-typing at its (now-ready)
+/// prompt: it must land in the shell's edit buffer UNSENT, never executed.
+///
+/// Bracketed: `bracket_paste`'s wrap (`ESC[200~`…`ESC[201~`) already produces
+/// exactly this — the guarded newlines stay inert inside a shell with
+/// bracketed-paste support, so this delegates rather than duplicating the
+/// stripping logic.
+///
+/// Not bracketed: there is no guard, so a bare `\n` would submit the command
+/// immediately (the opposite of "unsent"). Newlines are replaced with a
+/// single space instead — the command still lands in the buffer, just
+/// flattened onto one line.
+pub(crate) fn pretype_bytes(cmd: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        bracket_paste(cmd, true)
+    } else {
+        cmd.replace('\n', " ").into_bytes()
+    }
+}
+
 /// Shell-escape one dropped-file path for insertion at a prompt (Finder /
 /// file-manager drop — iTerm2 parity): a path made only of clearly-safe
 /// characters passes through untouched; anything else is single-quoted with
@@ -5109,9 +5161,9 @@ mod tests {
     use super::{
         BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, TabId, bell_flash_intensity,
         bracket_paste, clamp_to_visible_monitor, encode_key, match_tab_title,
-        match_tab_title_across, next_prev_index, queue_close_this, queue_close_window,
-        resolve_index, resolve_restore_cwd, shell_escape_path, tab_display_title, url_is_openable,
-        window_owning_tab,
+        match_tab_title_across, next_prev_index, pretype_bytes, queue_close_this,
+        queue_close_window, resolve_index, resolve_restore_cwd, shell_escape_path,
+        tab_display_title, url_is_openable, window_owning_tab,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
@@ -5429,6 +5481,15 @@ mod tests {
         // ESC[201~ is removed so the payload can't escape into command position.
         let got = bracket_paste("a\x1b[201~rm -rf /\n", true);
         assert_eq!(got, b"\x1b[200~arm -rf /\n\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn pretype_wraps_or_sanitizes() {
+        assert_eq!(
+            pretype_bytes("gt crew at skippy", true),
+            b"\x1b[200~gt crew at skippy\x1b[201~".to_vec()
+        );
+        assert_eq!(pretype_bytes("a\nb", false), b"a b".to_vec());
     }
 
     #[test]

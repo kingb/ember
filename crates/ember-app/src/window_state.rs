@@ -709,6 +709,21 @@ fn find_setting_row_by_label(label: &str) -> Option<&'static ember_core::Setting
     setting_rows().iter().find(|r| r.label == label)
 }
 
+/// Send raw bytes to one specific session's PTY, wherever it lives. A
+/// generalization of `WindowState::send_to_focused` (which delegates here)
+/// for callers — like the restored-session pre-type latch — that need to
+/// address a pane that isn't necessarily focused, or isn't even in the
+/// caller's own window. Pure lookup through `shared.sessions`: no
+/// `WindowState`/pane-tree traversal needed, since the PTY handle is keyed
+/// by `SessionId` alone.
+pub(crate) fn send_to_pane(shared: &Shared, session_id: &SessionId, bytes: Vec<u8>) {
+    if let Some(h) = shared.sessions.get(session_id) {
+        let _ = h
+            .control
+            .send(BackendControl::Input(bytes.into_boxed_slice()));
+    }
+}
+
 impl WindowState {
     /// Build a fresh per-window state around an already-created `renderer` +
     /// seeded `tree`; every other field starts at its "nothing in progress"
@@ -956,10 +971,8 @@ impl WindowState {
 
     /// Send raw bytes to the focused session's PTY (used by control + key paths).
     pub(crate) fn send_to_focused(&self, shared: &Shared, bytes: Vec<u8>) {
-        if let Some(h) = self.focused_session(shared) {
-            let _ = h
-                .control
-                .send(BackendControl::Input(bytes.into_boxed_slice()));
+        if let Some(id) = self.focused_session_id() {
+            send_to_pane(shared, &id, bytes);
         }
     }
 
