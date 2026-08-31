@@ -23,14 +23,52 @@ sudo apt install build-essential pkg-config libwayland-dev libxkbcommon-dev \
 Ember renders through wgpu, so it needs a working Vulkan driver (Mesa's
 `lavapipe` software rasterizer is enough for headless or CI use).
 
-At **runtime** the windowed app additionally needs `libxi6` (the X11 input
-extension; winit fails at event-loop creation without it) and
-`libxkbcommon-x11-0` (a separate library from `libxkbcommon`; the app panics
-at startup on X11 without it), alongside the `libxkbcommon`/`libxcursor`
-runtime libraries. Desktop installs usually have them all; minimal containers
-don't — and note that headless `--screenshot` runs never create a window, so
-they can't catch a missing windowed-only dependency. The X11 smoke test
-(windowed app under Xvfb) is what catches this class.
+### Runtime dependencies
+
+Building is not the whole story: winit `dlopen`s several libraries only when a
+real window opens, so a build can succeed and the app still die at startup.
+Anything packaging Ember (`.deb`, AppImage, bottle) must depend on:
+
+```sh
+sudo apt install libxkbcommon0 libxkbcommon-x11-0 libxcursor1 libxi6 \
+    libwayland-client0 libvulkan1 mesa-vulkan-drivers fontconfig fonts-dejavu-core
+```
+
+- `libxi6` — X11 input extension; winit fails at event-loop creation without it.
+- `libxkbcommon-x11-0` — a *separate* package from `libxkbcommon0`; the app
+  panics at startup on X11 without it.
+- `libxcursor1`, `libwayland-client0` — cursor themes and the Wayland client
+  transport.
+- fontconfig plus at least one monospace family — no fonts, nothing to shape.
+
+Desktop installs generally have all of these already (GNOME pulls them in);
+minimal containers do not. Headless `--screenshot` runs never create a window,
+so they cannot catch a missing windowed-only dependency, and neither can
+`cargo test`. Only a real window does — which is what the smoke tests below
+exist for.
+
+## Real-window smoke tests (Linux)
+
+`scripts/smoke/linux-window-smoke.sh <x11|wayland> [binary] [out-dir]` launches
+the actual windowed binary against a headless display server (Xvfb for X11,
+weston's headless backend for Wayland) and drives it over the control socket:
+the app must come up, report a non-zero surface and grid, round-trip typed
+input through a real shell, render a live screenshot, and survive an idle soak
+without panicking.
+
+CI runs both backends on every push and pull request (the `linux-smoke` job in
+`.github/workflows/ci.yml`), so a winit/wgpu/runtime-library regression fails
+the build instead of waiting for a release. To reproduce a failure — or check a
+change — from a Mac:
+
+```sh
+scripts/smoke/container-smoke.sh both      # or: x11 | wayland
+```
+
+That builds the current working tree in an `ubuntu:24.04` container and runs the
+same script CI runs. `scripts/smoke/x11-container-smoke.sh` is the older,
+broader X11 container exploration (it also exercises tab/pane drag); the two
+above are the maintained gate.
 
 ## Packaging (macOS)
 

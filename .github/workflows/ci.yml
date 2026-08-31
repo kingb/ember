@@ -73,3 +73,48 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses
+
+  linux-smoke:
+    # The real-window gate. `check` above runs `cargo test`, which never opens
+    # a window — it has therefore never exercised winit, wgpu surface creation,
+    # or the runtime shared libraries the windowed app dlopens (a missing
+    # libxkbcommon-x11-0 panicked at startup and CI stayed green). This job
+    # launches the actual binary against a headless X11 and a headless Wayland
+    # compositor and drives it through the control socket.
+    name: linux real-window smoke (X11 + Wayland)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Release profile — separate cache from `check`'s debug artifacts.
+          shared-key: linux-smoke
+      - name: Install build + runtime deps and headless display servers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev \
+            libxi-dev libxrandr-dev libxcb1-dev libvulkan-dev \
+            libfontconfig1-dev \
+            mesa-vulkan-drivers fonts-dejavu-core \
+            libxi6 libxcursor1 libxkbcommon-x11-0 libwayland-client0 \
+            xvfb x11-utils weston
+      - name: Build the real binary
+        run: cargo build --release -p ember-app --bin ember-term
+      # Both backends run even if the first fails, so one report covers both:
+      # X11 and Wayland are separate winit backends and break independently.
+      - name: Smoke — X11 (Xvfb)
+        run: scripts/smoke/linux-window-smoke.sh x11 target/release/ember-term "$RUNNER_TEMP/smoke"
+      - name: Smoke — Wayland (weston headless)
+        # Runs even when X11 failed — the two winit backends break
+        # independently, so one run should report on both.
+        if: ${{ !cancelled() }}
+        run: scripts/smoke/linux-window-smoke.sh wayland target/release/ember-term "$RUNNER_TEMP/smoke"
+      - name: Upload smoke artifacts (logs, state, screenshots)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-smoke
+          path: ${{ runner.temp }}/smoke
+          if-no-files-found: warn
