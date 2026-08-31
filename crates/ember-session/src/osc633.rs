@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn oversized_sequence_resyncs() {
         let mut b = b"\x1b]633;E;".to_vec();
-        b.extend(std::iter::repeat(b'a').take(MAX_SEQ + 1));
+        b.extend(std::iter::repeat_n(b'a', MAX_SEQ + 1));
         b.extend_from_slice(b"\x1b]633;E;ok\x07");
         assert_eq!(cmds(&b), vec!["ok"]);
     }
