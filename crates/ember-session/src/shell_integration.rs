@@ -127,7 +127,12 @@ fn prepare_zsh(dir: &Path) -> std::io::Result<Injection> {
 
 const RCFILE_BASH_HEAD: &str = r#"[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc"
 _ember_precmd() {
-  local ret=$?
+  # `$?` here is the FOREGROUND command's exit status only because
+  # `_ember_status` was captured before the user's own PROMPT_COMMAND
+  # fragments (starship, direnv, etc.) ran and reset `$?` to their own —
+  # usually zero — result. The `:-$?` fallback is just a sane default for
+  # the (never expected) case this runs before that capture ever fires.
+  local ret=${_ember_status:-$?}
   printf '\e]133;D;%s\e\\' "$ret"
   printf '\e]133;A\e\\'
   printf '\e]1337;CurrentDir=%s\e\\' "$PWD"
@@ -142,7 +147,13 @@ _ember_escape_cmd() {
 }
 case "$PROMPT_COMMAND" in
   *_ember_precmd*) ;;
-  *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_ember_precmd" ;;
+  # Capture the foreground command's exit status FIRST, before any of the
+  # user's own PROMPT_COMMAND fragments run and overwrite `$?` with their
+  # own (usually zero) result — otherwise OSC 133;D would report bash's
+  # last hook status instead of the command the user actually ran.
+  # `_ember_precmd` stays LAST: the DEBUG-trap latch (`_ember_interactive`)
+  # depends on it running after everything else in PROMPT_COMMAND.
+  *) PROMPT_COMMAND="_ember_status=\$?; ${PROMPT_COMMAND:+$PROMPT_COMMAND; }_ember_precmd" ;;
 esac
 trap 'if [ "$_ember_interactive" = "on" ] && [ -z "$COMP_LINE" ]; then _ember_interactive=; _ember_hist_line=$(HISTTIMEFORMAT= history 1); if [ -n "$_ember_hist_line" ] && [ "$_ember_hist_line" != "$_ember_last_hist" ]; then _ember_last_hist=$_ember_hist_line; _ember_cmd=$(printf "%s\n" "$_ember_hist_line" | sed "s/^[[:space:]]*[0-9]*[[:space:]]*//"); printf "\e]633;E;%s\e\\" "$(_ember_escape_cmd "$_ember_cmd")"; fi; fi; printf "\e]133;C\e\\"' DEBUG
 "#;
@@ -261,6 +272,44 @@ mod tests {
         let rc = std::fs::read_to_string(dir.join("ember-bash-rc")).unwrap();
         assert!(rc.contains("633;E;"));
         assert!(rc.contains("_ember_hist_line")); // History dedup mechanism
+    }
+
+    /// Regression: the foreground command's exit status must be captured
+    /// BEFORE any of the user's own `PROMPT_COMMAND` fragments (starship,
+    /// direnv, etc.) run — otherwise those fragments (usually exit-0
+    /// themselves) clobber `$?` before `_ember_precmd` ever reads it, and
+    /// OSC 133;D reports the wrong status. `_ember_precmd` must still be
+    /// LAST, since the DEBUG-trap latch depends on it running after
+    /// everything else in `PROMPT_COMMAND`.
+    #[test]
+    fn bash_rcfile_captures_exit_status_before_user_prompt_command() {
+        let dir = std::env::temp_dir().join(format!("ember-si-bash-status-{}", std::process::id()));
+        prepare("bash", &dir);
+        let rc = std::fs::read_to_string(dir.join("ember-bash-rc")).unwrap();
+
+        assert!(
+            rc.contains("local ret=${_ember_status:-$?}"),
+            "_ember_precmd must read the captured status, not raw $?: {rc:?}"
+        );
+
+        let assign_at = rc
+            .find("PROMPT_COMMAND=\"_ember_status=\\$?;")
+            .expect("status capture must open the new PROMPT_COMMAND assignment");
+        let user_frag_at = rc
+            .find("${PROMPT_COMMAND:+$PROMPT_COMMAND; }")
+            .expect("must still chain the user's existing PROMPT_COMMAND");
+        let precmd_call_at = rc
+            .rfind("_ember_precmd\"")
+            .expect("_ember_precmd must be appended to the assignment");
+        assert!(
+            assign_at < user_frag_at,
+            "status capture must precede the user's PROMPT_COMMAND fragment: {rc:?}"
+        );
+        assert!(
+            user_frag_at < precmd_call_at,
+            "_ember_precmd must run after the user's fragment (DEBUG-trap latch depends on it being last): {rc:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -453,6 +502,58 @@ mod tests {
             precmd_count, 0,
             "Spurious 633;E emitted for _ember_precmd {} times: {:?}",
             precmd_count, stdout_str
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Drives a REAL bash through the injection with a user `PROMPT_COMMAND`
+    /// set (the exact condition that broke exit-status reporting: `starship`,
+    /// `direnv`, and similar hooks install their own `PROMPT_COMMAND`
+    /// fragment, which previously ran BEFORE `_ember_precmd` and clobbered
+    /// `$?` with their own — usually zero — result). Runs a command that
+    /// fails (`false`, exit 1) and confirms OSC 133;D still reports the
+    /// FOREGROUND command's real exit status, not the user fragment's.
+    #[test]
+    fn bash_reports_real_exit_status_with_a_user_prompt_command_set() {
+        if !std::path::Path::new("/bin/bash").exists() {
+            return; // no bash on this runner — skip
+        }
+        let dir = std::env::temp_dir().join(format!("ember-si-bash-exit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = prepare("bash", &dir);
+
+        let rcfile = dir.join("ember-bash-rc");
+        let output_file = dir.join("output.txt");
+
+        let mut cmd = std::process::Command::new("/bin/bash");
+        cmd.args(["--rcfile", rcfile.to_string_lossy().as_ref(), "-i"]);
+        // A user PROMPT_COMMAND fragment that itself exits 0 — like
+        // starship/direnv's hooks typically do. Before the fix, this ran
+        // BEFORE `_ember_precmd` and silently reset `$?` to 0.
+        cmd.env("PROMPT_COMMAND", "true");
+        cmd.env("HISTFILE", "/dev/null");
+        cmd.stdin(std::process::Stdio::piped());
+        let file = std::fs::File::create(&output_file).unwrap();
+        cmd.stdout(file);
+
+        let mut child = cmd.spawn().unwrap();
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            use std::io::Write;
+            stdin.write_all(b"false\nexit\n").unwrap();
+        }
+        let _ = child.wait().unwrap();
+
+        let stdout_str = std::fs::read_to_string(&output_file).unwrap_or_default();
+        eprintln!("Bash exit-status test output:\n{}", stdout_str);
+
+        assert!(
+            stdout_str.contains("133;D;1"),
+            "expected 133;D;1 (the real exit status of `false`) with a user \
+             PROMPT_COMMAND set — got 0 or missing, meaning the user's \
+             fragment clobbered $? before _ember_precmd read it: {:?}",
+            stdout_str
         );
 
         let _ = std::fs::remove_dir_all(&dir);

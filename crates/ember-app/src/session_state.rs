@@ -1164,6 +1164,72 @@ mod tests {
         assert!(loaded.windows[0].tabs[0].named_by_user);
     }
 
+    /// The full "Capture commands off must actually keep commands off disk"
+    /// regression, not just the on-disk strip: `strip_commands` above only
+    /// rewrites the FILE as it stands the instant capture is toggled off.
+    /// The real bug was that the next `session_dirty` reassembled from
+    /// `Shared::pane_meta` — which the strip never touches — and silently
+    /// wrote every live command straight back on top of the file that was
+    /// just stripped. This exercises the other two legs of the fix against
+    /// the real `assemble` pure function: `crate::clear_captured_commands`
+    /// scrubbing pane metadata that (like the bug) still has a command sitting
+    /// in it, and `crate::pane_snap_for` gating `last_cmd` on
+    /// `capture_commands` as a second, independent line of defense — so a
+    /// subsequent assemble carries no commands whether or not the metadata
+    /// was scrubbed in time.
+    #[test]
+    fn subsequent_assemble_carries_no_commands_once_capture_is_off() {
+        use ember_core::ids::{PaneId, SessionId, TabId};
+        use ember_core::layout::{LayoutNode, Tab, WindowTree};
+
+        let p = tmp("strip-then-reassemble");
+        write_atomic(&p, &snap_with_commands()).unwrap();
+        strip_commands(&p).unwrap();
+
+        let sid = SessionId::new("s1");
+        let tree = WindowTree {
+            active: 0,
+            tabs: vec![Tab {
+                id: TabId(1),
+                title: String::new(),
+                focus: PaneId(1),
+                root: LayoutNode::pane(PaneId(1), sid.clone()),
+            }],
+        };
+
+        // Live metadata that a race (or a missed call site) left un-scrubbed
+        // at toggle time, same as the bug: a command still sitting in
+        // `pane_meta` when the next dirty event fires.
+        let mut pane_meta = std::collections::HashMap::new();
+        pane_meta.insert(
+            sid.clone(),
+            crate::PaneMeta {
+                cwd: Some("/a".to_string()),
+                last_cmd: Some("echo left".to_string()),
+                was_running: true,
+            },
+        );
+
+        // Leg (a): the settings-effect handler scrubs it directly.
+        crate::clear_captured_commands(&mut pane_meta);
+
+        // Leg (b): `pane_snap_for`'s gate is the belt-and-braces backstop —
+        // still holds even if a future call site skips leg (a).
+        let capture_commands = false;
+        let snap = assemble(&[(None, (80, 24), &tree, &[false])], &|s| {
+            crate::pane_snap_for(pane_meta.get(s), capture_commands)
+        });
+
+        let NodeSnap::Pane(p) = &snap.windows[0].tabs[0].splits else {
+            panic!("expected pane")
+        };
+        assert_eq!(p.last_cmd, None);
+        // cwd and was_running are unrelated to the command-privacy fix and
+        // must survive.
+        assert_eq!(p.cwd.as_deref(), Some("/a"));
+        assert!(p.was_running);
+    }
+
     #[test]
     fn strip_commands_is_a_noop_when_file_is_missing() {
         let p = tmp("strip-missing").with_file_name("does-not-exist.json");

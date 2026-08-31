@@ -4463,11 +4463,20 @@ impl WindowState {
         }
 
         if before.capture_commands && !after.capture_commands {
+            // Belt and braces (see `crate::pane_snap_for`'s doc): clear the
+            // live metadata that the NEXT `session_dirty` would otherwise
+            // reassemble commands from, strip whatever's already on disk,
+            // then mark dirty so a command-free snapshot supersedes
+            // anything a pre-toggle dirty event already queued in the
+            // debounced writer (which could otherwise flush after this
+            // strip and put the commands right back).
+            crate::clear_captured_commands(&mut shared.pane_meta);
             if let Some(path) = session_state::state_path() {
                 if let Err(e) = session_state::strip_commands(&path) {
                     eprintln!("[ember] session command strip failed: {e}");
                 }
             }
+            shared.snapshot_dirty = true;
         }
     }
 

@@ -275,6 +275,44 @@ pub(crate) struct PaneMeta {
     was_running: bool,
 }
 
+/// Build one session's `PaneSnap` from its live `PaneMeta`, honoring the
+/// "Capture commands" setting: `last_cmd` is included only when
+/// `capture_commands` is true. This is the belt half of "belt and braces" —
+/// `Shared::pane_meta` is also cleared directly the instant capture is
+/// toggled off (`clear_captured_commands`, called from
+/// `WindowState::adjust_setting_and_apply_restore_effects`) — but gating
+/// here too means a command can never reach a snapshot while the setting is
+/// off, even from a `pane_meta` entry a future call site forgets to scrub.
+/// Pure and unit-testable without `Shared`/`WindowState`; `session_dirty`'s
+/// `assemble` closure is a thin wrapper around this.
+pub(crate) fn pane_snap_for(
+    meta: Option<&PaneMeta>,
+    capture_commands: bool,
+) -> session_state::PaneSnap {
+    session_state::PaneSnap {
+        cwd: meta.and_then(|m| m.cwd.clone()),
+        last_cmd: if capture_commands {
+            meta.and_then(|m| m.last_cmd.clone())
+        } else {
+            None
+        },
+        was_running: meta.map(|m| m.was_running).unwrap_or(false),
+    }
+}
+
+/// Clear `last_cmd` on every tracked pane. The other half of "belt and
+/// braces": `session_state::strip_commands` scrubs the on-disk FILE at the
+/// instant "Capture commands" is toggled off, but never touches
+/// `Shared::pane_meta` — without this, the very next `session_dirty` would
+/// reassemble from that still-populated map and silently write every live
+/// command straight back on top of the file that was just stripped. Pure
+/// over the map so it's unit-testable without a live window.
+pub(crate) fn clear_captured_commands(pane_meta: &mut HashMap<SessionId, PaneMeta>) {
+    for meta in pane_meta.values_mut() {
+        meta.last_cmd = None;
+    }
+}
+
 /// Process-wide state that is not tied to any one window: the running sessions,
 /// user config, OS effect seam, control socket, and per-session bookkeeping.
 pub(crate) struct Shared {
@@ -1846,6 +1884,12 @@ impl ApplicationHandler<EmberEvent> for App {
                 // Drop silently rather than typing into a stale context.
                 continue;
             }
+            // `shared.bracketed` may still lag the shell's actual mode this
+            // early (bracketed-paste mode is itself set by an OSC/DEC report
+            // that can arrive after this first `PromptStart`); worst case
+            // that's read as `false` here, so `pretype_bytes` falls into its
+            // newline-flattening arm — never the unbracketed-and-unguarded
+            // path that could let a stray `\n`/`\r` execute.
             let bracketed = shared.bracketed.get(&id).copied().unwrap_or(false);
             let bytes = pretype_bytes(&p.cmd, bracketed);
             window_state::send_to_pane(shared, &id, bytes);
@@ -3771,13 +3815,9 @@ fn session_dirty(shared: &mut Shared, windows: &HashMap<WindowId, WindowState>) 
         .map(|(pos, px, tree, named)| (*pos, *px, *tree, named.as_slice()))
         .collect();
     let pane_meta = &shared.pane_meta;
+    let capture_commands = shared.config.restore.capture_commands;
     let snap = session_state::assemble(&refs, &|sid: &SessionId| {
-        let m = pane_meta.get(sid);
-        session_state::PaneSnap {
-            cwd: m.and_then(|m| m.cwd.clone()),
-            last_cmd: m.and_then(|m| m.last_cmd.clone()),
-            was_running: m.map(|m| m.was_running).unwrap_or(false),
-        }
+        pane_snap_for(pane_meta.get(sid), capture_commands)
     });
     handle.update(snap);
 }
@@ -4902,15 +4942,16 @@ fn bracket_paste(text: &str, bracketed: bool) -> Vec<u8> {
 /// bracketed-paste support, so this delegates rather than duplicating the
 /// stripping logic.
 ///
-/// Not bracketed: there is no guard, so a bare `\n` would submit the command
-/// immediately (the opposite of "unsent"). Newlines are replaced with a
-/// single space instead — the command still lands in the buffer, just
-/// flattened onto one line.
+/// Not bracketed: there is no guard, so a bare `\n` OR `\r` would submit the
+/// command immediately (the opposite of "unsent") — a plain `\r` reaches the
+/// shell's line editor exactly like Enter, same as `\n`, so both must be
+/// flattened. They're replaced with a single space instead — the command
+/// still lands in the buffer, just flattened onto one line.
 pub(crate) fn pretype_bytes(cmd: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
         bracket_paste(cmd, true)
     } else {
-        cmd.replace('\n', " ").into_bytes()
+        cmd.replace(['\n', '\r'], " ").into_bytes()
     }
 }
 
@@ -5159,11 +5200,11 @@ fn encode_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, TabId, bell_flash_intensity,
-        bracket_paste, clamp_to_visible_monitor, encode_key, match_tab_title,
-        match_tab_title_across, next_prev_index, pretype_bytes, queue_close_this,
-        queue_close_window, resolve_index, resolve_restore_cwd, shell_escape_path,
-        tab_display_title, url_is_openable, window_owning_tab,
+        BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, SessionId, TabId,
+        bell_flash_intensity, bracket_paste, clamp_to_visible_monitor, clear_captured_commands,
+        encode_key, match_tab_title, match_tab_title_across, next_prev_index, pane_snap_for,
+        pretype_bytes, queue_close_this, queue_close_window, resolve_index, resolve_restore_cwd,
+        shell_escape_path, tab_display_title, url_is_openable, window_owning_tab,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
@@ -5256,6 +5297,73 @@ mod tests {
             std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
         );
         assert_eq!(pretype, None);
+    }
+
+    // --- pane_snap_for / clear_captured_commands (capture-commands-off fix)
+
+    #[test]
+    fn pane_snap_for_includes_last_cmd_when_capture_is_on() {
+        let meta = PaneMeta {
+            cwd: Some("/tmp".to_string()),
+            last_cmd: Some("echo hi".to_string()),
+            was_running: true,
+        };
+        let snap = pane_snap_for(Some(&meta), true);
+        assert_eq!(snap.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(snap.last_cmd.as_deref(), Some("echo hi"));
+        assert!(snap.was_running);
+    }
+
+    #[test]
+    fn pane_snap_for_drops_last_cmd_when_capture_is_off_even_if_meta_still_has_one() {
+        // The exact regression: `pane_meta` still holds a command (nothing
+        // upstream scrubbed it yet) but capture is off — `last_cmd` must
+        // never reach the snapshot regardless.
+        let meta = PaneMeta {
+            cwd: Some("/tmp".to_string()),
+            last_cmd: Some("echo hi".to_string()),
+            was_running: true,
+        };
+        let snap = pane_snap_for(Some(&meta), false);
+        assert_eq!(snap.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(snap.last_cmd, None);
+        assert!(snap.was_running);
+    }
+
+    #[test]
+    fn pane_snap_for_handles_no_meta_at_all() {
+        let snap = pane_snap_for(None, true);
+        assert_eq!(snap.cwd, None);
+        assert_eq!(snap.last_cmd, None);
+        assert!(!snap.was_running);
+    }
+
+    #[test]
+    fn clear_captured_commands_clears_last_cmd_but_keeps_cwd_and_was_running() {
+        let mut pane_meta = std::collections::HashMap::new();
+        pane_meta.insert(
+            SessionId::new("s1"),
+            PaneMeta {
+                cwd: Some("/a".to_string()),
+                last_cmd: Some("echo left".to_string()),
+                was_running: true,
+            },
+        );
+        pane_meta.insert(
+            SessionId::new("s2"),
+            PaneMeta {
+                cwd: Some("/b".to_string()),
+                last_cmd: None,
+                was_running: false,
+            },
+        );
+        clear_captured_commands(&mut pane_meta);
+        for meta in pane_meta.values() {
+            assert_eq!(meta.last_cmd, None);
+        }
+        assert_eq!(pane_meta[&SessionId::new("s1")].cwd.as_deref(), Some("/a"));
+        assert!(pane_meta[&SessionId::new("s1")].was_running);
+        assert_eq!(pane_meta[&SessionId::new("s2")].cwd.as_deref(), Some("/b"));
     }
 
     // --- split-replay acceptance is viewport-size-dependent (Task 8 fix) --
@@ -5490,6 +5598,11 @@ mod tests {
             b"\x1b[200~gt crew at skippy\x1b[201~".to_vec()
         );
         assert_eq!(pretype_bytes("a\nb", false), b"a b".to_vec());
+        // A bare `\r` reaches the shell's line editor exactly like Enter,
+        // same as `\n` — it must be flattened too, or a pre-typed command
+        // could submit itself instead of landing unsent in the buffer.
+        assert_eq!(pretype_bytes("a\rb", false), b"a b".to_vec());
+        assert_eq!(pretype_bytes("a\r\nb", false), b"a  b".to_vec());
     }
 
     #[test]
