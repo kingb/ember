@@ -345,7 +345,9 @@ pub fn load(path: &Path) -> LoadOutcome {
         Err(_) => {
             // Corrupt JSON: rename to quarantine and return Corrupt.
             let corrupt_path = path.with_extension("json.corrupt");
-            let _ = std::fs::rename(path, &corrupt_path);
+            if let Err(e) = std::fs::rename(path, &corrupt_path) {
+                log_write_failure_once(&e);
+            }
             LoadOutcome::Corrupt
         }
     }
@@ -423,17 +425,24 @@ pub fn archive(path: &Path) -> io::Result<()> {
 
 /// Archive with an explicit stamp (for testing). Renames `path` to
 /// `session.json.prev-<stamp>`, then prunes old archives to keep only
-/// the `MAX_ARCHIVES` newest by timestamp.
+/// the `MAX_ARCHIVES` newest by timestamp. If a file with that stamp
+/// already exists, appends a numeric suffix (`-2`, `-3`, etc.) to avoid
+/// collisions; the suffixed name still sorts lexicographically as newer.
 pub fn archive_with_stamp(path: &Path, stamp: &str) -> io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
 
-    // Rename to archive
+    // Rename to archive, with collision avoidance via numeric suffix
     let Some(dir) = path.parent() else {
         return Ok(());
     };
-    let archive_path = dir.join(format!("session.json.prev-{}", stamp));
+    let mut archive_path = dir.join(format!("session.json.prev-{}", stamp));
+    let mut suffix = 2;
+    while archive_path.exists() {
+        archive_path = dir.join(format!("session.json.prev-{}-{}", stamp, suffix));
+        suffix += 1;
+    }
     std::fs::rename(path, archive_path)?;
 
     // Prune old archives
@@ -944,5 +953,61 @@ mod tests {
         // Verify newest first: stamps are lexicographically ordered, so newest
         // has the highest last digits
         assert!(list[0].stamp > list[9].stamp, "Archives not sorted newest first");
+    }
+
+    #[test]
+    fn archive_collision_avoidance_with_numeric_suffix() {
+        let p = tmp("collision");
+        let parent = p.parent().unwrap();
+        let stamp = "20260801-123456";
+
+        // Archive twice with the same stamp
+        write_atomic(&p, &snap("first")).unwrap();
+        archive_with_stamp(&p, stamp).unwrap();
+
+        write_atomic(&p, &snap("second")).unwrap();
+        archive_with_stamp(&p, stamp).unwrap();
+
+        // Both archives should exist with distinct names
+        let list = list_archives(parent);
+        assert_eq!(
+            list.len(),
+            2,
+            "Expected 2 archives after collision avoidance, got {}",
+            list.len()
+        );
+
+        // Verify newest first (the -2 suffix sorts after the base stamp)
+        assert!(list[0].stamp > list[1].stamp);
+
+        // One entry should have base stamp, the other should have -2 suffix
+        let stamps: Vec<&String> = list.iter().map(|e| &e.stamp).collect();
+        assert!(
+            stamps.contains(&&stamp.to_string())
+                || stamps.iter().any(|s| s.as_str() == &format!("{}-2", stamp)),
+            "Expected base or -2 suffix stamp"
+        );
+    }
+
+    #[test]
+    fn list_archives_skips_unparseable_prev_files() {
+        let p = tmp("unparseable");
+        let parent = p.parent().unwrap();
+
+        // Create one valid archive
+        write_atomic(&p, &snap("valid")).unwrap();
+        archive_with_stamp(&p, "20260801-100000").unwrap();
+
+        // Create an unparseable prev-* file
+        std::fs::write(
+            parent.join("session.json.prev-20260801-110000"),
+            b"this is not json",
+        )
+        .unwrap();
+
+        let list = list_archives(parent);
+        // Should only contain the valid archive, not the unparseable one
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].stamp, "20260801-100000");
     }
 }
