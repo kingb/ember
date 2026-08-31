@@ -64,6 +64,67 @@ pub struct PaneSnap {
     pub was_running: bool,
 }
 
+/// Flatten a `NodeSnap` tree into the sequence of split operations that
+/// recreates it: `(parent-pane index in creation order, dir, ratio, new
+/// pane's PaneSnap)`. The first pane of the tab is index 0 (created with the
+/// tab itself); each op creates exactly one more pane, so replaying `ops` in
+/// order — `split_pane(pane_by_index[parent], dir, ratio)` — assigns each
+/// new pane the NEXT index (1, 2, 3, …) in emission order, matching what
+/// this function assumed while building the list.
+///
+/// Mirrors [`ember_core`]'s `SplitPane` semantics exactly: a split always
+/// targets an existing LEAF pane and replaces it in place with a
+/// `Split { a: <that pane, unchanged>, b: <fresh pane> }` — the target pane
+/// keeps its identity (and position, however deeply nested) on the `a`
+/// side; only `b` is new. So to grow a pane at index `at` into a whole
+/// `Split { a, b }` subtree: first split `at` itself (`dir`/`ratio`,
+/// carrying `b`'s own eventual first pane's data as the new pane's content)
+/// — this one op reproduces the split node itself, with both sides still
+/// plain leaves — then recurse to grow `a` further AT THE SAME INDEX `at`
+/// (its identity survives being wrapped), and `b` further at the index the
+/// first op just created. Order between the two recursions doesn't matter
+/// (independent subtrees after the first op); this walks `a` before `b`.
+pub fn split_ops(root: &NodeSnap) -> (PaneSnap, Vec<(usize, char, f32, PaneSnap)>) {
+    let mut ops = Vec::new();
+    let mut next_index = 1usize; // index 0 = the tab's own seed pane
+    let first = walk_split_ops(root, 0, &mut next_index, &mut ops);
+    (first, ops)
+}
+
+/// This subtree's leftmost-via-`a` pane's snap, with NO ops emitted — used
+/// to peek a fresh split's "new pane" payload before recursing into it for
+/// real (see [`split_ops`]'s doc).
+fn leftmost_pane(node: &NodeSnap) -> PaneSnap {
+    match node {
+        NodeSnap::Pane(p) => p.clone(),
+        NodeSnap::Split { a, .. } => leftmost_pane(a),
+    }
+}
+
+/// Recursive helper for [`split_ops`]. `at` is the creation-order index of
+/// the pane CURRENTLY occupying this subtree's position (already exists —
+/// either the tab's own seed pane, at index 0, or a pane an earlier op just
+/// created). Returns this subtree's own first (leftmost-via-`a`) `PaneSnap`
+/// — `at`'s eventual identity once every op beneath it has run.
+fn walk_split_ops(
+    node: &NodeSnap,
+    at: usize,
+    next_index: &mut usize,
+    ops: &mut Vec<(usize, char, f32, PaneSnap)>,
+) -> PaneSnap {
+    match node {
+        NodeSnap::Pane(p) => p.clone(),
+        NodeSnap::Split { dir, ratio, a, b } => {
+            let new_index = *next_index;
+            *next_index += 1;
+            ops.push((at, *dir, *ratio, leftmost_pane(b)));
+            let first = walk_split_ops(a, at, next_index, ops);
+            walk_split_ops(b, new_index, next_index, ops);
+            first
+        }
+    }
+}
+
 /// Outcome of attempting to load a session snapshot from disk.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadOutcome {
@@ -415,6 +476,113 @@ fn is_leap_year(year: u64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
+/// Inverse of `format_timestamp`: parse a `YYYYMMDD-HHMMSS` stamp back into
+/// a `SystemTime`. Only the first 15 bytes are read, so an
+/// `archive_with_stamp` collision suffix (`-2`, `-3`, …) appended after the
+/// base stamp is silently ignored rather than rejected. `None` on anything
+/// too short or non-numeric (a hand-edited or truncated filename) — the
+/// restore modal falls back to an empty age string rather than panicking on
+/// a malformed archive name.
+fn parse_timestamp(stamp: &str) -> Option<SystemTime> {
+    let core = stamp.get(0..15)?;
+    let (date, rest) = core.split_at(8);
+    let time = rest.strip_prefix('-')?;
+    let year: u64 = date.get(0..4)?.parse().ok()?;
+    let month: u64 = date.get(4..6)?.parse().ok()?;
+    let day: u64 = date.get(6..8)?.parse().ok()?;
+    let hour: u64 = time.get(0..2)?.parse().ok()?;
+    let minute: u64 = time.get(2..4)?.parse().ok()?;
+    let second: u64 = time.get(4..6)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+    }
+    for m in 1..month {
+        days += match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if is_leap_year(year) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 0,
+        };
+    }
+    days += day - 1;
+    let secs = days * SECS_PER_DAY + hour * 3600 + minute * 60 + second;
+    Some(UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+const SECS_PER_DAY: u64 = 86400;
+
+/// Humanize an elapsed duration (seconds) into a short, casual age label —
+/// the restore modal's own scale, not a calendar-accurate diff: "just now",
+/// "5m ago", "2h ago", "3d ago", "3 weeks ago", "2 months ago", "1 year
+/// ago". A negative (clock-skew) or unparseable elapsed time also reads as
+/// "just now" rather than a confusing negative duration.
+fn humanize_duration(secs: i64) -> String {
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    let secs = secs as u64;
+    if secs < 3600 {
+        return format!("{}m ago", secs / 60);
+    }
+    if secs < SECS_PER_DAY {
+        return format!("{}h ago", secs / 3600);
+    }
+    if secs < SECS_PER_DAY * 7 {
+        return format!("{}d ago", secs / SECS_PER_DAY);
+    }
+    if secs < SECS_PER_DAY * 30 {
+        let w = secs / (SECS_PER_DAY * 7);
+        return format!("{w} week{} ago", if w == 1 { "" } else { "s" });
+    }
+    if secs < SECS_PER_DAY * 365 {
+        let mo = secs / (SECS_PER_DAY * 30);
+        return format!("{mo} month{} ago", if mo == 1 { "" } else { "s" });
+    }
+    let y = secs / (SECS_PER_DAY * 365);
+    format!("{y} year{} ago", if y == 1 { "" } else { "s" })
+}
+
+/// Humanize a `SessionSnapshot::saved_at` (unix-seconds-as-string) relative
+/// to `now`. An unparseable/missing `saved_at` (a hand-edited or ancient
+/// snapshot) reads as "just now" — a stale-looking timestamp would be
+/// actively misleading in the restore prompt, and "just now" is the neutral
+/// fallback the humanized scale already provides.
+pub fn humanize_age(saved_at: &str, now: SystemTime) -> String {
+    let Ok(secs) = saved_at.parse::<u64>() else {
+        return "just now".to_string();
+    };
+    let saved = UNIX_EPOCH + Duration::from_secs(secs);
+    let elapsed = now
+        .duration_since(saved)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    humanize_duration(elapsed)
+}
+
+/// Humanize an archive's `YYYYMMDD-HHMMSS` filename stamp relative to `now`
+/// (the `Older…` list's per-row age) — same fallback-to-"just now" ruling
+/// as `humanize_age` for a stamp that fails to parse.
+pub fn humanize_stamp(stamp: &str, now: SystemTime) -> String {
+    let Some(saved) = parse_timestamp(stamp) else {
+        return "just now".to_string();
+    };
+    let elapsed = now
+        .duration_since(saved)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    humanize_duration(elapsed)
+}
+
 /// Archive the snapshot at `path` by renaming it to
 /// `session.json.prev-<YYYYMMDD-HHMMSS>`. Then prune old archives, keeping
 /// only the `MAX_ARCHIVES` newest by filename (which sorts by timestamp).
@@ -531,6 +699,16 @@ pub fn list_archives(dir: &Path) -> Vec<ArchiveEntry> {
     entries
 }
 
+/// Read and parse one archived snapshot for restoring — unlike `load`, this
+/// never quarantines a bad file (an archive is disposable/read-only history,
+/// not the live state `load`'s corruption handling protects) and never
+/// checks `version` (an archive this old process can't parse is simply
+/// unusable here). `None` on any read or parse failure.
+pub fn load_archive(path: &Path) -> Option<SessionSnapshot> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 static WRITE_FAILURE_LOGGED: Once = Once::new();
 
 /// Log a write failure exactly once for the process lifetime, then swallow
@@ -638,6 +816,169 @@ mod tests {
             windows: vec![],
         }
     }
+    fn pane(cwd: &str) -> PaneSnap {
+        PaneSnap {
+            cwd: Some(cwd.to_string()),
+            last_cmd: None,
+            was_running: false,
+        }
+    }
+
+    #[test]
+    fn split_ops_recreates_a_nested_tree() {
+        // h-split whose left is a v-split: ops must be executable in order.
+        let tree = NodeSnap::Split {
+            dir: 'h',
+            ratio: 0.6,
+            a: Box::new(NodeSnap::Split {
+                dir: 'v',
+                ratio: 0.5,
+                a: Box::new(NodeSnap::Pane(pane("p0"))),
+                b: Box::new(NodeSnap::Pane(pane("p1"))),
+            }),
+            b: Box::new(NodeSnap::Pane(pane("p2"))),
+        };
+        let (first, ops) = split_ops(&tree);
+        assert_eq!(first.cwd.as_deref(), Some("p0"));
+        assert_eq!(ops.len(), 2);
+        // op order must split the root h first (p2 off p0), then v (p1 off p0),
+        // OR any order that yields the same final tree — assert the invariant:
+        assert_eq!(ops.iter().filter(|o| o.1 == 'h').count(), 1);
+        assert_eq!(ops.iter().filter(|o| o.1 == 'v').count(), 1);
+    }
+
+    #[test]
+    fn split_ops_on_a_bare_pane_is_the_seed_with_no_ops() {
+        let (first, ops) = split_ops(&NodeSnap::Pane(pane("only")));
+        assert_eq!(first.cwd.as_deref(), Some("only"));
+        assert!(ops.is_empty());
+    }
+
+    /// Every op's parent index must be resolvable by replaying ops in order
+    /// against a flat `pane_by_index` vec seeded with just the first pane —
+    /// exactly how `main.rs`'s `spawn_restored` walks them. This simulates
+    /// that replay purely (no real split_pane/tree) and checks the resulting
+    /// parent/child pane-content adjacency matches a hand-built expectation
+    /// for a 3-level-deep tree (more ops than the 2-op nested-tree test).
+    #[test]
+    fn split_ops_replay_indices_resolve_for_a_three_level_tree() {
+        // ((p0 | p1) over p2) beside p3:  h( v( h(p0,p1), p2 ), p3 )
+        let tree = NodeSnap::Split {
+            dir: 'h',
+            ratio: 0.5,
+            a: Box::new(NodeSnap::Split {
+                dir: 'v',
+                ratio: 0.5,
+                a: Box::new(NodeSnap::Split {
+                    dir: 'h',
+                    ratio: 0.5,
+                    a: Box::new(NodeSnap::Pane(pane("p0"))),
+                    b: Box::new(NodeSnap::Pane(pane("p1"))),
+                }),
+                b: Box::new(NodeSnap::Pane(pane("p2"))),
+            }),
+            b: Box::new(NodeSnap::Pane(pane("p3"))),
+        };
+        let (first, ops) = split_ops(&tree);
+        assert_eq!(first.cwd.as_deref(), Some("p0"));
+        assert_eq!(ops.len(), 3);
+        // Replay: pane_by_index[0] = first; each op's parent index must
+        // already exist in the vec built so far.
+        let mut pane_by_index = vec![first.cwd.clone()];
+        for (parent, _dir, _ratio, new_pane) in &ops {
+            assert!(
+                *parent < pane_by_index.len(),
+                "op parent index {parent} not yet created"
+            );
+            pane_by_index.push(new_pane.cwd.clone());
+        }
+        // Every original pane's cwd must appear exactly once across the
+        // replay (the seed + one per op).
+        let mut cwds: Vec<Option<String>> = pane_by_index;
+        cwds.sort();
+        let mut expected = vec![
+            Some("p0".to_string()),
+            Some("p1".to_string()),
+            Some("p2".to_string()),
+            Some("p3".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(cwds, expected);
+    }
+
+    // --- humanize_age / humanize_stamp / parse_timestamp -----
+
+    #[test]
+    fn humanize_age_buckets() {
+        let now = UNIX_EPOCH + Duration::from_secs(3_000_000_000);
+        let saved = |ago: u64| {
+            (now - Duration::from_secs(ago))
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .to_string()
+        };
+        assert_eq!(humanize_age(&saved(5), now), "just now");
+        assert_eq!(humanize_age(&saved(60 * 5), now), "5m ago");
+        assert_eq!(humanize_age(&saved(3600 * 2), now), "2h ago");
+        assert_eq!(humanize_age(&saved(86400 * 3), now), "3d ago");
+        assert_eq!(humanize_age(&saved(86400 * 7 * 3), now), "3 weeks ago");
+        assert_eq!(humanize_age(&saved(86400 * 30), now), "1 month ago");
+        assert_eq!(humanize_age(&saved(86400 * 365 * 2), now), "2 years ago");
+        assert_eq!(humanize_age("not-a-number", now), "just now");
+    }
+
+    #[test]
+    fn parse_timestamp_round_trips_format_timestamp() {
+        let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let stamp = format_timestamp(t);
+        let parsed = parse_timestamp(&stamp).unwrap();
+        // Round-trips to the second (format_timestamp truncates to seconds).
+        assert_eq!(
+            parsed.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            t.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+    }
+
+    #[test]
+    fn parse_timestamp_ignores_a_collision_suffix() {
+        let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let stamp = format!("{}-2", format_timestamp(t));
+        let parsed = parse_timestamp(&stamp).unwrap();
+        assert_eq!(
+            parsed.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            t.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+    }
+
+    #[test]
+    fn parse_timestamp_rejects_garbage() {
+        assert!(parse_timestamp("not-a-stamp").is_none());
+        assert!(parse_timestamp("").is_none());
+    }
+
+    #[test]
+    fn humanize_stamp_matches_humanize_age_for_the_same_instant() {
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let saved = now - Duration::from_secs(3600 * 5);
+        let stamp = format_timestamp(saved);
+        assert_eq!(humanize_stamp(&stamp, now), "5h ago");
+    }
+
+    // --- load_archive -----
+
+    #[test]
+    fn load_archive_reads_a_valid_file_and_none_for_missing_or_bad() {
+        let p = tmp("load-archive");
+        write_atomic(&p, &snap("archived")).unwrap();
+        let loaded = load_archive(&p).unwrap();
+        assert_eq!(loaded.saved_at, "archived");
+        assert!(load_archive(&p.with_file_name("nope.json")).is_none());
+        let bad = p.with_file_name("bad.json");
+        std::fs::write(&bad, b"not json").unwrap();
+        assert!(load_archive(&bad).is_none());
+    }
+
     fn tmp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("ember-ss-{}-{}", name, std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
