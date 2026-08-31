@@ -14,6 +14,7 @@ mod control;
 #[cfg(unix)]
 mod mcp;
 mod screenshot;
+mod session_state;
 mod window_state;
 
 use window_state::{DragEnded, HoldTick, MorphTick, WindowState};
