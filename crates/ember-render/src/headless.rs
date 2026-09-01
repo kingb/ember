@@ -78,7 +78,7 @@ pub struct Shot<'a> {
     /// IME composition (preedit) text, drawn at the focused pane's cursor.
     pub ime_preedit: Option<String>,
     /// Command palette: `(query, filtered rows (desc, chord), selected)`.
-    pub palette: Option<(String, Vec<(String, String)>, usize)>,
+    pub palette: Option<crate::renderer::PaletteView>,
     /// Visual-bell flash intensity (`0..1`) — a warm amber wash over the panes.
     pub bell_flash: f32,
     /// Terminal font point size (matches the live renderer's current zoom).

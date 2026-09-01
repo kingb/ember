@@ -192,7 +192,9 @@ impl SessionBackend for LocalPty {
             let event_tx = event_tx.clone();
             let busy = Arc::clone(&busy);
             thread::spawn(move || {
-                emulation_loop(dims, event_tx, frame_tx, irx, wtx, master, child, busy, osc52_read)
+                emulation_loop(
+                    dims, event_tx, frame_tx, irx, wtx, master, child, busy, osc52_read,
+                )
             });
         }
 

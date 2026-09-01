@@ -363,7 +363,12 @@ impl<L: EventListener> AlacrittyProjection<L> {
                 None
             } else {
                 let top = -display_offset;
-                Some(matches.iter().position(|(s, _)| s.line.0 >= top).unwrap_or(0))
+                Some(
+                    matches
+                        .iter()
+                        .position(|(s, _)| s.line.0 >= top)
+                        .unwrap_or(0),
+                )
             };
             self.search = Some(SearchState {
                 pattern: pattern.to_string(),
@@ -423,14 +428,10 @@ impl<L: EventListener> AlacrittyProjection<L> {
     ) -> Vec<(Point, Point)> {
         let mut out: Vec<(Point, Point)> = Vec::new();
         let mut origin = Point::new(Line(-(hist as i32)), Column(0));
-        loop {
-            let m = match self
-                .term
-                .search_next(regex, origin, Direction::Right, Side::Left, None)
-            {
-                Some(m) => m,
-                None => break,
-            };
+        while let Some(m) = self
+            .term
+            .search_next(regex, origin, Direction::Right, Side::Left, None)
+        {
             let (s, e) = (*m.start(), *m.end());
             // Matches come out strictly increasing; anything not past the last
             // means the scan wrapped the buffer or stalled at the end.

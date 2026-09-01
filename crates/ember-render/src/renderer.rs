@@ -75,6 +75,9 @@ pub struct VisiblePane {
 /// [`Renderer::set_morph`]'s doc for what each field means.
 pub type MorphState = ([f32; 4], (f32, f32), f32, bool);
 
+/// Command palette overlay: `(query, filtered rows (desc, chord), selected)`.
+pub type PaletteView = (String, Vec<(String, String)>, usize);
+
 /// One entry in the tab strip.
 #[derive(Clone, Debug)]
 pub struct TabLabel {
@@ -651,7 +654,7 @@ pub struct Renderer {
     fps_overlay: Option<String>,
     search_bar: Option<String>,
     ime_preedit: Option<String>,
-    palette: Option<(String, Vec<(String, String)>, usize)>,
+    palette: Option<PaletteView>,
     /// Glyph buffer for the FPS overlay.
     fps_buffer: Buffer,
     search_buffer: Buffer,
@@ -1505,7 +1508,7 @@ impl Renderer {
     }
 
     /// Set or clear the command palette overlay: `(query, rows, selected)`.
-    pub fn set_palette(&mut self, view: Option<(String, Vec<(String, String)>, usize)>) {
+    pub fn set_palette(&mut self, view: Option<PaletteView>) {
         self.scene_dirty = true;
         self.palette = view;
         self.window.request_redraw();
