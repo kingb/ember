@@ -3063,12 +3063,22 @@ fn spawn_restored(
 /// that would fit fine once actually resized. `Window::request_inner_size`
 /// is synchronous on some platforms (macOS, Windows, X11) and returns
 /// `Some(actual_size)` immediately, in which case the replay runs right
-/// here against the corrected size; on others (Wayland) it's only a
-/// request — returns `None` — and the real size arrives later as a
+/// here against the corrected size; on others (Wayland, and X11 in
+/// practice) it's only a request — returns `None`. When that request is a
+/// genuine size change, the real size arrives later as a
 /// `WindowEvent::Resized`, so the whole tab/split replay is deferred via
 /// `Shared::pending_restore_replay` until `window_event`'s `Resized` arm
-/// drains it. Either way `replay_restored_window` is the one place that
-/// actually builds the tabs/splits, so the two paths can't drift apart.
+/// drains it. But when the requested size already equals the window's
+/// current size (a very common case — the saved size matches the default
+/// creation size), the request is a no-op and no `Resized` event is ever
+/// delivered: deferring unconditionally on `None` left the window parked
+/// forever, with no shell ever spawned — a dead black pane with no input.
+/// So a `None` result is only deferred when the requested size actually
+/// differs from the window's current size (see `needs_deferred_replay`);
+/// otherwise (equal sizes, or a degenerate zero-sized saved window) the
+/// replay runs immediately against the window's current size instead.
+/// Either way `replay_restored_window` is the one place that actually
+/// builds the tabs/splits, so the paths can't drift apart.
 ///
 /// Returns the new window's id (which exists either way — with a live
 /// first pane if replayed synchronously, or still just the bare seed pane
@@ -3103,6 +3113,7 @@ fn spawn_restored_window(
     let window_id = open_window(windows, shared, event_loop, tree, position);
     let win = windows.get_mut(&window_id)?;
 
+    let current_px = win.px;
     let applied_synchronously = if win_snap.size.0 > 0 && win_snap.size.1 > 0 {
         win.renderer
             .window()
@@ -3125,10 +3136,12 @@ fn spawn_restored_window(
                 return None;
             }
         }
-        None => {
-            // Async platform: only a request went out. Defer the whole
-            // replay until the matching `Resized` event tells us the real
-            // size (`window_event`'s `Resized` arm drains this).
+        None if needs_deferred_replay(win_snap.size, current_px) => {
+            // Async platform, and the requested size genuinely differs
+            // from the window's current size: only a request went out.
+            // Defer the whole replay until the matching `Resized` event
+            // tells us the real size (`window_event`'s `Resized` arm
+            // drains this).
             shared.pending_restore_replay.insert(
                 window_id,
                 PendingRestore {
@@ -3137,8 +3150,32 @@ fn spawn_restored_window(
                 },
             );
         }
+        None => {
+            // No genuine resize is coming — either the saved size already
+            // matches the window's current size (a no-op request produces
+            // no `Resized` event), or the saved size was degenerate
+            // (zero-width/height). `win.px` is already correct, so replay
+            // immediately at the current size rather than waiting forever
+            // for an event that will never arrive.
+            if !replay_restored_window(win, shared, win_snap, session) {
+                close_window(windows, shared, focused_window, window_id);
+                return None;
+            }
+        }
     }
     Some(window_id)
+}
+
+/// Whether a restored window's saved size, if requested via
+/// `Window::request_inner_size` and not applied synchronously, needs its
+/// tab/split replay deferred until the resulting `WindowEvent::Resized`
+/// (versus running the replay immediately against the window's current
+/// size because no such event is actually coming). False when `requested`
+/// already equals `current` (a no-op resize request — no `Resized` event
+/// follows) or when either dimension of `requested` is zero (a degenerate
+/// saved size, never actually requested); true otherwise.
+fn needs_deferred_replay(requested: (u32, u32), current: (u32, u32)) -> bool {
+    requested.0 > 0 && requested.1 > 0 && requested != current
 }
 
 /// Replay one restored window's tabs + split trees onto an already-created,
@@ -5200,9 +5237,10 @@ mod tests {
     use super::{
         BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, SessionId, TabId,
         bell_flash_intensity, bracket_paste, clamp_to_visible_monitor, clear_captured_commands,
-        encode_key, match_tab_title, match_tab_title_across, next_prev_index, pane_snap_for,
-        pretype_bytes, queue_close_this, queue_close_window, resolve_index, resolve_restore_cwd,
-        shell_escape_path, tab_display_title, url_is_openable, window_owning_tab,
+        encode_key, match_tab_title, match_tab_title_across, needs_deferred_replay,
+        next_prev_index, pane_snap_for, pretype_bytes, queue_close_this, queue_close_window,
+        resolve_index, resolve_restore_cwd, shell_escape_path, tab_display_title, url_is_openable,
+        window_owning_tab,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
@@ -5295,6 +5333,25 @@ mod tests {
             std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
         );
         assert_eq!(pretype, None);
+    }
+
+    // --- needs_deferred_replay (spawn_restored_window's black-pane fix) --
+
+    #[test]
+    fn needs_deferred_replay_is_false_when_requested_matches_current() {
+        assert!(!needs_deferred_replay((800, 600), (800, 600)));
+    }
+
+    #[test]
+    fn needs_deferred_replay_is_false_for_a_degenerate_zero_sized_request() {
+        assert!(!needs_deferred_replay((0, 600), (800, 600)));
+        assert!(!needs_deferred_replay((800, 0), (800, 600)));
+        assert!(!needs_deferred_replay((0, 0), (800, 600)));
+    }
+
+    #[test]
+    fn needs_deferred_replay_is_true_when_requested_differs_from_current() {
+        assert!(needs_deferred_replay((1200, 900), (800, 600)));
     }
 
     // --- pane_snap_for / clear_captured_commands (capture-commands-off fix)
