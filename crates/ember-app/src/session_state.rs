@@ -1400,7 +1400,7 @@ mod tests {
         let stamps: Vec<&String> = list.iter().map(|e| &e.stamp).collect();
         assert!(
             stamps.contains(&&stamp.to_string())
-                || stamps.iter().any(|s| s.as_str() == &format!("{}-2", stamp)),
+                || stamps.iter().any(|s| s.as_str() == format!("{}-2", stamp)),
             "Expected base or -2 suffix stamp"
         );
     }
