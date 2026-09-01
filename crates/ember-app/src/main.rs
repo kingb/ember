@@ -1329,13 +1329,11 @@ impl ApplicationHandler<EmberEvent> for App {
                     }
                 }
             }
-            WindowEvent::Ime(ime) => {
-                match ime {
+            WindowEvent::Ime(ime) => match ime {
                 winit::event::Ime::Preedit(text, _) => win.set_ime_preedit(text),
                 winit::event::Ime::Commit(text) => win.ime_commit(shared, &text),
                 winit::event::Ime::Enabled | winit::event::Ime::Disabled => {}
-                }
-            }
+            },
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
                     return;
@@ -1810,7 +1808,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     }
                     BackendEvent::Exited(_) => exited.push(id.clone()),
                     BackendEvent::Bell => belled.push(id.clone()),
-                    BackendEvent::SearchResult(hit) => search_hits.push((id.clone(), hit.clone())),
+                    BackendEvent::SearchResult(hit) => search_hits.push((id.clone(), hit)),
                     // OSC 52 copy from any pane (tmux/nvim-over-ssh).
                     BackendEvent::Clipboard(ClipboardOp::Set(text)) => {
                         clipboard_set = Some(text);
@@ -5926,8 +5924,7 @@ mod tests {
         // as a TAB anywhere (it became a pane inside another tab), so no
         // window's tab list contains it -- the carry must be a no-op, not
         // a panic or a wrong guess.
-        let by_window: Vec<(u32, Vec<TabId>)> =
-            vec![(10, vec![TabId(1)]), (20, vec![TabId(2)])];
+        let by_window: Vec<(u32, Vec<TabId>)> = vec![(10, vec![TabId(1)]), (20, vec![TabId(2)])];
         assert_eq!(window_owning_tab(&by_window, TabId(99)), None);
     }
 }

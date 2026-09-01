@@ -456,7 +456,13 @@ fn format_timestamp(time: SystemTime) -> String {
         let days_in_month = match m {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
             4 | 6 | 9 | 11 => 30,
-            2 => if is_leap_year(year) { 29 } else { 28 },
+            2 => {
+                if is_leap_year(year) {
+                    29
+                } else {
+                    28
+                }
+            }
             _ => 0,
         };
         if day <= days_in_month {
@@ -1359,7 +1365,10 @@ mod tests {
         assert_eq!(list.len(), 10, "Expected 10 archives, got {}", list.len());
         // Verify newest first: stamps are lexicographically ordered, so newest
         // has the highest last digits
-        assert!(list[0].stamp > list[9].stamp, "Archives not sorted newest first");
+        assert!(
+            list[0].stamp > list[9].stamp,
+            "Archives not sorted newest first"
+        );
     }
 
     #[test]

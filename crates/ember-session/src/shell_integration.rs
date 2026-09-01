@@ -324,17 +324,32 @@ mod tests {
         // Verify that the hooks are correctly installed in the generated rc files
         let rc = std::fs::read_to_string(dir.join(".zshrc")).unwrap();
         assert!(rc.contains("633;E;"), "OSC 633;E not in .zshrc");
-        assert!(rc.contains("_ember_escape_cmd"), "Escape function not in .zshrc");
+        assert!(
+            rc.contains("_ember_escape_cmd"),
+            "Escape function not in .zshrc"
+        );
         assert!(rc.contains("_ember_preexec"), "Preexec hook not in .zshrc");
 
         // Verify that the escape function has the correct escaping logic
-        assert!(rc.contains(r#"s=${s//$'\\'/\\\\}"#), "Backslash escaping not found");
-        assert!(rc.contains(r#"s=${s//;/\\x3b}"#), "Semicolon escaping not found");
-        assert!(rc.contains(r#"s=${s//$'\n'/\\x0a}"#), "Newline escaping not found");
+        assert!(
+            rc.contains(r#"s=${s//$'\\'/\\\\}"#),
+            "Backslash escaping not found"
+        );
+        assert!(
+            rc.contains(r#"s=${s//;/\\x3b}"#),
+            "Semicolon escaping not found"
+        );
+        assert!(
+            rc.contains(r#"s=${s//$'\n'/\\x0a}"#),
+            "Newline escaping not found"
+        );
 
         // Run zsh to verify the hooks are syntactically valid and load
         let mut cmd = std::process::Command::new("/bin/zsh");
-        cmd.args(["-ic", "whence _ember_escape_cmd >/dev/null && echo HOOKS_OK"]);
+        cmd.args([
+            "-ic",
+            "whence _ember_escape_cmd >/dev/null && echo HOOKS_OK",
+        ]);
         for (k, v) in &inj.env {
             cmd.env(k, v);
         }
@@ -447,11 +462,7 @@ mod tests {
         // The user's PROMPT_COMMAND has a marker that we can detect in the output
         // Use /dev/null for HISTFILE to avoid polluting real history
         let mut cmd = std::process::Command::new("/bin/bash");
-        cmd.args([
-            "--rcfile",
-            rcfile.to_string_lossy().as_ref(),
-            "-i",
-        ]);
+        cmd.args(["--rcfile", rcfile.to_string_lossy().as_ref(), "-i"]);
         cmd.env("PROMPT_COMMAND", "echo USER-PROMPT-MARKER");
         cmd.env("HISTFILE", "/dev/null");
         cmd.stdin(std::process::Stdio::piped());
