@@ -1123,13 +1123,11 @@ impl ApplicationHandler<EmberEvent> for App {
                     }
                 }
             }
-            WindowEvent::Ime(ime) => {
-                match ime {
+            WindowEvent::Ime(ime) => match ime {
                 winit::event::Ime::Preedit(text, _) => win.set_ime_preedit(text),
                 winit::event::Ime::Commit(text) => win.ime_commit(shared, &text),
                 winit::event::Ime::Enabled | winit::event::Ime::Disabled => {}
-                }
-            }
+            },
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {
                     return;
@@ -1571,7 +1569,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     }
                     BackendEvent::Exited(_) => exited.push(id.clone()),
                     BackendEvent::Bell => belled.push(id.clone()),
-                    BackendEvent::SearchResult(hit) => search_hits.push((id.clone(), hit.clone())),
+                    BackendEvent::SearchResult(hit) => search_hits.push((id.clone(), hit)),
                     // OSC 52 copy from any pane (tmux/nvim-over-ssh).
                     BackendEvent::Clipboard(ClipboardOp::Set(text)) => {
                         clipboard_set = Some(text);

@@ -30,9 +30,9 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     BTN_COLS, CLOSE_COLS, bell_wash, build_about, build_confirm, build_fps, build_help,
-    build_ime_preedit, build_palette, build_search_bar, build_settings, build_tabs, debug_emit, grid_quads, hold_ring_quads, measure_cell_width,
-    morph_quads, push_backdrop, scrollbar, scrollbar_geometry, selection_quads, shape_grid,
-    spark_quads, split_preview,
+    build_ime_preedit, build_palette, build_search_bar, build_settings, build_tabs, debug_emit,
+    grid_quads, hold_ring_quads, measure_cell_width, morph_quads, push_backdrop, scrollbar,
+    scrollbar_geometry, selection_quads, shape_grid, spark_quads, split_preview,
 };
 use crate::selection::AnchoredSelection;
 
@@ -73,6 +73,9 @@ pub struct VisiblePane {
 /// all logical px/`0..1`, this window's own space — see
 /// [`Renderer::set_morph`]'s doc for what each field means.
 pub type MorphState = ([f32; 4], (f32, f32), f32, bool);
+
+/// Command palette overlay: `(query, filtered rows (desc, chord), selected)`.
+pub type PaletteView = (String, Vec<(String, String)>, usize);
 
 /// One entry in the tab strip.
 #[derive(Clone, Debug)]
@@ -615,7 +618,7 @@ pub struct Renderer {
     fps_overlay: Option<String>,
     search_bar: Option<String>,
     ime_preedit: Option<String>,
-    palette: Option<(String, Vec<(String, String)>, usize)>,
+    palette: Option<PaletteView>,
     /// Glyph buffer for the FPS overlay.
     fps_buffer: Buffer,
     search_buffer: Buffer,
@@ -1447,7 +1450,7 @@ impl Renderer {
     }
 
     /// Set or clear the command palette overlay: `(query, rows, selected)`.
-    pub fn set_palette(&mut self, view: Option<(String, Vec<(String, String)>, usize)>) {
+    pub fn set_palette(&mut self, view: Option<PaletteView>) {
         self.scene_dirty = true;
         self.palette = view;
         self.window.request_redraw();

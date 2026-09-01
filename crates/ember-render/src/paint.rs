@@ -1602,7 +1602,10 @@ pub(crate) fn build_ime_preedit(
 ) -> (f32, f32) {
     let w = (text.chars().count() as f32 * cw * 2.0).max(cw); // CJK cells are wide
     let x = x.min((logical_w - w).max(0.0));
-    out.push((scaled(x, y, w, ch, sf), lin_rgba(Rgb::new(30, 20, 14), 0.95)));
+    out.push((
+        scaled(x, y, w, ch, sf),
+        lin_rgba(Rgb::new(30, 20, 14), 0.95),
+    ));
     // Accent composition underline.
     out.push((scaled(x, y + ch - 2.0, w, 2.0, sf), lin_rgba(ACCENT, 0.95)));
     buf.set_size(font_system, Some(w), Some(ch));
@@ -1642,7 +1645,7 @@ pub(crate) fn build_palette(
     // At least one row of height so the "(no matching actions)" line stays
     // visible when a query matches nothing (an invisible captured overlay
     // reads as "the terminal stopped responding").
-    let shown = rows.len().min(12).max(1);
+    let shown = rows.len().clamp(1, 12);
     // Text layout is: query line, a blank spacer line, then the rows — so the
     // panel needs (shown + 2) lines and row `i` sits at line (2 + i). The
     // highlight below uses the same arithmetic; keep them in lockstep.
@@ -1683,7 +1686,10 @@ pub(crate) fn build_palette(
     let mut text = format!("> {query}\u{2038}\n");
     text.push('\n');
     for (desc, chord) in rows.iter().take(shown) {
-        let d: String = desc.chars().take(inner_cols.saturating_sub(chord.chars().count() + 2)).collect();
+        let d: String = desc
+            .chars()
+            .take(inner_cols.saturating_sub(chord.chars().count() + 2))
+            .collect();
         let pad = inner_cols
             .saturating_sub(d.chars().count())
             .saturating_sub(chord.chars().count());
