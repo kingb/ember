@@ -644,12 +644,20 @@ enum RestoreKeyAction {
     /// `Older`.
     Back,
     /// A printable keystroke (`Key::Character`, or `Space` normalized to a
-    /// literal space) — the product ruling: typing while the prompt is up
-    /// means "get me to a shell now," so this always resolves to
-    /// `RestoreAction::StartFreshAndType`, in both screens.
+    /// literal space) held with no Ctrl/Super modifier — the product
+    /// ruling: typing while the prompt is up means "get me to a shell
+    /// now," so this always resolves to `RestoreAction::StartFreshAndType`,
+    /// in both screens.
     TypeThrough(String),
-    /// Anything else (function keys, bare modifiers, etc.) — no-op, matching
-    /// today's behavior.
+    /// Anything else: function keys, bare modifiers, a Ctrl-modified
+    /// character (Ctrl+C must not literally type "c" into the fresh
+    /// shell), or — defense in depth for callers that could somehow reach
+    /// this with Super held — a Super-modified character. No-op, matching
+    /// today's swallow. Real Super *chords* (Cmd+Q, Cmd+W, …) never reach
+    /// this function at all on the keyboard path: `main.rs` skips the
+    /// restore-modal branch entirely while Super is held, exactly like the
+    /// palette/search/rename capture guards, so they fall through to the
+    /// normal shortcut handlers below instead of being classified here.
     Swallow,
 }
 
@@ -664,9 +672,13 @@ enum RestoreNavDir {
 }
 
 /// Classify one key press against the restore modal's fixed control
-/// surface. See [`RestoreKeyAction`]'s doc for why this is a free pure
-/// function rather than a `WindowState` method.
-fn restore_key_action(key: &Key) -> RestoreKeyAction {
+/// surface, given the modifiers held alongside it. See
+/// [`RestoreKeyAction`]'s doc for why this is a free pure function rather
+/// than a `WindowState` method, and for why `mods` only ever gates
+/// `TypeThrough` rather than the named control keys (Escape/Enter/arrows/
+/// Tab keep their meaning modifier or not, unchanged from before this
+/// keystroke ever carried a modifier check).
+fn restore_key_action(key: &Key, mods: ModifiersState) -> RestoreKeyAction {
     match key {
         Key::Named(NamedKey::Escape) => RestoreKeyAction::Back,
         Key::Named(NamedKey::Enter) => RestoreKeyAction::Activate,
@@ -676,8 +688,12 @@ fn restore_key_action(key: &Key) -> RestoreKeyAction {
         }
         Key::Named(NamedKey::ArrowUp) => RestoreKeyAction::Nav(RestoreNavDir::Up),
         Key::Named(NamedKey::ArrowDown) => RestoreKeyAction::Nav(RestoreNavDir::Down),
-        Key::Named(NamedKey::Space) => RestoreKeyAction::TypeThrough(" ".to_string()),
-        Key::Character(s) => RestoreKeyAction::TypeThrough(s.to_string()),
+        Key::Named(NamedKey::Space) if !mods.control_key() && !mods.super_key() => {
+            RestoreKeyAction::TypeThrough(" ".to_string())
+        }
+        Key::Character(s) if !mods.control_key() && !mods.super_key() => {
+            RestoreKeyAction::TypeThrough(s.to_string())
+        }
         _ => RestoreKeyAction::Swallow,
     }
 }
@@ -1089,11 +1105,21 @@ impl WindowState {
         // (Left/Right/Tab/Up/Down navigate, Enter activates, Esc backs out,
         // a printable key or a whole `Type` types through — see
         // `restore_key_action`/`RestoreAction::StartFreshAndType`).
+        //
+        // No Super-bypass gate here (contrast the keyboard call site in
+        // `main.rs`): `ControlMsg::Key`'s `named_key` lookup produces a bare
+        // `Key` with no modifier at all, so a ctl caller has no way to
+        // synthesize a Super-held (or Ctrl-held) character in the first
+        // place — `restore_key`'s own `mods: ModifiersState::empty()` below
+        // is therefore always the true state, not a lossy approximation.
+        // `ControlMsg::Chord` (the ctl verb that DOES carry modifiers, e.g.
+        // "cmd+q") isn't matched below at all and falls to `_ => {}` —
+        // already swallowed before this change, unchanged by it.
         if self.restore_prompt.is_some() {
             match &msg {
                 ControlMsg::Key(name) => {
                     if let Some(k) = named_key(name) {
-                        if let Some(action) = self.restore_key(&k) {
+                        if let Some(action) = self.restore_key(&k, ModifiersState::empty()) {
                             return Some(ControlClose::Restore(action));
                         }
                         self.renderer.window().request_redraw();
@@ -1102,8 +1128,11 @@ impl WindowState {
                 // Scripted launches send the whole typed string in one shot
                 // rather than one `ControlMsg::Key` per character — same
                 // dismissal as a single printable keystroke, just with the
-                // full text riding along instead of one character.
-                ControlMsg::Type(text) => {
+                // full text riding along instead of one character. An empty
+                // string carries nothing to forward, so it's a no-op: the
+                // modal stays up rather than archiving and dismissing for
+                // literally nothing typed.
+                ControlMsg::Type(text) if !text.is_empty() => {
                     self.restore_prompt = None;
                     self.update_restore_view();
                     return Some(ControlClose::Restore(RestoreAction::StartFreshAndType(
@@ -4312,8 +4341,18 @@ impl WindowState {
     /// guaranteed untouched while any window's `restore_prompt.is_some()`
     /// (`main.rs`'s `session_dirty` guard) — so the reload always reproduces
     /// exactly what `Main` showed before.
-    pub(crate) fn restore_key(&mut self, key: &Key) -> Option<RestoreAction> {
-        let key_action = restore_key_action(key);
+    ///
+    /// `mods`: the modifiers held alongside `key`, fed straight into
+    /// [`restore_key_action`]. The keyboard call site (`main.rs`) never
+    /// reaches here at all while Super is held — that branch is skipped
+    /// entirely so Cmd+Q/Cmd+W/etc. fall through to the real shortcut
+    /// handlers, matching the palette/search/rename capture guards — so in
+    /// practice this only ever sees Super held via a hypothetical future
+    /// ctl caller; `ControlMsg::Key` today has no way to attach modifiers
+    /// at all (see `handle_control`'s restore-prompt branch), so it always
+    /// passes `ModifiersState::empty()`.
+    pub(crate) fn restore_key(&mut self, key: &Key, mods: ModifiersState) -> Option<RestoreAction> {
+        let key_action = restore_key_action(key, mods);
         let prompt = self.restore_prompt.as_mut()?;
         if let RestoreKeyAction::TypeThrough(text) = key_action {
             self.restore_prompt = None;
@@ -5140,11 +5179,11 @@ mod tests {
     #[test]
     fn printable_characters_type_through() {
         use super::{RestoreKeyAction, restore_key_action};
-        use winit::keyboard::{Key, SmolStr};
+        use winit::keyboard::{Key, ModifiersState, SmolStr};
 
         for ch in ["a", "Z", "5", "?", "\u{222b}"] {
             assert_eq!(
-                restore_key_action(&Key::Character(SmolStr::new(ch))),
+                restore_key_action(&Key::Character(SmolStr::new(ch)), ModifiersState::empty()),
                 RestoreKeyAction::TypeThrough(ch.to_string()),
                 "printable {ch:?} must type through"
             );
@@ -5154,10 +5193,10 @@ mod tests {
     #[test]
     fn space_types_through_as_a_literal_space() {
         use super::{RestoreKeyAction, restore_key_action};
-        use winit::keyboard::{Key, NamedKey};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
 
         assert_eq!(
-            restore_key_action(&Key::Named(NamedKey::Space)),
+            restore_key_action(&Key::Named(NamedKey::Space), ModifiersState::empty()),
             RestoreKeyAction::TypeThrough(" ".to_string())
         );
     }
@@ -5165,10 +5204,10 @@ mod tests {
     #[test]
     fn enter_activates() {
         use super::{RestoreKeyAction, restore_key_action};
-        use winit::keyboard::{Key, NamedKey};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
 
         assert_eq!(
-            restore_key_action(&Key::Named(NamedKey::Enter)),
+            restore_key_action(&Key::Named(NamedKey::Enter), ModifiersState::empty()),
             RestoreKeyAction::Activate
         );
     }
@@ -5176,10 +5215,10 @@ mod tests {
     #[test]
     fn escape_backs_out() {
         use super::{RestoreKeyAction, restore_key_action};
-        use winit::keyboard::{Key, NamedKey};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
 
         assert_eq!(
-            restore_key_action(&Key::Named(NamedKey::Escape)),
+            restore_key_action(&Key::Named(NamedKey::Escape), ModifiersState::empty()),
             RestoreKeyAction::Back
         );
     }
@@ -5187,30 +5226,30 @@ mod tests {
     #[test]
     fn arrows_and_tab_classify_as_directional_nav() {
         use super::{RestoreKeyAction, RestoreNavDir, restore_key_action};
-        use winit::keyboard::{Key, NamedKey};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
 
         // Left/Right/Tab are `Main`'s button-cycling keys; Up/Down are
         // `Older`'s list-cursor keys — `restore_key_action` classifies all
         // of them uniformly, and `restore_key` picks the ones that mean
         // something on the screen that's actually open.
         assert_eq!(
-            restore_key_action(&Key::Named(NamedKey::ArrowLeft)),
+            restore_key_action(&Key::Named(NamedKey::ArrowLeft), ModifiersState::empty()),
             RestoreKeyAction::Nav(RestoreNavDir::Left)
         );
         assert_eq!(
-            restore_key_action(&Key::Named(NamedKey::ArrowRight)),
+            restore_key_action(&Key::Named(NamedKey::ArrowRight), ModifiersState::empty()),
             RestoreKeyAction::Nav(RestoreNavDir::Right)
         );
         assert_eq!(
-            restore_key_action(&Key::Named(NamedKey::Tab)),
+            restore_key_action(&Key::Named(NamedKey::Tab), ModifiersState::empty()),
             RestoreKeyAction::Nav(RestoreNavDir::Right)
         );
         assert_eq!(
-            restore_key_action(&Key::Named(NamedKey::ArrowUp)),
+            restore_key_action(&Key::Named(NamedKey::ArrowUp), ModifiersState::empty()),
             RestoreKeyAction::Nav(RestoreNavDir::Up)
         );
         assert_eq!(
-            restore_key_action(&Key::Named(NamedKey::ArrowDown)),
+            restore_key_action(&Key::Named(NamedKey::ArrowDown), ModifiersState::empty()),
             RestoreKeyAction::Nav(RestoreNavDir::Down)
         );
     }
@@ -5218,7 +5257,7 @@ mod tests {
     #[test]
     fn unhandled_named_keys_are_swallowed() {
         use super::{RestoreKeyAction, restore_key_action};
-        use winit::keyboard::{Key, NamedKey};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
 
         // Stand-ins for "IME/other named keys keep today's swallow" —
         // anything with no defined modal meaning and no printable text.
@@ -5227,11 +5266,84 @@ mod tests {
             Key::Named(NamedKey::Backspace),
             Key::Named(NamedKey::Shift),
         ] {
-            assert_eq!(restore_key_action(&key), RestoreKeyAction::Swallow);
+            assert_eq!(
+                restore_key_action(&key, ModifiersState::empty()),
+                RestoreKeyAction::Swallow
+            );
         }
     }
 
-    // --- find_setting_row_by_label: the resolved-view/static-table lookup --
+    // --- restore_key_action: modifier gating (review fix) ------------------
+    //
+    // Super-modified characters never reach `restore_key_action` on the real
+    // keyboard path at all — `main.rs` skips the whole restore-modal branch
+    // while Super is held, exactly like the palette/search/rename capture
+    // guards, so Cmd+Q/Cmd+W/etc. fall through to the normal shortcut
+    // handlers untouched. These tests cover the classifier's OWN defense in
+    // depth for that case (a hypothetical ctl caller that could somehow
+    // attach Super to a `Key`) plus the real, reachable case: Ctrl-modified
+    // characters, which DO reach here (nothing gates entry on Ctrl), and
+    // must not type a literal letter for what's meant as a control chord
+    // (Ctrl+C, Ctrl+D, …).
+
+    #[test]
+    fn plain_characters_are_unaffected_by_the_modifier_gate() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, SmolStr};
+
+        assert_eq!(
+            restore_key_action(&Key::Character(SmolStr::new("a")), ModifiersState::empty()),
+            RestoreKeyAction::TypeThrough("a".to_string())
+        );
+    }
+
+    #[test]
+    fn control_modified_characters_are_swallowed_not_typed() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, SmolStr};
+
+        for ch in ["c", "d", "a"] {
+            assert_eq!(
+                restore_key_action(&Key::Character(SmolStr::new(ch)), ModifiersState::CONTROL),
+                RestoreKeyAction::Swallow,
+                "Ctrl+{ch} must not type the literal letter"
+            );
+        }
+    }
+
+    #[test]
+    fn control_modified_space_is_swallowed_not_typed() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::Space), ModifiersState::CONTROL),
+            RestoreKeyAction::Swallow
+        );
+    }
+
+    #[test]
+    fn super_modified_characters_are_swallowed_not_typed() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, SmolStr};
+
+        // Defense in depth: on the real keyboard path this case can't
+        // happen (see this section's doc) — `main.rs` never calls
+        // `restore_key`/`restore_key_action` at all while Super is held.
+        // The classifier still refuses to type Super-held characters
+        // through, so any caller that DID somehow reach it this way (e.g. a
+        // future ctl verb that can attach modifiers) gets the safe answer
+        // rather than a stray dismiss-and-type.
+        for ch in ["q", "w", "n", "t"] {
+            assert_eq!(
+                restore_key_action(&Key::Character(SmolStr::new(ch)), ModifiersState::SUPER),
+                RestoreKeyAction::Swallow,
+                "Super+{ch} must not type the literal letter"
+            );
+        }
+    }
+
+    // --- find_setting_row_by_label: the resolved-view/static-table lookup --    // --- find_setting_row_by_label: the resolved-view/static-table lookup --
 
     #[test]
     fn find_setting_row_by_label_locates_and_adjusts_a_representative_cycle_row() {

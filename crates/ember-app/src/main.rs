@@ -1393,11 +1393,22 @@ impl ApplicationHandler<EmberEvent> for App {
                     return;
                 }
                 // The restore-on-launch modal (Task 8): Left/Right/Tab/Up/Down
-                // navigate, Enter activates, Esc backs out. Auto-repeat ignored
-                // so a held key can't fire an action twice.
-                if win.restore_prompt.is_some() {
+                // navigate, Enter activates, Esc backs out, a printable
+                // keystroke types through (dismisses as Start Fresh and
+                // forwards the text — see `restore_key`/`RestoreAction::
+                // StartFreshAndType`). Auto-repeat ignored so a held key
+                // can't fire an action twice.
+                //
+                // NOT captured here while Super is held: Cmd+Q, Cmd+N,
+                // Cmd+W, etc. must keep working while this modal is up
+                // rather than being dismissed-and-typed-through as a stray
+                // letter — same "capture typing, but not Cmd combos" guard
+                // the palette/search/rename branches above already use, so
+                // Super-held keys fall through to the Cmd+Q handler and the
+                // Super-shortcut block further down, untouched.
+                if win.restore_prompt.is_some() && !win.modifiers.super_key() {
                     if !key.repeat {
-                        if let Some(action) = win.restore_key(&key.logical_key) {
+                        if let Some(action) = win.restore_key(&key.logical_key, win.modifiers) {
                             resolve_restore_action(
                                 &mut self.windows,
                                 shared,
