@@ -2891,6 +2891,22 @@ fn resolve_restore_action(
                 }
             }
         }
+        window_state::RestoreAction::StartFreshAndType(text) => {
+            // Same archive semantics as plain `StartFresh`; the prompting
+            // window's already-live shell (the "fresh" session) then gets
+            // the keystroke it would otherwise have lost. Reuses
+            // `send_to_focused` — the same write path `ControlMsg::Type`
+            // uses on a modal-less window — so this isn't a second way to
+            // put bytes on a pty.
+            if let Some(path) = session_state::state_path() {
+                if let Err(e) = session_state::archive(&path) {
+                    eprintln!("[ember] archive on start-fresh failed: {e}");
+                }
+            }
+            if let Some(win) = windows.get(&prompting_window) {
+                win.send_to_focused(shared, text.into_bytes());
+            }
+        }
         window_state::RestoreAction::Restore {
             snapshot,
             archive_current,

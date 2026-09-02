@@ -617,6 +617,69 @@ pub(crate) enum RestoreAction {
     /// "Start fresh": archive the current live session file and proceed
     /// with the normal (already-created) empty default window.
     StartFresh,
+    /// Type-through dismissal: a printable keystroke (or a scripted
+    /// `ControlMsg::Type`) arrived while the prompt was up. Same archive
+    /// semantics as `StartFresh` — the prompting window IS the fresh
+    /// session, so it stays open — plus the text is written to its focused
+    /// pane afterward so nothing the user typed is lost.
+    StartFreshAndType(String),
+}
+
+/// What one key press does to the restore modal, independent of which
+/// screen (`Main`/`Older`) is showing — mirrors `settings_action_for_key`:
+/// a pure function, unit-tested directly, since the GPU-coupled
+/// `WindowState` this classification ultimately feeds can't be constructed
+/// in tests. `restore_key` interprets `Nav`'s direction differently per
+/// screen (Left/Right/Tab cycle `Main`'s 3 buttons; Up/Down move `Older`'s
+/// list cursor) and does the actual state mutation/I/O itself — this type
+/// only decides WHAT KIND of thing a key press is, not what effect it has.
+#[derive(Clone, Debug, PartialEq)]
+enum RestoreKeyAction {
+    /// A directional key with a screen-specific meaning (see this enum's
+    /// doc): Left, Right/Tab, Up, or Down.
+    Nav(RestoreNavDir),
+    /// Enter: confirm the highlighted button (`Main`) or list row (`Older`).
+    Activate,
+    /// Esc: back out — "Start fresh" from `Main`, return to `Main` from
+    /// `Older`.
+    Back,
+    /// A printable keystroke (`Key::Character`, or `Space` normalized to a
+    /// literal space) — the product ruling: typing while the prompt is up
+    /// means "get me to a shell now," so this always resolves to
+    /// `RestoreAction::StartFreshAndType`, in both screens.
+    TypeThrough(String),
+    /// Anything else (function keys, bare modifiers, etc.) — no-op, matching
+    /// today's behavior.
+    Swallow,
+}
+
+/// Direction for [`RestoreKeyAction::Nav`] — see that variant's doc for how
+/// `Main`/`Older` each interpret it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RestoreNavDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Classify one key press against the restore modal's fixed control
+/// surface. See [`RestoreKeyAction`]'s doc for why this is a free pure
+/// function rather than a `WindowState` method.
+fn restore_key_action(key: &Key) -> RestoreKeyAction {
+    match key {
+        Key::Named(NamedKey::Escape) => RestoreKeyAction::Back,
+        Key::Named(NamedKey::Enter) => RestoreKeyAction::Activate,
+        Key::Named(NamedKey::ArrowLeft) => RestoreKeyAction::Nav(RestoreNavDir::Left),
+        Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Tab) => {
+            RestoreKeyAction::Nav(RestoreNavDir::Right)
+        }
+        Key::Named(NamedKey::ArrowUp) => RestoreKeyAction::Nav(RestoreNavDir::Up),
+        Key::Named(NamedKey::ArrowDown) => RestoreKeyAction::Nav(RestoreNavDir::Down),
+        Key::Named(NamedKey::Space) => RestoreKeyAction::TypeThrough(" ".to_string()),
+        Key::Character(s) => RestoreKeyAction::TypeThrough(s.to_string()),
+        _ => RestoreKeyAction::Swallow,
+    }
 }
 
 /// The restore modal's header line: `"Restore N windows, M tabs (from
@@ -1023,15 +1086,31 @@ impl WindowState {
             }
         }
         // Mirror the keyboard: the restore-on-launch modal captures input
-        // (Left/Right/Tab/Up/Down navigate, Enter activates, Esc backs out).
+        // (Left/Right/Tab/Up/Down navigate, Enter activates, Esc backs out,
+        // a printable key or a whole `Type` types through — see
+        // `restore_key_action`/`RestoreAction::StartFreshAndType`).
         if self.restore_prompt.is_some() {
-            if let ControlMsg::Key(name) = &msg {
-                if let Some(k) = named_key(name) {
-                    if let Some(action) = self.restore_key(&k) {
-                        return Some(ControlClose::Restore(action));
+            match &msg {
+                ControlMsg::Key(name) => {
+                    if let Some(k) = named_key(name) {
+                        if let Some(action) = self.restore_key(&k) {
+                            return Some(ControlClose::Restore(action));
+                        }
+                        self.renderer.window().request_redraw();
                     }
-                    self.renderer.window().request_redraw();
                 }
+                // Scripted launches send the whole typed string in one shot
+                // rather than one `ControlMsg::Key` per character — same
+                // dismissal as a single printable keystroke, just with the
+                // full text riding along instead of one character.
+                ControlMsg::Type(text) => {
+                    self.restore_prompt = None;
+                    self.update_restore_view();
+                    return Some(ControlClose::Restore(RestoreAction::StartFreshAndType(
+                        text.clone(),
+                    )));
+                }
+                _ => {}
             }
             return None;
         }
@@ -4234,25 +4313,31 @@ impl WindowState {
     /// (`main.rs`'s `session_dirty` guard) — so the reload always reproduces
     /// exactly what `Main` showed before.
     pub(crate) fn restore_key(&mut self, key: &Key) -> Option<RestoreAction> {
+        let key_action = restore_key_action(key);
         let prompt = self.restore_prompt.as_mut()?;
+        if let RestoreKeyAction::TypeThrough(text) = key_action {
+            self.restore_prompt = None;
+            self.update_restore_view();
+            return Some(RestoreAction::StartFreshAndType(text));
+        }
         match prompt {
-            RestorePrompt::Main { snap, focus } => match key {
-                Key::Named(NamedKey::Escape) => {
+            RestorePrompt::Main { snap, focus } => match key_action {
+                RestoreKeyAction::Back => {
                     self.restore_prompt = None;
                     self.update_restore_view();
                     Some(RestoreAction::StartFresh)
                 }
-                Key::Named(NamedKey::ArrowLeft) => {
+                RestoreKeyAction::Nav(RestoreNavDir::Left) => {
                     *focus = (*focus + 2) % 3; // -1 mod 3
                     self.update_restore_view();
                     None
                 }
-                Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Tab) => {
+                RestoreKeyAction::Nav(RestoreNavDir::Right) => {
                     *focus = (*focus + 1) % 3;
                     self.update_restore_view();
                     None
                 }
-                Key::Named(NamedKey::Enter) => match *focus {
+                RestoreKeyAction::Activate => match *focus {
                     0 => {
                         let snapshot = snap.clone();
                         self.restore_prompt = None;
@@ -4276,26 +4361,28 @@ impl WindowState {
                         None
                     }
                 },
+                // Up/Down have no meaning on `Main`; `TypeThrough` is fully
+                // handled above before this match ever runs.
                 _ => None,
             },
-            RestorePrompt::Older { list, sel } => match key {
-                Key::Named(NamedKey::Escape) => {
+            RestorePrompt::Older { list, sel } => match key_action {
+                RestoreKeyAction::Back => {
                     self.reload_restore_main(2);
                     None
                 }
-                Key::Named(NamedKey::ArrowUp) => {
+                RestoreKeyAction::Nav(RestoreNavDir::Up) => {
                     *sel = sel.saturating_sub(1);
                     self.update_restore_view();
                     None
                 }
-                Key::Named(NamedKey::ArrowDown) => {
+                RestoreKeyAction::Nav(RestoreNavDir::Down) => {
                     if *sel + 1 < list.len() {
                         *sel += 1;
                     }
                     self.update_restore_view();
                     None
                 }
-                Key::Named(NamedKey::Enter) => {
+                RestoreKeyAction::Activate => {
                     let entry = list.get(*sel).cloned()?;
                     let snapshot = session_state::load_archive(&entry.path)?;
                     self.restore_prompt = None;
@@ -4305,6 +4392,8 @@ impl WindowState {
                         archive_current: true,
                     })
                 }
+                // Left/Right have no meaning on `Older`; `TypeThrough` is
+                // fully handled above before this match ever runs.
                 _ => None,
             },
         }
@@ -5036,6 +5125,109 @@ mod tests {
                 settings_action_for_key(&Key::Named(NamedKey::Tab), kind),
                 SettingsAction::None
             );
+        }
+    }
+
+    // --- restore_key_action: type-through dismissal (PR 13) ----------------
+    //
+    // Same reasoning as `settings_action_for_key`'s tests above: the restore
+    // modal's key -> action decision is a pure function precisely so it can
+    // be tested here without a live `WindowState`/GPU-backed `Renderer`.
+    // `restore_key_action` itself doesn't know about `Main`/`Older` — both
+    // screens funnel through it, so these tests cover both by construction
+    // rather than by asserting on a live prompt.
+
+    #[test]
+    fn printable_characters_type_through() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, SmolStr};
+
+        for ch in ["a", "Z", "5", "?", "\u{222b}"] {
+            assert_eq!(
+                restore_key_action(&Key::Character(SmolStr::new(ch))),
+                RestoreKeyAction::TypeThrough(ch.to_string()),
+                "printable {ch:?} must type through"
+            );
+        }
+    }
+
+    #[test]
+    fn space_types_through_as_a_literal_space() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, NamedKey};
+
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::Space)),
+            RestoreKeyAction::TypeThrough(" ".to_string())
+        );
+    }
+
+    #[test]
+    fn enter_activates() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, NamedKey};
+
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::Enter)),
+            RestoreKeyAction::Activate
+        );
+    }
+
+    #[test]
+    fn escape_backs_out() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, NamedKey};
+
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::Escape)),
+            RestoreKeyAction::Back
+        );
+    }
+
+    #[test]
+    fn arrows_and_tab_classify_as_directional_nav() {
+        use super::{RestoreKeyAction, RestoreNavDir, restore_key_action};
+        use winit::keyboard::{Key, NamedKey};
+
+        // Left/Right/Tab are `Main`'s button-cycling keys; Up/Down are
+        // `Older`'s list-cursor keys — `restore_key_action` classifies all
+        // of them uniformly, and `restore_key` picks the ones that mean
+        // something on the screen that's actually open.
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::ArrowLeft)),
+            RestoreKeyAction::Nav(RestoreNavDir::Left)
+        );
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::ArrowRight)),
+            RestoreKeyAction::Nav(RestoreNavDir::Right)
+        );
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::Tab)),
+            RestoreKeyAction::Nav(RestoreNavDir::Right)
+        );
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::ArrowUp)),
+            RestoreKeyAction::Nav(RestoreNavDir::Up)
+        );
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::ArrowDown)),
+            RestoreKeyAction::Nav(RestoreNavDir::Down)
+        );
+    }
+
+    #[test]
+    fn unhandled_named_keys_are_swallowed() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, NamedKey};
+
+        // Stand-ins for "IME/other named keys keep today's swallow" —
+        // anything with no defined modal meaning and no printable text.
+        for key in [
+            Key::Named(NamedKey::F1),
+            Key::Named(NamedKey::Backspace),
+            Key::Named(NamedKey::Shift),
+        ] {
+            assert_eq!(restore_key_action(&key), RestoreKeyAction::Swallow);
         }
     }
 
