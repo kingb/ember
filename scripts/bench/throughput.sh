@@ -69,40 +69,66 @@ if awk -v l="$load" 'BEGIN{exit !(l+0 > 2.5)}'; then
   fi
 fi
 
-# ---- build both binaries (restore the tree no matter what) ---------------
-ORIG_REF="$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)"
-STASHED=0
-restore() {
-  git checkout -q "$ORIG_REF" 2>/dev/null || true
-  [ "$STASHED" = 1 ] && git stash pop -q 2>/dev/null || true
+# ---- build both binaries (in ISOLATED worktrees; never touch this tree) ---
+# Each ref is built in its own `git worktree`, so this script never checks out,
+# stashes, or otherwise mutates the tree you invoked it from. The old approach
+# (stash -> checkout -> checkout back) broke whenever a build dirtied the tree
+# mid-run: tags at or before v0.5.0 carry a STALE Cargo.lock (workspace crates
+# pinned to the previous version), so building one regenerates the lockfile and
+# the NEXT checkout aborts — leaving HEAD detached on a release tag and an
+# orphaned stash behind. Worktrees remove that whole class, and they also make
+# it safe to read repo files while a run is in flight.
+CAND_BIN="$(mktemp -t bench-cand)"; BASE_BIN="$(mktemp -t bench-base)"
+WORKTREES=()
+cleanup() {
+  local wt
+  for wt in ${WORKTREES+"${WORKTREES[@]}"}; do
+    git worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
+  done
+  rm -f "$CAND_BIN" "$BASE_BIN"
 }
-trap restore EXIT
+trap cleanup EXIT
+
+# Deliberately NOT a shared CARGO_TARGET_DIR. Sharing one target dir across
+# worktrees makes artifact selection ambiguous — `cargo ... --message-format=json`
+# can report an executable built for the OTHER ref, and you measure the same
+# binary twice while believing you compared two. That produced a phantom 2x
+# "regression" once; correctness beats the rebuild time it would save.
+unset CARGO_TARGET_DIR
 
 build_bench() {  # $1 = ref | WORKTREE ; $2 = output path
-  local ref="$1" out="$2" bin
-  [ "$ref" != WORKTREE ] && { git checkout -q "$ref" || { echo "checkout '$ref' failed"; exit 1; }; }
-  touch crates/ember-session/src/projection.rs   # force a rebuild so cargo can't hand back a stale binary
-  bin=$(cargo bench -p ember-session --bench throughput --no-run 2>&1 \
-        | grep -oE 'target/release/deps/throughput-[a-f0-9]+' | tail -1)
+  local ref="$1" out="$2" bin src wt
+  if [ "$ref" = WORKTREE ]; then
+    src="$REPO"
+  else
+    wt="$(mktemp -d -t bench-wt)"; rmdir "$wt"   # `worktree add` wants a fresh path
+    git worktree add -q --detach "$wt" "$ref" || { echo "worktree for '$ref' failed"; exit 1; }
+    WORKTREES+=("$wt")
+    # Physical path: macOS symlinks /var -> /private/var, so mktemp's path and
+    # the one cargo reports are the same dir spelled two ways. Compare resolved.
+    src="$(cd "$wt" && pwd -P)"
+  fi
+  # --message-format=json gives the executable path outright: parsing the human
+  # output was fragile, and a relative 'target/...' match breaks the moment
+  # CARGO_TARGET_DIR points elsewhere.
+  # Force a rebuild: cargo must never hand back a binary it considers "Fresh"
+  # from an earlier ref's build.
+  touch "$src/crates/ember-session/src/projection.rs"
+  bin=$( cd "$src" && cargo bench -p ember-session --bench throughput --no-run \
+           --message-format=json 2>/dev/null \
+         | grep -o '"executable":"[^"]*throughput-[^"]*"' | tail -1 \
+         | sed 's/.*:"\(.*\)"/\1/' )
+  # The executable must live inside THIS ref's worktree; anything else means we
+  # picked up a foreign artifact.
+  case "$bin" in "$src"/*) ;; *) echo "built binary '$bin' is outside worktree '$src'"; exit 1;; esac
   [ -n "$bin" ] && [ -x "$bin" ] || { echo "bench build failed for '$ref'"; exit 1; }
   cp "$bin" "$out"; chmod +x "$out"   # mktemp'd $out is 0600; cp won't restore the +x bit
 }
 
-CAND_BIN="$(mktemp -t bench-cand)"; BASE_BIN="$(mktemp -t bench-base)"
-dirty() { ! git diff --quiet || ! git diff --cached --quiet; }
-
 echo "building candidate (${CANDIDATE:-working tree})..."
-if [ -z "$CANDIDATE" ]; then
-  build_bench WORKTREE "$CAND_BIN"              # build the dirty tree AS-IS first
-  if dirty; then git stash push -q; STASHED=1; fi
-else
-  if dirty; then git stash push -q; STASHED=1; fi
-  build_bench "$CANDIDATE" "$CAND_BIN"
-fi
+build_bench "${CANDIDATE:-WORKTREE}" "$CAND_BIN"
 echo "building baseline (${BASELINE})..."
 build_bench "$BASELINE" "$BASE_BIN"
-restore; STASHED=0                              # back on the original tree
-trap 'rm -f "$CAND_BIN" "$BASE_BIN"' EXIT       # tree already restored; just drop temp binaries
 
 [ "$(shasum "$CAND_BIN" | cut -c1-12)" = "$(shasum "$BASE_BIN" | cut -c1-12)" ] \
   && echo "  ! candidate and baseline binaries are identical (same ref?)"
