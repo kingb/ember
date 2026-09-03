@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-02
+
 ### Added
 
 - Session restore. Ember now remembers your windows, tabs, splits, and each
@@ -345,7 +347,8 @@ this first release:
   created owner-only, use no fixed or predictable paths, and return
   JSON-encoded errors rather than leaking internal state.
 
-[Unreleased]: https://github.com/kingb/ember/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/kingb/ember/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/kingb/ember/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/kingb/ember/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/kingb/ember/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/kingb/ember/compare/v0.4.0...v0.4.1
