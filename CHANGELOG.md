@@ -6,6 +6,28 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Session restore. Ember now remembers your windows, tabs, splits, and each
+  pane's working directory, and offers to bring them back the next time you
+  launch. Snapshots are written continuously as you work, so a crash or a
+  hard power-off loses at most a second of bookkeeping rather than the whole
+  layout. On launch you choose whether to restore or start fresh, and if you
+  just start typing, Ember takes that as "start fresh" and keeps what you
+  typed instead of swallowing it.
+- The last command you ran in each pane comes back pre-typed at the restored
+  prompt, unsent. Press Enter to pick up where you left off, or edit it first,
+  or clear it and carry on.
+- Settings for all of it: choose whether Ember asks on launch, always
+  restores, or never does; turn command capture off entirely; and delete
+  saved sessions.
+
+### Fixed
+
+- Settings action rows activate on Enter or Space only. Arrow keys move
+  between rows without setting them off, so you can no longer trigger an
+  action just by navigating past it.
+
 ## [0.5.0] - 2026-07-18
 
 ### Added
