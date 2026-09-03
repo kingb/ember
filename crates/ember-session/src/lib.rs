@@ -7,6 +7,7 @@
 pub mod local_pty;
 pub mod osc133;
 pub mod osc1337;
+pub mod osc633;
 pub mod palette;
 pub mod projection;
 pub mod shell_integration;

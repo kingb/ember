@@ -12,7 +12,7 @@
 //! row's logic only touches its own `Config` parameter (no captured
 //! environment), so non-capturing closures coerce to `fn` pointers for free.
 
-use crate::config::{Config, SparksMode, WispStyleSelection};
+use crate::config::{Config, RestoreMode, SparksMode, WispStyleSelection};
 
 /// What kind of row this is, driving both rendering and key-handling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,8 +28,11 @@ pub enum RowKind {
     Cycle,
     /// Shown but not adjustable (e.g. the config.toml-only backdrop image).
     ReadOnly,
-    /// Triggers an action on Enter/Space rather than adjusting a value. No
-    /// row uses this yet — reserved for a future "Check for updates" row.
+    /// Triggers an action on Enter/Space rather than adjusting a value —
+    /// e.g. "Delete saved sessions (N)…". Has no `Config`-mutating
+    /// `SettingRow::adjust`: the action isn't a config field, so the app
+    /// layer (`ember-app`'s `settings_key`) handles it by matching on this
+    /// kind rather than calling `adjust`.
     Action,
     /// A category divider: not selectable, skipped by Up/Down navigation.
     SectionHeader,
@@ -61,24 +64,63 @@ pub struct SettingRow {
 /// the `ember-app`/`ember-render` boundary — `ember-app` builds these each
 /// time the overlay needs a repaint (via [`resolve_rows`]), `ember-render`
 /// only ever sees already-formatted strings + the row's `kind`.
+///
+/// `label` is owned (not `&'static str` like `SettingRow::label`) because
+/// one synthesized row — "Delete saved sessions (N)…" — bakes a live count
+/// into its label text; every other row's label is just its static
+/// `SettingRow::label` copied in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettingsRowView {
-    pub label: &'static str,
+    pub label: String,
     pub value: String,
     pub kind: RowKind,
 }
 
+/// The "Session restore" cycle row's static label — also the anchor
+/// `resolve_rows` inserts the synthesized "Delete saved sessions" row
+/// after, so the two can't drift apart.
+const SESSION_RESTORE_LABEL: &str = "Session restore";
+/// The "Capture commands" toggle row's static label — also what
+/// `resolve_rows` matches on to hide the row while `restore.mode == Off`
+/// (nothing to capture) and to anchor the delete row's insertion point when
+/// it's visible.
+const CAPTURE_COMMANDS_LABEL: &str = "Capture commands";
+
 /// Resolve every row in [`setting_rows`] against `config` into render-ready
-/// views, in table order.
-pub fn resolve_rows(config: &Config) -> Vec<SettingsRowView> {
-    setting_rows()
-        .iter()
-        .map(|r| SettingsRowView {
-            label: r.label,
+/// views, in table order — plus the "Delete saved sessions (N)…" action row
+/// synthesized right after the Session-restore rows (it isn't a `Config`
+/// field, so it has no entry in [`setting_rows`]'s static table).
+///
+/// `saved_sessions` is the count of on-disk session-state files (the live
+/// snapshot, its quarantined-corrupt sibling, and every `.prev-*` archive —
+/// `ember-app`'s `session_state::saved_state_count`); the delete row is
+/// omitted entirely when it's `0` (nothing to delete). `Capture commands` is
+/// likewise omitted while `config.restore.mode == RestoreMode::Off` — there
+/// is nothing to capture, and no `SettingRow::adjust` fn for it to mutate
+/// meaningfully in that state.
+pub fn resolve_rows(config: &Config, saved_sessions: usize) -> Vec<SettingsRowView> {
+    let mut rows = Vec::new();
+    for r in setting_rows() {
+        if r.label == CAPTURE_COMMANDS_LABEL && config.restore.mode == RestoreMode::Off {
+            continue;
+        }
+        rows.push(SettingsRowView {
+            label: r.label.to_string(),
             value: (r.format)(config),
             kind: r.kind,
-        })
-        .collect()
+        });
+        let is_last_session_row = (r.label == SESSION_RESTORE_LABEL
+            && config.restore.mode == RestoreMode::Off)
+            || r.label == CAPTURE_COMMANDS_LABEL;
+        if is_last_session_row && saved_sessions > 0 {
+            rows.push(SettingsRowView {
+                label: format!("Delete saved sessions ({saved_sessions})…"),
+                value: String::new(),
+                kind: RowKind::Action,
+            });
+        }
+    }
+    rows
 }
 
 fn on_off(b: bool) -> String {
@@ -260,6 +302,33 @@ fn adjust_option_as_meta(c: &mut Config, _dir: f32) {
     c.option_as_meta = !c.option_as_meta;
 }
 
+// --- Session restore ---------------------------------------------------------
+
+/// The restore-mode dial's three-state cycle, `off → ask → always → off`.
+/// Direction-agnostic (like the sparks/wisp-style dials): always steps
+/// forward regardless of `dir`.
+fn fmt_restore_mode(c: &Config) -> String {
+    match c.restore.mode {
+        RestoreMode::Off => "off".to_string(),
+        RestoreMode::Ask => "ask".to_string(),
+        RestoreMode::Always => "always".to_string(),
+    }
+}
+fn adjust_restore_mode(c: &mut Config, _dir: f32) {
+    c.restore.mode = match c.restore.mode {
+        RestoreMode::Off => RestoreMode::Ask,
+        RestoreMode::Ask => RestoreMode::Always,
+        RestoreMode::Always => RestoreMode::Off,
+    };
+}
+
+fn fmt_capture_commands(c: &Config) -> String {
+    on_off(c.restore.capture_commands)
+}
+fn adjust_capture_commands(c: &mut Config, _dir: f32) {
+    c.restore.capture_commands = !c.restore.capture_commands;
+}
+
 // --- Developer -----------------------------------------------------------------
 
 fn fmt_developer_mode(c: &Config) -> String {
@@ -398,6 +467,35 @@ pub fn setting_rows() -> &'static [SettingRow] {
             help: Help::Inline(
                 "macOS: Opt+key sends ESC key (readline/emacs Meta) instead of composing accented \
                  characters. Takes effect immediately.",
+            ),
+        },
+        SettingRow {
+            label: "Session",
+            kind: RowKind::SectionHeader,
+            format: |_| String::new(),
+            adjust: None,
+            help: Help::Inline(""),
+        },
+        SettingRow {
+            label: SESSION_RESTORE_LABEL,
+            kind: RowKind::Cycle,
+            format: fmt_restore_mode,
+            adjust: Some(adjust_restore_mode),
+            help: Help::Inline(
+                "Snapshot open windows/tabs/splits and offer to restore them on next launch: \
+                 off, ask first (default), or always restore silently. Off leaves any \
+                 already-saved session on disk; delete it with the row below.",
+            ),
+        },
+        SettingRow {
+            label: CAPTURE_COMMANDS_LABEL,
+            kind: RowKind::Toggle,
+            format: fmt_capture_commands,
+            adjust: Some(adjust_capture_commands),
+            help: Help::Inline(
+                "Capture each pane's last shell command line so restore can re-type it \
+                 (unsent) at the prompt. Off keeps layout/cwd restore but immediately clears \
+                 any commands already saved.",
             ),
         },
         SettingRow {
@@ -718,12 +816,131 @@ mod tests {
     }
 
     #[test]
-    fn category_order_is_appearance_terminal_developer() {
+    fn category_order_is_appearance_terminal_session_developer() {
         let headers: Vec<&str> = setting_rows()
             .iter()
             .filter(|r| r.kind == RowKind::SectionHeader)
             .map(|r| r.label)
             .collect();
-        assert_eq!(headers, vec!["Appearance", "Terminal", "Developer"]);
+        assert_eq!(
+            headers,
+            vec!["Appearance", "Terminal", "Session", "Developer"]
+        );
+    }
+
+    // --- session restore: config rows, hide/show, delete-action synthesis ---
+
+    #[test]
+    fn settings_include_restore_rows() {
+        let rows = resolve_rows(&Config::default(), 0);
+        assert!(rows.iter().any(|r| r.label.starts_with("Session restore")));
+        assert!(rows.iter().any(|r| r.label.starts_with("Capture commands")));
+    }
+
+    #[test]
+    fn session_restore_row_is_a_cycle() {
+        assert_eq!(row(SESSION_RESTORE_LABEL).kind, RowKind::Cycle);
+    }
+
+    #[test]
+    fn session_restore_cycle_visits_all_three_states_and_wraps() {
+        let mut c = Config::default();
+        c.restore.mode = RestoreMode::Off;
+        let adjust = row(SESSION_RESTORE_LABEL).adjust.unwrap();
+        adjust(&mut c, 1.0);
+        assert_eq!(c.restore.mode, RestoreMode::Ask);
+        adjust(&mut c, 1.0);
+        assert_eq!(c.restore.mode, RestoreMode::Always);
+        adjust(&mut c, 1.0);
+        assert_eq!(c.restore.mode, RestoreMode::Off);
+    }
+
+    #[test]
+    fn session_restore_cycle_mutates_only_restore_mode() {
+        let mut c = Config::default();
+        let before = c.clone();
+        (row(SESSION_RESTORE_LABEL).adjust.unwrap())(&mut c, 1.0);
+        assert_ne!(c.restore.mode, before.restore.mode);
+        assert_eq!(c.restore.capture_commands, before.restore.capture_commands);
+        assert_eq!(c.developer_mode, before.developer_mode);
+    }
+
+    #[test]
+    fn capture_commands_row_is_a_toggle() {
+        assert_eq!(row(CAPTURE_COMMANDS_LABEL).kind, RowKind::Toggle);
+    }
+
+    #[test]
+    fn capture_commands_toggle_mutates_only_capture_commands() {
+        let mut c = Config::default();
+        let before = c.clone();
+        (row(CAPTURE_COMMANDS_LABEL).adjust.unwrap())(&mut c, 1.0);
+        assert_ne!(c.restore.capture_commands, before.restore.capture_commands);
+        assert_eq!(c.restore.mode, before.restore.mode);
+    }
+
+    #[test]
+    fn capture_commands_row_hidden_when_restore_is_off() {
+        let mut c = Config::default();
+        c.restore.mode = RestoreMode::Off;
+        let rows = resolve_rows(&c, 0);
+        assert!(!rows.iter().any(|r| r.label == CAPTURE_COMMANDS_LABEL));
+    }
+
+    #[test]
+    fn capture_commands_row_shown_when_restore_is_ask_or_always() {
+        for mode in [RestoreMode::Ask, RestoreMode::Always] {
+            let mut c = Config::default();
+            c.restore.mode = mode;
+            let rows = resolve_rows(&c, 0);
+            assert!(
+                rows.iter().any(|r| r.label == CAPTURE_COMMANDS_LABEL),
+                "capture commands row missing for mode {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_saved_sessions_row_hidden_when_count_is_zero() {
+        let rows = resolve_rows(&Config::default(), 0);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.label.starts_with("Delete saved sessions"))
+        );
+    }
+
+    #[test]
+    fn delete_saved_sessions_row_shown_with_count_in_label_when_nonzero() {
+        let rows = resolve_rows(&Config::default(), 4);
+        let r = rows
+            .iter()
+            .find(|r| r.label.starts_with("Delete saved sessions"))
+            .expect("delete row present");
+        assert_eq!(r.label, "Delete saved sessions (4)…");
+        assert_eq!(r.kind, RowKind::Action);
+    }
+
+    #[test]
+    fn delete_saved_sessions_row_shown_even_when_restore_is_off() {
+        // Off keeps files on disk (ruling) — the delete action must still be
+        // reachable to clear them.
+        let mut c = Config::default();
+        c.restore.mode = RestoreMode::Off;
+        let rows = resolve_rows(&c, 2);
+        assert!(rows.iter().any(|r| r.label == "Delete saved sessions (2)…"));
+    }
+
+    #[test]
+    fn action_rows_have_no_adjust() {
+        for r in setting_rows() {
+            if r.kind == RowKind::Action {
+                assert!(
+                    r.adjust.is_none(),
+                    "{:?} action row must not be adjustable",
+                    r.label
+                );
+            }
+        }
     }
 }

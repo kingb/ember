@@ -1482,10 +1482,16 @@ pub(crate) fn build_settings(
         };
         spans.push((text, color));
     }
-    spans.push((
-        "\n↑/↓ select   ←/→ change   esc close".to_string(),
-        Color::rgb(0x80, 0x80, 0x80),
-    ));
+    // The action row ("Delete saved sessions…") only fires on Enter/Space,
+    // never Left/Right (see `settings_action_for_key` in `ember-app`) — the
+    // footer hint reflects that instead of advertising a "change" arrows
+    // hint that would do nothing on that row.
+    let hint = if rows.get(selected).map(|r| r.kind) == Some(RowKind::Action) {
+        "\n↑/↓ select   enter/space activate   esc close"
+    } else {
+        "\n↑/↓ select   ←/→ change   esc close"
+    };
+    spans.push((hint.to_string(), Color::rgb(0x80, 0x80, 0x80)));
     buf.set_rich_text(
         font_system,
         spans
@@ -1963,6 +1969,214 @@ pub(crate) fn build_confirm(
             ([ok_x, by, ok_w, btn_h], 1),
         ],
     }
+}
+
+/// Text-placement result from [`build_restore_main`] (logical px).
+pub(crate) struct RestoreMainLayout {
+    pub header_origin: (f32, f32),
+    /// `[Restore, Start fresh, Older…]` label text origins, in that order.
+    pub button_origins: [(f32, f32); 3],
+}
+
+/// The restore-modal Main screen's three fixed button labels, in `focused`
+/// index order — shared by the draw code here and `WindowState`'s key
+/// handling (Left/Right/Tab cycles `focused` through these same 3 slots).
+pub(crate) const RESTORE_MAIN_LABELS: [&str; 3] = ["Restore", "Start fresh", "Older…"];
+
+/// Draw the restore-on-launch modal's Main screen: a scrim + centered
+/// rounded panel with the header line ("Restore N windows, M tabs (from
+/// <age>)?") and three buttons (Restore / Start fresh / Older…). Mirrors
+/// [`build_confirm`]'s panel/button visual language (ember ring on the
+/// focused button, same scrim/panel colors) generalized from two buttons to
+/// three; the first (Restore) is ember-tinted as the primary action instead
+/// of only the confirm slot being tinted. Everything rides `rounded` so the
+/// modal draws over all content, same layering rule as `build_confirm`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_restore_main(
+    font_system: &mut FontSystem,
+    header_buf: &mut Buffer,
+    btn_bufs: &mut [Buffer; 3],
+    header: &str,
+    focused: usize,
+    cw: f32,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+    rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
+) -> RestoreMainLayout {
+    let pad = 20.0;
+    let btn_h = 30.0;
+    let btn_gap = 10.0;
+    let label_w = |s: &str| s.chars().count() as f32 * cw + 26.0;
+    let widths: [f32; 3] = [
+        label_w(RESTORE_MAIN_LABELS[0]).max(72.0),
+        label_w(RESTORE_MAIN_LABELS[1]).max(72.0),
+        label_w(RESTORE_MAIN_LABELS[2]).max(72.0),
+    ];
+    let btn_total_w = widths[0] + widths[1] + widths[2] + btn_gap * 2.0;
+    let header_w_needed = header.chars().count() as f32 * cw + 2.0 * pad;
+    let cap = (logical_w - 24.0).max(btn_total_w + 2.0 * pad);
+    let w = (logical_w * 0.6)
+        .clamp(380.0, 620.0)
+        .max(btn_total_w + 2.0 * pad)
+        .max(header_w_needed)
+        .min(cap);
+    let h = pad + LINE_HEIGHT + 18.0 + btn_h + pad;
+    let x = ((logical_w - w) * 0.5).max(0.0);
+    let y = ((logical_h - h) * 0.5).max(4.0);
+
+    // Scrim (radius 0), then the panel (rounded, ember ring border).
+    rounded.push((
+        scaled(0.0, 0.0, logical_w, logical_h, sf),
+        lin_rgba(Rgb::new(0, 0, 0), 0.62),
+        0.0,
+    ));
+    let r = 10.0;
+    rounded.push((
+        scaled(x - 1.5, y - 1.5, w + 3.0, h + 3.0, sf),
+        lin_rgba(ACCENT, 0.9),
+        (r + 1.5) * sf,
+    ));
+    rounded.push((
+        scaled(x, y, w, h, sf),
+        lin_rgba(Rgb::new(0x20, 0x22, 0x28), 1.0),
+        r * sf,
+    ));
+
+    // Buttons: centered as one row, Restore first (leftmost, primary/ember-tinted).
+    let by = y + h - pad - btn_h;
+    let start_x = x + (w - btn_total_w) * 0.5;
+    let mut bx = start_x;
+    let mut origins = [(0.0, 0.0); 3];
+    for (i, &bw) in widths.iter().enumerate() {
+        if focused == i {
+            rounded.push((
+                scaled(bx - 1.5, by - 1.5, bw + 3.0, btn_h + 3.0, sf),
+                lin_rgba(Rgb::new(0xff, 0xff, 0xff), 0.8),
+                (8.0 + 1.5) * sf,
+            ));
+        }
+        let (bg, alpha) = if i == 0 {
+            (ACCENT, 0.92) // Restore is the primary action.
+        } else {
+            (Rgb::new(0x3a, 0x3a, 0x3d), 1.0)
+        };
+        rounded.push((scaled(bx, by, bw, btn_h, sf), lin_rgba(bg, alpha), 8.0 * sf));
+        let label = RESTORE_MAIN_LABELS[i];
+        origins[i] = (
+            bx + (bw - label.chars().count() as f32 * cw) * 0.5,
+            by + (btn_h - LINE_HEIGHT) * 0.5,
+        );
+        bx += bw + btn_gap;
+    }
+
+    let shape = |fs: &mut FontSystem, buf: &mut Buffer, text: &str, color: Color, width: f32| {
+        buf.set_size(fs, Some(width), Some(LINE_HEIGHT));
+        buf.set_text(
+            fs,
+            text,
+            &Attrs::new().family(Family::Monospace).color(color),
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(fs, false);
+    };
+    shape(
+        font_system,
+        header_buf,
+        header,
+        Color::rgb(0xff, 0xff, 0xff),
+        w - 2.0 * pad,
+    );
+    for (i, buf) in btn_bufs.iter_mut().enumerate() {
+        let color = if i == 0 {
+            Color::rgb(0xff, 0xff, 0xff)
+        } else {
+            Color::rgb(0xf0, 0xf0, 0xf0)
+        };
+        shape(font_system, buf, RESTORE_MAIN_LABELS[i], color, widths[i]);
+    }
+
+    RestoreMainLayout {
+        header_origin: (x + pad, y + pad),
+        button_origins: origins,
+    }
+}
+
+/// Draw the restore-on-launch modal's `Older…` screen: a scrim + centered
+/// panel listing up to 10 archived snapshots (`rows`, already formatted as
+/// `"<age> · N windows, M tabs"`), the header question kept on screen above
+/// them, and a highlight on `selected`. Structurally `build_palette` minus
+/// the live query line — same single-multi-line-buffer/selected-row-highlight
+/// shape, just seeded with a static header instead of live query text.
+/// Returns the text origin for the caller's one `TextArea`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_restore_list(
+    font_system: &mut FontSystem,
+    buf: &mut Buffer,
+    header: &str,
+    rows: &[String],
+    selected: usize,
+    cw: f32,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+    rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
+) -> (f32, f32) {
+    let ipad = 10.0;
+    let cols = 56usize;
+    let w = (cols as f32 * cw + 2.0 * ipad).min(logical_w - 24.0);
+    // At least one row of height so an empty archive list still shows its
+    // "(no archived sessions)" line (an invisible captured overlay reads as
+    // "the app stopped responding").
+    let shown = rows.len().clamp(1, 10);
+    let h = (shown as f32 + 2.0) * LINE_HEIGHT + 2.0 * ipad;
+    let x = ((logical_w - w) * 0.5).max(0.0);
+    let y = (logical_h * 0.18).max(44.0);
+
+    rounded.push((
+        scaled(0.0, 0.0, logical_w, logical_h, sf),
+        lin_rgba(Rgb::new(0, 0, 0), 0.62),
+        0.0,
+    ));
+    rounded.push((
+        scaled(x - 1.0, y - 1.0, w + 2.0, h + 2.0, sf),
+        lin_rgba(ACCENT, 0.9),
+        0.0,
+    ));
+    rounded.push((
+        scaled(x, y, w, h, sf),
+        lin_rgba(Rgb::new(0x20, 0x22, 0x28), 1.0),
+        0.0,
+    ));
+    if !rows.is_empty() && selected < shown {
+        let ry = y + ipad + (selected as f32 + 2.0) * LINE_HEIGHT;
+        rounded.push((
+            scaled(x + 3.0, ry, w - 6.0, LINE_HEIGHT, sf),
+            lin_rgba(ACCENT, 0.28),
+            0.0,
+        ));
+    }
+    let mut text = format!("{header}\n\n");
+    for r in rows.iter().take(shown) {
+        text.push_str(r);
+        text.push('\n');
+    }
+    if rows.is_empty() {
+        text.push_str("(no archived sessions)\n");
+    }
+    buf.set_size(font_system, Some(w - 2.0 * ipad), Some(h));
+    buf.set_text(
+        font_system,
+        &text,
+        &Attrs::new()
+            .family(Family::Monospace)
+            .color(Color::rgb(0xf5, 0xf5, 0xdc)),
+        Shaping::Advanced,
+        None,
+    );
+    buf.shape_until_scroll(font_system, false);
+    (x + ipad, y + ipad)
 }
 
 #[cfg(test)]

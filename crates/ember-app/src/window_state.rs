@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 
 use ember_core::{
     Axis, BackendControl, BackendHandle, Direction, DropZone, GridDims, LayoutCommand,
-    LayoutEffect, PaneId, Rect, RowKind, ScrollAmount, SessionBackend, SessionId, SettingsRowView,
-    SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, apply, drop_zone_for, layout, remove_pane,
-    setting_rows,
+    LayoutEffect, PaneId, Rect, RestoreMode, RowKind, ScrollAmount, SessionBackend, SessionId,
+    SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, apply, drop_zone_for, layout,
+    remove_pane, setting_rows,
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
@@ -39,6 +39,7 @@ use winit::window::{CursorIcon, WindowId};
 
 use crate::config;
 use crate::control::ControlMsg;
+use crate::session_state;
 use crate::{
     ControlClose, DEFAULT_COLS, DEFAULT_ROWS, DragState, DropHover, MULTI_CLICK, PAD, PendingClose,
     Shared, about_info, bell_flash_intensity, bracket_paste, dims_for_rect, ember_glow, encode_key,
@@ -559,6 +560,247 @@ pub(crate) struct WindowState {
     /// drag resolves to a `Move` might be about to be DESTROYED by that
     /// same move, in which case it must never re-appear first.
     hidden_for_carry: bool,
+    /// Tabs the user has explicitly renamed via the inline editor (double-
+    /// click + commit) — core's `Tab` has no such field, so it's tracked
+    /// here as a side set and fed into `TabSnap::named_by_user` at snapshot
+    /// time. Never pruned when a tab closes: a `TabId` is never reused
+    /// within a window's lifetime, so a stale entry is inert.
+    pub(crate) named_tabs: std::collections::HashSet<TabId>,
+    /// The restore-on-launch modal (Task 8), if this window's the one
+    /// showing it — set once at startup (`restore.mode == Ask` + a loaded
+    /// snapshot), never re-armed later in the session. `None` on every
+    /// window opened after startup, and on this one too the instant the
+    /// prompt resolves.
+    pub(crate) restore_prompt: Option<RestorePrompt>,
+}
+
+/// The restore-on-launch modal's own state machine (Task 8) — mirrors
+/// `PendingClose`'s "app-level enum, `WindowState` owns an `Option` of it"
+/// shape. `Main` is the first screen shown; `Older` is reached via its
+/// third button and, on `Esc`, returns to a freshly reloaded `Main` (see
+/// `WindowState::restore_key`'s doc for why `Older` doesn't itself carry the
+/// original `snap` back).
+#[derive(Clone, Debug)]
+pub(crate) enum RestorePrompt {
+    /// `focus`: which of the 3 buttons (`Restore` / `Start fresh` /
+    /// `Older…`, in that order) is highlighted; `u8` (not `usize`) because
+    /// it only ever cycles through 3 fixed values via `%`.
+    Main {
+        snap: session_state::SessionSnapshot,
+        focus: u8,
+    },
+    /// `list`: up to 10 archives, newest first (`session_state::
+    /// list_archives`'s own cap). `sel`: the highlighted row.
+    Older {
+        list: Vec<session_state::ArchiveEntry>,
+        sel: usize,
+    },
+}
+
+/// What the restore modal wants done, once a choice is made — returned by
+/// [`WindowState::restore_key`] for `main.rs`'s keyboard handler to actually
+/// perform (spawning windows and touching the filesystem both need
+/// `event_loop`/paths this method doesn't have, same reasoning as
+/// `PendingClose::Quit` needing its caller to call `event_loop.exit()`).
+#[derive(Debug)]
+pub(crate) enum RestoreAction {
+    /// Rebuild every window from `snapshot`. `archive_current`: whether the
+    /// CURRENT live session file must also be archived first — true only
+    /// for an `Older…` pick (the live file would otherwise still be sitting
+    /// there, about to be silently overwritten by the restored session's
+    /// own first snapshot); false for the Main "Restore" button, where the
+    /// live file IS the snapshot just restored (nothing to archive away).
+    Restore {
+        snapshot: session_state::SessionSnapshot,
+        archive_current: bool,
+    },
+    /// "Start fresh": archive the current live session file and proceed
+    /// with the normal (already-created) empty default window.
+    StartFresh,
+    /// Type-through dismissal: a printable keystroke (or a scripted
+    /// `ControlMsg::Type`) arrived while the prompt was up. Same archive
+    /// semantics as `StartFresh` — the prompting window IS the fresh
+    /// session, so it stays open — plus the text is written to its focused
+    /// pane afterward so nothing the user typed is lost.
+    StartFreshAndType(String),
+}
+
+/// What one key press does to the restore modal, independent of which
+/// screen (`Main`/`Older`) is showing — mirrors `settings_action_for_key`:
+/// a pure function, unit-tested directly, since the GPU-coupled
+/// `WindowState` this classification ultimately feeds can't be constructed
+/// in tests. `restore_key` interprets `Nav`'s direction differently per
+/// screen (Left/Right/Tab cycle `Main`'s 3 buttons; Up/Down move `Older`'s
+/// list cursor) and does the actual state mutation/I/O itself — this type
+/// only decides WHAT KIND of thing a key press is, not what effect it has.
+#[derive(Clone, Debug, PartialEq)]
+enum RestoreKeyAction {
+    /// A directional key with a screen-specific meaning (see this enum's
+    /// doc): Left, Right/Tab, Up, or Down.
+    Nav(RestoreNavDir),
+    /// Enter: confirm the highlighted button (`Main`) or list row (`Older`).
+    Activate,
+    /// Esc: back out — "Start fresh" from `Main`, return to `Main` from
+    /// `Older`.
+    Back,
+    /// A printable keystroke (`Key::Character`, or `Space` normalized to a
+    /// literal space) held with no Ctrl/Super modifier — the product
+    /// ruling: typing while the prompt is up means "get me to a shell
+    /// now," so this always resolves to `RestoreAction::StartFreshAndType`,
+    /// in both screens.
+    TypeThrough(String),
+    /// Anything else: function keys, bare modifiers, a Ctrl-modified
+    /// character (Ctrl+C must not literally type "c" into the fresh
+    /// shell), or — defense in depth for callers that could somehow reach
+    /// this with Super held — a Super-modified character. No-op, matching
+    /// today's swallow. Real Super *chords* (Cmd+Q, Cmd+W, …) never reach
+    /// this function at all on the keyboard path: `main.rs` skips the
+    /// restore-modal branch entirely while Super is held, exactly like the
+    /// palette/search/rename capture guards, so they fall through to the
+    /// normal shortcut handlers below instead of being classified here.
+    Swallow,
+}
+
+/// Direction for [`RestoreKeyAction::Nav`] — see that variant's doc for how
+/// `Main`/`Older` each interpret it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RestoreNavDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Classify one key press against the restore modal's fixed control
+/// surface, given the modifiers held alongside it. See
+/// [`RestoreKeyAction`]'s doc for why this is a free pure function rather
+/// than a `WindowState` method, and for why `mods` only ever gates
+/// `TypeThrough` rather than the named control keys (Escape/Enter/arrows/
+/// Tab keep their meaning modifier or not, unchanged from before this
+/// keystroke ever carried a modifier check).
+fn restore_key_action(key: &Key, mods: ModifiersState) -> RestoreKeyAction {
+    match key {
+        Key::Named(NamedKey::Escape) => RestoreKeyAction::Back,
+        Key::Named(NamedKey::Enter) => RestoreKeyAction::Activate,
+        Key::Named(NamedKey::ArrowLeft) => RestoreKeyAction::Nav(RestoreNavDir::Left),
+        Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Tab) => {
+            RestoreKeyAction::Nav(RestoreNavDir::Right)
+        }
+        Key::Named(NamedKey::ArrowUp) => RestoreKeyAction::Nav(RestoreNavDir::Up),
+        Key::Named(NamedKey::ArrowDown) => RestoreKeyAction::Nav(RestoreNavDir::Down),
+        Key::Named(NamedKey::Space) if !mods.control_key() && !mods.super_key() => {
+            RestoreKeyAction::TypeThrough(" ".to_string())
+        }
+        Key::Character(s) if !mods.control_key() && !mods.super_key() => {
+            RestoreKeyAction::TypeThrough(s.to_string())
+        }
+        _ => RestoreKeyAction::Swallow,
+    }
+}
+
+/// The restore modal's header line: `"Restore N windows, M tabs (from
+/// <age>)?"`, singular-aware (`1 window`/`1 tab`) — shared by `Main` (built
+/// straight from its own `snap`) and `Older` (re-derived from the reloaded
+/// live file, see `RestorePrompt`'s doc).
+fn restore_header(snap: &session_state::SessionSnapshot, now: std::time::SystemTime) -> String {
+    let windows = snap.windows.len();
+    let tabs: usize = snap.windows.iter().map(|w| w.tabs.len()).sum();
+    format!(
+        "Restore {windows} window{}, {tabs} tab{} (from {})?",
+        if windows == 1 { "" } else { "s" },
+        if tabs == 1 { "" } else { "s" },
+        session_state::humanize_age(&snap.saved_at, now),
+    )
+}
+
+/// What a key press does while the Settings overlay is open, given the
+/// currently selected row's `kind` (`None` when nothing is selected, e.g.
+/// an empty row list). Pure and independent of `WindowState`/`Shared` —
+/// unit-tested directly (see `settings_action_for_key`'s tests) rather than
+/// through a live overlay, since `Renderer` needs a GPU context this crate's
+/// test harness doesn't provide.
+///
+/// The critical bit this type exists to make impossible to get wrong again:
+/// `Activate` (which fires a `RowKind::Action` row, e.g. "Delete saved
+/// sessions") is only ever produced for Enter/Space, never for
+/// Left/Right — so routine navigation on an action row can never trigger
+/// it, even though Left/Right/Space/Enter all drive ordinary rows via the
+/// same `Adjust` variant.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SettingsAction {
+    Close,
+    MoveUp,
+    MoveDown,
+    /// Adjust the selected row's value by this direction (+1.0 / -1.0) —
+    /// meaningless for `RowKind::Action` rows, which never produce this.
+    Adjust(f32),
+    /// Fire the selected `RowKind::Action` row. Only ever produced when the
+    /// selected row's kind is `RowKind::Action` and the key was Enter or
+    /// Space.
+    Activate,
+    None,
+}
+
+/// Map a key press onto a [`SettingsAction`], given the currently selected
+/// row's `kind`. See [`SettingsAction`]'s docs for the invariant this
+/// exists to enforce.
+fn settings_action_for_key(key: &Key, selected_kind: Option<RowKind>) -> SettingsAction {
+    let is_action_row = selected_kind == Some(RowKind::Action);
+    match key {
+        Key::Named(NamedKey::Escape) => SettingsAction::Close,
+        Key::Named(NamedKey::ArrowUp) => SettingsAction::MoveUp,
+        Key::Named(NamedKey::ArrowDown) => SettingsAction::MoveDown,
+        Key::Named(NamedKey::ArrowRight) => {
+            if is_action_row {
+                SettingsAction::None
+            } else {
+                SettingsAction::Adjust(1.0)
+            }
+        }
+        Key::Named(NamedKey::ArrowLeft) => {
+            if is_action_row {
+                SettingsAction::None
+            } else {
+                SettingsAction::Adjust(-1.0)
+            }
+        }
+        Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter) => {
+            if is_action_row {
+                SettingsAction::Activate
+            } else {
+                SettingsAction::Adjust(1.0)
+            }
+        }
+        _ => SettingsAction::None,
+    }
+}
+
+/// Find the `SettingRow` in `ember_core`'s static table whose label matches
+/// `label` exactly — what `adjust_setting` looks up to call the row's own
+/// `adjust` fn. Pure (no `Shared`/`WindowState`), so the label-matching
+/// itself — the fix for the resolved-view/static-table index mismatch
+/// `resolve_rows` introduced once it could hide/synthesize rows — is
+/// unit-testable on its own. Returns `None` for a label that isn't in the
+/// static table at all, e.g. the synthesized "Delete saved sessions (N)…"
+/// row, which is intentional: that row has no `Config`-mutating `adjust`,
+/// so a miss here just means "nothing to adjust," not a bug.
+fn find_setting_row_by_label(label: &str) -> Option<&'static ember_core::SettingRow> {
+    setting_rows().iter().find(|r| r.label == label)
+}
+
+/// Send raw bytes to one specific session's PTY, wherever it lives. A
+/// generalization of `WindowState::send_to_focused` (which delegates here)
+/// for callers — like the restored-session pre-type latch — that need to
+/// address a pane that isn't necessarily focused, or isn't even in the
+/// caller's own window. Pure lookup through `shared.sessions`: no
+/// `WindowState`/pane-tree traversal needed, since the PTY handle is keyed
+/// by `SessionId` alone.
+pub(crate) fn send_to_pane(shared: &Shared, session_id: &SessionId, bytes: Vec<u8>) {
+    if let Some(h) = shared.sessions.get(session_id) {
+        let _ = h
+            .control
+            .send(BackendControl::Input(bytes.into_boxed_slice()));
+    }
 }
 
 impl WindowState {
@@ -624,6 +866,8 @@ impl WindowState {
             carried_exclusion: None,
             exclusion_applied: false,
             hidden_for_carry: false,
+            named_tabs: std::collections::HashSet::new(),
+            restore_prompt: None,
         }
     }
 
@@ -806,10 +1050,8 @@ impl WindowState {
 
     /// Send raw bytes to the focused session's PTY (used by control + key paths).
     pub(crate) fn send_to_focused(&self, shared: &Shared, bytes: Vec<u8>) {
-        if let Some(h) = self.focused_session(shared) {
-            let _ = h
-                .control
-                .send(BackendControl::Input(bytes.into_boxed_slice()));
+        if let Some(id) = self.focused_session_id() {
+            send_to_pane(shared, &id, bytes);
         }
     }
 
@@ -858,6 +1100,48 @@ impl WindowState {
                 }
                 return None;
             }
+        }
+        // Mirror the keyboard: the restore-on-launch modal captures input
+        // (Left/Right/Tab/Up/Down navigate, Enter activates, Esc backs out,
+        // a printable key or a whole `Type` types through — see
+        // `restore_key_action`/`RestoreAction::StartFreshAndType`).
+        //
+        // No Super-bypass gate here (contrast the keyboard call site in
+        // `main.rs`): `ControlMsg::Key`'s `named_key` lookup produces a bare
+        // `Key` with no modifier at all, so a ctl caller has no way to
+        // synthesize a Super-held (or Ctrl-held) character in the first
+        // place — `restore_key`'s own `mods: ModifiersState::empty()` below
+        // is therefore always the true state, not a lossy approximation.
+        // `ControlMsg::Chord` (the ctl verb that DOES carry modifiers, e.g.
+        // "cmd+q") isn't matched below at all and falls to `_ => {}` —
+        // already swallowed before this change, unchanged by it.
+        if self.restore_prompt.is_some() {
+            match &msg {
+                ControlMsg::Key(name) => {
+                    if let Some(k) = named_key(name) {
+                        if let Some(action) = self.restore_key(&k, ModifiersState::empty()) {
+                            return Some(ControlClose::Restore(action));
+                        }
+                        self.renderer.window().request_redraw();
+                    }
+                }
+                // Scripted launches send the whole typed string in one shot
+                // rather than one `ControlMsg::Key` per character — same
+                // dismissal as a single printable keystroke, just with the
+                // full text riding along instead of one character. An empty
+                // string carries nothing to forward, so it's a no-op: the
+                // modal stays up rather than archiving and dismissing for
+                // literally nothing typed.
+                ControlMsg::Type(text) if !text.is_empty() => {
+                    self.restore_prompt = None;
+                    self.update_restore_view();
+                    return Some(ControlClose::Restore(RestoreAction::StartFreshAndType(
+                        text.clone(),
+                    )));
+                }
+                _ => {}
+            }
+            return None;
         }
         // Mirror the keyboard: the close-confirm modal captures input (arrows/Tab
         // move focus, Enter activates, Esc cancels).
@@ -1013,6 +1297,7 @@ impl WindowState {
                 let vp = self.viewport();
                 apply(&mut self.tree, LayoutCommand::MoveTab { from, to }, vp);
                 self.sync_layout(shared);
+                shared.snapshot_dirty = true;
             }
             ControlMsg::RenameTab(i, name) => {
                 if let Some(t) = self.tree.tabs.get(i) {
@@ -1027,6 +1312,7 @@ impl WindowState {
                         vp,
                     );
                     self.sync_layout(shared);
+                    shared.snapshot_dirty = true;
                 }
             }
             ControlMsg::EditTab(i) => self.start_rename(shared, i),
@@ -1444,8 +1730,6 @@ impl WindowState {
         axis: Axis,
         ratio: f64,
     ) {
-        let new_pane = PaneId(shared.next_pane);
-        let new_session = SessionId::new(format!("s{}", shared.next_session));
         // Cwd-inheriting split (design §8.1): the new pane starts where the
         // split's parent pane last reported itself (OSC 1337 `CurrentDir`).
         let inherited_cwd = self
@@ -1454,6 +1738,27 @@ impl WindowState {
             .session_of(target)
             .and_then(|sid| shared.cwd_by_session.get(sid))
             .cloned();
+        self.split_pane_with_cwd(shared, target, axis, ratio, inherited_cwd);
+    }
+
+    /// Same as [`Self::split_pane`], but with an EXPLICIT cwd for the new
+    /// pane instead of inheriting `target`'s live-reported OSC 1337 dir —
+    /// used by the session-restore rebuild path (`main.rs`'s
+    /// `spawn_restored`), where `target`'s shell was JUST spawned and has
+    /// had no chance to report a cwd yet (`shared.cwd_by_session` has
+    /// nothing to inherit there); the caller resolves the real cwd (or a
+    /// `$HOME` fallback) from the saved snapshot instead and passes it here
+    /// directly.
+    pub(crate) fn split_pane_with_cwd(
+        &mut self,
+        shared: &mut Shared,
+        target: PaneId,
+        axis: Axis,
+        ratio: f64,
+        cwd: Option<String>,
+    ) {
+        let new_pane = PaneId(shared.next_pane);
+        let new_session = SessionId::new(format!("s{}", shared.next_session));
         let vp = self.viewport();
         let min_px = self.min_px(axis);
         // Spawn only if the split is actually accepted (min-size may refuse it),
@@ -1480,7 +1785,7 @@ impl WindowState {
             shared,
             new_session,
             GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
-            inherited_cwd,
+            cwd,
         ) {
             // Spawn failed after the tree accepted the split: roll the pane back
             // out so we don't render a dead pane.
@@ -1496,6 +1801,7 @@ impl WindowState {
         }
         self.apply_effects(shared, effects);
         self.sync_layout(shared);
+        shared.snapshot_dirty = true;
     }
 
     /// Whether Ctrl+Opt is currently held (the visual-split modifier).
@@ -1598,27 +1904,41 @@ impl WindowState {
         let vp = self.viewport();
         let effects = apply(&mut self.tree, LayoutCommand::ClosePane { target }, vp);
         self.apply_effects(shared, effects);
+        shared.snapshot_dirty = true;
         if !self.tree.tabs.is_empty() {
             self.sync_layout(shared);
         }
     }
 
     pub(crate) fn new_tab(&mut self, shared: &mut Shared) {
+        // Design §8.1 scopes cwd inheritance to splits, not new tabs — a new
+        // tab starts at the shell's own default, same as today.
+        self.new_tab_with_cwd(shared, None);
+    }
+
+    /// Same as [`Self::new_tab`], but the fresh tab's seed pane spawns in
+    /// `cwd` instead of the shell's own default — used by the
+    /// session-restore rebuild path (`main.rs`'s `spawn_restored`) to seed
+    /// each restored tab in its saved directory. Returns whether the tab
+    /// was actually created (`false` only if the shell failed to spawn, in
+    /// which case nothing was added — mirrors `new_tab`'s existing
+    /// early-return-on-spawn-failure, just surfaced to the caller instead of
+    /// silently swallowed, since the rebuild path needs to know whether to
+    /// keep going with this tab's titling/splits or skip it).
+    pub(crate) fn new_tab_with_cwd(&mut self, shared: &mut Shared, cwd: Option<String>) -> bool {
         let id = TabId(shared.next_tab);
         shared.next_tab += 1;
         let pane = PaneId(shared.next_pane);
         shared.next_pane += 1;
         let session = SessionId::new(format!("s{}", shared.next_session));
         shared.next_session += 1;
-        // Design §8.1 scopes cwd inheritance to splits, not new tabs — a new
-        // tab starts at the shell's own default, same as today.
         if !self.spawn_session(
             shared,
             session.clone(),
             GridDims::new(DEFAULT_COLS, DEFAULT_ROWS),
-            None,
+            cwd,
         ) {
-            return;
+            return false;
         }
         let vp = self.viewport();
         let effects = apply(
@@ -1628,6 +1948,8 @@ impl WindowState {
         );
         self.apply_effects(shared, effects);
         self.sync_layout(shared);
+        shared.snapshot_dirty = true;
+        true
     }
 
     /// Keyboard resize of the focused pane: `dir` (±1) grows/shrinks it by a few
@@ -1851,6 +2173,11 @@ impl WindowState {
         } else if let Some(d) = self.tab_drag.take() {
             self.renderer.set_tab_drag(None);
             ended = if d.active {
+                // The strip live-reorders `self.tree` as the drag crosses
+                // slot boundaries (`drag_tab_to`, which only has `&Shared`)
+                // — this release is the first point with `&mut Shared` to
+                // mark the result dirty.
+                shared.snapshot_dirty = true;
                 DragEnded::Reorder
             } else {
                 DragEnded::None
@@ -3208,6 +3535,12 @@ impl WindowState {
                             LayoutCommand::MoveTab { from: src_tab, to },
                             vp,
                         );
+                        // Same-window tear-off-and-redrop reorder: unlike the
+                        // in-strip live reorder (`drag_tab_to` + `left_release`)
+                        // and the cross-window path (`apply_move`), this arm
+                        // mutates `self.tree` directly and never goes through
+                        // either funnel.
+                        shared.snapshot_dirty = true;
                     }
                     self.tree.active = to;
                     self.sync_layout(shared);
@@ -3353,8 +3686,10 @@ impl WindowState {
         self.sync_layout(shared);
     }
 
-    /// Commit the in-progress rename (Enter / click away) → sets the tab title.
-    pub(crate) fn commit_rename(&mut self, shared: &Shared) {
+    /// Commit the in-progress rename (Enter / click away) → sets the tab title
+    /// and, since this is the interactive "user typed a name" path, marks the
+    /// tab as user-named for the session snapshot (`named_tabs`).
+    pub(crate) fn commit_rename(&mut self, shared: &mut Shared) {
         let Some(i) = self.editing_tab.take() else {
             return;
         };
@@ -3367,6 +3702,8 @@ impl WindowState {
                 LayoutCommand::RenameTab { tab: id, title },
                 vp,
             );
+            self.named_tabs.insert(id);
+            shared.snapshot_dirty = true;
         }
         self.edit_buffer.clear();
         self.sync_layout(shared);
@@ -3381,7 +3718,7 @@ impl WindowState {
     }
 
     /// Route a key into the inline tab-rename editor.
-    pub(crate) fn rename_key(&mut self, shared: &Shared, key: &Key) {
+    pub(crate) fn rename_key(&mut self, shared: &mut Shared, key: &Key) {
         match key {
             Key::Named(NamedKey::Enter) => self.commit_rename(shared),
             Key::Named(NamedKey::Escape) => self.cancel_rename(shared),
@@ -3937,6 +4274,184 @@ impl WindowState {
         }
     }
 
+    /// Show the restore-on-launch modal (startup only — see `main.rs`'s
+    /// `resumed`). Exclusive with the close-confirm modal in practice, but
+    /// there's nothing to hide here: at the point this is called, nothing
+    /// else has had a chance to show yet.
+    pub(crate) fn show_restore_prompt(&mut self, snap: session_state::SessionSnapshot) {
+        self.restore_prompt = Some(RestorePrompt::Main { snap, focus: 0 });
+        self.update_restore_view();
+    }
+
+    /// (Re)build the renderer's `RestoreView` from `self.restore_prompt`.
+    /// No-op-safe to call with `restore_prompt == None` (clears the view).
+    pub(crate) fn update_restore_view(&mut self) {
+        let now = std::time::SystemTime::now();
+        let view = match &self.restore_prompt {
+            None => None,
+            Some(RestorePrompt::Main { snap, focus }) => Some(ember_render::RestoreView::Main {
+                header: restore_header(snap, now),
+                focused: *focus as usize,
+            }),
+            Some(RestorePrompt::Older { list, sel }) => {
+                // The header stays the same restore question throughout —
+                // re-derive it from the CURRENT live file rather than
+                // threading the original `snap` through `Older` (see
+                // `RestorePrompt`'s doc for why `Older` doesn't carry one).
+                let header = session_state::state_path()
+                    .map(|p| session_state::load(&p))
+                    .and_then(|o| match o {
+                        session_state::LoadOutcome::Loaded(s) => Some(restore_header(&s, now)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "Restore session?".to_string());
+                Some(ember_render::RestoreView::Older {
+                    header,
+                    rows: list
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "{} · {} window{}, {} tab{}",
+                                session_state::humanize_stamp(&e.stamp, now),
+                                e.windows,
+                                if e.windows == 1 { "" } else { "s" },
+                                e.tabs,
+                                if e.tabs == 1 { "" } else { "s" },
+                            )
+                        })
+                        .collect(),
+                    selected: *sel,
+                })
+            }
+        };
+        self.renderer.set_restore(view);
+    }
+
+    /// Handle one key while the restore modal is open. Pure navigation is
+    /// resolved entirely here (including reading `list_archives`/re-loading
+    /// the live file off disk, both cheap local I/O); an actual choice
+    /// (Restore / Start fresh) is returned as a [`RestoreAction`] for the
+    /// caller (`main.rs`'s keyboard handler) to carry out — spawning
+    /// windows and archiving files both need state (`Shared`, `event_loop`)
+    /// this method doesn't have.
+    ///
+    /// `Older`'s `Esc` returns to `Main` by RE-READING the live session file
+    /// rather than restoring a stashed copy: `RestorePrompt::Older` (per its
+    /// own doc) doesn't carry the original `snap`, and the live file is
+    /// guaranteed untouched while any window's `restore_prompt.is_some()`
+    /// (`main.rs`'s `session_dirty` guard) — so the reload always reproduces
+    /// exactly what `Main` showed before.
+    ///
+    /// `mods`: the modifiers held alongside `key`, fed straight into
+    /// [`restore_key_action`]. The keyboard call site (`main.rs`) never
+    /// reaches here at all while Super is held — that branch is skipped
+    /// entirely so Cmd+Q/Cmd+W/etc. fall through to the real shortcut
+    /// handlers, matching the palette/search/rename capture guards — so in
+    /// practice this only ever sees Super held via a hypothetical future
+    /// ctl caller; `ControlMsg::Key` today has no way to attach modifiers
+    /// at all (see `handle_control`'s restore-prompt branch), so it always
+    /// passes `ModifiersState::empty()`.
+    pub(crate) fn restore_key(&mut self, key: &Key, mods: ModifiersState) -> Option<RestoreAction> {
+        let key_action = restore_key_action(key, mods);
+        let prompt = self.restore_prompt.as_mut()?;
+        if let RestoreKeyAction::TypeThrough(text) = key_action {
+            self.restore_prompt = None;
+            self.update_restore_view();
+            return Some(RestoreAction::StartFreshAndType(text));
+        }
+        match prompt {
+            RestorePrompt::Main { snap, focus } => match key_action {
+                RestoreKeyAction::Back => {
+                    self.restore_prompt = None;
+                    self.update_restore_view();
+                    Some(RestoreAction::StartFresh)
+                }
+                RestoreKeyAction::Nav(RestoreNavDir::Left) => {
+                    *focus = (*focus + 2) % 3; // -1 mod 3
+                    self.update_restore_view();
+                    None
+                }
+                RestoreKeyAction::Nav(RestoreNavDir::Right) => {
+                    *focus = (*focus + 1) % 3;
+                    self.update_restore_view();
+                    None
+                }
+                RestoreKeyAction::Activate => match *focus {
+                    0 => {
+                        let snapshot = snap.clone();
+                        self.restore_prompt = None;
+                        self.update_restore_view();
+                        Some(RestoreAction::Restore {
+                            snapshot,
+                            archive_current: false,
+                        })
+                    }
+                    1 => {
+                        self.restore_prompt = None;
+                        self.update_restore_view();
+                        Some(RestoreAction::StartFresh)
+                    }
+                    _ => {
+                        let list = session_state::state_path()
+                            .and_then(|p| p.parent().map(session_state::list_archives))
+                            .unwrap_or_default();
+                        self.restore_prompt = Some(RestorePrompt::Older { list, sel: 0 });
+                        self.update_restore_view();
+                        None
+                    }
+                },
+                // Up/Down have no meaning on `Main`; `TypeThrough` is fully
+                // handled above before this match ever runs.
+                _ => None,
+            },
+            RestorePrompt::Older { list, sel } => match key_action {
+                RestoreKeyAction::Back => {
+                    self.reload_restore_main(2);
+                    None
+                }
+                RestoreKeyAction::Nav(RestoreNavDir::Up) => {
+                    *sel = sel.saturating_sub(1);
+                    self.update_restore_view();
+                    None
+                }
+                RestoreKeyAction::Nav(RestoreNavDir::Down) => {
+                    if *sel + 1 < list.len() {
+                        *sel += 1;
+                    }
+                    self.update_restore_view();
+                    None
+                }
+                RestoreKeyAction::Activate => {
+                    let entry = list.get(*sel).cloned()?;
+                    let snapshot = session_state::load_archive(&entry.path)?;
+                    self.restore_prompt = None;
+                    self.update_restore_view();
+                    Some(RestoreAction::Restore {
+                        snapshot,
+                        archive_current: true,
+                    })
+                }
+                // Left/Right have no meaning on `Older`; `TypeThrough` is
+                // fully handled above before this match ever runs.
+                _ => None,
+            },
+        }
+    }
+
+    /// `Older…`'s `Esc`: reload the live session file and return to `Main`,
+    /// focused on the button (`focus`) that led here — see `restore_key`'s
+    /// doc for why this reloads rather than stashing/restoring `snap`.
+    fn reload_restore_main(&mut self, focus: u8) {
+        let snap = session_state::state_path()
+            .map(|p| session_state::load(&p))
+            .and_then(|o| match o {
+                session_state::LoadOutcome::Loaded(s) => Some(s),
+                _ => None,
+            });
+        self.restore_prompt = snap.map(|snap| RestorePrompt::Main { snap, focus });
+        self.update_restore_view();
+    }
+
     /// Dismiss whichever modal overlay is open; returns whether one was showing.
     pub(crate) fn dismiss_overlay(&mut self) -> bool {
         let shown = self.help || self.about || self.settings_open;
@@ -4008,38 +4523,110 @@ impl WindowState {
     /// Handle a key while the Settings overlay is open: navigate + change values.
     pub(crate) fn settings_key(&mut self, shared: &mut Shared, key: &Key) {
         let rows = shared.settings_rows();
-        match key {
-            Key::Named(NamedKey::Escape) => {
+        let selected_kind = rows.get(self.settings_sel).map(|r| r.kind);
+        match settings_action_for_key(key, selected_kind) {
+            SettingsAction::Close => {
                 self.hide_settings();
                 return;
             }
-            Key::Named(NamedKey::ArrowUp) => {
+            SettingsAction::MoveUp => {
                 self.settings_sel = step_selectable_row(&rows, self.settings_sel, -1);
             }
-            Key::Named(NamedKey::ArrowDown) => {
+            SettingsAction::MoveDown => {
                 self.settings_sel = step_selectable_row(&rows, self.settings_sel, 1);
             }
-            Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Space) => {
-                self.adjust_setting(shared, 1.0)
+            SettingsAction::Adjust(dir) => {
+                self.adjust_setting_and_apply_restore_effects(shared, dir)
             }
-            Key::Named(NamedKey::ArrowLeft) => self.adjust_setting(shared, -1.0),
-            _ => {}
+            SettingsAction::Activate => self.activate_action_row(),
+            SettingsAction::None => {}
         }
+        // Rows can appear/disappear as a result of the action above (the
+        // Capture-commands and Delete-saved-sessions rows both depend on
+        // live state, not just table position) — re-resolve and make sure
+        // the selection didn't land on a header or fall off the end before
+        // pushing the refreshed rows to the renderer.
+        let rows = shared.settings_rows();
+        self.ensure_settings_sel_selectable(&rows);
         self.refresh_settings(shared);
     }
 
+    /// Fire the currently selected `RowKind::Action` row. Only "Delete
+    /// saved sessions" exists today, so there's nothing to dispatch on by
+    /// label yet. Safe to call unconditionally: the only caller is
+    /// `settings_key`, which only ever produces `SettingsAction::Activate`
+    /// (routed here) when `settings_action_for_key` has already confirmed
+    /// the selected row is `RowKind::Action` — and that function gates
+    /// `Activate` to Enter/Space only, never Left/Right, so routine
+    /// navigation can never delete anything.
+    fn activate_action_row(&mut self) {
+        let removed = session_state::delete_all_state();
+        eprintln!("[ember] deleted {removed} saved session file(s)");
+    }
+
+    /// Adjust the selected setting by `dir`, then apply the session-restore
+    /// side effects `config.restore` can trigger — spawning/dropping the
+    /// snapshot writer, the immediate command-strip — by diffing `restore`
+    /// before and after `adjust_setting`.
+    fn adjust_setting_and_apply_restore_effects(&mut self, shared: &mut Shared, dir: f32) {
+        let before = shared.config.restore.clone();
+        self.adjust_setting(shared, dir);
+        let after = shared.config.restore.clone();
+
+        if before.mode != after.mode {
+            match after.mode {
+                RestoreMode::Off => {
+                    // Drop flushes any pending snapshot; existing files on
+                    // disk are left alone (ruling) — only the explicit
+                    // Delete action removes them.
+                    shared.snapshots = None;
+                }
+                RestoreMode::Ask | RestoreMode::Always => {
+                    if shared.snapshots.is_none() {
+                        shared.snapshots =
+                            session_state::state_path().map(session_state::SnapshotWriter::spawn);
+                    }
+                }
+            }
+        }
+
+        if before.capture_commands && !after.capture_commands {
+            // Belt and braces (see `crate::pane_snap_for`'s doc): clear the
+            // live metadata that the NEXT `session_dirty` would otherwise
+            // reassemble commands from, strip whatever's already on disk,
+            // then mark dirty so a command-free snapshot supersedes
+            // anything a pre-toggle dirty event already queued in the
+            // debounced writer (which could otherwise flush after this
+            // strip and put the commands right back).
+            crate::clear_captured_commands(&mut shared.pane_meta);
+            if let Some(path) = session_state::state_path() {
+                if let Err(e) = session_state::strip_commands(&path) {
+                    eprintln!("[ember] session command strip failed: {e}");
+                }
+            }
+            shared.snapshot_dirty = true;
+        }
+    }
+
     /// Change the selected setting by `dir` (+1 / -1) via its own row's
-    /// `adjust` fn — the row table *is* the dispatch, there is no positional
-    /// match here to drift out of sync with it. Persists the config, then
-    /// re-applies every live side effect unconditionally: backdrop
+    /// `adjust` fn. Looks the row up in `ember_core`'s static table by
+    /// label rather than by `self.settings_sel`'s position: the resolved
+    /// view `shared.settings_rows()` returns can hide or synthesize rows
+    /// (session-restore's Capture-commands/Delete-saved-sessions rows), so
+    /// its indices no longer line up 1:1 with the static table's — the
+    /// label is the one thing both sides agree on. Persists the config,
+    /// then re-applies every live side effect unconditionally: backdrop
     /// appearance, font size, font family, and the developer-mode control
     /// socket. Each is already a cheap no-op when its target value hasn't
     /// changed (matching `zoom_to`'s existing no-op-if-unchanged pattern),
     /// so this never needs to know which row actually fired.
     pub(crate) fn adjust_setting(&mut self, shared: &mut Shared, dir: f32) {
-        if let Some(row) = setting_rows().get(self.settings_sel) {
-            if let Some(adjust) = row.adjust {
-                adjust(&mut shared.config, dir);
+        let rows = shared.settings_rows();
+        if let Some(selected) = rows.get(self.settings_sel) {
+            if let Some(row) = find_setting_row_by_label(&selected.label) {
+                if let Some(adjust) = row.adjust {
+                    adjust(&mut shared.config, dir);
+                }
             }
         }
         if let Err(e) = config::save(&shared.config) {
@@ -4246,6 +4833,7 @@ impl WindowState {
             vp,
         );
         self.apply_effects(shared, effects);
+        shared.snapshot_dirty = true;
         if self.tree.tabs.is_empty() {
             return true;
         }
@@ -4271,6 +4859,7 @@ impl WindowState {
         let vp = self.viewport();
         let effects = apply(&mut self.tree, LayoutCommand::CloseTab { tab }, vp);
         self.apply_effects(shared, effects);
+        shared.snapshot_dirty = true;
         if self.tree.tabs.is_empty() {
             return true;
         }
@@ -4468,5 +5057,326 @@ mod tests {
             pane_drag_source(4, 0, PaneId(7), 0),
             SurfaceRef::Tab { window: 4, tab: 0 }
         );
+    }
+
+    // --- settings_action_for_key: the arrows-must-never-delete fix ---------
+    //
+    // Building a live `WindowState`/`Shared` here isn't practical (the
+    // `Renderer` needs a real GPU context this crate's test harness doesn't
+    // provide), so the key -> action decision was extracted into a pure
+    // function and is tested directly here, independent of the overlay.
+
+    #[test]
+    fn action_row_arrow_keys_do_nothing() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for key in [
+            Key::Named(NamedKey::ArrowLeft),
+            Key::Named(NamedKey::ArrowRight),
+        ] {
+            assert_eq!(
+                settings_action_for_key(&key, Some(RowKind::Action)),
+                SettingsAction::None,
+                "{key:?} on an Action row must not delete anything"
+            );
+        }
+    }
+
+    #[test]
+    fn action_row_enter_or_space_activates() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for key in [Key::Named(NamedKey::Enter), Key::Named(NamedKey::Space)] {
+            assert_eq!(
+                settings_action_for_key(&key, Some(RowKind::Action)),
+                SettingsAction::Activate,
+                "{key:?} on an Action row must activate it"
+            );
+        }
+    }
+
+    #[test]
+    fn non_action_row_arrow_keys_adjust_in_the_matching_direction() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for kind in [RowKind::Toggle, RowKind::Cycle, RowKind::Number] {
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::ArrowRight), Some(kind)),
+                SettingsAction::Adjust(1.0)
+            );
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::ArrowLeft), Some(kind)),
+                SettingsAction::Adjust(-1.0)
+            );
+        }
+    }
+
+    #[test]
+    fn non_action_row_enter_and_space_adjust_forward() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for key in [Key::Named(NamedKey::Enter), Key::Named(NamedKey::Space)] {
+            assert_eq!(
+                settings_action_for_key(&key, Some(RowKind::Toggle)),
+                SettingsAction::Adjust(1.0)
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_and_escape_are_unaffected_by_row_kind() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for kind in [None, Some(RowKind::Action), Some(RowKind::Toggle)] {
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::Escape), kind),
+                SettingsAction::Close
+            );
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::ArrowUp), kind),
+                SettingsAction::MoveUp
+            );
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::ArrowDown), kind),
+                SettingsAction::MoveDown
+            );
+        }
+    }
+
+    #[test]
+    fn an_unhandled_key_is_a_no_op_regardless_of_row_kind() {
+        use super::{SettingsAction, settings_action_for_key};
+        use ember_core::RowKind;
+        use winit::keyboard::{Key, NamedKey};
+
+        for kind in [None, Some(RowKind::Action), Some(RowKind::Toggle)] {
+            assert_eq!(
+                settings_action_for_key(&Key::Named(NamedKey::Tab), kind),
+                SettingsAction::None
+            );
+        }
+    }
+
+    // --- restore_key_action: type-through dismissal (PR 13) ----------------
+    //
+    // Same reasoning as `settings_action_for_key`'s tests above: the restore
+    // modal's key -> action decision is a pure function precisely so it can
+    // be tested here without a live `WindowState`/GPU-backed `Renderer`.
+    // `restore_key_action` itself doesn't know about `Main`/`Older` — both
+    // screens funnel through it, so these tests cover both by construction
+    // rather than by asserting on a live prompt.
+
+    #[test]
+    fn printable_characters_type_through() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, SmolStr};
+
+        for ch in ["a", "Z", "5", "?", "\u{222b}"] {
+            assert_eq!(
+                restore_key_action(&Key::Character(SmolStr::new(ch)), ModifiersState::empty()),
+                RestoreKeyAction::TypeThrough(ch.to_string()),
+                "printable {ch:?} must type through"
+            );
+        }
+    }
+
+    #[test]
+    fn space_types_through_as_a_literal_space() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::Space), ModifiersState::empty()),
+            RestoreKeyAction::TypeThrough(" ".to_string())
+        );
+    }
+
+    #[test]
+    fn enter_activates() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::Enter), ModifiersState::empty()),
+            RestoreKeyAction::Activate
+        );
+    }
+
+    #[test]
+    fn escape_backs_out() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::Escape), ModifiersState::empty()),
+            RestoreKeyAction::Back
+        );
+    }
+
+    #[test]
+    fn arrows_and_tab_classify_as_directional_nav() {
+        use super::{RestoreKeyAction, RestoreNavDir, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        // Left/Right/Tab are `Main`'s button-cycling keys; Up/Down are
+        // `Older`'s list-cursor keys — `restore_key_action` classifies all
+        // of them uniformly, and `restore_key` picks the ones that mean
+        // something on the screen that's actually open.
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::ArrowLeft), ModifiersState::empty()),
+            RestoreKeyAction::Nav(RestoreNavDir::Left)
+        );
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::ArrowRight), ModifiersState::empty()),
+            RestoreKeyAction::Nav(RestoreNavDir::Right)
+        );
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::Tab), ModifiersState::empty()),
+            RestoreKeyAction::Nav(RestoreNavDir::Right)
+        );
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::ArrowUp), ModifiersState::empty()),
+            RestoreKeyAction::Nav(RestoreNavDir::Up)
+        );
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::ArrowDown), ModifiersState::empty()),
+            RestoreKeyAction::Nav(RestoreNavDir::Down)
+        );
+    }
+
+    #[test]
+    fn unhandled_named_keys_are_swallowed() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        // Stand-ins for "IME/other named keys keep today's swallow" —
+        // anything with no defined modal meaning and no printable text.
+        for key in [
+            Key::Named(NamedKey::F1),
+            Key::Named(NamedKey::Backspace),
+            Key::Named(NamedKey::Shift),
+        ] {
+            assert_eq!(
+                restore_key_action(&key, ModifiersState::empty()),
+                RestoreKeyAction::Swallow
+            );
+        }
+    }
+
+    // --- restore_key_action: modifier gating (review fix) ------------------
+    //
+    // Super-modified characters never reach `restore_key_action` on the real
+    // keyboard path at all — `main.rs` skips the whole restore-modal branch
+    // while Super is held, exactly like the palette/search/rename capture
+    // guards, so Cmd+Q/Cmd+W/etc. fall through to the normal shortcut
+    // handlers untouched. These tests cover the classifier's OWN defense in
+    // depth for that case (a hypothetical ctl caller that could somehow
+    // attach Super to a `Key`) plus the real, reachable case: Ctrl-modified
+    // characters, which DO reach here (nothing gates entry on Ctrl), and
+    // must not type a literal letter for what's meant as a control chord
+    // (Ctrl+C, Ctrl+D, …).
+
+    #[test]
+    fn plain_characters_are_unaffected_by_the_modifier_gate() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, SmolStr};
+
+        assert_eq!(
+            restore_key_action(&Key::Character(SmolStr::new("a")), ModifiersState::empty()),
+            RestoreKeyAction::TypeThrough("a".to_string())
+        );
+    }
+
+    #[test]
+    fn control_modified_characters_are_swallowed_not_typed() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, SmolStr};
+
+        for ch in ["c", "d", "a"] {
+            assert_eq!(
+                restore_key_action(&Key::Character(SmolStr::new(ch)), ModifiersState::CONTROL),
+                RestoreKeyAction::Swallow,
+                "Ctrl+{ch} must not type the literal letter"
+            );
+        }
+    }
+
+    #[test]
+    fn control_modified_space_is_swallowed_not_typed() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        assert_eq!(
+            restore_key_action(&Key::Named(NamedKey::Space), ModifiersState::CONTROL),
+            RestoreKeyAction::Swallow
+        );
+    }
+
+    #[test]
+    fn super_modified_characters_are_swallowed_not_typed() {
+        use super::{RestoreKeyAction, restore_key_action};
+        use winit::keyboard::{Key, ModifiersState, SmolStr};
+
+        // Defense in depth: on the real keyboard path this case can't
+        // happen (see this section's doc) — `main.rs` never calls
+        // `restore_key`/`restore_key_action` at all while Super is held.
+        // The classifier still refuses to type Super-held characters
+        // through, so any caller that DID somehow reach it this way (e.g. a
+        // future ctl verb that can attach modifiers) gets the safe answer
+        // rather than a stray dismiss-and-type.
+        for ch in ["q", "w", "n", "t"] {
+            assert_eq!(
+                restore_key_action(&Key::Character(SmolStr::new(ch)), ModifiersState::SUPER),
+                RestoreKeyAction::Swallow,
+                "Super+{ch} must not type the literal letter"
+            );
+        }
+    }
+
+    // --- find_setting_row_by_label: the resolved-view/static-table lookup --    // --- find_setting_row_by_label: the resolved-view/static-table lookup --
+
+    #[test]
+    fn find_setting_row_by_label_locates_and_adjusts_a_representative_cycle_row() {
+        use super::find_setting_row_by_label;
+        use ember_core::{Config, RestoreMode, RowKind};
+
+        let row = find_setting_row_by_label("Session restore").expect("row must be found");
+        assert_eq!(row.kind, RowKind::Cycle);
+        let mut c = Config::default();
+        assert_eq!(c.restore.mode, RestoreMode::Ask); // starting point
+        (row.adjust.expect("cycle row has an adjust fn"))(&mut c, 1.0);
+        assert_eq!(c.restore.mode, RestoreMode::Always);
+    }
+
+    #[test]
+    fn find_setting_row_by_label_locates_and_adjusts_a_representative_toggle_row() {
+        use super::find_setting_row_by_label;
+        use ember_core::Config;
+
+        let row = find_setting_row_by_label("Capture commands").expect("row must be found");
+        let mut c = Config::default();
+        assert!(c.restore.capture_commands);
+        (row.adjust.expect("toggle row has an adjust fn"))(&mut c, 1.0);
+        assert!(!c.restore.capture_commands);
+    }
+
+    #[test]
+    fn find_setting_row_by_label_misses_cleanly_on_a_synthesized_label() {
+        use super::find_setting_row_by_label;
+
+        // "Delete saved sessions (N)…" is synthesized by `resolve_rows`,
+        // never a static-table label — the lookup must return `None`, not
+        // panic, so `adjust_setting` just skips mutation for it.
+        assert!(find_setting_row_by_label("Delete saved sessions (4)…").is_none());
     }
 }

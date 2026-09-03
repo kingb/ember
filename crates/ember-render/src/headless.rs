@@ -22,14 +22,14 @@ use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
     AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help, build_ime_preedit,
-    build_palette, build_search_bar, build_settings, build_tabs, grid_quads, hold_ring_quads,
-    link_quads, measure_cell_width, morph_quads, push_backdrop, scrollbar, selection_quads,
-    shape_grid, spark_quads, split_preview,
+    build_palette, build_restore_list, build_restore_main, build_search_bar, build_settings,
+    build_tabs, grid_quads, hold_ring_quads, link_quads, measure_cell_width, morph_quads,
+    push_backdrop, scrollbar, selection_quads, shape_grid, spark_quads, split_preview,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
     ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, BG, BackdropParams, FG, FONT_SIZE,
-    HELP_PAD, ImageFit, LINE_HEIGHT, PAD, TabLabel,
+    HELP_PAD, ImageFit, LINE_HEIGHT, PAD, RestoreView, TabLabel,
 };
 use crate::selection::Selection;
 
@@ -87,6 +87,9 @@ pub struct Shot<'a> {
     pub font_family: Option<String>,
     /// A blocking confirm modal drawn over everything, if shown.
     pub confirm: Option<crate::renderer::ConfirmView>,
+    /// The restore-on-launch modal (Task 8), drawn over everything if shown.
+    /// Mutually exclusive with `confirm` in practice.
+    pub restore: Option<RestoreView>,
     /// Hold-to-wisp ring (v1.1): `(logical x, logical y, progress 0..1)` —
     /// mirrors [`crate::Renderer`]'s live `hold_ring` state so a mid-gesture
     /// `ctl screenshot` shows the sweep for visual verification.
@@ -270,6 +273,15 @@ pub fn capture_reusing(
     let mut cf_cancel = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut cf_ok = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut confirm_layout: Option<crate::paint::ConfirmLayout> = None;
+    let mut restore_header = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut restore_buttons = [
+        Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT)),
+        Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT)),
+        Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT)),
+    ];
+    let mut restore_list = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut restore_main_layout: Option<crate::paint::RestoreMainLayout> = None;
+    let mut restore_list_origin: Option<(f32, f32)> = None;
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut rounded: Vec<([f32; 4], [f32; 4], f32)> = Vec::new();
     let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
@@ -546,6 +558,44 @@ pub fn capture_reusing(
             &mut rounded,
         ));
     }
+    // Restore-on-launch modal (Task 8) — same overlay-pass layering as the
+    // confirm modal just above; mirrors the live renderer's `render` exactly
+    // so a `--screenshot` capture matches on-screen pixel-for-pixel.
+    match &shot.restore {
+        Some(RestoreView::Main { header, focused }) => {
+            restore_main_layout = Some(build_restore_main(
+                font_system,
+                &mut restore_header,
+                &mut restore_buttons,
+                header,
+                *focused,
+                cw,
+                shot.logical_w,
+                shot.logical_h,
+                sf,
+                &mut rounded,
+            ));
+        }
+        Some(RestoreView::Older {
+            header,
+            rows,
+            selected,
+        }) => {
+            restore_list_origin = Some(build_restore_list(
+                font_system,
+                &mut restore_list,
+                header,
+                rows,
+                *selected,
+                cw,
+                shot.logical_w,
+                shot.logical_h,
+                sf,
+                &mut rounded,
+            ));
+        }
+        None => {}
+    }
     quads.prepare(
         device,
         queue,
@@ -724,6 +774,39 @@ pub fn capture_reusing(
                 custom_glyphs: &[],
             });
         }
+    }
+    if let Some(rl) = &restore_main_layout {
+        overlay_areas.push(TextArea {
+            buffer: &restore_header,
+            left: rl.header_origin.0 * sf,
+            top: rl.header_origin.1 * sf,
+            scale: sf,
+            bounds: full_bounds,
+            default_color: Color::rgb(FG.r, FG.g, FG.b),
+            custom_glyphs: &[],
+        });
+        for (buf, (ox, oy)) in restore_buttons.iter().zip(rl.button_origins) {
+            overlay_areas.push(TextArea {
+                buffer: buf,
+                left: ox * sf,
+                top: oy * sf,
+                scale: sf,
+                bounds: full_bounds,
+                default_color: Color::rgb(FG.r, FG.g, FG.b),
+                custom_glyphs: &[],
+            });
+        }
+    }
+    if let Some((left, top)) = restore_list_origin {
+        overlay_areas.push(TextArea {
+            buffer: &restore_list,
+            left: left * sf,
+            top: top * sf,
+            scale: sf,
+            bounds: full_bounds,
+            default_color: Color::rgb(0xf5, 0xf5, 0xdc),
+            custom_glyphs: &[],
+        });
     }
     text_renderer
         .prepare_with_custom(

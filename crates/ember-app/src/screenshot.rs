@@ -40,6 +40,13 @@ pub struct Opts {
     pub hover_tab: Option<usize>,
     /// Draw a sample "Close this tab?" confirm modal over the panes.
     pub confirm: bool,
+    /// Draw the restore-on-launch modal's Main screen over the panes, with
+    /// representative fixture text (Task 8's own headless-verification
+    /// hook — see `RestoreView`'s doc for what the two screens show).
+    pub restore_main: bool,
+    /// Draw the restore-on-launch modal's `Older…` screen over the panes,
+    /// with a fixture 3-entry archive list.
+    pub restore_older: bool,
     /// Split drop-zone preview on the focused pane: `(horizontal, ratio)`.
     pub split_preview: Option<(bool, f32)>,
     /// How long to let the shells produce output before capturing.
@@ -104,6 +111,8 @@ impl Default for Opts {
             tab_drag: None,
             hover_tab: None,
             confirm: false,
+            restore_main: false,
+            restore_older: false,
             split_preview: None,
             settle_ms: 700,
             backdrop: false,
@@ -173,6 +182,8 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
                 opts.hover_tab = Some(next()?.parse().map_err(|e| format!("--hover-tab: {e}"))?)
             }
             "--confirm" => opts.confirm = true,
+            "--restore-main" => opts.restore_main = true,
+            "--restore-older" => opts.restore_older = true,
             "--help-overlay" => opts.help_overlay = true,
             "--settings" => opts.settings = true,
             "--tab-drag" => {
@@ -424,7 +435,9 @@ pub fn run(opts: Opts) -> Result<String, String> {
             let mut config = ember_core::Config::default();
             config.font.family = opts.font.clone();
             config.font.size = opts.font_size;
-            let rows = ember_core::resolve_rows(&config);
+            // A headless doc/preview shot has no live session-state dir to
+            // count, so the "Delete saved sessions" row never appears here.
+            let rows = ember_core::resolve_rows(&config, 0);
             let sel = rows
                 .iter()
                 .position(|r| r.label == "Font family")
@@ -470,6 +483,24 @@ pub fn run(opts: Opts) -> Result<String, String> {
             confirm_label: "Close".to_string(),
             focused: 0,
         }),
+        restore: if opts.restore_main {
+            Some(ember_render::RestoreView::Main {
+                header: "Restore 2 windows, 3 tabs (from 2h ago)?".to_string(),
+                focused: 0,
+            })
+        } else if opts.restore_older {
+            Some(ember_render::RestoreView::Older {
+                header: "Restore 2 windows, 3 tabs (from 2h ago)?".to_string(),
+                rows: vec![
+                    "2h ago · 2 windows, 3 tabs".to_string(),
+                    "1d ago · 1 window, 1 tab".to_string(),
+                    "3 weeks ago · 3 windows, 5 tabs".to_string(),
+                ],
+                selected: 0,
+            })
+        } else {
+            None
+        },
         hold_ring: opts.hold_ring,
         // No offline `--screenshot` flag for these (v0.4.0): both are live
         // cross-window-drag/tear-off previews with no meaningful "just render

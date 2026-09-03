@@ -87,6 +87,8 @@ pub struct AlacrittyProjection<L: EventListener> {
     scan_tail_133: Vec<u8>,
     /// Same, for OSC 1337.
     scan_tail_1337: Vec<u8>,
+    /// Same, for OSC 633.
+    scan_tail_633: Vec<u8>,
     /// Live scrollback-search state: the pattern as typed, its compiled DFA,
     /// and the engine-space range of the last match (the origin the next
     /// `search` call continues from). Reset when the pattern changes.
@@ -121,6 +123,7 @@ struct Mark {
 enum Scanned {
     C133(Osc133),
     C1337(crate::osc1337::Osc1337),
+    C633(crate::osc633::Osc633),
 }
 
 impl<L: EventListener> AlacrittyProjection<L> {
@@ -140,22 +143,25 @@ impl<L: EventListener> AlacrittyProjection<L> {
             resync: false,
             scan_tail_133: Vec::new(),
             scan_tail_1337: Vec::new(),
+            scan_tail_633: Vec::new(),
         }
     }
 
     /// Feed raw PTY bytes through the VT parser into the engine, and pre-scan them
-    /// for OSC 133 + OSC 1337 shell-integration sequences (alacritty ignores both,
-    /// so the bytes still flow through unchanged). Returns the semantic events
-    /// found, in order, and records prompt/exit/manual-mark state for the gutter.
+    /// for OSC 133 + OSC 1337 + OSC 633 shell-integration sequences (alacritty
+    /// ignores all three, so the bytes still flow through unchanged). Returns
+    /// the semantic events found, in order, and records prompt/exit/manual-mark
+    /// state for the gutter.
     pub fn advance(&mut self, bytes: &[u8]) -> Vec<OscEvent> {
         let mut events = Vec::new();
         // Scan over (carried tail ++ new bytes): a mark split across the 8 KB
         // read boundary is statistically inevitable in long sessions and used
         // to be lost forever. The tail's bytes were already fed to the engine
-        // last read — the carry exists only for the scanner. OSC 133 and OSC
-        // 1337 are scanned independently (each with its own carry), then
-        // merged back into buffer order below — carrying a wrong shared tail
-        // would either re-feed already-consumed bytes or duplicate a mark.
+        // last read — the carry exists only for the scanner. OSC 133, OSC
+        // 1337, and OSC 633 are scanned independently (each with its own
+        // carry), then merged back into buffer order below — carrying a wrong
+        // shared tail would either re-feed already-consumed bytes or
+        // duplicate a mark.
         let tail_len_133 = self.scan_tail_133.len();
         let owned_133: Vec<u8>;
         let scan_buf_133: &[u8] = if tail_len_133 == 0 {
@@ -176,15 +182,27 @@ impl<L: EventListener> AlacrittyProjection<L> {
             owned_1337 = v;
             &owned_1337
         };
+        let tail_len_633 = self.scan_tail_633.len();
+        let owned_633: Vec<u8>;
+        let scan_buf_633: &[u8] = if tail_len_633 == 0 {
+            bytes
+        } else {
+            let mut v = std::mem::take(&mut self.scan_tail_633);
+            v.extend_from_slice(bytes);
+            owned_633 = v;
+            &owned_633
+        };
         let result_133 = crate::osc133::scan_split(scan_buf_133);
         let result_1337 = crate::osc1337::scan_split(scan_buf_1337);
+        let result_633 = crate::osc633::scan_split(scan_buf_633);
 
         // Both scans' offsets are relative to their OWN scan buffer (which may
         // carry a different-length tail); rebase each to "offset within this
         // read's `bytes`" before merging, so the combined list is in true
         // buffer order regardless of which protocol's tail was longer.
-        let mut merged: Vec<(usize, Scanned)> =
-            Vec::with_capacity(result_133.marks.len() + result_1337.marks.len());
+        let mut merged: Vec<(usize, Scanned)> = Vec::with_capacity(
+            result_133.marks.len() + result_1337.marks.len() + result_633.marks.len(),
+        );
         merged.extend(result_133.marks.into_iter().map(|(past, m)| {
             (
                 past.saturating_sub(tail_len_133).min(bytes.len()),
@@ -195,6 +213,12 @@ impl<L: EventListener> AlacrittyProjection<L> {
             (
                 past.saturating_sub(tail_len_1337).min(bytes.len()),
                 Scanned::C1337(m),
+            )
+        }));
+        merged.extend(result_633.marks.into_iter().map(|(past, m)| {
+            (
+                past.saturating_sub(tail_len_633).min(bytes.len()),
+                Scanned::C633(m),
             )
         }));
         merged.sort_by_key(|(off, _)| *off);
@@ -250,6 +274,9 @@ impl<L: EventListener> AlacrittyProjection<L> {
                     }
                     events.push(OscEvent::SetMark);
                 }
+                Scanned::C633(crate::osc633::Osc633::CommandLine(cmd)) => {
+                    events.push(OscEvent::CommandLine(cmd));
+                }
             }
         }
         // Feed the remainder.
@@ -263,6 +290,10 @@ impl<L: EventListener> AlacrittyProjection<L> {
         self.scan_tail_1337.clear();
         if let Some(inc) = result_1337.incomplete {
             self.scan_tail_1337.extend_from_slice(&scan_buf_1337[inc..]);
+        }
+        self.scan_tail_633.clear();
+        if let Some(inc) = result_633.incomplete {
+            self.scan_tail_633.extend_from_slice(&scan_buf_633[inc..]);
         }
         events
     }
@@ -799,6 +830,29 @@ mod tests {
                 OscEvent::PromptStart,
                 OscEvent::SetMark,
             ]
+        );
+    }
+
+    #[test]
+    fn advance_emits_command_line_in_order() {
+        let mut p = proj();
+        let events = p.advance(b"\x1b]133;B\x07\x1b]633;E;cargo test\x07\x1b]133;C\x07");
+        assert!(matches!(events.as_slice(),
+            [OscEvent::CommandStart, OscEvent::CommandLine(c), OscEvent::OutputStart]
+            if c == "cargo test"));
+    }
+
+    #[test]
+    fn command_line_split_across_advances() {
+        let mut p = proj();
+        assert!(
+            p.advance(b"\x1b]633;E;gt crew ")
+                .iter()
+                .all(|e| !matches!(e, OscEvent::CommandLine(_)))
+        );
+        let events = p.advance(b"at skippy\x07");
+        assert!(
+            matches!(events.as_slice(), [OscEvent::CommandLine(c)] if c == "gt crew at skippy")
         );
     }
 

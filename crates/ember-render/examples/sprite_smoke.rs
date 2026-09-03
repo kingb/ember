@@ -88,6 +88,7 @@ fn main() {
         font_size: 12.0,
         font_family: None,
         confirm: None,
+        restore: None,
         hold_ring: None,
         ghost_tab: None,
         morph: None,

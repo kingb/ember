@@ -46,6 +46,11 @@ pub struct Config {
     /// `wisp` is true. Default `cinder` (the original look, unchanged —
     /// renamed from `ember` in v0.4.1; the old name still parses).
     pub wisp_style: WispStyleSelection,
+    /// Session restore (design doc `2026-08-31-session-restore-design.md`):
+    /// whether Ember snapshots window/tab/pane state for restore on next
+    /// launch, whether restoring asks first, and whether shell commands are
+    /// captured for the restore pre-type. See [`RestoreConfig`].
+    pub restore: RestoreConfig,
 }
 
 impl Default for Config {
@@ -60,6 +65,54 @@ impl Default for Config {
             wisp: true,
             osc52_read: false,
             wisp_style: WispStyleSelection::Cinder,
+            restore: RestoreConfig::default(),
+        }
+    }
+}
+
+/// Session-restore mode: whether Ember snapshots window/tab/pane state for
+/// restore on next launch, and whether restoring is silent or asks first.
+/// Serialized lowercase (`"off"` / `"ask"` / `"always"`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RestoreMode {
+    /// Never snapshot or restore. Existing on-disk session files are left
+    /// alone — turning this off only stops writing more; deleting what's
+    /// already saved is the separate, explicit "Delete saved sessions"
+    /// Settings action.
+    Off,
+    /// Snapshot continuously; on launch with a saved session, ask before
+    /// restoring it. The shipping default: restoring the exact session you
+    /// left is useful, but reopening N windows unannounced on every launch
+    /// isn't.
+    #[default]
+    Ask,
+    /// Snapshot continuously; on launch with a saved session, restore it
+    /// immediately without asking.
+    Always,
+}
+
+/// Session-restore configuration: the mode dial plus the command-capture
+/// kill-switch. `#[serde(default)]` so a `config.toml` predating this
+/// feature (no `[restore]` table at all) still loads, picking up
+/// `RestoreMode::Ask` + capture-on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RestoreConfig {
+    pub mode: RestoreMode,
+    /// Capture each pane's last shell command line into the snapshot, for
+    /// restore's pre-type. On by default. Turning this off keeps
+    /// layout/cwd restore but immediately strips any commands already
+    /// written to disk (privacy: command lines can carry inline secrets,
+    /// e.g. `export TOKEN=...`).
+    pub capture_commands: bool,
+}
+
+impl Default for RestoreConfig {
+    fn default() -> Self {
+        Self {
+            mode: RestoreMode::Ask,
+            capture_commands: true,
         }
     }
 }
@@ -428,6 +481,33 @@ mod tests {
         );
         assert_eq!(WispStyleSelection::Comet.resolve(1), WispStyle::Comet);
         assert_eq!(WispStyleSelection::Goo.resolve(2), WispStyle::Goo);
+    }
+
+    // --- restore config: defaults, roundtrip, backcompat --------------------
+
+    #[test]
+    fn restore_config_defaults() {
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.restore.mode, RestoreMode::Ask);
+        assert!(c.restore.capture_commands);
+    }
+
+    #[test]
+    fn restore_config_roundtrips() {
+        let mut c = Config::default();
+        c.restore.mode = RestoreMode::Always;
+        c.restore.capture_commands = false;
+        let c2: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(c2.restore.mode, RestoreMode::Always);
+        assert!(!c2.restore.capture_commands);
+    }
+
+    #[test]
+    fn restore_partial_table_fills_the_other_field_from_default() {
+        // Only `mode` set; `capture_commands` must still default to true.
+        let c: Config = toml::from_str("[restore]\nmode = \"off\"\n").unwrap();
+        assert_eq!(c.restore.mode, RestoreMode::Off);
+        assert!(c.restore.capture_commands);
     }
 
     #[test]

@@ -659,6 +659,7 @@ dependencies = [
  "ember-session",
  "libc",
  "log",
+ "serde",
  "serde_json",
  "toml",
  "winit",
