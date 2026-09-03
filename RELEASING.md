@@ -42,6 +42,22 @@ Every one of these has bitten a real release. Read once.
 - [ ] Version chosen per SemVer: patch (fixes), minor (features), major (breaks).
 - [ ] `main` pulled; `cargo test --workspace` green; `cargo clippy` clean.
 - [ ] Any feature branches merged and seam-reviewed.
+- [ ] **⛔ GATE — throughput.** `scripts/bench/throughput.sh <last-release-tag>
+      main --rounds 8` passes. AC power, High Power Mode, machine quiet. This
+      compares against the LAST RELEASED TAG, not an older one — the script's
+      built-in default goes stale the moment you ship.
+- [ ] **⛔ GATE — re-run after any late change.** If ANY commit lands after
+      that gate ran — a revert, a fix, a merge, anything — the gate result is
+      void. Run it again against the tip you actually intend to tag.
+
+      This is not hypothetical bookkeeping. 0.5.0 was held at this gate, the
+      offending commit was reverted, and the release shipped on the pre-revert
+      measurement. The tag went out with `dense_ascii` parse time roughly
+      doubled versus 0.4.2 on some Apple Silicon hardware, and nobody knew for
+      seven weeks. The gate did its job; the process discarded the answer.
+- [ ] **Sanity-check any large delta with the slot-swap control** before acting
+      on it: put each ref in the baseline slot in turn. If the effect follows
+      the slot rather than the ref, it is harness bias, not a finding.
 
 ## Phase 1 — Cut the version
 
@@ -138,4 +154,5 @@ Every one of these has bitten a real release. Read once.
 | `scripts/release/bottle-build.sh` | 5 | Native 22.04 bottle build + glibc-ceiling + Xvfb smoke |
 | `scripts/release/pour-verify.sh` | 5 | Clean-container `brew install` pour assertion |
 | `scripts/smoke/x11-container-smoke.sh` | test | Windowed app + drag on X11 under Xvfb |
+| `scripts/bench/throughput.sh` | 0 | **⛔ Throughput gate** vs the last released tag; re-run after any late change |
 | `scripts/bench/{idle-cpu,gpu-idle}.sh` | notes | Idle CPU / GPU cost for the release benchmark table |
