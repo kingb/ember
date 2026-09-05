@@ -26,7 +26,8 @@ pub use backend::{
 };
 pub use command::{LayoutCommand, LayoutEffect, apply};
 pub use config::{
-    Background, Config, Font, RestoreConfig, RestoreMode, SparksMode, WispStyle, WispStyleSelection,
+    Background, Config, Font, RestoreConfig, RestoreMode, SparksMode, TabColorRule,
+    TabColorsConfig, WispStyle, WispStyleSelection,
 };
 pub use focus::{Direction, focus_dir};
 pub use geom::Rect;

@@ -31,13 +31,15 @@ use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims,
     LayoutCommand, LayoutNode, MoveEffect, MoveError, OscEvent, PaneId, Rect, RowKind,
     ScrollAmount, SessionId, SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab,
-    TabColorChan, TabColorChoice, TabId, WispStyle, WispStyleSelection, apply, resolve_rows,
+    TabColorChan, TabColorChoice, TabColorRule, TabId, WispStyle, WispStyleSelection, apply,
+    resolve_rows,
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
     BackdropParams, CELL_HEIGHT, CELL_WIDTH, RenderOutcome, Renderer, TabHit, WispRenderer,
     WispUnsupported,
 };
+use regex::Regex;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -347,6 +349,89 @@ pub(crate) fn osc_color_of(map: &HashMap<SessionId, (u8, u8, u8)>, sid: &Session
         .map(|&(r, g, b)| ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
 }
 
+// --- Tab-color regex rules (design: tab-colors, T4) -------------------------
+//
+// `ember_core::config::TabColorRule` is a plain, unvalidated `{pattern,
+// color}` pair (`regex` isn't an ember-core dependency, so it can't compile
+// or validate either field itself). This is the ember-app-side compiled
+// form: `compile_rules` turns the config's `Vec<TabColorRule>` into
+// `Shared.tab_color_rules`, skipping (never panicking on) an invalid regex
+// or unparseable color, and `rule_color_for` is the actual first-match-wins
+// resolver `WindowState::recompute_tab_rule_colors` calls per tab.
+
+/// One `TabColorRule` with its pattern compiled and its color parsed —
+/// built once by `compile_rules`, not on every match.
+pub(crate) struct CompiledRule {
+    regex: Regex,
+    color: u32,
+}
+
+static INVALID_RULE_LOGGED: std::sync::Once = std::sync::Once::new();
+
+/// Log an invalid tab-color rule exactly once for the process lifetime, then
+/// swallow every subsequent one — a typo'd regex or color must never spam
+/// the log on every recompute, and must never be the other rules' problem
+/// (mirrors `session_state::log_write_failure_once`'s pattern).
+fn log_invalid_rule_once(msg: &str) {
+    INVALID_RULE_LOGGED.call_once(|| {
+        eprintln!("[ember] {msg}");
+    });
+}
+
+/// Parse a rule's `color` field: `#rrggbb`, exactly 6 hex digits after the
+/// `#` (case-insensitive). Standalone rather than reusing
+/// `window_state::parse_color_token`: a rule's color is always a literal
+/// hex color, never `default`/`clear`/`swatch-N`.
+fn parse_rule_color(s: &str) -> Option<u32> {
+    let hex = s.trim().strip_prefix('#')?;
+    if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        None
+    }
+}
+
+/// Compile every configured rule, skipping one with an invalid regex or an
+/// unparseable color rather than panicking or dropping the rest — see the
+/// module-level doc above. Called on config load and whenever the config
+/// changes (a Settings adjustment) — never per-frame.
+pub(crate) fn compile_rules(rules: &[TabColorRule]) -> Vec<CompiledRule> {
+    rules
+        .iter()
+        .filter_map(|r| {
+            let regex = match Regex::new(&r.pattern) {
+                Ok(re) => re,
+                Err(e) => {
+                    log_invalid_rule_once(&format!(
+                        "tab color rule skipped: invalid pattern {:?}: {e}",
+                        r.pattern
+                    ));
+                    return None;
+                }
+            };
+            let Some(color) = parse_rule_color(&r.color) else {
+                log_invalid_rule_once(&format!(
+                    "tab color rule skipped: invalid color {:?} for pattern {:?}",
+                    r.color, r.pattern
+                ));
+                return None;
+            };
+            Some(CompiledRule { regex, color })
+        })
+        .collect()
+}
+
+/// First-match-wins regex color for `title` against `rules` — the third
+/// `ember_core::effective_color` precedence layer (manual pick > OSC 6 >
+/// regex rule > none). `None` if no rule matches (including an empty
+/// `rules` slice).
+pub(crate) fn rule_color_for(title: &str, rules: &[CompiledRule]) -> Option<u32> {
+    rules
+        .iter()
+        .find(|r| r.regex.is_match(title))
+        .map(|r| r.color)
+}
+
 /// Process-wide state that is not tied to any one window: the running sessions,
 /// user config, OS effect seam, control socket, and per-session bookkeeping.
 pub(crate) struct Shared {
@@ -436,6 +521,14 @@ pub(crate) struct Shared {
     /// `SessionId` is never reused, so entries are never pruned on exit
     /// (matches `cwd_by_session`'s convention).
     pub(crate) osc_tab_color: std::collections::HashMap<SessionId, (u8, u8, u8)>,
+    /// Compiled tab-color regex rules (`config.tab_colors.rules`, compiled
+    /// by `compile_rules`) — the rule layer of `ember_core::effective_color`.
+    /// Rebuilt on config load and on every Settings adjustment; never
+    /// per-frame. `WindowState::recompute_tab_rule_colors` reads this to
+    /// fill each window's own per-tab rule-color cache (see that method's
+    /// doc for why the per-tab result is cached rather than matched fresh
+    /// in `sync_layout`).
+    pub(crate) tab_color_rules: Vec<CompiledRule>,
     /// The debounced session-snapshot writer thread's handle, or `None` when
     /// no state path resolved at startup (`session_state::state_path()`) —
     /// every dirty-marking site and `session_dirty` itself must treat that
@@ -951,6 +1044,9 @@ impl ApplicationHandler<EmberEvent> for App {
             return;
         }
         let config = config::load();
+        // Compile the tab-color rules once here, at config load — see
+        // `Shared::tab_color_rules`'s doc for the other recompute triggers.
+        let tab_color_rules = compile_rules(&config.tab_colors.rules);
         let restore_on = config.restore.mode != ember_core::RestoreMode::Off;
         // Session-restore (Task 8): what happens to the very first window
         // depends on `restore.mode` + whether a snapshot actually loaded.
@@ -991,6 +1087,7 @@ impl ApplicationHandler<EmberEvent> for App {
             cwd_by_session: std::collections::HashMap::new(),
             pane_meta: std::collections::HashMap::new(),
             osc_tab_color: std::collections::HashMap::new(),
+            tab_color_rules,
             snapshots: restore_on
                 .then(|| session_state::state_path().map(session_state::SnapshotWriter::spawn))
                 .flatten(),
@@ -3419,6 +3516,12 @@ fn replay_restored_window(
     if !win.tree.tabs.is_empty() {
         win.tree.active = win_snap.focused_tab.min(win.tree.tabs.len() - 1);
     }
+    // Auto/programmatic title change (design: tab-colors recompute trigger
+    // #2): every tab just got its saved title (if any) via `RenameTab`
+    // above, none of it through the interactive editor `commit_rename`
+    // covers — refresh once for the whole window before the `sync_layout`
+    // right below reads the cache.
+    win.recompute_tab_rule_colors(shared);
     win.sync_layout(shared);
     win.apply_appearance(shared);
     true
@@ -5425,12 +5528,13 @@ mod tests {
     use super::{
         BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, SessionId, TabColorChan,
         TabId, bell_flash_intensity, bracket_paste, clamp_to_visible_monitor,
-        clear_captured_commands, compose_tab_color_channel, encode_key, match_tab_title,
-        match_tab_title_across, needs_deferred_replay, next_prev_index, osc_color_of,
-        pane_snap_for, pretype_bytes, queue_close_this, queue_close_window, resolve_index,
-        resolve_restore_cwd, shell_escape_path, tab_display_title, url_is_openable,
-        window_owning_tab,
+        clear_captured_commands, compile_rules, compose_tab_color_channel, encode_key,
+        match_tab_title, match_tab_title_across, needs_deferred_replay, next_prev_index,
+        osc_color_of, pane_snap_for, pretype_bytes, queue_close_this, queue_close_window,
+        resolve_index, resolve_restore_cwd, rule_color_for, shell_escape_path, tab_display_title,
+        url_is_openable, window_owning_tab,
     };
+    use ember_core::TabColorRule;
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
     fn enc(key: Key, mods: ModifiersState) -> Option<Vec<u8>> {
@@ -5642,6 +5746,70 @@ mod tests {
         assert_eq!(osc_color_of(&map, &sid), Some(0x0011_2233));
         // A session that never reported one stays absent.
         assert_eq!(osc_color_of(&map, &SessionId::new("s2")), None);
+    }
+
+    // --- compile_rules / rule_color_for (design: tab-colors, T4) ----------
+
+    fn rule(pattern: &str, color: &str) -> TabColorRule {
+        TabColorRule {
+            pattern: pattern.to_string(),
+            color: color.to_string(),
+        }
+    }
+
+    #[test]
+    fn rule_color_for_first_match_wins() {
+        let compiled = compile_rules(&[rule("prod", "#ff0000"), rule("^ssh ", "#00ff00")]);
+        // Both patterns match "ssh prod-box"; the first rule in the list wins.
+        assert_eq!(rule_color_for("ssh prod-box", &compiled), Some(0x00ff_0000));
+    }
+
+    #[test]
+    fn rule_color_for_falls_through_to_a_later_rule() {
+        let compiled = compile_rules(&[rule("^ssh ", "#00ff00"), rule("prod", "#ff0000")]);
+        assert_eq!(
+            rule_color_for("just-prod-here", &compiled),
+            Some(0x00ff_0000)
+        );
+    }
+
+    #[test]
+    fn rule_color_for_none_when_nothing_matches() {
+        let compiled = compile_rules(&[rule("^ssh ", "#00ff00")]);
+        assert_eq!(rule_color_for("zsh", &compiled), None);
+    }
+
+    #[test]
+    fn rule_color_for_none_with_no_rules_configured() {
+        let compiled = compile_rules(&[]);
+        assert_eq!(rule_color_for("anything", &compiled), None);
+    }
+
+    #[test]
+    fn compile_rules_skips_an_invalid_regex_without_panicking() {
+        // Unbalanced group — not a valid regex.
+        let compiled = compile_rules(&[rule("(unterminated", "#ff0000"), rule("ok", "#00ff00")]);
+        assert_eq!(compiled.len(), 1, "the invalid rule must be dropped");
+        assert_eq!(rule_color_for("ok", &compiled), Some(0x0000_ff00));
+    }
+
+    #[test]
+    fn compile_rules_skips_an_unparseable_color_without_panicking() {
+        let compiled = compile_rules(&[rule("ok", "not-a-color"), rule("also-ok", "#123456")]);
+        assert_eq!(compiled.len(), 1, "the bad-color rule must be dropped");
+        assert_eq!(rule_color_for("also-ok", &compiled), Some(0x0012_3456));
+    }
+
+    #[test]
+    fn compile_rules_keeps_the_other_rules_when_one_is_invalid() {
+        let compiled = compile_rules(&[
+            rule("a", "#111111"),
+            rule("(bad", "#222222"),
+            rule("c", "#333333"),
+        ]);
+        assert_eq!(compiled.len(), 2);
+        assert_eq!(rule_color_for("a", &compiled), Some(0x0011_1111));
+        assert_eq!(rule_color_for("c", &compiled), Some(0x0033_3333));
     }
 
     // --- split-replay acceptance is viewport-size-dependent (Task 8 fix) --

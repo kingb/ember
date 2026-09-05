@@ -42,10 +42,10 @@ use crate::control::ControlMsg;
 use crate::session_state;
 use crate::{
     ControlClose, DEFAULT_COLS, DEFAULT_ROWS, DragState, DropHover, MULTI_CLICK, PAD, PendingClose,
-    Shared, about_info, bell_flash_intensity, bracket_paste, dims_for_rect, ember_glow, encode_key,
-    help_lines, inset, load_backdrop_image, named_key, osc_color_of, parse_chord,
-    resolve_window_index, shell_escape_path, step_selectable_row, tab_display_title,
-    url_is_openable,
+    Shared, about_info, bell_flash_intensity, bracket_paste, compile_rules, dims_for_rect,
+    ember_glow, encode_key, help_lines, inset, load_backdrop_image, named_key, osc_color_of,
+    parse_chord, resolve_window_index, rule_color_for, shell_escape_path, step_selectable_row,
+    tab_display_title, url_is_openable,
 };
 #[cfg(target_os = "linux")]
 use crate::{alt_digit_tab, linux_chord_translate};
@@ -574,6 +574,17 @@ pub(crate) struct WindowState {
     /// time. Never pruned when a tab closes: a `TabId` is never reused
     /// within a window's lifetime, so a stale entry is inert.
     pub(crate) named_tabs: std::collections::HashSet<TabId>,
+    /// Per-tab regex-rule color cache (design: tab-colors, T4) — `Shared::
+    /// tab_color_rules` matched against each tab's title, keyed by `TabId`.
+    /// Core's `Tab` has no such field (same reasoning as `named_tabs`: this
+    /// is app-side derived state, and `regex` isn't an ember-core
+    /// dependency). Recomputed via [`Self::recompute_tab_rule_colors`] only
+    /// at the four event sites that can change what it should hold — rename
+    /// commit, an auto/programmatic title change, a Settings adjustment, and
+    /// config load — never per-`sync_layout`/per-frame; `sync_layout` only
+    /// ever reads it. A tab absent here (not yet touched by any of those
+    /// four triggers) resolves to `None`, same as an empty rule set would.
+    pub(crate) tab_rule_colors: std::collections::HashMap<TabId, Option<u32>>,
     /// The restore-on-launch modal (Task 8), if this window's the one
     /// showing it — set once at startup (`restore.mode == Ask` + a loaded
     /// snapshot), never re-armed later in the session. `None` on every
@@ -1011,6 +1022,7 @@ impl WindowState {
             exclusion_applied: false,
             hidden_for_carry: false,
             named_tabs: std::collections::HashSet::new(),
+            tab_rule_colors: std::collections::HashMap::new(),
             restore_prompt: None,
         }
     }
@@ -1476,6 +1488,10 @@ impl WindowState {
                         },
                         vp,
                     );
+                    // Auto/programmatic title change (design: tab-colors
+                    // recompute trigger #2) — a `ctl` rename, not the
+                    // interactive editor `commit_rename` covers.
+                    self.recompute_tab_rule_colors(shared);
                     self.sync_layout(shared);
                     shared.snapshot_dirty = true;
                 }
@@ -1585,6 +1601,22 @@ impl WindowState {
         }
     }
 
+    /// Rebuild [`Self::tab_rule_colors`] for every tab in this window against
+    /// `shared.tab_color_rules` — the ONLY place that cache is written.
+    /// Called at each of the four trigger sites named on the field's doc
+    /// (rename commit, auto/programmatic title change, Settings adjustment,
+    /// config load); `sync_layout` — which runs far more often, on every
+    /// resize/focus/drag change too — only ever reads it, so a regex never
+    /// re-runs on a tab whose title hasn't changed.
+    pub(crate) fn recompute_tab_rule_colors(&mut self, shared: &Shared) {
+        self.tab_rule_colors = self
+            .tree
+            .tabs
+            .iter()
+            .map(|t| (t.id, rule_color_for(&t.title, &shared.tab_color_rules)))
+            .collect();
+    }
+
     /// Recompute the active tab's tiling, hand it to the renderer, and resize each
     /// session's PTY whose grid dims changed. Idempotent; the single source of
     /// truth for "what's on screen and how big each shell is."
@@ -1692,10 +1724,16 @@ impl WindowState {
                     .into_iter()
                     .find(|(p, _)| *p == t.focus)
                     .and_then(|(_, sid)| osc_color_of(&shared.osc_tab_color, &sid));
+                // The rule layer is a cache lookup, not a fresh regex match —
+                // see `tab_rule_colors`'s and `recompute_tab_rule_colors`'s
+                // docs for why matching doesn't happen here, on every
+                // `sync_layout` call.
+                let rule = self.tab_rule_colors.get(&t.id).copied().flatten();
                 let color = effective_color(
-                    t.color, osc,
-                    None,  // TODO(tab-color-rules): Task 4 wires the rule layer in here.
-                    false, // TODO(tab-color-rules): Task 4 wires config.tab_colors.osc6_overrides_manual in here.
+                    t.color,
+                    osc,
+                    rule,
+                    shared.config.tab_colors.osc6_overrides_manual,
                 );
                 TabLabel {
                     title: if editing {
@@ -3924,6 +3962,10 @@ impl WindowState {
             shared.snapshot_dirty = true;
         }
         self.edit_buffer.clear();
+        // Rename commit (design: tab-colors recompute trigger #1): the
+        // title just changed, so the rule-color cache for this window needs
+        // refreshing before the next `sync_layout` reads it.
+        self.recompute_tab_rule_colors(shared);
         if let Some(choice) = color {
             // `apply_tab_color` calls `sync_layout` itself, so it also covers
             // the rename's own redraw — no separate `sync_layout` needed below.
@@ -4963,11 +5005,20 @@ impl WindowState {
         }
         self.apply_appearance(shared);
         shared.set_developer_mode(shared.config.developer_mode);
-        let mut relayout = self.renderer.set_font_size(shared.config.font.size);
-        relayout |= self.renderer.set_family(shared.config.font.family.clone());
-        if relayout {
-            self.sync_layout(shared);
-        }
+        // Settings toggle change (design: tab-colors recompute trigger #3):
+        // rebuild the compiled rules from the just-saved config, then this
+        // window's per-tab cache against them — cheap even when the row
+        // that actually fired had nothing to do with tab colors, matching
+        // every other live side effect above ("cheap no-op when unchanged").
+        shared.tab_color_rules = compile_rules(&shared.config.tab_colors.rules);
+        self.recompute_tab_rule_colors(shared);
+        let _ = self.renderer.set_font_size(shared.config.font.size);
+        let _ = self.renderer.set_family(shared.config.font.family.clone());
+        // Unconditional (not just the old `if relayout`): a tab-color
+        // setting change needs `sync_layout` to actually repaint the strip,
+        // and `sync_layout`'s own dims_cache/etc. checks already make a
+        // redundant call cheap.
+        self.sync_layout(shared);
     }
 
     /// Push the current config's appearance (campfire backdrop + ember sparks) to

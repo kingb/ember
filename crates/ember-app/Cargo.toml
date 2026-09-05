@@ -18,6 +18,9 @@ winit.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+# Tab-color regex rules (design: tab-colors) — compiled here, not in
+# ember-core, so a config-only crate never depends on a regex engine.
+regex = "1"
 # The EMBER_FONT_DEBUG logger: surfaces cosmic-text's internal font
 # diagnostics (see FontDebugLogger in main.rs).
 log = "0.4"

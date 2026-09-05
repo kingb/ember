@@ -85,6 +85,11 @@ const SESSION_RESTORE_LABEL: &str = "Session restore";
 /// (nothing to capture) and to anchor the delete row's insertion point when
 /// it's visible.
 const CAPTURE_COMMANDS_LABEL: &str = "Capture commands";
+/// The "Shell color overrides manual" toggle row's static label — also
+/// what `resolve_rows` matches on to synthesize the read-only "Tab color
+/// rules (N)" info row right after it (v1: rule editing is config.toml-only,
+/// this row is informational — see the design doc `2026-09-04-tab-colors`).
+const SHELL_OVERRIDES_MANUAL_LABEL: &str = "Shell color overrides manual";
 
 /// Resolve every row in [`setting_rows`] against `config` into render-ready
 /// views, in table order — plus the "Delete saved sessions (N)…" action row
@@ -117,6 +122,18 @@ pub fn resolve_rows(config: &Config, saved_sessions: usize) -> Vec<SettingsRowVi
                 label: format!("Delete saved sessions ({saved_sessions})…"),
                 value: String::new(),
                 kind: RowKind::Action,
+            });
+        }
+        // "Tab color rules (N)": a read-only info row (v1 — full rule
+        // editing in Settings is not this task) synthesized right after the
+        // knob, always shown (even at N=0 — "no rules configured" is useful
+        // too), so it can't drift from the static table like the delete-row
+        // anchor above.
+        if r.label == SHELL_OVERRIDES_MANUAL_LABEL {
+            rows.push(SettingsRowView {
+                label: format!("Tab color rules ({})", config.tab_colors.rules.len()),
+                value: String::new(),
+                kind: RowKind::ReadOnly,
             });
         }
     }
@@ -329,6 +346,15 @@ fn adjust_capture_commands(c: &mut Config, _dir: f32) {
     c.restore.capture_commands = !c.restore.capture_commands;
 }
 
+// --- Tab colors ------------------------------------------------------------
+
+fn fmt_osc6_overrides_manual(c: &Config) -> String {
+    on_off(c.tab_colors.osc6_overrides_manual)
+}
+fn adjust_osc6_overrides_manual(c: &mut Config, _dir: f32) {
+    c.tab_colors.osc6_overrides_manual = !c.tab_colors.osc6_overrides_manual;
+}
+
 // --- Developer -----------------------------------------------------------------
 
 fn fmt_developer_mode(c: &Config) -> String {
@@ -499,6 +525,25 @@ pub fn setting_rows() -> &'static [SettingRow] {
             ),
         },
         SettingRow {
+            label: "Tab colors",
+            kind: RowKind::SectionHeader,
+            format: |_| String::new(),
+            adjust: None,
+            help: Help::Inline(""),
+        },
+        SettingRow {
+            label: SHELL_OVERRIDES_MANUAL_LABEL,
+            kind: RowKind::Toggle,
+            format: fmt_osc6_overrides_manual,
+            adjust: Some(adjust_osc6_overrides_manual),
+            help: Help::Inline(
+                "When on, a shell's OSC 6 tab-color report beats a manually picked color \
+                 (a pinned default still blocks it). Off by default: your manual pick wins. \
+                 Regex rules are edited in config.toml; the row below just shows how many \
+                 are configured.",
+            ),
+        },
+        SettingRow {
             label: "Developer",
             kind: RowKind::SectionHeader,
             format: |_| String::new(),
@@ -518,6 +563,7 @@ pub fn setting_rows() -> &'static [SettingRow] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TabColorRule;
 
     fn row(label: &str) -> &'static SettingRow {
         setting_rows().iter().find(|r| r.label == label).unwrap()
@@ -824,7 +870,13 @@ mod tests {
             .collect();
         assert_eq!(
             headers,
-            vec!["Appearance", "Terminal", "Session", "Developer"]
+            vec![
+                "Appearance",
+                "Terminal",
+                "Session",
+                "Tab colors",
+                "Developer"
+            ]
         );
     }
 
@@ -942,5 +994,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- tab colors: knob row + read-only rule-count row ---------------------
+
+    #[test]
+    fn shell_overrides_manual_row_is_a_toggle() {
+        assert_eq!(row(SHELL_OVERRIDES_MANUAL_LABEL).kind, RowKind::Toggle);
+    }
+
+    #[test]
+    fn shell_overrides_manual_toggle_mutates_only_that_field() {
+        let mut c = Config::default();
+        let before = c.clone();
+        (row(SHELL_OVERRIDES_MANUAL_LABEL).adjust.unwrap())(&mut c, 1.0);
+        assert!(c.tab_colors.osc6_overrides_manual);
+        assert_eq!(c.tab_colors.rules, before.tab_colors.rules);
+        assert_eq!(c.developer_mode, before.developer_mode);
+    }
+
+    #[test]
+    fn settings_include_the_shell_overrides_manual_row() {
+        let rows = resolve_rows(&Config::default(), 0);
+        assert!(rows.iter().any(|r| r.label == SHELL_OVERRIDES_MANUAL_LABEL));
+    }
+
+    #[test]
+    fn tab_color_rules_info_row_shows_zero_by_default() {
+        let rows = resolve_rows(&Config::default(), 0);
+        let r = rows
+            .iter()
+            .find(|r| r.label.starts_with("Tab color rules"))
+            .expect("tab color rules row present");
+        assert_eq!(r.label, "Tab color rules (0)");
+        assert_eq!(r.kind, RowKind::ReadOnly);
+    }
+
+    #[test]
+    fn tab_color_rules_info_row_reflects_the_configured_count() {
+        let mut c = Config::default();
+        c.tab_colors.rules = vec![
+            TabColorRule {
+                pattern: "^ssh ".to_string(),
+                color: "#ff0000".to_string(),
+            },
+            TabColorRule {
+                pattern: "prod".to_string(),
+                color: "#00ff00".to_string(),
+            },
+        ];
+        let rows = resolve_rows(&c, 0);
+        assert!(
+            rows.iter()
+                .any(|r| r.label == "Tab color rules (2)" && r.kind == RowKind::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn tab_color_rules_info_row_is_shown_even_when_zero() {
+        // Unlike "Delete saved sessions", this row is always present — "no
+        // rules configured" is informational too, not something to hide.
+        let rows = resolve_rows(&Config::default(), 0);
+        assert!(rows.iter().any(|r| r.label == "Tab color rules (0)"));
+    }
+
+    #[test]
+    fn tab_color_rules_row_immediately_follows_the_knob_row() {
+        let rows = resolve_rows(&Config::default(), 0);
+        let knob_idx = rows
+            .iter()
+            .position(|r| r.label == SHELL_OVERRIDES_MANUAL_LABEL)
+            .expect("knob row present");
+        assert_eq!(rows[knob_idx + 1].label, "Tab color rules (0)");
     }
 }
