@@ -7,6 +7,39 @@ broke, so they fail loud instead of shipping something wrong.
 Mechanics (script internals, signing setup) live in [BUILDING.md](BUILDING.md);
 this file is the operator's runbook.
 
+## Once the operator says go
+
+"Go," "release," "ship it," or equivalent authorizes running every phase in
+this file through to the end, in order, without stopping to ask permission
+between phases or between steps within a phase. A **⛔ GATE** passing is not
+a checkpoint to report and wait on — it's the reason to move to the next
+line. Don't ask "should I continue to Phase N?"; continue.
+
+Stop and report instead of proceeding when:
+
+- **A GATE fails**, or a script exits non-zero, or a result is ambiguous
+  rather than clean.
+- **Something outside your access blocks a step** — an invalid or expired
+  token, a locked credential, a missing permission — that you cannot safely
+  route around. Say what's blocked and what you need from the operator; don't
+  work around it via a side channel (e.g. deploying from a raw file tree
+  because the CLI's stored login is stale).
+- **A step is destructive or hard to reverse in a way this checklist doesn't
+  already cover.** The steps written here — tagging, notarizing, publishing
+  the release, pushing the formula/cask, deploying the site — are
+  pre-authorized by "go." Anything *not* on this list (force-pushing,
+  rewriting history, deleting a prior release) still needs to be asked for
+  separately, same as any other session.
+- **A result contradicts something already established this run** — a
+  benchmark that inverts a prior measurement, a verification that disagrees
+  with itself, a check that passed by accident (see the throughput-harness
+  saga this runbook's later gates exist because of). That's grounds to pause
+  and dig, not to push through on the newer number.
+
+Finishing a phase, a gate passing, or a script completing cleanly are not
+pause points — that's the entire value of saying "go" once instead of at
+every step.
+
 ## Before you start: the scars
 
 Every one of these has bitten a real release. Read once.
