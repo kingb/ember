@@ -21,8 +21,8 @@ pub mod windows;
 pub use app::{AppState, ChromeRow, ChromeRowKind, ChromeState, Gate, GateId, GateRegistry};
 pub use backend::{
     BackendControl, BackendEvent, BackendHandle, ClipboardOp, ExitStatus, FrameRx, FrameTx,
-    OscEvent, PassthroughEvent, ScrollAmount, SearchHit, SessionBackend, VtProjection,
-    frame_channel,
+    OscEvent, PassthroughEvent, ScrollAmount, SearchHit, SessionBackend, TabColorChan,
+    VtProjection, frame_channel,
 };
 pub use command::{LayoutCommand, LayoutEffect, apply};
 pub use config::{

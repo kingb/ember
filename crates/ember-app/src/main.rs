@@ -31,7 +31,7 @@ use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims,
     LayoutCommand, LayoutNode, MoveEffect, MoveError, OscEvent, PaneId, Rect, RowKind,
     ScrollAmount, SessionId, SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab,
-    TabColorChoice, TabId, WispStyle, WispStyleSelection, apply, resolve_rows,
+    TabColorChan, TabColorChoice, TabId, WispStyle, WispStyleSelection, apply, resolve_rows,
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
@@ -313,6 +313,41 @@ pub(crate) fn clear_captured_commands(pane_meta: &mut HashMap<SessionId, PaneMet
     }
 }
 
+/// Fold one OSC 6 channel report into a session's accumulated tab color.
+/// OSC tab color is per-session APP state, not persisted (design decision: a
+/// restored shell re-announces its own color, so there's nothing to save) —
+/// this only ever touches `Shared::osc_tab_color`, never `pane_meta` or the
+/// snapshot. A session with no entry yet initializes the other two channels
+/// to 0, then sets the reported one. Pure over the tuple so it's
+/// unit-testable without `Shared`.
+pub(crate) fn compose_tab_color_channel(
+    current: Option<(u8, u8, u8)>,
+    chan: TabColorChan,
+    value: u8,
+) -> (u8, u8, u8) {
+    let (mut r, mut g, mut b) = current.unwrap_or((0, 0, 0));
+    match chan {
+        TabColorChan::Red => r = value,
+        TabColorChan::Green => g = value,
+        TabColorChan::Blue => b = value,
+    }
+    (r, g, b)
+}
+
+/// Compose a session's accumulated OSC 6 channels into a packed `0xRRGGBB`
+/// color, or `None` if the session has never reported one (never touched, or
+/// reset via `OscEvent::TabColorReset`). Pure over the map so it's
+/// unit-testable without `Shared`.
+///
+/// Not read by any render/resolver path yet: this task's deliverable ends at
+/// `Shared::osc_tab_color` + this accessor. A follow-up task wires it into
+/// the tab-color precedence resolver (`ember_core::effective_color`).
+#[allow(dead_code)]
+pub(crate) fn osc_color_of(map: &HashMap<SessionId, (u8, u8, u8)>, sid: &SessionId) -> Option<u32> {
+    map.get(sid)
+        .map(|&(r, g, b)| ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
+}
+
 /// Process-wide state that is not tied to any one window: the running sessions,
 /// user config, OS effect seam, control socket, and per-session bookkeeping.
 pub(crate) struct Shared {
@@ -394,6 +429,14 @@ pub(crate) struct Shared {
     /// `SessionId` is never reused, and `assemble` only ever looks one up
     /// for a pane that's still a live leaf in some window's tree.
     pub(crate) pane_meta: std::collections::HashMap<SessionId, PaneMeta>,
+    /// Live per-session OSC 6 (iTerm2 tab color), composed from whichever
+    /// channel reports have arrived so far — a session absent here has never
+    /// reported one. Per-session APP state, not persisted: a restored shell
+    /// re-announces its own tab color, so this is never read by
+    /// `session_state::assemble` and never marks `snapshot_dirty`. A dead
+    /// `SessionId` is never reused, so entries are never pruned on exit
+    /// (matches `cwd_by_session`'s convention).
+    pub(crate) osc_tab_color: std::collections::HashMap<SessionId, (u8, u8, u8)>,
     /// The debounced session-snapshot writer thread's handle, or `None` when
     /// no state path resolved at startup (`session_state::state_path()`) —
     /// every dirty-marking site and `session_dirty` itself must treat that
@@ -948,6 +991,7 @@ impl ApplicationHandler<EmberEvent> for App {
             titles: std::collections::HashMap::new(),
             cwd_by_session: std::collections::HashMap::new(),
             pane_meta: std::collections::HashMap::new(),
+            osc_tab_color: std::collections::HashMap::new(),
             snapshots: restore_on
                 .then(|| session_state::state_path().map(session_state::SnapshotWriter::spawn))
                 .flatten(),
@@ -1809,6 +1853,12 @@ impl ApplicationHandler<EmberEvent> for App {
         // same reason `cwd_updates`/`cmd_updates` are: this loop borrows
         // `shared.sessions`.
         let mut prompt_starts: Vec<SessionId> = Vec::new();
+        // OSC 6 (iTerm2 tab color) channel reports and resets. Collected here
+        // rather than applied in-loop for the same reason `cwd_updates` is:
+        // this loop borrows `shared.sessions`. Per-session APP state, not
+        // persisted — this never touches `pane_meta`/`snapshot_dirty`.
+        let mut tab_color_updates: Vec<(SessionId, TabColorChan, u8)> = Vec::new();
+        let mut tab_color_resets: Vec<SessionId> = Vec::new();
         for (id, handle) in &shared.sessions {
             while let Ok(event) = handle.events.try_recv() {
                 match event {
@@ -1838,6 +1888,12 @@ impl ApplicationHandler<EmberEvent> for App {
                     }
                     BackendEvent::Osc(OscEvent::PromptStart) => {
                         prompt_starts.push(id.clone());
+                    }
+                    BackendEvent::Osc(OscEvent::TabColorChannel(chan, v)) => {
+                        tab_color_updates.push((id.clone(), chan, v));
+                    }
+                    BackendEvent::Osc(OscEvent::TabColorReset) => {
+                        tab_color_resets.push(id.clone());
                     }
                     _ => {}
                 }
@@ -1875,6 +1931,18 @@ impl ApplicationHandler<EmberEvent> for App {
                 meta.was_running = false;
                 meta_dirty = true;
             }
+        }
+        // OSC tab color (design decision: per-session APP state, not
+        // persisted — never marks `meta_dirty`/`snapshot_dirty`; a restored
+        // shell re-announces its own color).
+        for (id, chan, v) in tab_color_updates {
+            let current = shared.osc_tab_color.get(&id).copied();
+            shared
+                .osc_tab_color
+                .insert(id, compose_tab_color_channel(current, chan, v));
+        }
+        for id in tab_color_resets {
+            shared.osc_tab_color.remove(&id);
         }
         // Pre-type latch (Task 9): a restored pane's saved command types
         // itself into the shell's edit buffer, unsent, the moment that
@@ -5265,11 +5333,12 @@ fn encode_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, SessionId, TabId,
-        bell_flash_intensity, bracket_paste, clamp_to_visible_monitor, clear_captured_commands,
-        encode_key, match_tab_title, match_tab_title_across, needs_deferred_replay,
-        next_prev_index, pane_snap_for, pretype_bytes, queue_close_this, queue_close_window,
-        resolve_index, resolve_restore_cwd, shell_escape_path, tab_display_title, url_is_openable,
+        BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, SessionId, TabColorChan,
+        TabId, bell_flash_intensity, bracket_paste, clamp_to_visible_monitor,
+        clear_captured_commands, compose_tab_color_channel, encode_key, match_tab_title,
+        match_tab_title_across, needs_deferred_replay, next_prev_index, osc_color_of,
+        pane_snap_for, pretype_bytes, queue_close_this, queue_close_window, resolve_index,
+        resolve_restore_cwd, shell_escape_path, tab_display_title, url_is_openable,
         window_owning_tab,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
@@ -5449,6 +5518,40 @@ mod tests {
         assert_eq!(pane_meta[&SessionId::new("s1")].cwd.as_deref(), Some("/a"));
         assert!(pane_meta[&SessionId::new("s1")].was_running);
         assert_eq!(pane_meta[&SessionId::new("s2")].cwd.as_deref(), Some("/b"));
+    }
+
+    // --- compose_tab_color_channel / osc_color_of (OSC 6 accumulation) --
+
+    #[test]
+    fn compose_tab_color_channel_defaults_other_channels_to_zero_on_first_touch() {
+        assert_eq!(
+            compose_tab_color_channel(None, TabColorChan::Green, 200),
+            (0, 200, 0)
+        );
+    }
+
+    #[test]
+    fn compose_tab_color_channel_updates_only_the_reported_channel() {
+        let after_red = compose_tab_color_channel(None, TabColorChan::Red, 10);
+        assert_eq!(after_red, (10, 0, 0));
+        let after_green = compose_tab_color_channel(Some(after_red), TabColorChan::Green, 20);
+        assert_eq!(after_green, (10, 20, 0));
+        let after_blue = compose_tab_color_channel(Some(after_green), TabColorChan::Blue, 30);
+        assert_eq!(after_blue, (10, 20, 30));
+        // Re-reporting red doesn't disturb green/blue.
+        let after_red_again = compose_tab_color_channel(Some(after_blue), TabColorChan::Red, 99);
+        assert_eq!(after_red_again, (99, 20, 30));
+    }
+
+    #[test]
+    fn osc_color_of_packs_rgb_and_is_none_when_absent() {
+        let mut map = std::collections::HashMap::new();
+        let sid = SessionId::new("s1");
+        assert_eq!(osc_color_of(&map, &sid), None);
+        map.insert(sid.clone(), (0x11, 0x22, 0x33));
+        assert_eq!(osc_color_of(&map, &sid), Some(0x0011_2233));
+        // A session that never reported one stays absent.
+        assert_eq!(osc_color_of(&map, &SessionId::new("s2")), None);
     }
 
     // --- split-replay acceptance is viewport-size-dependent (Task 8 fix) --
