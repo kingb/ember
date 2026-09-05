@@ -276,6 +276,10 @@ struct App {
 /// alongside `was_running = false` and never persisted (it rides only the
 /// `ctl state` JSON via `pane_status_for`, not `PaneSnap`/the on-disk
 /// snapshot): a restored pane has no prior command to report an exit for.
+/// A CODE-LESS `CommandEnd` (the shell didn't report one) still overwrites
+/// `last_exit` with `None` — see `apply_command_end` — deliberately
+/// clearing whatever a PRIOR command left behind rather than leaving a
+/// stale exit code visible for a command that never reported its own.
 #[derive(Default, Clone, Debug)]
 pub(crate) struct PaneMeta {
     cwd: Option<String>,
@@ -322,6 +326,17 @@ pub(crate) fn pane_status_for(meta: Option<&PaneMeta>) -> (bool, Option<i32>) {
         meta.map(|m| m.was_running).unwrap_or(false),
         meta.and_then(|m| m.last_exit),
     )
+}
+
+/// Apply one `CommandEnd` report to a pane's live metadata: the command is
+/// no longer running, and `last_exit` becomes exactly what `CommandEnd`
+/// reported — including `None` for a code-less report, which DELIBERATELY
+/// clears any exit code a PRIOR command left behind (see `PaneMeta::
+/// last_exit`'s doc). Pure and unit-testable without `Shared`; the
+/// `cmd_ends` application loop above is a thin wrapper around this.
+fn apply_command_end(meta: &mut PaneMeta, code: Option<i32>) {
+    meta.was_running = false;
+    meta.last_exit = code;
 }
 
 /// Clear `last_cmd` on every tracked pane. The other half of "belt and
@@ -2084,8 +2099,7 @@ impl ApplicationHandler<EmberEvent> for App {
         }
         for (id, code) in cmd_ends {
             if let Some(meta) = shared.pane_meta.get_mut(&id) {
-                meta.was_running = false;
-                meta.last_exit = code;
+                apply_command_end(meta, code);
                 meta_dirty = true;
             }
         }
@@ -5616,7 +5630,7 @@ fn encode_key(
 mod tests {
     use super::{
         BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, SessionId, TabColorChan,
-        TabId, bell_flash_intensity, bracket_paste, clamp_to_visible_monitor,
+        TabId, apply_command_end, bell_flash_intensity, bracket_paste, clamp_to_visible_monitor,
         clear_captured_commands, compile_rules, compose_tab_color_channel, compute_tab_rule_colors,
         encode_key, match_tab_title, match_tab_title_across, needs_deferred_replay,
         next_prev_index, osc_color_of, pane_snap_for, pane_status_for, pretype_bytes,
@@ -5804,6 +5818,29 @@ mod tests {
     #[test]
     fn pane_status_for_handles_no_meta_at_all() {
         assert_eq!(pane_status_for(None), (false, None));
+    }
+
+    // --- apply_command_end (the cmd_ends application loop's pure half) -----
+
+    #[test]
+    fn command_end_without_a_code_clears_a_previously_held_exit_code() {
+        // A held exit code from a FINISHED command must not survive a
+        // second, code-less `CommandEnd` for a later command — that would
+        // misreport the later command as having exited with the earlier
+        // one's code.
+        let mut meta = PaneMeta {
+            cwd: None,
+            last_cmd: Some("false".to_string()),
+            was_running: false,
+            last_exit: None,
+        };
+        apply_command_end(&mut meta, Some(1));
+        assert_eq!(meta.last_exit, Some(1));
+        assert!(!meta.was_running);
+
+        apply_command_end(&mut meta, None);
+        assert_eq!(meta.last_exit, None);
+        assert!(!meta.was_running);
     }
 
     #[test]

@@ -1612,9 +1612,24 @@ impl WindowState {
     ///   its `CommandEnd` report — `null` until the pane's first command
     ///   completes. Same `$?` semantics as a shell prompt: it keeps showing
     ///   the previous command's exit code while `busy` is true for the next
-    ///   one, and only changes when THAT command's own `CommandEnd` arrives).
-    ///   Any of `dims`/`cursor`/`styles_known`/`text` is `null` when the pane
-    ///   has no snapshot yet (a shell that hasn't painted its first frame).
+    ///   one, and only changes when THAT command's own `CommandEnd` arrives —
+    ///   except a CODE-LESS `CommandEnd` itself, which clears `last_exit`
+    ///   back to `null`, per `apply_command_end`'s doc in `main.rs`).
+    ///   BOTH `busy` and `last_exit` require the shell to have shell
+    ///   integration installed AND the "Capture commands" setting on:
+    ///   `busy` only ever becomes `true` from a `CommandLine` report, which
+    ///   `main.rs`'s event loop collects only when `capture_commands` is
+    ///   set, so with it off `busy` reads `false` for every pane, always.
+    ///   `last_exit` follows the same shell-integration dependency (no
+    ///   `CommandEnd` ever arrives without it) and in practice also tracks
+    ///   `capture_commands` in the common case, since it can only update an
+    ///   ALREADY-EXISTING `PaneMeta` entry (`CommandEnd`'s handler never
+    ///   creates one) and the entries that matter here are the ones
+    ///   `CommandLine` creates — so with "Capture commands" off, expect
+    ///   `null` there too. With neither shell integration nor the setting
+    ///   on, both fields read `false`/`null` for every pane. Any of
+    ///   `dims`/`cursor`/`styles_known`/`text` is `null` when the pane has
+    ///   no snapshot yet (a shell that hasn't painted its first frame).
     pub(crate) fn state_json(&self, shared: &Shared) -> String {
         let sf = self.renderer.window().scale_factor();
         let tab = self.active_tab();
