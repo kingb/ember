@@ -30,8 +30,8 @@ use ember_core::{
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
-    AbsPoint, AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode, SwatchView,
-    TabHit, TabLabel, VisiblePane,
+    AbsPoint, AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode,
+    SwatchPopoverHit, SwatchView, TabHit, TabLabel, VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -2514,6 +2514,19 @@ impl WindowState {
     }
 
     pub(crate) fn left_click(&mut self, shared: &mut Shared) {
+        // While the swatch popover is open, it captures EVERY click (mouse
+        // parity with `swatch_key_input`'s keyboard capture): a hit on a
+        // curated cell/`Default`/`Clear` applies that pick, anything else —
+        // padding inside the panel, or genuinely outside it — dismisses the
+        // popover WITHOUT touching the rename underneath (mirrors Esc's
+        // `SwatchAction::Close`, which also leaves the rename editor open).
+        // Must run before every other branch below: the popover can only
+        // ever be open while a tab is `editing`, and none of those other
+        // branches know to leave that rename alone.
+        if self.swatch_open.is_some() {
+            self.swatch_click(shared);
+            return;
+        }
         // A click on an About-overlay link button (Docs/GitHub) opens the URL
         // rather than dismissing the overlay.
         if self.about {
@@ -2558,11 +2571,9 @@ impl WindowState {
             self.open_swatch(i);
             return;
         }
-        // A click anywhere else dismisses an open popover without applying a
-        // pick — same "click away" dismissal every other overlay here uses.
-        if self.swatch_open.is_some() {
-            self.close_swatch();
-        }
+        // (The popover itself is handled by the early `swatch_click` return
+        // above — by construction `self.swatch_open` is `None` past this
+        // point.)
         // Any click commits an in-progress tab rename first.
         let was_editing = self.editing_tab.is_some();
         self.commit_rename(shared);
@@ -4155,6 +4166,36 @@ impl WindowState {
             }
             SwatchAction::Close => self.close_swatch(),
             SwatchAction::None => {}
+        }
+    }
+
+    /// Route a left-click into the open tab-color popover — the mouse
+    /// counterpart to [`Self::swatch_key_input`]. A hit on a curated cell
+    /// picks that color; `Default`/`Clear` apply those choices; anything
+    /// else (padding inside the panel, or a click that missed the panel
+    /// entirely) just dismisses the popover, same as `Esc`
+    /// (`SwatchAction::Close`) — no rename commit/cancel either way, so the
+    /// editor underneath stays exactly as the user left it. Panel geometry
+    /// comes from `Renderer::swatch_hit`, which reads the SAME
+    /// `paint::swatch_geom` the popover is drawn from, so a click always
+    /// lands on what's actually on screen.
+    fn swatch_click(&mut self, shared: &mut Shared) {
+        let Some(i) = self.swatch_open else { return };
+        let (x, y) = self.cursor;
+        match self.renderer.swatch_hit(x as f32, y as f32) {
+            Some(SwatchPopoverHit::Swatch(idx)) => {
+                self.apply_tab_color(shared, i, TabColorChoice::Color(SWATCHES[idx]));
+                self.close_swatch();
+            }
+            Some(SwatchPopoverHit::Default) => {
+                self.apply_tab_color(shared, i, TabColorChoice::PinnedDefault);
+                self.close_swatch();
+            }
+            Some(SwatchPopoverHit::Clear) => {
+                self.apply_tab_color(shared, i, TabColorChoice::Unset);
+                self.close_swatch();
+            }
+            Some(SwatchPopoverHit::Blank) | None => self.close_swatch(),
         }
     }
 
