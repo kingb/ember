@@ -44,8 +44,9 @@ use crate::{
     ControlClose, DEFAULT_COLS, DEFAULT_ROWS, DragState, DropHover, MULTI_CLICK, PAD, PendingClose,
     Shared, about_info, bell_flash_intensity, bracket_paste, compile_rules,
     compute_tab_rule_colors, dims_for_rect, ember_glow, encode_key, help_lines, inset,
-    load_backdrop_image, named_key, osc_color_of, parse_chord, resolve_window_index,
-    shell_escape_path, step_selectable_row, tab_display_title, url_is_openable,
+    load_backdrop_image, named_key, osc_color_of, pane_status_for, parse_chord,
+    resolve_window_index, shell_escape_path, step_selectable_row, tab_display_title,
+    url_is_openable,
 };
 #[cfg(target_os = "linux")]
 use crate::{alt_digit_tab, linux_chord_translate};
@@ -794,6 +795,29 @@ fn settings_action_for_key(key: &Key, selected_kind: Option<RowKind>) -> Setting
     }
 }
 
+/// A tab's own live OSC 6 color: its own focused pane's session's entry in
+/// `shared.osc_tab_color`, if any. Every tab carries its own `root`/`focus`,
+/// so this is re-derived PER TAB rather than reusing a window's overall
+/// focused session (which is scoped to the ACTIVE tab only) — the shared
+/// half of the OSC layer lookup `sync_layout`'s `TabLabel` build and
+/// `tabs_summary_json`'s `"color"` field both need (cheap: a handful of
+/// leaves per tab, once per call, never per frame beyond that).
+fn tab_osc_color(tab: &Tab, shared: &Shared) -> Option<u32> {
+    tab.root
+        .leaves()
+        .into_iter()
+        .find(|(p, _)| *p == tab.focus)
+        .and_then(|(_, sid)| osc_color_of(&shared.osc_tab_color, &sid))
+}
+
+/// Format an effective tab color (an [`effective_color`] result) as the
+/// `ctl state` JSON's `"#rrggbb"` string; `None` (serialized as `null`) for
+/// an uncolored tab. Pure formatting only — the four-layer composition
+/// itself happens at the call site, via `effective_color`.
+pub(crate) fn color_hex(color: Option<u32>) -> Option<String> {
+    color.map(|c| format!("#{:06x}", c & 0x00ff_ffff))
+}
+
 /// Parse a `commit_rename`/`ctl set-tab-color` color token into a
 /// [`TabColorChoice`](ember_core::TabColorChoice). Accepts `#rrggbb` (exactly
 /// 6 hex digits after the `#`, case-insensitive), `default` (pins the theme's
@@ -1522,8 +1546,18 @@ impl WindowState {
 
     /// The `tabs` array shape shared by `ctl state`'s per-window `windows[]`
     /// entries and its top-level (focused-window) fields: every tab's
-    /// 1-based `index`/`active`/displayed `title`/`sessions`.
-    pub(crate) fn tabs_summary_json(&self) -> Vec<serde_json::Value> {
+    /// 1-based `index`/`active`/displayed `title`/`sessions`/`color`.
+    ///
+    /// `color` (design: tab-colors, T5) is the tab's EFFECTIVE color —
+    /// `ember_core::effective_color`'s full precedence ladder (manual pin >
+    /// OSC 6 > regex rule > unset), same composition `sync_layout` runs to
+    /// build the renderer's `TabLabel` — as `"#rrggbb"`, or `null` for an
+    /// uncolored tab. Needs `shared` (the live OSC-color map and the
+    /// `osc6_overrides_manual` knob) and `self.tab_rule_colors` (the rule
+    /// cache), so both call sites — `state_json` below, for the focused
+    /// window, and `build_state_json` in `main.rs`, for every OTHER
+    /// window's `windows[]` entry — hand those through.
+    pub(crate) fn tabs_summary_json(&self, shared: &Shared) -> Vec<serde_json::Value> {
         self.tree
             .tabs
             .iter()
@@ -1531,23 +1565,56 @@ impl WindowState {
             .map(|(i, t)| {
                 let sessions: Vec<String> =
                     t.root.leaves().iter().map(|(_, s)| s.0.clone()).collect();
+                let osc = tab_osc_color(t, shared);
+                let rule = self.tab_rule_colors.get(&t.id).copied().flatten();
+                let color = effective_color(
+                    t.color,
+                    osc,
+                    rule,
+                    shared.config.tab_colors.osc6_overrides_manual,
+                );
                 serde_json::json!({
                     "index": i + 1,
                     "active": i == self.tree.active,
                     "title": tab_display_title(&t.title, i),
                     "sessions": sessions,
+                    "color": color_hex(color),
                 })
             })
             .collect()
     }
 
     /// A JSON snapshot of the live app for the debug control surface: scale,
-    /// surface size, tabs, and the active tab's panes (dims/cursor/styles/text).
+    /// surface size, tabs, and the active tab's panes (dims/cursor/styles/
+    /// text/busy/last_exit).
     ///
     /// This describes ONE window. The App-level multi-window `ctl state`
     /// builder (`build_state_json` in `main.rs`) uses this for the focused
     /// window's top-level (compatibility) fields, and `tabs_summary_json` for
     /// every OTHER window's lighter `windows[]` entry.
+    ///
+    /// The Stream-Deck-facing contract (design: tab-colors, T5) — every field
+    /// a poller can read, and what it means:
+    /// - `scale_factor`, `surface`: display scale and the window's pixel size.
+    /// - `tabs[]`: `index` (1-based), `active`, `title`, `sessions` (ids),
+    ///   `color` (`"#rrggbb"` or `null` — the tab's EFFECTIVE color; see
+    ///   `tabs_summary_json`'s doc for the precedence it composes).
+    /// - `active_tab`, `focus_pane`: the focused tab's 0-based index and the
+    ///   focused pane's id within it.
+    /// - `bracketed_paste`: whether the focused pane's shell has bracketed
+    ///   paste (DEC 2004) enabled.
+    /// - `panes[]`: one entry per pane in the active tab — `session`/`pane`
+    ///   ids, `focused`, `dims` (`[cols, rows]`), `cursor`
+    ///   (`{row, col, visible}`), `styles_known`, `text` (the pane's visible
+    ///   grid text), `busy` (a command is currently running — shell
+    ///   integration's OSC 633;E seen with no matching `CommandEnd` yet), and
+    ///   `last_exit` (the MOST RECENTLY FINISHED command's exit code, from
+    ///   its `CommandEnd` report — `null` until the pane's first command
+    ///   completes. Same `$?` semantics as a shell prompt: it keeps showing
+    ///   the previous command's exit code while `busy` is true for the next
+    ///   one, and only changes when THAT command's own `CommandEnd` arrives).
+    ///   Any of `dims`/`cursor`/`styles_known`/`text` is `null` when the pane
+    ///   has no snapshot yet (a shell that hasn't painted its first frame).
     pub(crate) fn state_json(&self, shared: &Shared) -> String {
         let sf = self.renderer.window().scale_factor();
         let tab = self.active_tab();
@@ -1558,6 +1625,7 @@ impl WindowState {
             .iter()
             .map(|(pane, sess)| {
                 let snap = self.renderer.pane_snapshot(sess);
+                let (busy, last_exit) = pane_status_for(shared.pane_meta.get(sess));
                 serde_json::json!({
                     "session": sess.0,
                     "pane": pane.0,
@@ -1568,6 +1636,8 @@ impl WindowState {
                     })),
                     "styles_known": snap.as_ref().map(|s| s.styles_known),
                     "text": snap.as_ref().map(|s| s.text.clone()),
+                    "busy": busy,
+                    "last_exit": last_exit,
                 })
             })
             .collect();
@@ -1578,7 +1648,7 @@ impl WindowState {
         // Every tab, not just the active one — external tools map a name to a
         // tab index with this (`index` is 1-based, matching `cmd+N` and
         // `ctl focus`). `title` is the strip's displayed title, same rule.
-        let tabs = self.tabs_summary_json();
+        let tabs = self.tabs_summary_json(shared);
         serde_json::json!({
             "scale_factor": sf,
             "surface": [self.px.0, self.px.1],
@@ -1707,18 +1777,7 @@ impl WindowState {
             .filter(|(_, t)| Some(t.id) != excluded_tab)
             .map(|(i, t)| {
                 let editing = editing_tab == Some(i);
-                // The OSC layer needs THIS tab's own focused pane's session —
-                // not the window's overall `focused_session` above, which is
-                // scoped to the ACTIVE tab only. Every tab carries its own
-                // `root`/`focus`, so re-derive per tab (cheap: a handful of
-                // leaves per tab, once per `sync_layout` call, not per frame
-                // beyond that).
-                let osc = t
-                    .root
-                    .leaves()
-                    .into_iter()
-                    .find(|(p, _)| *p == t.focus)
-                    .and_then(|(_, sid)| osc_color_of(&shared.osc_tab_color, &sid));
+                let osc = tab_osc_color(t, shared);
                 // The rule layer is a cache lookup, not a fresh regex match —
                 // see `tab_rule_colors`'s and `recompute_tab_rule_colors`'s
                 // docs for why matching doesn't happen here, on every
@@ -5918,5 +5977,31 @@ mod tests {
         assert!(!swatch_open_is_stale(None, 0));
         assert!(!swatch_open_is_stale(None, 5));
         assert!(!swatch_open_is_stale(Some(4), 5)); // last valid index
+    }
+
+    // --- color_hex: the `ctl state` tab "color" field's pure formatting
+    // half (design: tab-colors, T5) --------------------------------------
+
+    #[test]
+    fn color_hex_formats_an_effective_color_as_lowercase_rrggbb() {
+        use super::color_hex;
+
+        assert_eq!(color_hex(Some(0xFF8800)), Some("#ff8800".to_string()));
+        assert_eq!(color_hex(Some(0x000000)), Some("#000000".to_string()));
+    }
+
+    #[test]
+    fn color_hex_pads_short_values_to_six_digits() {
+        use super::color_hex;
+
+        // A component-heavy zero red byte must not shrink the string.
+        assert_eq!(color_hex(Some(0x0000ff)), Some("#0000ff".to_string()));
+    }
+
+    #[test]
+    fn color_hex_is_none_for_an_uncolored_tab() {
+        use super::color_hex;
+
+        assert_eq!(color_hex(None), None);
     }
 }

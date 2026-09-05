@@ -270,11 +270,18 @@ struct App {
 /// whether that command is still running (no matching `CommandEnd` yet).
 /// Feeds `session_state::assemble`'s `meta` closure — never logged, never
 /// read back out except into a `PaneSnap` for the on-disk snapshot.
+///
+/// `last_exit` (design: tab-colors' `ctl state` surface, T5) is the exit
+/// code from that same `CommandEnd` report, if the shell sent one — set
+/// alongside `was_running = false` and never persisted (it rides only the
+/// `ctl state` JSON via `pane_status_for`, not `PaneSnap`/the on-disk
+/// snapshot): a restored pane has no prior command to report an exit for.
 #[derive(Default, Clone, Debug)]
 pub(crate) struct PaneMeta {
     cwd: Option<String>,
     last_cmd: Option<String>,
     was_running: bool,
+    last_exit: Option<i32>,
 }
 
 /// Build one session's `PaneSnap` from its live `PaneMeta`, honoring the
@@ -300,6 +307,21 @@ pub(crate) fn pane_snap_for(
         },
         was_running: meta.map(|m| m.was_running).unwrap_or(false),
     }
+}
+
+/// Build one session's `("busy", "last_exit")` pair for `ctl state`'s
+/// per-pane JSON (design: tab-colors, T5), from its live `PaneMeta` — the
+/// `ctl`-facing sibling of `pane_snap_for` above, which builds the ON-DISK
+/// `PaneSnap` instead. `busy` is `PaneMeta::was_running` under its
+/// Stream-Deck-facing name; `last_exit` never rides the snapshot (see
+/// `PaneMeta::last_exit`'s doc), only this. Pure and unit-testable without
+/// `Shared`/`WindowState`; `window_state::WindowState::state_json` is a
+/// thin wrapper around this.
+pub(crate) fn pane_status_for(meta: Option<&PaneMeta>) -> (bool, Option<i32>) {
+    (
+        meta.map(|m| m.was_running).unwrap_or(false),
+        meta.and_then(|m| m.last_exit),
+    )
 }
 
 /// Clear `last_cmd` on every tracked pane. The other half of "belt and
@@ -1980,7 +2002,7 @@ impl ApplicationHandler<EmberEvent> for App {
         // snapshot). Collected here rather than applied in-loop for the same
         // reason `cwd_updates` is: this loop borrows `shared.sessions`.
         let mut cmd_updates: Vec<(SessionId, String)> = Vec::new();
-        let mut cmd_ends: Vec<SessionId> = Vec::new();
+        let mut cmd_ends: Vec<(SessionId, Option<i32>)> = Vec::new();
         // OSC 133;A prompt-start reports — the latch a restored pane's
         // `Shared::pretype` entry (Task 8) waits on before it's safe to type
         // its saved command. Collected here (not applied in-loop) for the
@@ -2017,8 +2039,8 @@ impl ApplicationHandler<EmberEvent> for App {
                             cmd_updates.push((id.clone(), cmd));
                         }
                     }
-                    BackendEvent::Osc(OscEvent::CommandEnd(_)) => {
-                        cmd_ends.push(id.clone());
+                    BackendEvent::Osc(OscEvent::CommandEnd(code)) => {
+                        cmd_ends.push((id.clone(), code));
                     }
                     BackendEvent::Osc(OscEvent::PromptStart) => {
                         prompt_starts.push(id.clone());
@@ -2060,9 +2082,10 @@ impl ApplicationHandler<EmberEvent> for App {
             meta.was_running = true;
             meta_dirty = true;
         }
-        for id in cmd_ends {
+        for (id, code) in cmd_ends {
             if let Some(meta) = shared.pane_meta.get_mut(&id) {
                 meta.was_running = false;
+                meta.last_exit = code;
                 meta_dirty = true;
             }
         }
@@ -3519,6 +3542,17 @@ fn replay_restored_window(
         if tab_snap.named_by_user {
             win.named_tabs.insert(tid);
         }
+        // Restore the tab's own color choice (design: tab-colors) — the
+        // user's manual pick is the ONLY color layer `TabSnap` carries; OSC
+        // 6 and regex-rule colors are deliberately NOT restored here (a
+        // restored shell re-announces its own OSC color, and
+        // `recompute_tab_rule_colors` below re-derives the rule layer from
+        // the just-restored title against the CURRENT config). Set directly
+        // rather than via `apply_tab_color`: that also marks
+        // `snapshot_dirty` and calls `sync_layout` per tab, both redundant
+        // here since this whole function's tail already does both once for
+        // the entire window after every tab is built.
+        win.tree.tabs[tab_idx].color = tab_snap.color;
         // Splits: replay `ops` (pre-order, parent-index-addressed — see
         // `split_ops`'s doc) through `split_pane_with_cwd`, tracking each
         // new pane's id by creation order so later ops can address it.
@@ -5041,7 +5075,7 @@ fn build_state_json(
                     "id": i + 1,
                     "focused": Some(*wid) == focused_window,
                     "active_tab": w.tree.active,
-                    "tabs": w.tabs_summary_json(),
+                    "tabs": w.tabs_summary_json(shared),
                 });
                 if let Ok(pos) = win.inner_position() {
                     let size = win.inner_size();
@@ -5585,9 +5619,9 @@ mod tests {
         TabId, bell_flash_intensity, bracket_paste, clamp_to_visible_monitor,
         clear_captured_commands, compile_rules, compose_tab_color_channel, compute_tab_rule_colors,
         encode_key, match_tab_title, match_tab_title_across, needs_deferred_replay,
-        next_prev_index, osc_color_of, pane_snap_for, pretype_bytes, queue_close_this,
-        queue_close_window, resolve_index, resolve_restore_cwd, rule_color_for, shell_escape_path,
-        tab_display_title, url_is_openable, window_owning_tab,
+        next_prev_index, osc_color_of, pane_snap_for, pane_status_for, pretype_bytes,
+        queue_close_this, queue_close_window, resolve_index, resolve_restore_cwd, rule_color_for,
+        shell_escape_path, tab_display_title, url_is_openable, window_owning_tab,
     };
     use ember_core::TabColorRule;
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
@@ -5710,6 +5744,7 @@ mod tests {
             cwd: Some("/tmp".to_string()),
             last_cmd: Some("echo hi".to_string()),
             was_running: true,
+            last_exit: None,
         };
         let snap = pane_snap_for(Some(&meta), true);
         assert_eq!(snap.cwd.as_deref(), Some("/tmp"));
@@ -5726,6 +5761,7 @@ mod tests {
             cwd: Some("/tmp".to_string()),
             last_cmd: Some("echo hi".to_string()),
             was_running: true,
+            last_exit: None,
         };
         let snap = pane_snap_for(Some(&meta), false);
         assert_eq!(snap.cwd.as_deref(), Some("/tmp"));
@@ -5741,6 +5777,35 @@ mod tests {
         assert!(!snap.was_running);
     }
 
+    // --- pane_status_for (ctl state's "busy"/"last_exit", T5) --------------
+
+    #[test]
+    fn pane_status_for_reports_busy_and_no_exit_while_a_command_runs() {
+        let meta = PaneMeta {
+            cwd: None,
+            last_cmd: Some("sleep 100".to_string()),
+            was_running: true,
+            last_exit: None,
+        };
+        assert_eq!(pane_status_for(Some(&meta)), (true, None));
+    }
+
+    #[test]
+    fn pane_status_for_reports_not_busy_and_the_exit_code_after_command_end() {
+        let meta = PaneMeta {
+            cwd: None,
+            last_cmd: Some("false".to_string()),
+            was_running: false,
+            last_exit: Some(1),
+        };
+        assert_eq!(pane_status_for(Some(&meta)), (false, Some(1)));
+    }
+
+    #[test]
+    fn pane_status_for_handles_no_meta_at_all() {
+        assert_eq!(pane_status_for(None), (false, None));
+    }
+
     #[test]
     fn clear_captured_commands_clears_last_cmd_but_keeps_cwd_and_was_running() {
         let mut pane_meta = std::collections::HashMap::new();
@@ -5750,6 +5815,7 @@ mod tests {
                 cwd: Some("/a".to_string()),
                 last_cmd: Some("echo left".to_string()),
                 was_running: true,
+                last_exit: None,
             },
         );
         pane_meta.insert(
@@ -5758,6 +5824,7 @@ mod tests {
                 cwd: Some("/b".to_string()),
                 last_cmd: None,
                 was_running: false,
+                last_exit: Some(0),
             },
         );
         clear_captured_commands(&mut pane_meta);

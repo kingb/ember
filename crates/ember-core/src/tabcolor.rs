@@ -126,4 +126,30 @@ mod tests {
         let t: TabColorChoice = serde_json::from_str("\"Unset\"").unwrap();
         assert_eq!(t, TabColorChoice::Unset);
     }
+
+    /// Carried in from the Task 1 review: a whole `Tab` JSON written before
+    /// this feature existed has no `"color"` key at all. `#[serde(default)]`
+    /// on `Tab::color` (`layout.rs`) must fill it with `Unset` rather than
+    /// failing to parse — this pins that against regression, alongside the
+    /// unit-level `choice_serde_defaults_unset` above.
+    #[test]
+    fn tab_missing_color_field_deserializes_as_unset() {
+        use crate::ids::{PaneId, SessionId, TabId};
+        use crate::layout::{LayoutNode, Tab};
+
+        let json = serde_json::json!({
+            "id": 1,
+            "title": "old snapshot",
+            "root": { "Pane": { "id": 1, "session": "s1" } },
+            "focus": 1,
+        });
+        let tab: Tab = serde_json::from_value(json).unwrap();
+        assert_eq!(tab.color, TabColorChoice::Unset);
+        // Sanity: the rest of the struct still parsed correctly, not just
+        // fell back to defaults everywhere.
+        assert_eq!(tab.id, TabId(1));
+        assert_eq!(tab.title, "old snapshot");
+        assert_eq!(tab.focus, PaneId(1));
+        assert_eq!(tab.root, LayoutNode::pane(PaneId(1), SessionId::new("s1")));
+    }
 }
