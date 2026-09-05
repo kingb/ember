@@ -99,7 +99,7 @@ fn srgb_to_oklab(c: u32) -> (f64, f64, f64) {
     (
         0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
         1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
-        0.0259040425 * l_ + 0.7827717125 * m_ - 0.8086757549 * s_,
+        0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
     )
 }
 
@@ -234,6 +234,21 @@ mod tests {
     }
 
     // --- Oklab/OKLCH round-trip sanity -----------------------------------
+
+    #[test]
+    fn oklab_matches_ottossons_worked_example_for_pure_red() {
+        // Round-trip alone can't catch a self-consistent-but-wrong matrix
+        // pair (a review finding: an earlier version of this fn's `b`-row
+        // coefficients were transcribed wrong in the 8th decimal, and still
+        // round-tripped perfectly since the same wrong matrix was used both
+        // ways). Pin against Ottosson's own published worked example
+        // instead: pure sRGB red converts to Oklab `(0.6280, 0.2249,
+        // 0.1258)` (<https://bottosson.github.io/posts/oklab/>).
+        let (l, a, b) = srgb_to_oklab(0xff0000);
+        assert!((l - 0.6280).abs() < 1e-3, "L = {l}");
+        assert!((a - 0.2249).abs() < 1e-3, "a = {a}");
+        assert!((b - 0.1258).abs() < 1e-3, "b = {b}");
+    }
 
     #[test]
     fn oklab_round_trip_is_stable_for_swatches() {

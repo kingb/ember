@@ -742,19 +742,51 @@ fn unpack_rgb(c: u32) -> Rgb {
     Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
-/// How far an INACTIVE colored tab's pill blends toward [`STRIP_BG`] (the
-/// redesign, item 2): the ACTIVE tab always renders its color at full
-/// strength, so an inactive tab needs to sit far enough back that the active
-/// one still reads as clearly the selected tab at a glance — `0.55` (55%
-/// toward the strip background) keeps the hue identifiable while leaving a
-/// clear step up to the active tab's full-strength fill.
-const INACTIVE_COLOR_BLEND: f64 = 0.55;
+/// How far an INACTIVE, un-hovered colored tab's pill blends toward
+/// [`STRIP_BG`] (the redesign, item 2): the ACTIVE tab always renders its
+/// color at full strength, so an inactive tab needs to sit far enough back
+/// that the active one still reads as clearly the selected tab at a glance.
+///
+/// `0.68`, not the original `0.55` — review finding: at `0.55`, 3 of the 12
+/// curated `SWATCHES` (`0xE8C547`, `0xFF9D3C`, `0x3FB8AF`) blended-and-inked
+/// fell short of the WCAG 4.5:1 text-contrast minimum (as low as 3.47:1).
+/// The blend/contrast curve isn't monotonic — there's a dead zone roughly
+/// `0.05..0.65` where several swatches sit awkwardly between the two ink
+/// choices and fail badly (down to ~2.9:1) — so the only values that clear
+/// 4.5:1 for every swatch are either very close to full strength or `>=
+/// ~0.65`; `every_colored_fill_meets_wcag_text_contrast` (below) pins this
+/// against regression for both this and [`HOVER_COLOR_BLEND`].
+const INACTIVE_COLOR_BLEND: f64 = 0.68;
 
-/// The effective on-screen fill for an INACTIVE tab colored `c` — `c`
-/// blended [`INACTIVE_COLOR_BLEND`] of the way toward the strip background.
+/// How far a HOVERED, inactive colored tab's pill blends toward
+/// [`STRIP_BG`] — noticeably less than [`INACTIVE_COLOR_BLEND`] (review
+/// ruling: hover should read as a distinct, brighter step toward the tab's
+/// full color, consistent with the uncolored hover lift's brightening,
+/// while the active tab still reads strongest at full strength/`0.0`).
+///
+/// `0.03`, not some mid-range value — the same dead zone that ruled out
+/// `INACTIVE_COLOR_BLEND`'s old `0.55` also rules out most of the range
+/// between `0.0` and `INACTIVE_COLOR_BLEND`: only very-close-to-full-strength
+/// (`< ~0.045`) or very-close-to-the-inactive-default (`>= ~0.65`) clears
+/// 4.5:1 for every swatch, and only the former reads as "brighter than
+/// inactive." `0.03` sits inside that safe window with margin.
+const HOVER_COLOR_BLEND: f64 = 0.03;
+
+/// The effective on-screen fill for an INACTIVE, un-hovered tab colored `c`
+/// — `c` blended [`INACTIVE_COLOR_BLEND`] of the way toward the strip
+/// background.
 fn inactive_pill_fill(c: u32) -> Rgb {
     unpack_rgb(blend_toward(c, pack_rgb(STRIP_BG), INACTIVE_COLOR_BLEND))
 }
+
+/// The effective on-screen fill for a HOVERED, inactive tab colored `c` —
+/// `c` blended [`HOVER_COLOR_BLEND`] of the way toward the strip background
+/// (much closer to full strength than [`inactive_pill_fill`], so hovering a
+/// colored tab still reads as a distinct lift).
+fn hover_pill_fill(c: u32) -> Rgb {
+    unpack_rgb(blend_toward(c, pack_rgb(STRIP_BG), HOVER_COLOR_BLEND))
+}
+
 /// Width (in columns) of each trailing tab-strip utility button ("+", "?", "⚙").
 pub(crate) const BTN_COLS: usize = 3;
 /// Columns reserved at the left of a *hovered* tab for the "✕ " close affordance.
@@ -844,6 +876,24 @@ fn pill_cap_center(x: f32, w: f32, strip_h: f32, cw: f32) -> (f32, f32) {
 fn pill_right_cap_center(x: f32, w: f32, strip_h: f32, cw: f32) -> (f32, f32) {
     let (px, inset_y, pw, ph, radius) = pill_geom(x, w, strip_h, cw);
     (px + pw - radius, inset_y + ph * 0.5)
+}
+
+/// Columns reserved for the tab area itself, given the strip's total
+/// logical width and cell width — the trailing "+"/"?"/"⚙" buttons each
+/// claim up to [`BTN_COLS`], and whatever's left over is the tab area.
+/// Mirrors [`build_tabs`]'s own `total_cols`/`plus_cols`/`help_cols`/
+/// `gear_cols` prefix math exactly; pulled out as its own helper (review
+/// finding: this prefix had drifted into three separate copies — the live
+/// renderer's popover draw, the headless popover draw, and
+/// `Renderer::swatch_hit` — any one of which could silently fall out of
+/// sync with `build_tabs` on its own) so anchoring the swatch popover
+/// (drawing OR hit-testing) always reads the exact same tab-area width.
+pub(crate) fn tab_area_cols(logical_w: f32, cw: f32) -> usize {
+    let total_cols = (logical_w / cw).floor() as usize;
+    let plus_cols = BTN_COLS.min(total_cols);
+    let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
+    let gear_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols + help_cols));
+    total_cols.saturating_sub(plus_cols + help_cols + gear_cols)
 }
 
 /// `x`/width (logical px) of tab `i`'s segment in the strip, given `n` real
@@ -1056,16 +1106,22 @@ pub(crate) fn build_tabs(
             // toward the strip background when the tab isn't active/editing
             // (the redesign, item 2) — `None` for both an uncolored tab AND
             // a colored one currently being dragged (the recessed gap below
-            // isn't a pill, so there's no fill to color). This is the SAME
-            // value used for the pill fill, the title ink (item 3), and the
-            // close "✕"/selection-ring accent (item 4) — computed once so
-            // all four always agree on "what color is this tab."
+            // isn't a pill, so there's no fill to color). Hovering an
+            // inactive colored tab uses the brighter `hover_pill_fill`
+            // (review ruling) rather than the plain inactive blend, so
+            // hover still reads as a distinct lift — mirroring the
+            // uncolored `TAB_HOVER` treatment below. This is the SAME value
+            // used for the pill fill, the title ink (item 3), and the close
+            // "✕"/selection-ring accent (item 4) — computed once so all
+            // four always agree on "what color is this tab, right now."
             let colored_fill = if dragging_this {
                 None
             } else {
                 tab.color.map(|c| {
                     if tab.editing || tab.active {
                         unpack_rgb(c)
+                    } else if hovered == Some(i) {
+                        hover_pill_fill(c)
                     } else {
                         inactive_pill_fill(c)
                     }
@@ -1086,8 +1142,10 @@ pub(crate) fn build_tabs(
                 let fill = colored_fill.unwrap_or(TAB_ACTIVE);
                 push_pill(rounded, x, w, strip_h, cw, sf, fill, Some(ACCENT));
             } else if let Some(fill) = colored_fill {
-                // Inactive, colored: the blended fill, no ring — the ring is
-                // reserved for the active/editing tab so it stays the one
+                // Inactive, colored (`fill` is already the hover-brightened
+                // variant when this tab is hovered — see `colored_fill`
+                // above): the blended fill, no ring — the ring is reserved
+                // for the active/editing tab so it stays the one
                 // clearly-selected pill.
                 push_pill(rounded, x, w, strip_h, cw, sf, fill, None);
             } else if hovered == Some(i) {
@@ -1149,11 +1207,20 @@ pub(crate) fn build_tabs(
                 }
             }
             // Unseen-bell indicator: a small amber dot in the tab's top-right.
+            // Pushed onto `rounded`, NOT `out` — the same sharp-before-rounded
+            // layering trap the old color chip fell into (the quad renderer
+            // draws every sharp `rects` quad before ANY rounded one), so a
+            // plain `rects` dot silently vanished under a colored tab's pill
+            // fill, which is itself a `rounded` quad drawn on top of
+            // everything in `out` (review finding: a colored tab lost its
+            // bell notification). `d * 0.5` radius makes it a full circle,
+            // not just rounded corners.
             if tab.bell {
                 let d = 5.0;
-                out.push((
+                rounded.push((
                     scaled(x + w - d - 4.0, 4.0, d, d, sf),
                     lin_rgba(AMBER, 0.95),
+                    d * 0.5 * sf,
                 ));
             }
             // Editing → buffer + caret; dragging → title only (no ⌘N, grabbed); else
@@ -2892,6 +2959,62 @@ mod tests {
         let a = ghost_pill_quads(0.0, 120.0, 34.0, 8.0, 1.0, 0.0)[0].1[3];
         let b = ghost_pill_quads(0.0, 120.0, 34.0, 8.0, 1.0, 1.0)[0].1[3];
         assert!((a - b).abs() > 0.001, "expected the flicker to vary with t");
+    }
+
+    // --- inactive_pill_fill / hover_pill_fill: item 3's WCAG floor applies
+    // to what's ACTUALLY painted, not just the raw swatch (review finding:
+    // the original 0.55 inactive blend put 3 of 12 swatches below 4.5:1) ---
+
+    use super::{hover_pill_fill, inactive_pill_fill, pack_rgb};
+    use ember_core::{SWATCHES, contrast_ratio, ink_for};
+
+    #[test]
+    fn every_inactive_blend_meets_wcag_text_contrast() {
+        for &c in SWATCHES.iter() {
+            let fill = pack_rgb(inactive_pill_fill(c));
+            let ink = ink_for(fill);
+            let ratio = contrast_ratio(fill, ink);
+            assert!(
+                ratio >= 4.5,
+                "swatch {c:#08x}'s inactive fill {fill:#08x} only gets {ratio:.2}:1 against ink {ink:#08x}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_hover_blend_meets_wcag_text_contrast() {
+        for &c in SWATCHES.iter() {
+            let fill = pack_rgb(hover_pill_fill(c));
+            let ink = ink_for(fill);
+            let ratio = contrast_ratio(fill, ink);
+            assert!(
+                ratio >= 4.5,
+                "swatch {c:#08x}'s hover fill {fill:#08x} only gets {ratio:.2}:1 against ink {ink:#08x}"
+            );
+        }
+    }
+
+    #[test]
+    fn hover_blend_is_brighter_than_the_plain_inactive_blend() {
+        // The review's ruling: hovering a colored inactive tab should read
+        // as noticeably closer to the tab's full color than the plain
+        // inactive treatment — assert the hover fill's luminance is always
+        // at least as far from the strip background as the inactive fill's
+        // (i.e. hover sits between inactive and full strength, never past
+        // either end).
+        use ember_core::relative_luminance;
+        for &c in SWATCHES.iter() {
+            let raw_l = relative_luminance(c);
+            let inactive_l = relative_luminance(pack_rgb(inactive_pill_fill(c)));
+            let hover_l = relative_luminance(pack_rgb(hover_pill_fill(c)));
+            let d_inactive = (raw_l - inactive_l).abs();
+            let d_hover = (raw_l - hover_l).abs();
+            assert!(
+                d_hover < d_inactive,
+                "swatch {c:#08x}: hover ({hover_l:.3}) isn't closer to the raw \
+                 color ({raw_l:.3}) than inactive ({inactive_l:.3})"
+            );
+        }
     }
 }
 

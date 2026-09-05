@@ -21,11 +21,11 @@ use wgpu::{
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    AboutLayout, BTN_COLS, bell_wash, build_about, build_confirm, build_fps, build_help,
-    build_ime_preedit, build_palette, build_restore_list, build_restore_main, build_search_bar,
-    build_settings, build_swatch_popover, build_tabs, grid_quads, hold_ring_quads, link_quads,
-    measure_cell_width, morph_quads, push_backdrop, scrollbar, selection_quads, shape_grid,
-    spark_quads, split_preview, tab_segment_x,
+    AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help, build_ime_preedit,
+    build_palette, build_restore_list, build_restore_main, build_search_bar, build_settings,
+    build_swatch_popover, build_tabs, grid_quads, hold_ring_quads, link_quads, measure_cell_width,
+    morph_quads, push_backdrop, scrollbar, selection_quads, shape_grid, spark_quads, split_preview,
+    tab_area_cols, tab_segment_x,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
@@ -611,11 +611,7 @@ pub fn capture_reusing(
     // the live renderer's matching comment).
     if let Some(view) = &shot.swatch {
         let strip_h = CELL_HEIGHT + 2.0 * PAD;
-        let total_cols = (shot.logical_w / cw).floor() as usize;
-        let plus_cols = BTN_COLS.min(total_cols);
-        let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
-        let gear_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols + help_cols));
-        let tab_cols = total_cols.saturating_sub(plus_cols + help_cols + gear_cols);
+        let tab_cols = tab_area_cols(shot.logical_w, cw);
         let (anchor_x, anchor_w) = tab_segment_x(shot.tabs.len(), tab_cols, cw, view.tab);
         swatch_layout = Some(build_swatch_popover(
             font_system,

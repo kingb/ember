@@ -34,7 +34,7 @@ use crate::paint::{
     build_restore_main, build_search_bar, build_settings, build_swatch_popover, build_tabs,
     debug_emit, grid_quads, hold_ring_quads, measure_cell_width, morph_quads, push_backdrop,
     scrollbar, scrollbar_geometry, selection_quads, shape_grid, spark_quads, split_preview,
-    swatch_geom, tab_segment_x,
+    swatch_geom, tab_area_cols, tab_segment_x,
 };
 use crate::selection::AnchoredSelection;
 
@@ -1444,11 +1444,7 @@ impl Renderer {
         let lw = self.config.width as f32 / sf;
         let cw = self.cell_w;
         let strip_h = CELL_HEIGHT + 2.0 * PAD;
-        let total_cols = (lw / cw).floor() as usize;
-        let plus_cols = BTN_COLS.min(total_cols);
-        let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
-        let gear_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols + help_cols));
-        let tab_cols = total_cols.saturating_sub(plus_cols + help_cols + gear_cols);
+        let tab_cols = tab_area_cols(lw, cw);
         let (anchor_x, anchor_w) = tab_segment_x(self.tabs.len(), tab_cols, cw, view.tab);
         let geom = swatch_geom(anchor_x, anchor_w, strip_h, cw, lw);
         swatch_popover_hit(&geom, x, y)
@@ -2365,11 +2361,7 @@ impl Renderer {
                 let lw = self.config.width as f32 / sf;
                 let cw = self.cell_w;
                 let strip_h = CELL_HEIGHT + 2.0 * PAD;
-                let total_cols = (lw / cw).floor() as usize;
-                let plus_cols = BTN_COLS.min(total_cols);
-                let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
-                let gear_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols + help_cols));
-                let tab_cols = total_cols.saturating_sub(plus_cols + help_cols + gear_cols);
+                let tab_cols = tab_area_cols(lw, cw);
                 let (anchor_x, anchor_w) = tab_segment_x(self.tabs.len(), tab_cols, cw, view.tab);
                 let sl = build_swatch_popover(
                     &mut self.font_system,

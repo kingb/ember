@@ -269,6 +269,15 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
         i += 1;
     }
     opts.tabs = opts.tabs.max(if opts.colored_tabs { 2 } else { 1 });
+    // `--colored-tabs` defaults to also belling the inactive colored tab
+    // (unless the caller asked for a specific `--bell-tab` of their own) —
+    // a colored tab's bell dot silently disappeared under its own pill fill
+    // (review finding: the dot drew as a sharp quad, and sharp quads all
+    // draw before any rounded one, so the pill covered it), so this fixture
+    // exercises the fix by default rather than needing a second flag.
+    if opts.colored_tabs && opts.bell_tab.is_none() {
+        opts.bell_tab = Some(1);
+    }
     Ok(opts)
 }
 
