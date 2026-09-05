@@ -901,6 +901,22 @@ fn wrap_swatch_sel(sel: usize, delta: i8) -> usize {
     (sel as i32 + delta as i32).rem_euclid(n) as usize
 }
 
+/// Whether the swatch popover's anchored tab index (Task 3) is no longer a
+/// valid slot among `tab_count` tabs. `sync_layout` (called after every
+/// tab-structural mutation this file makes) uses this as a backstop: the
+/// mutation sites that can shrink or reorder the tab list (`do_close`,
+/// `ControlMsg::ReorderTab`, `drag_tab_to`, `resolve_drag_drop`'s same-window
+/// reorder, `apply_move`'s touched-window loop) already call `close_swatch`
+/// explicitly, since a same-length reorder leaves the index in-bounds but
+/// pointing at a DIFFERENT tab — this out-of-bounds check alone can't catch
+/// that case, only a shrink. Kept as a pure, directly-testable fn rather
+/// than inlined, since building a live `WindowState`/`Renderer` to exercise
+/// `sync_layout` itself isn't practical in this crate's test harness (same
+/// reasoning as `settings_action_for_key`'s doc).
+fn swatch_open_is_stale(open: Option<usize>, tab_count: usize) -> bool {
+    open.is_some_and(|i| i >= tab_count)
+}
+
 /// Find the `SettingRow` in `ember_core`'s static table whose label matches
 /// `label` exactly — what `adjust_setting` looks up to call the row's own
 /// `adjust` fn. Pure (no `Shared`/`WindowState`), so the label-matching
@@ -1437,6 +1453,12 @@ impl WindowState {
                 }
             }
             ControlMsg::ReorderTab(from, to) => {
+                // A reorder leaves every affected tab's raw index pointing at
+                // a DIFFERENT tab than before — unlike a close, the swatch
+                // popover's anchor index would still be in-bounds, so it'd
+                // silently open, still look valid, and color the wrong tab.
+                // Close it rather than try to follow the reorder.
+                self.close_swatch();
                 let vp = self.viewport();
                 apply(&mut self.tree, LayoutCommand::MoveTab { from, to }, vp);
                 self.sync_layout(shared);
@@ -1567,6 +1589,12 @@ impl WindowState {
     /// session's PTY whose grid dims changed. Idempotent; the single source of
     /// truth for "what's on screen and how big each shell is."
     pub(crate) fn sync_layout(&mut self, shared: &Shared) {
+        // Backstop for the swatch popover's raw-index anchor (Task 3 review
+        // fix) — see `swatch_open_is_stale`'s doc for why this alone doesn't
+        // cover every case and why the mutation sites also close it directly.
+        if swatch_open_is_stale(self.swatch_open, self.tree.tabs.len()) {
+            self.close_swatch();
+        }
         if self.tree.tabs.is_empty() {
             return;
         }
@@ -3138,6 +3166,10 @@ impl WindowState {
                 if let Some(d) = self.tab_drag.as_mut() {
                     d.tab = slot;
                 }
+                // Same reasoning as `ReorderTab`: a live reorder shifts
+                // indices without changing tab count, which the swatch
+                // popover's raw-index anchor can't detect on its own.
+                self.close_swatch();
                 let vp = self.viewport();
                 apply(
                     &mut self.tree,
@@ -3708,6 +3740,9 @@ impl WindowState {
                     }
                     let to = insert_at.min(self.tree.tabs.len() - 1);
                     if to != src_tab {
+                        // Same reasoning as `ReorderTab`/`drag_tab_to`: a
+                        // reorder shifts indices without changing tab count.
+                        self.close_swatch();
                         let vp = self.viewport();
                         apply(
                             &mut self.tree,
@@ -4497,6 +4532,18 @@ impl WindowState {
 
     /// Actually perform a (possibly confirmed) close. Returns true to exit.
     pub(crate) fn do_close(&mut self, shared: &mut Shared, kind: PendingClose) -> bool {
+        // A pane close can dissolve its tab (the last-pane case) and a tab
+        // close always removes one — either way, every tab AFTER the
+        // closed one shifts down an index. The swatch popover (Task 3) is
+        // anchored by raw index, so it must not survive this: left open, a
+        // later Enter would silently color whichever tab slid into that now-
+        // stale slot instead of the one the user actually opened it on.
+        // Closing unconditionally here (rather than only on the branch that
+        // actually removes a tab) is deliberately conservative — cheap
+        // no-op when nothing was open, and `do_close` is the single choke
+        // point both `PendingClose::Pane` and `PendingClose::Tab` funnel
+        // through, so this covers Cmd+W (Pane) and `ctl` tab-close alike.
+        self.close_swatch();
         match kind {
             PendingClose::Pane => {
                 self.close_focused(shared);
@@ -5786,5 +5833,30 @@ mod tests {
         assert_eq!(wrap_swatch_sel(0, -1), 13); // Left before swatch 0 wraps to Clear
         assert_eq!(wrap_swatch_sel(0, -4), 10); // Up from row 0 wraps to the bottom
         assert_eq!(wrap_swatch_sel(13, 4), 3); // Down from Clear wraps to row 0
+    }
+
+    // --- swatch_open_is_stale: the popover's raw-index anchor going bad on
+    // a tab close/reorder (review fix) -----------------------------------
+
+    #[test]
+    fn swatch_open_is_stale_when_index_is_out_of_bounds() {
+        use super::swatch_open_is_stale;
+
+        // Anchored on tab 2 of a 3-tab window; tab 2 (and only tab 2) closes
+        // — 2 tabs remain, so index 2 is now out of bounds.
+        assert!(swatch_open_is_stale(Some(2), 2));
+        // Anchored on tab 0; unrelated tab elsewhere closes — 0 is still valid.
+        assert!(!swatch_open_is_stale(Some(0), 2));
+        // Every tab closes.
+        assert!(swatch_open_is_stale(Some(0), 0));
+    }
+
+    #[test]
+    fn swatch_open_is_stale_is_false_when_closed_or_in_bounds() {
+        use super::swatch_open_is_stale;
+
+        assert!(!swatch_open_is_stale(None, 0));
+        assert!(!swatch_open_is_stale(None, 5));
+        assert!(!swatch_open_is_stale(Some(4), 5)); // last valid index
     }
 }

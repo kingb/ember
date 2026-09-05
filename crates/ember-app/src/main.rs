@@ -4212,6 +4212,15 @@ fn apply_move(
     }
     for wid in touched {
         if let Some(w) = windows.get_mut(&wid) {
+            // Every surface-mobility gesture that reaches here (move-tab,
+            // promote-pane, merge-tab, a real cross-window drag-drop)
+            // replaced `w.tree` wholesale above, which can insert, remove,
+            // or reorder tabs in either the source or destination window
+            // without going through any of `WindowState`'s own tab-mutating
+            // methods. The swatch popover (Task 3) is anchored by raw
+            // index in whichever window had it open, so it can't safely
+            // assume its anchor still points at the same tab — close it.
+            w.close_swatch();
             w.sync_layout(shared);
             w.renderer.window().request_redraw();
         }

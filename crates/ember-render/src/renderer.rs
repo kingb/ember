@@ -262,10 +262,12 @@ pub enum StripSlot {
 }
 
 /// Resolve a tab-area column to a hit, mirroring the equal-width slot math in
-/// [`build_tabs`]. `hovered` gates the left `CLOSE_COLS` "✕" close zone (only the
-/// hovered tab exposes it); `editing` (Task 3) gates the right `SWATCH_COLS`
-/// swatch zone the same way, for whichever tab is being renamed. Pure so the
-/// geometry is unit-testable without a GPU.
+/// [`build_tabs`]. `hovered` gates the left `CLOSE_COLS` "✕" close zone (only
+/// the hovered tab exposes it, and NOT while that same tab is `editing` —
+/// `build_tabs` never draws the close "✕" during a rename either); `editing`
+/// (Task 3) gates the right `SWATCH_COLS` swatch zone the same way, for
+/// whichever tab is being renamed. Pure so the geometry is unit-testable
+/// without a GPU.
 fn tab_col_hit(
     n: usize,
     tab_cols: usize,
@@ -284,7 +286,11 @@ fn tab_col_hit(
             if editing == Some(i) && width > SWATCH_COLS && col >= acc + width - SWATCH_COLS {
                 return Some(TabHit::Swatch(i));
             }
-            if hovered == Some(i) && width > CLOSE_COLS && col - acc < CLOSE_COLS {
+            if hovered == Some(i)
+                && editing != Some(i)
+                && width > CLOSE_COLS
+                && col - acc < CLOSE_COLS
+            {
                 return Some(TabHit::CloseTab(i));
             }
             return Some(TabHit::Tab(i));
@@ -2630,6 +2636,28 @@ mod tests {
     fn swatch_zone_only_on_the_editing_tab() {
         assert_eq!(tab_col_hit(N, COLS, None, Some(1), 8), Some(TabHit::Tab(0)));
         assert_eq!(tab_col_hit(N, COLS, None, None, 18), Some(TabHit::Tab(1)));
+    }
+
+    #[test]
+    fn close_zone_is_suppressed_while_editing_that_tab() {
+        // Tab 1 both hovered AND being renamed: `build_tabs` never draws the
+        // hover "✕" there (suppressed while editing), so the hit-test must
+        // not manufacture a close either — its left columns fall through to
+        // a plain tab hit instead of `CloseTab`.
+        assert_eq!(
+            tab_col_hit(N, COLS, Some(1), Some(1), 10),
+            Some(TabHit::Tab(1))
+        );
+        assert_eq!(
+            tab_col_hit(N, COLS, Some(1), Some(1), 11),
+            Some(TabHit::Tab(1))
+        );
+        // The right-edge swatch zone still fires — hovering doesn't
+        // suppress it, only editing gates it (and this tab IS editing).
+        assert_eq!(
+            tab_col_hit(N, COLS, Some(1), Some(1), 18),
+            Some(TabHit::Swatch(1))
+        );
     }
 
     // --- tab_or_ghost_col_hit: strip slots for a live drag hover ---
