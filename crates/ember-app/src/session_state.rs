@@ -1041,6 +1041,7 @@ mod tests {
         use ember_core::{
             ids::{PaneId, SessionId, TabId},
             layout::{Axis, LayoutNode, Tab, WindowTree},
+            tabcolor::TabColorChoice,
         };
         let tree = WindowTree {
             active: 0,
@@ -1054,6 +1055,7 @@ mod tests {
                     LayoutNode::pane(PaneId(1), SessionId::new("s1")),
                     LayoutNode::pane(PaneId(2), SessionId::new("s2")),
                 ),
+                color: TabColorChoice::Unset,
             }],
         };
         let snap = assemble(
@@ -1083,6 +1085,7 @@ mod tests {
     fn assemble_caps_last_cmd_at_1024_on_a_char_boundary() {
         use ember_core::ids::{PaneId, SessionId, TabId};
         use ember_core::layout::{LayoutNode, Tab, WindowTree};
+        use ember_core::tabcolor::TabColorChoice;
         // A multi-byte char (3 bytes each) straddling the 1024 cutoff so a
         // byte-oblivious truncation would split it.
         let long: String = "€".repeat(400); // 1200 bytes
@@ -1093,6 +1096,7 @@ mod tests {
                 title: String::new(),
                 focus: PaneId(1),
                 root: LayoutNode::pane(PaneId(1), SessionId::new("s1")),
+                color: TabColorChoice::Unset,
             }],
         };
         let snap = assemble(&[(None, (100, 100), &tree, &[false])], &|_sid| PaneSnap {
@@ -1187,6 +1191,7 @@ mod tests {
     fn subsequent_assemble_carries_no_commands_once_capture_is_off() {
         use ember_core::ids::{PaneId, SessionId, TabId};
         use ember_core::layout::{LayoutNode, Tab, WindowTree};
+        use ember_core::tabcolor::TabColorChoice;
 
         let p = tmp("strip-then-reassemble");
         write_atomic(&p, &snap_with_commands()).unwrap();
@@ -1200,6 +1205,7 @@ mod tests {
                 title: String::new(),
                 focus: PaneId(1),
                 root: LayoutNode::pane(PaneId(1), sid.clone()),
+                color: TabColorChoice::Unset,
             }],
         };
 

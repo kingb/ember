@@ -15,6 +15,7 @@ pub mod ids;
 pub mod layout;
 pub mod links;
 pub mod settings;
+pub mod tabcolor;
 pub mod windows;
 
 pub use app::{AppState, ChromeRow, ChromeRowKind, ChromeState, Gate, GateId, GateRegistry};
@@ -37,6 +38,7 @@ pub use ids::{PaneId, SessionId, TabId};
 pub use layout::{Axis, LayoutNode, Tab, WindowTree, layout, remove_pane};
 pub use links::{UrlMatch, find_urls};
 pub use settings::{Help, RowKind, SettingRow, SettingsRowView, resolve_rows, setting_rows};
+pub use tabcolor::{SWATCHES, TabColorChoice, effective_color};
 pub use windows::{
     DropZone, MoveEffect, MoveError, SurfaceDest, SurfaceRef, Windows, drop_zone_for, move_surface,
     split_zone_for, window_under,

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use ember_core::{
     Axis, BackendControl, BackendHandle, LayoutCommand, LayoutNode, PaneId, Rect, SessionBackend,
-    SessionId, Tab, TabId, WindowTree, apply, layout,
+    SessionId, Tab, TabColorChoice, TabId, WindowTree, apply, layout,
 };
 use ember_render::headless::{self, PaneShot, Shot};
 use ember_render::{GridModel, Renderer, TabLabel};
@@ -305,6 +305,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
             title: String::new(),
             root: LayoutNode::pane(p1, s1),
             focus: p1,
+            color: TabColorChoice::Unset,
         }],
         active: 0,
     };

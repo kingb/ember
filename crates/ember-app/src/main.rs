@@ -30,8 +30,8 @@ use control::{ControlMsg, MoveTabTarget, PromotePaneTarget};
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims,
     LayoutCommand, LayoutNode, MoveEffect, MoveError, OscEvent, PaneId, Rect, RowKind,
-    ScrollAmount, SessionId, SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabId,
-    WispStyle, WispStyleSelection, apply, resolve_rows,
+    ScrollAmount, SessionId, SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab,
+    TabColorChoice, TabId, WispStyle, WispStyleSelection, apply, resolve_rows,
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
@@ -1006,6 +1006,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     title: String::new(),
                     root: LayoutNode::pane(pane, session.clone()),
                     focus: pane,
+                    color: TabColorChoice::Unset,
                 }],
                 active: 0,
             };
@@ -2860,6 +2861,7 @@ fn open_new_window(
             title: String::new(),
             root: LayoutNode::pane(pane, session.clone()),
             focus: pane,
+            color: TabColorChoice::Unset,
         }],
         active: 0,
     };
@@ -3134,6 +3136,7 @@ fn spawn_restored_window(
             title: String::new(),
             root: LayoutNode::pane(pane, session.clone()),
             focus: pane,
+            color: TabColorChoice::Unset,
         }],
         active: 0,
     };
@@ -5471,7 +5474,8 @@ mod tests {
     #[test]
     fn split_replay_that_default_window_size_refuses_succeeds_at_the_saved_size() {
         use ember_core::{
-            Axis, LayoutCommand, LayoutNode, PaneId, Rect, SessionId, Tab, TabId, WindowTree, apply,
+            Axis, LayoutCommand, LayoutNode, PaneId, Rect, SessionId, Tab, TabColorChoice, TabId,
+            WindowTree, apply,
         };
 
         let chrome = ember_render::Renderer::chrome_height() as f64;
@@ -5496,6 +5500,7 @@ mod tests {
                     title: String::new(),
                     root: LayoutNode::pane(p0, SessionId::new("s0")),
                     focus: p0,
+                    color: TabColorChoice::Unset,
                 }],
                 active: 0,
             };
