@@ -306,8 +306,9 @@ pub fn capture_reusing(
     let mut preedit_origin: Option<(f32, f32)> = None;
     let mut palette_buf = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut palette_origin: Option<(f32, f32)> = None;
-    // Center-x of the hovered tab's "✕" (pill left cap), when a tab is hovered.
-    let mut close_cx: Option<f32> = None;
+    // The hovered tab's "✕" (pill left cap position + derived color), when a
+    // tab is hovered.
+    let mut close_glyph: Option<crate::paint::CloseGlyph> = None;
 
     if let Some((rows, sel)) = &shot.settings {
         settings_origin = Some(build_settings(
@@ -464,7 +465,7 @@ pub fn capture_reusing(
         // signature without threading state through the headless path.
         let mut tabs_cache = crate::paint::TabsCache::default();
         let ghost = shot.ghost_tab.as_ref().map(|(l, t)| (l.as_str(), *t));
-        close_cx = build_tabs(
+        close_glyph = build_tabs(
             font_system,
             &mut chrome,
             &mut close_buf,
@@ -731,15 +732,15 @@ pub fn capture_reusing(
             custom_glyphs: &[],
         });
         // The hovered tab's "✕", pixel-centered in the pill's left cap (matches
-        // the windowed renderer).
-        if let Some(cx) = close_cx {
+        // the windowed renderer), in whatever color `build_tabs` derived (Task 4).
+        if let Some(glyph) = &close_glyph {
             areas.push(TextArea {
                 buffer: &close_buf,
-                left: (cx - cw * 0.5) * sf,
+                left: (glyph.cx - cw * 0.5) * sf,
                 top: PAD * sf,
                 scale: sf,
                 bounds: full_bounds,
-                default_color: Color::rgb(0xcc, 0xcc, 0xcc),
+                default_color: Color::rgb(glyph.color.r, glyph.color.g, glyph.color.b),
                 custom_glyphs: &[],
             });
         }
