@@ -47,6 +47,11 @@ pub struct Opts {
     /// Draw the restore-on-launch modal's `Older…` screen over the panes,
     /// with a fixture 3-entry archive list.
     pub restore_older: bool,
+    /// Draw the tab-color swatch popover (Task 3) over the panes, anchored
+    /// under tab 0 — which the fixture also puts mid-rename with an already-
+    /// set color, so one shot exercises the chip, the editor swatch, and the
+    /// popover together (`SwatchView { tab: 0, selected: 2 }`).
+    pub swatch_popover: bool,
     /// Split drop-zone preview on the focused pane: `(horizontal, ratio)`.
     pub split_preview: Option<(bool, f32)>,
     /// How long to let the shells produce output before capturing.
@@ -113,6 +118,7 @@ impl Default for Opts {
             confirm: false,
             restore_main: false,
             restore_older: false,
+            swatch_popover: false,
             split_preview: None,
             settle_ms: 700,
             backdrop: false,
@@ -184,6 +190,7 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--confirm" => opts.confirm = true,
             "--restore-main" => opts.restore_main = true,
             "--restore-older" => opts.restore_older = true,
+            "--swatch-popover" => opts.swatch_popover = true,
             "--help-overlay" => opts.help_overlay = true,
             "--settings" => opts.settings = true,
             "--tab-drag" => {
@@ -414,7 +421,12 @@ pub fn run(opts: Opts) -> Result<String, String> {
                 t.title.clone()
             },
             active: i == tree.active,
-            editing: false,
+            // `--swatch-popover` puts tab 0 mid-rename with a color already
+            // set, so this one fixture also exercises the chip (drawn from
+            // `color` on every tab) and the rename-editor swatch (drawn only
+            // while `editing`), not just the popover itself.
+            editing: opts.swatch_popover && i == 0,
+            color: (opts.swatch_popover && i == 0).then_some(ember_core::SWATCHES[2]),
             bell: opts.bell_tab == Some(i),
         })
         .collect();
@@ -502,6 +514,10 @@ pub fn run(opts: Opts) -> Result<String, String> {
         } else {
             None
         },
+        swatch: opts.swatch_popover.then_some(ember_render::SwatchView {
+            tab: 0,
+            selected: 2,
+        }),
         hold_ring: opts.hold_ring,
         // No offline `--screenshot` flag for these (v0.4.0): both are live
         // cross-window-drag/tear-off previews with no meaningful "just render

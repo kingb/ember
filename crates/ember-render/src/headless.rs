@@ -21,15 +21,16 @@ use wgpu::{
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    AboutLayout, bell_wash, build_about, build_confirm, build_fps, build_help, build_ime_preedit,
-    build_palette, build_restore_list, build_restore_main, build_search_bar, build_settings,
-    build_tabs, grid_quads, hold_ring_quads, link_quads, measure_cell_width, morph_quads,
-    push_backdrop, scrollbar, selection_quads, shape_grid, spark_quads, split_preview,
+    AboutLayout, BTN_COLS, bell_wash, build_about, build_confirm, build_fps, build_help,
+    build_ime_preedit, build_palette, build_restore_list, build_restore_main, build_search_bar,
+    build_settings, build_swatch_popover, build_tabs, grid_quads, hold_ring_quads, link_quads,
+    measure_cell_width, morph_quads, push_backdrop, scrollbar, selection_quads, shape_grid,
+    spark_quads, split_preview, tab_segment_x,
 };
 use crate::quads::{QuadRenderer, srgb_to_linear};
 use crate::renderer::{
-    ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, BG, BackdropParams, FG, FONT_SIZE,
-    HELP_PAD, ImageFit, LINE_HEIGHT, PAD, RestoreView, TabLabel,
+    ABOUT_TITLE_LINE, ABOUT_TITLE_SIZE, AMBER, AboutInfo, BG, BackdropParams, CELL_HEIGHT, FG,
+    FONT_SIZE, HELP_PAD, ImageFit, LINE_HEIGHT, PAD, RestoreView, SwatchView, TabLabel,
 };
 use crate::selection::Selection;
 
@@ -90,6 +91,10 @@ pub struct Shot<'a> {
     /// The restore-on-launch modal (Task 8), drawn over everything if shown.
     /// Mutually exclusive with `confirm` in practice.
     pub restore: Option<RestoreView>,
+    /// The tab-color swatch popover (Task 3), anchored under `swatch.tab`, or
+    /// `None` when closed. Not mutually exclusive with the other overlays
+    /// above — see the live renderer's matching draw block for why.
+    pub swatch: Option<SwatchView>,
     /// Hold-to-wisp ring (v1.1): `(logical x, logical y, progress 0..1)` —
     /// mirrors [`crate::Renderer`]'s live `hold_ring` state so a mid-gesture
     /// `ctl screenshot` shows the sweep for visual verification.
@@ -282,6 +287,9 @@ pub fn capture_reusing(
     let mut restore_list = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut restore_main_layout: Option<crate::paint::RestoreMainLayout> = None;
     let mut restore_list_origin: Option<(f32, f32)> = None;
+    let mut swatch_hint = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut swatch_label = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut swatch_layout: Option<crate::paint::SwatchLayout> = None;
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut rounded: Vec<([f32; 4], [f32; 4], f32)> = Vec::new();
     let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
@@ -596,6 +604,32 @@ pub fn capture_reusing(
         }
         None => {}
     }
+    // Tab-color swatch popover (Task 3) — mirrors the live renderer's own
+    // draw block exactly, so a `--swatch-popover` capture matches on-screen
+    // pixel-for-pixel. Not mutually exclusive with the modals above (see
+    // the live renderer's matching comment).
+    if let Some(view) = &shot.swatch {
+        let strip_h = CELL_HEIGHT + 2.0 * PAD;
+        let total_cols = (shot.logical_w / cw).floor() as usize;
+        let plus_cols = BTN_COLS.min(total_cols);
+        let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
+        let gear_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols + help_cols));
+        let tab_cols = total_cols.saturating_sub(plus_cols + help_cols + gear_cols);
+        let (anchor_x, anchor_w) = tab_segment_x(shot.tabs.len(), tab_cols, cw, view.tab);
+        swatch_layout = Some(build_swatch_popover(
+            font_system,
+            &mut swatch_hint,
+            &mut swatch_label,
+            anchor_x,
+            anchor_w,
+            strip_h,
+            view.selected,
+            cw,
+            shot.logical_w,
+            sf,
+            &mut rounded,
+        ));
+    }
     quads.prepare(
         device,
         queue,
@@ -805,6 +839,26 @@ pub fn capture_reusing(
             scale: sf,
             bounds: full_bounds,
             default_color: Color::rgb(0xf5, 0xf5, 0xdc),
+            custom_glyphs: &[],
+        });
+    }
+    if let Some(sl) = &swatch_layout {
+        overlay_areas.push(TextArea {
+            buffer: &swatch_hint,
+            left: sl.hint_origin.0 * sf,
+            top: sl.hint_origin.1 * sf,
+            scale: sf,
+            bounds: full_bounds,
+            default_color: Color::rgb(0x88, 0x88, 0x88),
+            custom_glyphs: &[],
+        });
+        overlay_areas.push(TextArea {
+            buffer: &swatch_label,
+            left: sl.label_origin.0 * sf,
+            top: sl.label_origin.1 * sf,
+            scale: sf,
+            bounds: full_bounds,
+            default_color: Color::rgb(0xf0, 0xf0, 0xf0),
             custom_glyphs: &[],
         });
     }

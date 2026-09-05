@@ -339,10 +339,9 @@ pub(crate) fn compose_tab_color_channel(
 /// reset via `OscEvent::TabColorReset`). Pure over the map so it's
 /// unit-testable without `Shared`.
 ///
-/// Not read by any render/resolver path yet: this task's deliverable ends at
-/// `Shared::osc_tab_color` + this accessor. A follow-up task wires it into
-/// the tab-color precedence resolver (`ember_core::effective_color`).
-#[allow(dead_code)]
+/// Read by `WindowState::sync_layout` (Task 3) as the `osc` layer of
+/// `ember_core::effective_color`'s precedence ladder when it builds each
+/// frame's `TabLabel`s.
 pub(crate) fn osc_color_of(map: &HashMap<SessionId, (u8, u8, u8)>, sid: &SessionId) -> Option<u32> {
     map.get(sid)
         .map(|&(r, g, b)| ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
@@ -1430,6 +1429,17 @@ impl ApplicationHandler<EmberEvent> for App {
                     win.search_key(shared, &key.logical_key);
                     return;
                 }
+                // The tab-color swatch popover (Task 3) captures all input
+                // while open — sits ABOVE the rename branch below since it
+                // can be open while that tab is still mid-rename underneath
+                // it (opened via that same rename's `ArrowDown`), and must
+                // intercept arrows/Enter/Esc before `rename_key` ever sees
+                // them. Same Cmd-bypass convention as every other capturing
+                // branch here.
+                if win.swatch_open.is_some() && !win.modifiers.super_key() {
+                    win.swatch_key_input(shared, &key.logical_key);
+                    return;
+                }
                 // Inline tab rename captures typing, but NOT Cmd combos — those
                 // stay app shortcuts (Cmd+W must not insert "w"), so fall through
                 // to the Super branch below when Cmd is held.
@@ -2149,6 +2159,13 @@ impl ApplicationHandler<EmberEvent> for App {
                 deferred_windows.push(DeferredWindowAction::Focus(query, reply));
                 continue;
             }
+            // `set-tab-color` (Task 3): same reasoning as `focus` just above
+            // — it resolves the tab by the identical cross-window title
+            // search, so it needs every window too.
+            if let ControlMsg::SetTabColor(query, token, reply) = cmd {
+                deferred_windows.push(DeferredWindowAction::SetTabColor(query, token, reply));
+                continue;
+            }
             // `ctl drag`: press/motion*/release must all run as one
             // sequence (there's no real per-event `WindowEvent` to hang each
             // step off), and — like the surface-mobility verbs above — a
@@ -2647,6 +2664,11 @@ impl ApplicationHandler<EmberEvent> for App {
                     );
                     let _ = reply.send(resp);
                 }
+                DeferredWindowAction::SetTabColor(query, token, reply) => {
+                    let resp =
+                        set_tab_color_across_windows(&mut self.windows, shared, &query, &token);
+                    let _ = reply.send(resp);
+                }
                 DeferredWindowAction::Drag {
                     window,
                     x1,
@@ -2760,6 +2782,10 @@ enum DeferredWindowAction {
     /// on) any window, not just the one `win` currently borrows. Resolved at
     /// the tail by `focus_across_windows`.
     Focus(String, std::sync::mpsc::Sender<String>),
+    /// `ctl set-tab-color` (Task 3): `(query, token)`, resolved by the exact
+    /// same cross-window title search as `Focus` — see
+    /// `set_tab_color_across_windows`.
+    SetTabColor(String, String, std::sync::mpsc::Sender<String>),
     /// `ctl drag`: synthesize a full press→motion*→release (or →Escape, if
     /// `cancel`) gesture on `window`, through the exact same `WindowState`
     /// methods a real mouse hits. Resolved at the tail by `run_ctl_drag`.
@@ -4921,6 +4947,61 @@ fn focus_across_windows(
                 // Focused event corrects this if the user switches away
                 // meanwhile.
                 *focused_window = Some(wid);
+            }
+            serde_json::json!({
+                "ok": true, "index": ti + 1, "title": title, "window": wi + 1,
+            })
+            .to_string()
+        }
+        None => {
+            let titles: Vec<String> = window_titles.into_iter().flatten().collect();
+            serde_json::json!({
+                "ok": false, "error": "no tab title matches", "titles": titles,
+            })
+            .to_string()
+        }
+    }
+}
+
+/// `ctl set-tab-color <query> <token>` (Task 3): resolves `query` by the
+/// exact same cross-window title search `focus_across_windows` uses (see
+/// `match_tab_title_across`), then applies `token` (parsed by
+/// `window_state::parse_color_token`) to that tab via `apply_tab_color`.
+/// Unlike `Focus`, a match here does NOT raise/select the window — setting a
+/// color is a background op, not a "come look at this" gesture. The reply
+/// shape mirrors `Focus`'s on success (`index`/`title`/`window`, all
+/// 1-based) so scripts can reuse the same parsing either way.
+fn set_tab_color_across_windows(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    query: &str,
+    token: &str,
+) -> String {
+    let Some(choice) = window_state::parse_color_token(token) else {
+        return serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "set-tab-color: bad color token {token:?} (expected #rrggbb|default|clear|swatch-N)"
+            ),
+        })
+        .to_string();
+    };
+    let window_titles: Vec<Vec<String>> = shared
+        .window_order
+        .iter()
+        .map(|wid| {
+            windows
+                .get(wid)
+                .map(WindowState::tab_titles)
+                .unwrap_or_default()
+        })
+        .collect();
+    match match_tab_title_across(&window_titles, query) {
+        Some((wi, ti)) => {
+            let title = window_titles[wi][ti].clone();
+            let wid = shared.window_order[wi];
+            if let Some(w) = windows.get_mut(&wid) {
+                w.apply_tab_color(shared, ti, choice);
             }
             serde_json::json!({
                 "ok": true, "index": ti + 1, "title": title, "window": wi + 1,

@@ -4,7 +4,7 @@
 //! identically. Stateless free functions over the renderer's colors/metrics; the
 //! `Renderer` struct + GPU plumbing live in `renderer.rs`.
 
-use ember_core::{MarkStatus, Rect, Rgb, RowKind, SettingsRowView};
+use ember_core::{MarkStatus, Rect, Rgb, RowKind, SWATCHES, SettingsRowView};
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
 
 use crate::grid_model::GridModel;
@@ -732,6 +732,15 @@ pub(crate) const BTN_COLS: usize = 3;
 /// [`build_tabs`] draws it and [`Renderer::tab_hit`](crate::Renderer::tab_hit)
 /// must mirror this to route a click there to a close.
 pub(crate) const CLOSE_COLS: usize = 2;
+/// Columns reserved at the right of a tab being RENAMED for the color swatch
+/// affordance (Task 3) — [`build_tabs`] draws it there and
+/// [`Renderer::tab_hit`](crate::Renderer::tab_hit) mirrors this to route a
+/// click there to opening the tab-color popover instead of the rename field.
+pub(crate) const SWATCH_COLS: usize = 2;
+/// Columns in the swatch popover's curated-color grid (`build_swatch_popover`).
+/// Kept in lockstep with `ember_app::window_state::SWATCH_GRID_COLS`, which
+/// drives the same 4-wide wrap for the pure keyboard classifier.
+pub(crate) const SWATCH_GRID_COLS: usize = 4;
 
 /// Center `s` in a field `width` **display columns** wide (truncating with `…`
 /// if too long). Uses Unicode display width — a CJK title char is 2 columns —
@@ -798,6 +807,30 @@ fn pill_geom(x: f32, w: f32, strip_h: f32, cw: f32) -> (f32, f32, f32, f32, f32)
 fn pill_cap_center(x: f32, w: f32, strip_h: f32, cw: f32) -> (f32, f32) {
     let (px, inset_y, _pw, ph, radius) = pill_geom(x, w, strip_h, cw);
     (px + radius, inset_y + ph * 0.5)
+}
+
+/// Center of a pill's RIGHT rounded cap (logical px) — where the rename-editor
+/// color swatch sits (Task 3). Mirrors [`pill_cap_center`], the left-cap
+/// counterpart used for the hover "✕".
+fn pill_right_cap_center(x: f32, w: f32, strip_h: f32, cw: f32) -> (f32, f32) {
+    let (px, inset_y, pw, ph, radius) = pill_geom(x, w, strip_h, cw);
+    (px + pw - radius, inset_y + ph * 0.5)
+}
+
+/// `x`/width (logical px) of tab `i`'s segment in the strip, given `n` real
+/// tabs and the columns reserved for the tab area — mirrors the (ghost-less)
+/// segment math in [`build_tabs`]'s main loop. The swatch popover only ever
+/// opens while renaming a tab, which never coexists with a cross-window drag
+/// ghost, so this doesn't need to account for one. Used to anchor
+/// [`build_swatch_popover`] under the editing tab.
+pub(crate) fn tab_segment_x(n: usize, tab_cols: usize, cw: f32, i: usize) -> (f32, f32) {
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let seg = tab_cols / n;
+    let col = seg * i.min(n - 1);
+    let width = if i == n - 1 { tab_cols - col } else { seg };
+    (col as f32 * cw, width as f32 * cw)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1001,6 +1034,71 @@ pub(crate) fn build_tabs(
             if hovered == Some(i) && !tab.editing && !dragging_this {
                 close_cx = Some(pill_cap_center(x, w, strip_h, cw).0);
             }
+            // Tab-color chip (Task 3): a small rounded square in the pill's
+            // left cap — the same spot the hover "✕" occupies, so it never
+            // competes with the centered title text. Chosen over a full-width
+            // underline: at 12px a thin underline reads as noise against the
+            // strip's existing accent-ring/hover-lift language, while a small
+            // swatch in an otherwise-idle corner stays legible and doesn't
+            // fight the active/hover treatments. Hidden under the close "✕"
+            // when both would land there (close wins — it's the active
+            // affordance in that frame).
+            let close_shown_here = hovered == Some(i) && !tab.editing && !dragging_this;
+            if let (Some(c), false) = (tab.color, close_shown_here) {
+                let (ccx, ccy) = pill_cap_center(x, w, strip_h, cw);
+                let d = 8.0;
+                // Pushed onto `rounded`, NOT `out`: sharp `rects` all draw
+                // before ANY rounded quad (the quad renderer's fixed
+                // sharp-then-rounded layering), so a plain `rects` chip would
+                // vanish under an active/editing/hovered tab's pill fill,
+                // which is itself a `rounded` quad drawn on top of everything
+                // in `out`.
+                rounded.push((
+                    scaled(ccx - d * 0.5, ccy - d * 0.5, d, d, sf),
+                    lin_rgba(Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8), 1.0),
+                    2.0 * sf,
+                ));
+            }
+            // Rename-editor swatch (Task 3): the current effective color in
+            // the pill's right cap while renaming — filled when set, a hollow
+            // ring when `None` — click opens the popover (`TabHit::Swatch`).
+            if tab.editing && !dragging_this {
+                let (scx, scy) = pill_right_cap_center(x, w, strip_h, cw);
+                let d = 8.0;
+                match tab.color {
+                    // `rounded`, not `out` — same sharp-then-rounded layering
+                    // reason as the chip above: the editing pill fill is
+                    // itself a `rounded` quad and would otherwise cover this.
+                    Some(c) => rounded.push((
+                        scaled(scx - d * 0.5, scy - d * 0.5, d, d, sf),
+                        lin_rgba(Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8), 1.0),
+                        2.0 * sf,
+                    )),
+                    None => {
+                        // Hollow: a thin ring only (no fill) — an outer square
+                        // minus a slightly smaller inset one, both pushed as
+                        // opaque quads onto `rounded` so the inner one can cut
+                        // a "window" back down to the pill fill beneath it.
+                        rounded.push((
+                            scaled(scx - d * 0.5, scy - d * 0.5, d, d, sf),
+                            lin_rgba(Rgb::new(0xaa, 0xaa, 0xaa), 0.9),
+                            2.0 * sf,
+                        ));
+                        let inset = 1.5;
+                        rounded.push((
+                            scaled(
+                                scx - d * 0.5 + inset,
+                                scy - d * 0.5 + inset,
+                                d - 2.0 * inset,
+                                d - 2.0 * inset,
+                                sf,
+                            ),
+                            lin_rgba(TAB_ACTIVE, 1.0),
+                            1.0 * sf,
+                        ));
+                    }
+                }
+            }
             // Unseen-bell indicator: a small amber dot in the tab's top-right.
             if tab.bell {
                 let d = 5.0;
@@ -1117,6 +1215,140 @@ pub(crate) fn build_tabs(
         cache.close_cw = Some(cw_bits);
     }
     close_cx
+}
+
+/// Text-placement result from [`build_swatch_popover`] (logical px).
+pub(crate) struct SwatchLayout {
+    /// Origin of the hint line ("↓ open · arrows move · Enter pick · Esc close").
+    pub hint_origin: (f32, f32),
+    /// Origin of the two-line "Default\nClear" label block.
+    pub label_origin: (f32, f32),
+}
+
+/// Draw the tab-color swatch popover (Task 3): a small panel anchored under
+/// the tab at `anchor_x`/`anchor_w` (the strip segment `tab_segment_x`
+/// resolved for the editing tab), offering the 12 curated `SWATCHES` in a
+/// `SWATCH_GRID_COLS`-wide grid, then `Default`/`Clear` as two labeled rows
+/// below — selection order `0..12`, `12`, `13`, matching
+/// `ember_app::window_state::swatch_key`'s indexing exactly. No full-window
+/// scrim (unlike the command palette / restore modal): this is a contextual
+/// popover anchored to a specific tab, not a blocking modal, so it only dims
+/// nothing behind it — same "non-blocking overlay" register as the hover "✕"
+/// or the bell dot, just bigger. Everything rides `rounded` so it draws over
+/// pane content, same layering rule as every other overlay here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_swatch_popover(
+    font_system: &mut FontSystem,
+    hint_buf: &mut Buffer,
+    label_buf: &mut Buffer,
+    anchor_x: f32,
+    anchor_w: f32,
+    strip_h: f32,
+    selected: usize,
+    cw: f32,
+    logical_w: f32,
+    sf: f32,
+    rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
+) -> SwatchLayout {
+    const HINT: &str = "↓ open · arrows move · Enter pick · Esc close";
+    let pad = 10.0;
+    let cell = 20.0;
+    let gap = 6.0;
+    let cols = SWATCH_GRID_COLS;
+    let rows = SWATCHES.len().div_ceil(cols);
+    let grid_w = cols as f32 * cell + (cols as f32 - 1.0) * gap;
+    let grid_h = rows as f32 * cell + (rows as f32 - 1.0) * gap;
+    let row_h = LINE_HEIGHT;
+    let hint_h = LINE_HEIGHT + 4.0;
+    // Wide enough for either the swatch grid or the hint line on ONE row —
+    // the hint is long, so without this the panel would stay grid-width and
+    // the hint would wrap onto extra lines this layout doesn't reserve
+    // space for, overlapping the grid below it.
+    let hint_w = HINT.chars().count() as f32 * cw + 4.0;
+    let w = (grid_w + 2.0 * pad).max(150.0).max(hint_w + 2.0 * pad);
+    let h = pad + hint_h + grid_h + 8.0 + row_h * 2.0 + pad;
+    let x = (anchor_x + anchor_w * 0.5 - w * 0.5).clamp(4.0, (logical_w - w - 4.0).max(4.0));
+    let y = strip_h + 4.0;
+
+    let r = 8.0;
+    rounded.push((
+        scaled(x - 1.5, y - 1.5, w + 3.0, h + 3.0, sf),
+        lin_rgba(ACCENT, 0.9),
+        (r + 1.5) * sf,
+    ));
+    rounded.push((
+        scaled(x, y, w, h, sf),
+        lin_rgba(Rgb::new(0x20, 0x22, 0x28), 1.0),
+        r * sf,
+    ));
+
+    // Centered, not left-aligned: the panel is often wider than the grid
+    // itself (sized to fit the hint line above), so a left-aligned grid
+    // would read as lopsided.
+    let grid_x = x + (w - grid_w) * 0.5;
+    let grid_y = y + pad + hint_h;
+    for (i, &c) in SWATCHES.iter().enumerate() {
+        let col = i % cols;
+        let row = i / cols;
+        let cx = grid_x + col as f32 * (cell + gap);
+        let cy = grid_y + row as f32 * (cell + gap);
+        if selected == i {
+            rounded.push((
+                scaled(cx - 2.0, cy - 2.0, cell + 4.0, cell + 4.0, sf),
+                lin_rgba(Rgb::new(0xff, 0xff, 0xff), 0.9),
+                4.0 * sf,
+            ));
+        }
+        rounded.push((
+            scaled(cx, cy, cell, cell, sf),
+            lin_rgba(Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8), 1.0),
+            3.0 * sf,
+        ));
+    }
+
+    // `Default` / `Clear` rows, below the grid.
+    let list_y = grid_y + grid_h + 8.0;
+    for (i, _) in ["Default", "Clear"].iter().enumerate() {
+        let ry = list_y + i as f32 * row_h;
+        if selected == SWATCHES.len() + i {
+            rounded.push((
+                scaled(x + 3.0, ry, w - 6.0, row_h, sf),
+                lin_rgba(ACCENT, 0.28),
+                0.0,
+            ));
+        }
+    }
+
+    let shape = |fs: &mut FontSystem, buf: &mut Buffer, text: &str, color: Color, width: f32| {
+        buf.set_size(fs, Some(width), Some(row_h * 2.0 + hint_h));
+        buf.set_text(
+            fs,
+            text,
+            &Attrs::new().family(Family::Monospace).color(color),
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(fs, false);
+    };
+    shape(
+        font_system,
+        hint_buf,
+        HINT,
+        Color::rgb(0x88, 0x88, 0x88),
+        w - 2.0 * pad,
+    );
+    shape(
+        font_system,
+        label_buf,
+        "Default\nClear\n",
+        Color::rgb(0xf0, 0xf0, 0xf0),
+        w - 2.0 * pad,
+    );
+
+    SwatchLayout {
+        hint_origin: (x + pad, y + pad),
+        label_origin: (x + pad, list_y),
+    }
 }
 
 /// Build the cheat-sheet overlay: a full scrim + a centered panel (accent border)
@@ -2251,6 +2483,7 @@ mod tests {
                 active: i == 0,
                 editing: false,
                 bell: false,
+                color: None,
             })
             .collect();
         let mut run = |cache: &mut TabsCache, reset: bool| {

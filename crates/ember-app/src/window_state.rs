@@ -24,14 +24,14 @@ use std::time::{Duration, Instant};
 
 use ember_core::{
     Axis, BackendControl, BackendHandle, Direction, DropZone, GridDims, LayoutCommand,
-    LayoutEffect, PaneId, Rect, RestoreMode, RowKind, ScrollAmount, SessionBackend, SessionId,
-    SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, apply, drop_zone_for, layout,
-    remove_pane, setting_rows,
+    LayoutEffect, PaneId, Rect, RestoreMode, RowKind, SWATCHES, ScrollAmount, SessionBackend,
+    SessionId, SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabColorChoice, TabId,
+    apply, drop_zone_for, effective_color, layout, remove_pane, setting_rows,
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
-    AbsPoint, AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode, TabHit,
-    TabLabel, VisiblePane,
+    AbsPoint, AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode, SwatchView,
+    TabHit, TabLabel, VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -43,8 +43,9 @@ use crate::session_state;
 use crate::{
     ControlClose, DEFAULT_COLS, DEFAULT_ROWS, DragState, DropHover, MULTI_CLICK, PAD, PendingClose,
     Shared, about_info, bell_flash_intensity, bracket_paste, dims_for_rect, ember_glow, encode_key,
-    help_lines, inset, load_backdrop_image, named_key, parse_chord, resolve_window_index,
-    shell_escape_path, step_selectable_row, tab_display_title, url_is_openable,
+    help_lines, inset, load_backdrop_image, named_key, osc_color_of, parse_chord,
+    resolve_window_index, shell_escape_path, step_selectable_row, tab_display_title,
+    url_is_openable,
 };
 #[cfg(target_os = "linux")]
 use crate::{alt_digit_tab, linux_chord_translate};
@@ -494,6 +495,13 @@ pub(crate) struct WindowState {
     /// Inline tab rename in progress: the tab index + the live edit buffer.
     pub(crate) editing_tab: Option<usize>,
     pub(crate) edit_buffer: String,
+    /// Tab-color swatch popover (Task 3): `Some(tab index)` while open,
+    /// anchored under that tab. Opened from a click on the rename-editor's
+    /// own swatch or `ArrowDown` while renaming — see `open_swatch`.
+    pub(crate) swatch_open: Option<usize>,
+    /// The popover's current selection: `0..12` = a `SWATCHES` cell, `12` =
+    /// `Default`, `13` = `Clear`. Meaningless while `swatch_open` is `None`.
+    pub(crate) swatch_sel: usize,
     /// A destructive close awaiting confirmation (a busy pane).
     pub(crate) pending_close: Option<PendingClose>,
     /// The focused confirm button: 0 = Cancel (safe default), 1 = Close/Quit.
@@ -775,6 +783,124 @@ fn settings_action_for_key(key: &Key, selected_kind: Option<RowKind>) -> Setting
     }
 }
 
+/// Parse a `commit_rename`/`ctl set-tab-color` color token into a
+/// [`TabColorChoice`](ember_core::TabColorChoice). Accepts `#rrggbb` (exactly
+/// 6 hex digits after the `#`, case-insensitive), `default` (pins the theme's
+/// default — [`ember_core::TabColorChoice::PinnedDefault`]), `clear` (back to
+/// [`ember_core::TabColorChoice::Unset`]), or `swatch-N` (0-based index into
+/// [`ember_core::SWATCHES`]). Anything else — a malformed hex, an
+/// out-of-range swatch index, an unrecognized word — is `None`; callers treat
+/// that as "not a color token" rather than an error (e.g. `commit_rename`
+/// leaves a non-matching `#...` substring in the title untouched).
+pub(crate) fn parse_color_token(tok: &str) -> Option<TabColorChoice> {
+    let t = tok.trim();
+    if let Some(hex) = t.strip_prefix('#') {
+        if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let v = u32::from_str_radix(hex, 16).ok()?;
+            return Some(TabColorChoice::Color(v));
+        }
+        return None;
+    }
+    match t {
+        "default" => Some(TabColorChoice::PinnedDefault),
+        "clear" => Some(TabColorChoice::Unset),
+        _ => {
+            let idx: usize = t.strip_prefix("swatch-")?.parse().ok()?;
+            SWATCHES.get(idx).map(|c| TabColorChoice::Color(*c))
+        }
+    }
+}
+
+/// Find a `#rrggbb` color token as a whole word anywhere in a rename
+/// buffer, strip it (and the surrounding whitespace) out of the title, and
+/// parse it. Only a `#`-prefixed word counts — a word like `default` typed
+/// as an ordinary title word must NOT silently pin the tab's default color,
+/// so this deliberately doesn't reuse `parse_color_token`'s `default`/
+/// `clear`/`swatch-N` forms, only its `#rrggbb` hex path. The first matching
+/// token wins; the title keeps every other word verbatim (including a
+/// second `#rrggbb`-shaped word, if any — "a token", singular).
+fn extract_color_token(buf: &str) -> (String, Option<TabColorChoice>) {
+    let mut color = None;
+    let mut words: Vec<&str> = Vec::new();
+    for word in buf.split_whitespace() {
+        if color.is_none() && word.starts_with('#') {
+            if let Some(c) = parse_color_token(word) {
+                color = Some(c);
+                continue;
+            }
+        }
+        words.push(word);
+    }
+    (words.join(" "), color)
+}
+
+/// What a key press does while the tab-color swatch popover is open — the
+/// `settings_action_for_key` precedent, generalized from a settings row to
+/// the popover's 14-item grid (12 curated `SWATCHES`, then `Default`, then
+/// `Clear` — indices `0..12`, `12`, `13` respectively; see
+/// [`WindowState::swatch_key`] for how `sel` resolves `Pick`/`PinDefault`/
+/// `Clear` into an actual color). Pure and independent of `WindowState`/
+/// `Shared`, so it's unit-tested directly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SwatchAction {
+    /// Move the selection by this many grid cells (arrows); the caller wraps
+    /// the result across the 14-item grid.
+    Move(i8),
+    /// Enter/Space on one of the 12 curated swatch cells (`sel < 12`).
+    Pick,
+    /// Enter/Space on the `Default` row (`sel == 12`).
+    PinDefault,
+    /// Enter/Space on the `Clear` row (`sel == 13`).
+    Clear,
+    /// Esc — dismiss the popover without changing the color.
+    Close,
+    /// Any other key: swallowed (the popover captures all input while open)
+    /// but changes nothing.
+    None,
+}
+
+/// Number of columns in the swatch popover's curated-color grid — arrow
+/// Up/Down step by this many items. Must match [`crate::paint::SWATCH_COLS`]
+/// (kept as separate constants: this one drives pure keyboard logic tested
+/// without a GPU context, that one drives the actual quad layout).
+const SWATCH_GRID_COLS: i8 = 4;
+
+/// Total selectable items in the popover: 12 curated `SWATCHES` + `Default` +
+/// `Clear`.
+const SWATCH_ITEM_COUNT: usize = 14;
+
+/// Map a key press onto a [`SwatchAction`], given the current selection
+/// `sel` (needed only to route Enter/Space to `Pick`/`PinDefault`/`Clear`
+/// correctly — arrows and Esc don't consult it). See [`SwatchAction`]'s docs.
+fn swatch_key(key: &Key, sel: usize) -> SwatchAction {
+    match key {
+        Key::Named(NamedKey::Escape) => SwatchAction::Close,
+        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => {
+            if sel < SWATCHES.len() {
+                SwatchAction::Pick
+            } else if sel == SWATCHES.len() {
+                SwatchAction::PinDefault
+            } else {
+                SwatchAction::Clear
+            }
+        }
+        Key::Named(NamedKey::ArrowRight) => SwatchAction::Move(1),
+        Key::Named(NamedKey::ArrowLeft) => SwatchAction::Move(-1),
+        Key::Named(NamedKey::ArrowDown) => SwatchAction::Move(SWATCH_GRID_COLS),
+        Key::Named(NamedKey::ArrowUp) => SwatchAction::Move(-SWATCH_GRID_COLS),
+        _ => SwatchAction::None,
+    }
+}
+
+/// Apply a [`SwatchAction::Move`] delta to `sel`, wrapping across the
+/// popover's 14-item grid (arrows never fall off either end). Pure, split
+/// out of [`WindowState::swatch_key_input`] so the wrap arithmetic is
+/// directly unit-testable alongside `swatch_key` itself.
+fn wrap_swatch_sel(sel: usize, delta: i8) -> usize {
+    let n = SWATCH_ITEM_COUNT as i32;
+    (sel as i32 + delta as i32).rem_euclid(n) as usize
+}
+
 /// Find the `SettingRow` in `ember_core`'s static table whose label matches
 /// `label` exactly — what `adjust_setting` looks up to call the row's own
 /// `adjust` fn. Pure (no `Shared`/`WindowState`), so the label-matching
@@ -853,6 +979,8 @@ impl WindowState {
             last_tab_click: None,
             editing_tab: None,
             edit_buffer: String::new(),
+            swatch_open: None,
+            swatch_sel: 0,
             pending_close: None,
             confirm_focus: 0,
             wheel_accum: 0.0,
@@ -1101,6 +1229,18 @@ impl WindowState {
                 return None;
             }
         }
+        // Route injected keys into the open tab-color popover (Task 3, for
+        // tests), mirroring the real keyboard path — checked before the
+        // rename-editor's own ctl routing further below for the same reason
+        // the live keyboard arm sits above `rename_key`'s.
+        if self.swatch_open.is_some() {
+            if let ControlMsg::Key(name) = &msg {
+                if let Some(k) = named_key(name) {
+                    self.swatch_key_input(shared, &k);
+                }
+                return None;
+            }
+        }
         // Mirror the keyboard: the restore-on-launch modal captures input
         // (Left/Right/Tab/Up/Down navigate, Enter activates, Esc backs out,
         // a printable key or a whole `Type` types through — see
@@ -1224,6 +1364,9 @@ impl WindowState {
             // so the match stays exhaustive.
             ControlMsg::State(_) => {}
             ControlMsg::Focus(..) => {}
+            // Same reasoning as `Focus` — resolves across every window, not
+            // just this one.
+            ControlMsg::SetTabColor(..) => {}
             ControlMsg::Raise => self.raise_window(),
             ControlMsg::Screenshot(path, reply) => {
                 let resp = match self.renderer.capture_to_png(std::path::Path::new(&path)) {
@@ -1509,6 +1652,23 @@ impl WindowState {
             .filter(|(_, t)| Some(t.id) != excluded_tab)
             .map(|(i, t)| {
                 let editing = editing_tab == Some(i);
+                // The OSC layer needs THIS tab's own focused pane's session —
+                // not the window's overall `focused_session` above, which is
+                // scoped to the ACTIVE tab only. Every tab carries its own
+                // `root`/`focus`, so re-derive per tab (cheap: a handful of
+                // leaves per tab, once per `sync_layout` call, not per frame
+                // beyond that).
+                let osc = t
+                    .root
+                    .leaves()
+                    .into_iter()
+                    .find(|(p, _)| *p == t.focus)
+                    .and_then(|(_, sid)| osc_color_of(&shared.osc_tab_color, &sid));
+                let color = effective_color(
+                    t.color, osc,
+                    None,  // TODO(tab-color-rules): Task 4 wires the rule layer in here.
+                    false, // TODO(tab-color-rules): Task 4 wires config.tab_colors.osc6_overrides_manual in here.
+                );
                 TabLabel {
                     title: if editing {
                         self.edit_buffer.clone()
@@ -1518,6 +1678,7 @@ impl WindowState {
                     active: i == active,
                     editing,
                     bell: belled.contains(&t.id),
+                    color,
                 }
             })
             .collect();
@@ -2245,11 +2406,26 @@ impl WindowState {
             // as an ordinary click.
             self.renderer.set_split_preview(None);
         }
+        let (x, y) = self.cursor;
+        let hit = self.renderer.tab_hit(x as f32, y as f32);
+        // Clicking the rename-editor's own swatch (Task 3) opens the popover
+        // WITHOUT touching the rename underneath it — this must run before
+        // `commit_rename` below, which would otherwise end the rename first
+        // and make this exact same click resolve as a plain `TabHit::Tab`
+        // instead (the swatch zone only exists while that tab is `editing`).
+        if let Some(TabHit::Swatch(i)) = hit {
+            self.open_swatch(i);
+            return;
+        }
+        // A click anywhere else dismisses an open popover without applying a
+        // pick — same "click away" dismissal every other overlay here uses.
+        if self.swatch_open.is_some() {
+            self.close_swatch();
+        }
         // Any click commits an in-progress tab rename first.
         let was_editing = self.editing_tab.is_some();
         self.commit_rename(shared);
-        let (x, y) = self.cursor;
-        if let Some(hit) = self.renderer.tab_hit(x as f32, y as f32) {
+        if let Some(hit) = hit {
             match hit {
                 TabHit::Tab(i) => {
                     // Second click on the same tab (and we weren't just committing a
@@ -2298,6 +2474,9 @@ impl WindowState {
                 TabHit::NewTab => self.new_tab(shared),
                 TabHit::Help => self.toggle_help(),
                 TabHit::Settings => self.toggle_settings(shared),
+                // Handled by the early return above, before `commit_rename`
+                // — kept here only so this match stays exhaustive.
+                TabHit::Swatch(_) => {}
             }
             return;
         }
@@ -3688,14 +3867,18 @@ impl WindowState {
 
     /// Commit the in-progress rename (Enter / click away) → sets the tab title
     /// and, since this is the interactive "user typed a name" path, marks the
-    /// tab as user-named for the session snapshot (`named_tabs`).
+    /// tab as user-named for the session snapshot (`named_tabs`). A `#rrggbb`
+    /// token anywhere in the typed name (Task 3) is stripped out of the title
+    /// and applied as the tab's manual color via `apply_tab_color` instead of
+    /// being kept as literal text — e.g. renaming to `deploy #ff9d3c` titles
+    /// the tab "deploy" and colors it amber.
     pub(crate) fn commit_rename(&mut self, shared: &mut Shared) {
         let Some(i) = self.editing_tab.take() else {
             return;
         };
+        let (title, color) = extract_color_token(&self.edit_buffer);
         if let Some(t) = self.tree.tabs.get(i) {
             let id = t.id;
-            let title = self.edit_buffer.clone();
             let vp = self.viewport();
             apply(
                 &mut self.tree,
@@ -3706,7 +3889,13 @@ impl WindowState {
             shared.snapshot_dirty = true;
         }
         self.edit_buffer.clear();
-        self.sync_layout(shared);
+        if let Some(choice) = color {
+            // `apply_tab_color` calls `sync_layout` itself, so it also covers
+            // the rename's own redraw — no separate `sync_layout` needed below.
+            self.apply_tab_color(shared, i, choice);
+        } else {
+            self.sync_layout(shared);
+        }
     }
 
     /// Discard the in-progress rename (Esc).
@@ -3722,6 +3911,17 @@ impl WindowState {
         match key {
             Key::Named(NamedKey::Enter) => self.commit_rename(shared),
             Key::Named(NamedKey::Escape) => self.cancel_rename(shared),
+            // Opens the tab-color popover (Task 3) without touching the
+            // in-progress rename underneath it — mirrors clicking the
+            // editor's own swatch (`TabHit::Swatch`, handled in `left_click`).
+            // Discoverability for this gesture lives in the popover's own
+            // hint row once it's open, per the project's "obvious-in-UI
+            // first" tenet.
+            Key::Named(NamedKey::ArrowDown) => {
+                if let Some(i) = self.editing_tab {
+                    self.open_swatch(i);
+                }
+            }
             Key::Named(NamedKey::Backspace) => {
                 self.edit_buffer.pop();
                 self.sync_layout(shared);
@@ -3737,6 +3937,88 @@ impl WindowState {
                 self.sync_layout(shared);
             }
             _ => {}
+        }
+    }
+
+    /// Open the tab-color popover (Task 3), anchored under tab `i` — from a
+    /// click on the rename-editor's swatch or `ArrowDown` while renaming.
+    /// Starting selection matches the tab's current color when it's one of
+    /// the 12 curated swatches, `Default`/`Clear` for those two choices, or
+    /// swatch 0 for anything else (a manual color outside the palette, or no
+    /// color at all) — so re-opening the popover on an already-colored tab
+    /// doesn't land on an arbitrary cell.
+    pub(crate) fn open_swatch(&mut self, i: usize) {
+        if i >= self.tree.tabs.len() {
+            return;
+        }
+        self.swatch_open = Some(i);
+        self.swatch_sel = match self.tree.tabs[i].color {
+            TabColorChoice::Color(c) => SWATCHES.iter().position(|&s| s == c).unwrap_or(0),
+            TabColorChoice::PinnedDefault => SWATCHES.len(),
+            TabColorChoice::Unset => SWATCHES.len() + 1,
+        };
+        self.update_swatch_view();
+    }
+
+    /// Close the popover without changing the tab's color (Esc, or after a
+    /// pick commits one).
+    pub(crate) fn close_swatch(&mut self) {
+        if self.swatch_open.take().is_some() {
+            self.update_swatch_view();
+        }
+    }
+
+    /// (Re)build the renderer's `SwatchView` from `self.swatch_open`/`swatch_sel`.
+    /// No-op-safe to call with `swatch_open == None` (clears the view).
+    fn update_swatch_view(&mut self) {
+        let view = self.swatch_open.map(|tab| SwatchView {
+            tab,
+            selected: self.swatch_sel,
+        });
+        self.renderer.set_swatch(view);
+    }
+
+    /// Route a key into the open tab-color popover (the keyboard arm sits
+    /// ABOVE the rename-editor branch in `main.rs`'s dispatcher and swallows
+    /// every key while open, matching the restore modal's/settings overlay's
+    /// own capture convention).
+    pub(crate) fn swatch_key_input(&mut self, shared: &mut Shared, key: &Key) {
+        let Some(i) = self.swatch_open else { return };
+        match swatch_key(key, self.swatch_sel) {
+            SwatchAction::Move(delta) => {
+                self.swatch_sel = wrap_swatch_sel(self.swatch_sel, delta);
+                self.update_swatch_view();
+            }
+            SwatchAction::Pick => {
+                self.apply_tab_color(shared, i, TabColorChoice::Color(SWATCHES[self.swatch_sel]));
+                self.close_swatch();
+            }
+            SwatchAction::PinDefault => {
+                self.apply_tab_color(shared, i, TabColorChoice::PinnedDefault);
+                self.close_swatch();
+            }
+            SwatchAction::Clear => {
+                self.apply_tab_color(shared, i, TabColorChoice::Unset);
+                self.close_swatch();
+            }
+            SwatchAction::Close => self.close_swatch(),
+            SwatchAction::None => {}
+        }
+    }
+
+    /// Set tab `tab_idx`'s color and redraw. The single mutation point for
+    /// every tab-color path — the rename-editor's `#rrggbb` token, the
+    /// swatch popover, and `ctl set-tab-color` all funnel through this.
+    pub(crate) fn apply_tab_color(
+        &mut self,
+        shared: &mut Shared,
+        tab_idx: usize,
+        choice: TabColorChoice,
+    ) {
+        if let Some(t) = self.tree.tabs.get_mut(tab_idx) {
+            t.color = choice;
+            shared.snapshot_dirty = true;
+            self.sync_layout(shared);
         }
     }
 
@@ -5378,5 +5660,131 @@ mod tests {
         // never a static-table label — the lookup must return `None`, not
         // panic, so `adjust_setting` just skips mutation for it.
         assert!(find_setting_row_by_label("Delete saved sessions (4)…").is_none());
+    }
+
+    // --- parse_color_token: commit_rename / ctl set-tab-color tokens -------
+
+    #[test]
+    fn parse_color_token_hex_happy_path() {
+        use super::parse_color_token;
+        use ember_core::TabColorChoice;
+
+        assert_eq!(
+            parse_color_token("#ff9d3c"),
+            Some(TabColorChoice::Color(0xff9d3c))
+        );
+        // Case-insensitive hex digits.
+        assert_eq!(
+            parse_color_token("#FF9D3C"),
+            Some(TabColorChoice::Color(0xff9d3c))
+        );
+    }
+
+    #[test]
+    fn parse_color_token_rejects_bad_hex() {
+        use super::parse_color_token;
+
+        assert_eq!(parse_color_token("#fff"), None); // too short
+        assert_eq!(parse_color_token("#gggggg"), None); // not hex digits
+        assert_eq!(parse_color_token("#ff9d3c1"), None); // too long
+        assert_eq!(parse_color_token("nothash"), None);
+    }
+
+    #[test]
+    fn parse_color_token_default_and_clear() {
+        use super::parse_color_token;
+        use ember_core::TabColorChoice;
+
+        assert_eq!(
+            parse_color_token("default"),
+            Some(TabColorChoice::PinnedDefault)
+        );
+        assert_eq!(parse_color_token("clear"), Some(TabColorChoice::Unset));
+    }
+
+    #[test]
+    fn parse_color_token_swatch_index() {
+        use super::parse_color_token;
+        use ember_core::TabColorChoice;
+
+        assert_eq!(
+            parse_color_token("swatch-3"),
+            Some(TabColorChoice::Color(ember_core::SWATCHES[3]))
+        );
+        // Out of range (SWATCHES has exactly 12 entries, 0..=11).
+        assert_eq!(parse_color_token("swatch-12"), None);
+        assert_eq!(parse_color_token("swatch-nope"), None);
+    }
+
+    // --- swatch_key: the tab-color popover's keyboard classifier -----------
+
+    #[test]
+    fn swatch_key_enter_resolves_by_selection() {
+        use super::{SwatchAction, swatch_key};
+        use winit::keyboard::{Key, NamedKey};
+
+        for key in [Key::Named(NamedKey::Enter), Key::Named(NamedKey::Space)] {
+            assert_eq!(swatch_key(&key, 0), SwatchAction::Pick);
+            assert_eq!(swatch_key(&key, 11), SwatchAction::Pick);
+            assert_eq!(swatch_key(&key, 12), SwatchAction::PinDefault);
+            assert_eq!(swatch_key(&key, 13), SwatchAction::Clear);
+        }
+    }
+
+    #[test]
+    fn swatch_key_escape_closes_regardless_of_selection() {
+        use super::{SwatchAction, swatch_key};
+        use winit::keyboard::{Key, NamedKey};
+
+        for sel in [0, 5, 12, 13] {
+            assert_eq!(
+                swatch_key(&Key::Named(NamedKey::Escape), sel),
+                SwatchAction::Close
+            );
+        }
+    }
+
+    #[test]
+    fn swatch_key_arrows_move() {
+        use super::{SwatchAction, swatch_key};
+        use winit::keyboard::{Key, NamedKey};
+
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::ArrowRight), 0),
+            SwatchAction::Move(1)
+        );
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::ArrowLeft), 0),
+            SwatchAction::Move(-1)
+        );
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::ArrowDown), 0),
+            SwatchAction::Move(4)
+        );
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::ArrowUp), 0),
+            SwatchAction::Move(-4)
+        );
+    }
+
+    #[test]
+    fn swatch_key_unhandled_key_is_a_no_op() {
+        use super::{SwatchAction, swatch_key};
+        use winit::keyboard::{Key, NamedKey};
+
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::Tab), 0),
+            SwatchAction::None
+        );
+    }
+
+    #[test]
+    fn wrap_swatch_sel_wraps_across_the_14_item_grid() {
+        use super::wrap_swatch_sel;
+
+        assert_eq!(wrap_swatch_sel(13, 1), 0); // Right past Clear wraps to swatch 0
+        assert_eq!(wrap_swatch_sel(0, -1), 13); // Left before swatch 0 wraps to Clear
+        assert_eq!(wrap_swatch_sel(0, -4), 10); // Up from row 0 wraps to the bottom
+        assert_eq!(wrap_swatch_sel(13, 4), 3); // Down from Clear wraps to row 0
     }
 }
