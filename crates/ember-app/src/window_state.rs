@@ -42,10 +42,10 @@ use crate::control::ControlMsg;
 use crate::session_state;
 use crate::{
     ControlClose, DEFAULT_COLS, DEFAULT_ROWS, DragState, DropHover, MULTI_CLICK, PAD, PendingClose,
-    Shared, about_info, bell_flash_intensity, bracket_paste, compile_rules, dims_for_rect,
-    ember_glow, encode_key, help_lines, inset, load_backdrop_image, named_key, osc_color_of,
-    parse_chord, resolve_window_index, rule_color_for, shell_escape_path, step_selectable_row,
-    tab_display_title, url_is_openable,
+    Shared, about_info, bell_flash_intensity, bracket_paste, compile_rules,
+    compute_tab_rule_colors, dims_for_rect, ember_glow, encode_key, help_lines, inset,
+    load_backdrop_image, named_key, osc_color_of, parse_chord, resolve_window_index,
+    shell_escape_path, step_selectable_row, tab_display_title, url_is_openable,
 };
 #[cfg(target_os = "linux")]
 use crate::{alt_digit_tab, linux_chord_translate};
@@ -1609,12 +1609,7 @@ impl WindowState {
     /// resize/focus/drag change too — only ever reads it, so a regex never
     /// re-runs on a tab whose title hasn't changed.
     pub(crate) fn recompute_tab_rule_colors(&mut self, shared: &Shared) {
-        self.tab_rule_colors = self
-            .tree
-            .tabs
-            .iter()
-            .map(|t| (t.id, rule_color_for(&t.title, &shared.tab_color_rules)))
-            .collect();
+        self.tab_rule_colors = compute_tab_rule_colors(&self.tree.tabs, &shared.tab_color_rules);
     }
 
     /// Recompute the active tab's tiling, hand it to the renderer, and resize each
@@ -2174,6 +2169,12 @@ impl WindowState {
             vp,
         );
         self.apply_effects(shared, effects);
+        // Fresh-tab recompute (design: tab-colors): a rule can match the
+        // tab's starting title (empty, or a catch-all like `.*`), and this
+        // is the one choke point every non-restore, non-split new-tab path
+        // (Cmd+T, ctl new-tab, `new_tab`) funnels through — without this the
+        // tab would render colorless until an unrelated later trigger ran.
+        self.recompute_tab_rule_colors(shared);
         self.sync_layout(shared);
         shared.snapshot_dirty = true;
         true
@@ -5012,6 +5013,14 @@ impl WindowState {
         // every other live side effect above ("cheap no-op when unchanged").
         shared.tab_color_rules = compile_rules(&shared.config.tab_colors.rules);
         self.recompute_tab_rule_colors(shared);
+        // This method only has `&mut self` (the window whose Settings
+        // overlay is open) — every OTHER open window's own rule-color cache
+        // and rendered strip would otherwise stay stale until its own next
+        // rename/resize/settings-adjustment. Flag it; `about_to_wait`'s tail
+        // is the one place that has `self.windows` fully free to broadcast
+        // the recompute+resync to every window (mirrors `snapshot_dirty`'s
+        // "flag now, flush once windows are free" pattern).
+        shared.tab_colors_broadcast_pending = true;
         let _ = self.renderer.set_font_size(shared.config.font.size);
         let _ = self.renderer.set_family(shared.config.font.family.clone());
         // Unconditional (not just the old `if relayout`): a tab-color

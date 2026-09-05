@@ -432,6 +432,22 @@ pub(crate) fn rule_color_for(title: &str, rules: &[CompiledRule]) -> Option<u32>
         .map(|r| r.color)
 }
 
+/// Rebuild the whole `TabId -> rule color` cache for `tabs` against `rules` —
+/// the pure core of `WindowState::recompute_tab_rule_colors`, pulled out
+/// here (rather than inlined against `self.tree.tabs`/`shared.tab_color_rules`)
+/// so it's unit-testable without a live `WindowState`/`Renderer`: this is
+/// exactly what runs whether the trigger is a rename, a fresh tab, a moved-
+/// or promoted-in tab carrying its (possibly restored) title, a Settings
+/// adjustment, or a config load — the recompute itself never cares which.
+pub(crate) fn compute_tab_rule_colors(
+    tabs: &[Tab],
+    rules: &[CompiledRule],
+) -> HashMap<TabId, Option<u32>> {
+    tabs.iter()
+        .map(|t| (t.id, rule_color_for(&t.title, rules)))
+        .collect()
+}
+
 /// Process-wide state that is not tied to any one window: the running sessions,
 /// user config, OS effect seam, control socket, and per-session bookkeeping.
 pub(crate) struct Shared {
@@ -529,6 +545,16 @@ pub(crate) struct Shared {
     /// doc for why the per-tab result is cached rather than matched fresh
     /// in `sync_layout`).
     pub(crate) tab_color_rules: Vec<CompiledRule>,
+    /// Set by `WindowState::adjust_setting` on every Settings adjustment
+    /// (that method only has `&mut self` — the window whose overlay is
+    /// open — so it can't itself reach every other open window). Flushed
+    /// once by `about_to_wait`'s tail, the same "flag now, flush once
+    /// `self.windows` is fully free" pattern `snapshot_dirty` uses:
+    /// recomputes + re-syncs EVERY window so a knob flip (or a future
+    /// config.toml rule edit picked up by a reload) is visible everywhere,
+    /// not just in the window whose Settings overlay happened to be open.
+    /// Event-driven — set once per adjustment, never per frame.
+    pub(crate) tab_colors_broadcast_pending: bool,
     /// The debounced session-snapshot writer thread's handle, or `None` when
     /// no state path resolved at startup (`session_state::state_path()`) —
     /// every dirty-marking site and `session_dirty` itself must treat that
@@ -1088,6 +1114,7 @@ impl ApplicationHandler<EmberEvent> for App {
             pane_meta: std::collections::HashMap::new(),
             osc_tab_color: std::collections::HashMap::new(),
             tab_color_rules,
+            tab_colors_broadcast_pending: false,
             snapshots: restore_on
                 .then(|| session_state::state_path().map(session_state::SnapshotWriter::spawn))
                 .flatten(),
@@ -2823,6 +2850,21 @@ impl ApplicationHandler<EmberEvent> for App {
                 shared.snapshot_dirty = false;
             }
         }
+
+        // Tab-color Settings-adjustment broadcast: same "flag now, flush
+        // once `self.windows` is fully free" reasoning as the snapshot flush
+        // right above — `WindowState::adjust_setting` only has `&mut self`,
+        // so it can't itself reach every OTHER open window. Gated on the
+        // flag: a tick with no settings change doesn't pay for a walk over
+        // every window, and this only ever fires once per adjustment, never
+        // per frame.
+        if shared.tab_colors_broadcast_pending {
+            for w in self.windows.values_mut() {
+                w.recompute_tab_rule_colors(shared);
+                w.sync_layout(shared);
+            }
+            shared.tab_colors_broadcast_pending = false;
+        }
     }
 }
 
@@ -3012,6 +3054,12 @@ fn open_window(
 
     let mut win = WindowState::new(renderer, tree);
     win.px = px;
+    // Populate the rule-color cache before the very first `sync_layout` —
+    // this window's tree can already carry titled tabs (a move/promote's
+    // `WindowOpened` effect, or a carried title restored by core's
+    // `move_surface`), and without this the strip would render them
+    // colorless until some unrelated later trigger ran.
+    win.recompute_tab_rule_colors(shared);
     win.sync_layout(shared);
     win.apply_appearance(shared);
     win.renderer.window().request_redraw();
@@ -4324,6 +4372,13 @@ fn apply_move(
             // index in whichever window had it open, so it can't safely
             // assume its anchor still points at the same tab — close it.
             w.close_swatch();
+            // Tab-color recompute trigger: a move/promote/merge replaces
+            // `w.tree` wholesale above without going through any of
+            // `WindowState`'s own title-mutating methods, so nothing else
+            // would refresh this window's rule-color cache — a rule-colored
+            // tab carried into (or left behind in) this window would
+            // otherwise render colorless until an unrelated later trigger.
+            w.recompute_tab_rule_colors(shared);
             w.sync_layout(shared);
             w.renderer.window().request_redraw();
         }
@@ -5528,11 +5583,11 @@ mod tests {
     use super::{
         BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, SessionId, TabColorChan,
         TabId, bell_flash_intensity, bracket_paste, clamp_to_visible_monitor,
-        clear_captured_commands, compile_rules, compose_tab_color_channel, encode_key,
-        match_tab_title, match_tab_title_across, needs_deferred_replay, next_prev_index,
-        osc_color_of, pane_snap_for, pretype_bytes, queue_close_this, queue_close_window,
-        resolve_index, resolve_restore_cwd, rule_color_for, shell_escape_path, tab_display_title,
-        url_is_openable, window_owning_tab,
+        clear_captured_commands, compile_rules, compose_tab_color_channel, compute_tab_rule_colors,
+        encode_key, match_tab_title, match_tab_title_across, needs_deferred_replay,
+        next_prev_index, osc_color_of, pane_snap_for, pretype_bytes, queue_close_this,
+        queue_close_window, resolve_index, resolve_restore_cwd, rule_color_for, shell_escape_path,
+        tab_display_title, url_is_openable, window_owning_tab,
     };
     use ember_core::TabColorRule;
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
@@ -5810,6 +5865,81 @@ mod tests {
         assert_eq!(compiled.len(), 2);
         assert_eq!(rule_color_for("a", &compiled), Some(0x0011_1111));
         assert_eq!(rule_color_for("c", &compiled), Some(0x0033_3333));
+    }
+
+    // --- compute_tab_rule_colors: the pure core of every recompute trigger -
+
+    /// Builds a minimal `Tab` with just an id and a title — every other
+    /// field is irrelevant to `compute_tab_rule_colors` (it only reads
+    /// `id`/`title`), mirroring `split_replay_that_default_window_size_
+    /// refuses_succeeds_at_the_saved_size`'s "no live `WindowState`/
+    /// `Renderer` needed" pure-seam pattern.
+    fn tab(id: u64, title: &str) -> ember_core::Tab {
+        use ember_core::{LayoutNode, PaneId, SessionId, TabColorChoice, TabId};
+        let pane = PaneId(id);
+        ember_core::Tab {
+            id: TabId(id),
+            title: title.to_string(),
+            root: LayoutNode::pane(pane, SessionId::new(format!("s{id}"))),
+            focus: pane,
+            color: TabColorChoice::Unset,
+        }
+    }
+
+    #[test]
+    fn compute_tab_rule_colors_matches_each_tab_by_its_own_title() {
+        let compiled = compile_rules(&[rule("^ssh ", "#00ff00"), rule("prod", "#ff0000")]);
+        let tabs = [tab(1, "ssh prod-box"), tab(2, "just-prod"), tab(3, "zsh")];
+        let cache = compute_tab_rule_colors(&tabs, &compiled);
+        assert_eq!(cache.len(), 3);
+        // Tab 1 matches BOTH rules; first-in-list wins (rule_color_for's
+        // own contract), not the more "specific"-looking one.
+        assert_eq!(cache[&TabId(1)], Some(0x0000_ff00));
+        assert_eq!(cache[&TabId(2)], Some(0x00ff_0000));
+        assert_eq!(cache[&TabId(3)], None);
+    }
+
+    #[test]
+    fn compute_tab_rule_colors_is_empty_for_an_empty_tab_list() {
+        let compiled = compile_rules(&[rule(".*", "#123456")]);
+        assert!(compute_tab_rule_colors(&[], &compiled).is_empty());
+    }
+
+    #[test]
+    fn compute_tab_rule_colors_none_for_every_tab_with_no_rules_configured() {
+        let tabs = [tab(1, "anything"), tab(2, "")];
+        let cache = compute_tab_rule_colors(&tabs, &[]);
+        assert_eq!(cache[&TabId(1)], None);
+        assert_eq!(cache[&TabId(2)], None);
+    }
+
+    #[test]
+    fn compute_tab_rule_colors_colors_a_fresh_tabs_default_empty_title() {
+        // Issue: a fresh tab (Cmd+T / ctl new-tab) starts titled `""` — a
+        // catch-all rule must still color it immediately, not just once it's
+        // renamed.
+        let compiled = compile_rules(&[rule(".*", "#abcdef")]);
+        let cache = compute_tab_rule_colors(&[tab(1, "")], &compiled);
+        assert_eq!(cache[&TabId(1)], Some(0x00ab_cdef));
+    }
+
+    #[test]
+    fn compute_tab_rule_colors_picks_up_a_tab_carried_in_from_another_window() {
+        // The `apply_move` scenario: a destination window's OWN pre-existing
+        // tabs are joined by one more, carrying its `TabId` (and, per core's
+        // "carried title" rule, possibly a title restored from context)
+        // across from wherever it moved/was promoted from. Recomputing
+        // against the post-move tab list (exactly what `apply_move`'s
+        // touched-window loop and `open_window`'s `WindowOpened` path do)
+        // must produce an entry for that arriving tab too, not just the
+        // tabs this window already had before the move.
+        let compiled = compile_rules(&[rule("prod", "#ff0000")]);
+        let pre_existing = tab(1, "scratch");
+        let carried_in = tab(2, "prod-box"); // arrived via move/promote
+        let cache = compute_tab_rule_colors(&[pre_existing, carried_in], &compiled);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache[&TabId(1)], None);
+        assert_eq!(cache[&TabId(2)], Some(0x00ff_0000));
     }
 
     // --- split-replay acceptance is viewport-size-dependent (Task 8 fix) --

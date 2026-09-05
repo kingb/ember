@@ -862,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn category_order_is_appearance_terminal_session_developer() {
+    fn category_order_is_appearance_terminal_session_tab_colors_developer() {
         let headers: Vec<&str> = setting_rows()
             .iter()
             .filter(|r| r.kind == RowKind::SectionHeader)
