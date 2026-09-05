@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod backend;
+pub mod colorderive;
 pub mod command;
 pub mod config;
 pub mod focus;
@@ -15,17 +16,22 @@ pub mod ids;
 pub mod layout;
 pub mod links;
 pub mod settings;
+pub mod tabcolor;
 pub mod windows;
 
 pub use app::{AppState, ChromeRow, ChromeRowKind, ChromeState, Gate, GateId, GateRegistry};
 pub use backend::{
     BackendControl, BackendEvent, BackendHandle, ClipboardOp, ExitStatus, FrameRx, FrameTx,
-    OscEvent, PassthroughEvent, ScrollAmount, SearchHit, SessionBackend, VtProjection,
-    frame_channel,
+    OscEvent, PassthroughEvent, ScrollAmount, SearchHit, SessionBackend, TabColorChan,
+    VtProjection, frame_channel,
+};
+pub use colorderive::{
+    INK_DARK, INK_LIGHT, blend_toward, contrast_ratio, derive_accent, ink_for, relative_luminance,
 };
 pub use command::{LayoutCommand, LayoutEffect, apply};
 pub use config::{
-    Background, Config, Font, RestoreConfig, RestoreMode, SparksMode, WispStyle, WispStyleSelection,
+    Background, Config, Font, RestoreConfig, RestoreMode, SparksMode, TabColorRule,
+    TabColorsConfig, WispStyle, WispStyleSelection,
 };
 pub use focus::{Direction, focus_dir};
 pub use geom::Rect;
@@ -37,6 +43,7 @@ pub use ids::{PaneId, SessionId, TabId};
 pub use layout::{Axis, LayoutNode, Tab, WindowTree, layout, remove_pane};
 pub use links::{UrlMatch, find_urls};
 pub use settings::{Help, RowKind, SettingRow, SettingsRowView, resolve_rows, setting_rows};
+pub use tabcolor::{SWATCHES, TabColorChoice, effective_color};
 pub use windows::{
     DropZone, MoveEffect, MoveError, SurfaceDest, SurfaceRef, Windows, drop_zone_for, move_surface,
     split_zone_for, window_under,

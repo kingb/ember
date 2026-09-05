@@ -16,7 +16,7 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape as AlacCursorShape, Processor};
 use ember_core::{
     Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, MarkStatus,
-    NeutralCell, OscEvent, ScrollAmount, Style, StyleId, VtProjection,
+    NeutralCell, OscEvent, ScrollAmount, Style, StyleId, TabColorChan, VtProjection,
 };
 
 use crate::osc133::Osc133;
@@ -89,6 +89,8 @@ pub struct AlacrittyProjection<L: EventListener> {
     scan_tail_1337: Vec<u8>,
     /// Same, for OSC 633.
     scan_tail_633: Vec<u8>,
+    /// Same, for OSC 6.
+    scan_tail_6: Vec<u8>,
     /// Live scrollback-search state: the pattern as typed, its compiled DFA,
     /// and the engine-space range of the last match (the origin the next
     /// `search` call continues from). Reset when the pattern changes.
@@ -124,6 +126,7 @@ enum Scanned {
     C133(Osc133),
     C1337(crate::osc1337::Osc1337),
     C633(crate::osc633::Osc633),
+    C6(crate::osc6::Osc6),
 }
 
 impl<L: EventListener> AlacrittyProjection<L> {
@@ -144,23 +147,24 @@ impl<L: EventListener> AlacrittyProjection<L> {
             scan_tail_133: Vec::new(),
             scan_tail_1337: Vec::new(),
             scan_tail_633: Vec::new(),
+            scan_tail_6: Vec::new(),
         }
     }
 
     /// Feed raw PTY bytes through the VT parser into the engine, and pre-scan them
-    /// for OSC 133 + OSC 1337 + OSC 633 shell-integration sequences (alacritty
-    /// ignores all three, so the bytes still flow through unchanged). Returns
-    /// the semantic events found, in order, and records prompt/exit/manual-mark
-    /// state for the gutter.
+    /// for OSC 133 + OSC 1337 + OSC 633 + OSC 6 shell-integration sequences
+    /// (alacritty ignores all four, so the bytes still flow through
+    /// unchanged). Returns the semantic events found, in order, and records
+    /// prompt/exit/manual-mark state for the gutter.
     pub fn advance(&mut self, bytes: &[u8]) -> Vec<OscEvent> {
         let mut events = Vec::new();
         // Scan over (carried tail ++ new bytes): a mark split across the 8 KB
         // read boundary is statistically inevitable in long sessions and used
         // to be lost forever. The tail's bytes were already fed to the engine
         // last read — the carry exists only for the scanner. OSC 133, OSC
-        // 1337, and OSC 633 are scanned independently (each with its own
-        // carry), then merged back into buffer order below — carrying a wrong
-        // shared tail would either re-feed already-consumed bytes or
+        // 1337, OSC 633, and OSC 6 are scanned independently (each with its
+        // own carry), then merged back into buffer order below — carrying a
+        // wrong shared tail would either re-feed already-consumed bytes or
         // duplicate a mark.
         let tail_len_133 = self.scan_tail_133.len();
         let owned_133: Vec<u8>;
@@ -192,16 +196,30 @@ impl<L: EventListener> AlacrittyProjection<L> {
             owned_633 = v;
             &owned_633
         };
+        let tail_len_6 = self.scan_tail_6.len();
+        let owned_6: Vec<u8>;
+        let scan_buf_6: &[u8] = if tail_len_6 == 0 {
+            bytes
+        } else {
+            let mut v = std::mem::take(&mut self.scan_tail_6);
+            v.extend_from_slice(bytes);
+            owned_6 = v;
+            &owned_6
+        };
         let result_133 = crate::osc133::scan_split(scan_buf_133);
         let result_1337 = crate::osc1337::scan_split(scan_buf_1337);
         let result_633 = crate::osc633::scan_split(scan_buf_633);
+        let result_6 = crate::osc6::scan_split(scan_buf_6);
 
         // Both scans' offsets are relative to their OWN scan buffer (which may
         // carry a different-length tail); rebase each to "offset within this
         // read's `bytes`" before merging, so the combined list is in true
         // buffer order regardless of which protocol's tail was longer.
         let mut merged: Vec<(usize, Scanned)> = Vec::with_capacity(
-            result_133.marks.len() + result_1337.marks.len() + result_633.marks.len(),
+            result_133.marks.len()
+                + result_1337.marks.len()
+                + result_633.marks.len()
+                + result_6.marks.len(),
         );
         merged.extend(result_133.marks.into_iter().map(|(past, m)| {
             (
@@ -219,6 +237,12 @@ impl<L: EventListener> AlacrittyProjection<L> {
             (
                 past.saturating_sub(tail_len_633).min(bytes.len()),
                 Scanned::C633(m),
+            )
+        }));
+        merged.extend(result_6.marks.into_iter().map(|(past, m)| {
+            (
+                past.saturating_sub(tail_len_6).min(bytes.len()),
+                Scanned::C6(m),
             )
         }));
         merged.sort_by_key(|(off, _)| *off);
@@ -277,6 +301,17 @@ impl<L: EventListener> AlacrittyProjection<L> {
                 Scanned::C633(crate::osc633::Osc633::CommandLine(cmd)) => {
                     events.push(OscEvent::CommandLine(cmd));
                 }
+                Scanned::C6(crate::osc6::Osc6::Channel(chan, v)) => {
+                    let chan = match chan {
+                        crate::osc6::Chan::Red => TabColorChan::Red,
+                        crate::osc6::Chan::Green => TabColorChan::Green,
+                        crate::osc6::Chan::Blue => TabColorChan::Blue,
+                    };
+                    events.push(OscEvent::TabColorChannel(chan, v));
+                }
+                Scanned::C6(crate::osc6::Osc6::Reset) => {
+                    events.push(OscEvent::TabColorReset);
+                }
             }
         }
         // Feed the remainder.
@@ -294,6 +329,10 @@ impl<L: EventListener> AlacrittyProjection<L> {
         self.scan_tail_633.clear();
         if let Some(inc) = result_633.incomplete {
             self.scan_tail_633.extend_from_slice(&scan_buf_633[inc..]);
+        }
+        self.scan_tail_6.clear();
+        if let Some(inc) = result_6.incomplete {
+            self.scan_tail_6.extend_from_slice(&scan_buf_6[inc..]);
         }
         events
     }
@@ -854,6 +893,34 @@ mod tests {
         assert!(
             matches!(events.as_slice(), [OscEvent::CommandLine(c)] if c == "gt crew at skippy")
         );
+    }
+
+    #[test]
+    fn advance_orders_tab_color_with_other_marks() {
+        let mut p = proj();
+        let ev = p.advance(b"\x1b]133;A\x07\x1b]6;1;bg;red;brightness;7\x07");
+        assert!(matches!(
+            ev.as_slice(),
+            [
+                OscEvent::PromptStart,
+                OscEvent::TabColorChannel(TabColorChan::Red, 7)
+            ]
+        ));
+    }
+
+    #[test]
+    fn tab_color_split_across_advances() {
+        let mut p = proj();
+        assert!(
+            p.advance(b"\x1b]6;1;bg;bl")
+                .iter()
+                .all(|e| !matches!(e, OscEvent::TabColorChannel(..) | OscEvent::TabColorReset))
+        );
+        let events = p.advance(b"ue;brightness;9\x07");
+        assert!(matches!(
+            events.as_slice(),
+            [OscEvent::TabColorChannel(TabColorChan::Blue, 9)]
+        ));
     }
 
     #[test]

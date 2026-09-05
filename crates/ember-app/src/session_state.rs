@@ -44,6 +44,16 @@ pub struct TabSnap {
     pub name: String,
     pub named_by_user: bool,
     pub splits: NodeSnap,
+    /// The user's own color pick for this tab (design: tab-colors), carried
+    /// across restart/restore so a hand-picked color persists. Deliberately
+    /// the ONLY color layer that rides the snapshot: OSC 6 is per-session
+    /// app-side state a restored shell re-announces on its own, and regex
+    /// rule colors are recomputed from the restored title against the
+    /// current config — neither belongs on disk. `#[serde(default)]` so a
+    /// pre-tab-colors snapshot with no `color` key loads as `Unset`, same
+    /// convention as `ember_core::layout::Tab::color`.
+    #[serde(default)]
+    pub color: ember_core::tabcolor::TabColorChoice,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -239,6 +249,7 @@ pub fn assemble(
                     name: tab.title.clone(),
                     named_by_user: named_by_user.get(i).copied().unwrap_or(false),
                     splits: assemble_node(&tab.root, meta),
+                    color: tab.color,
                 })
                 .collect(),
         })
@@ -1041,6 +1052,7 @@ mod tests {
         use ember_core::{
             ids::{PaneId, SessionId, TabId},
             layout::{Axis, LayoutNode, Tab, WindowTree},
+            tabcolor::TabColorChoice,
         };
         let tree = WindowTree {
             active: 0,
@@ -1054,6 +1066,7 @@ mod tests {
                     LayoutNode::pane(PaneId(1), SessionId::new("s1")),
                     LayoutNode::pane(PaneId(2), SessionId::new("s2")),
                 ),
+                color: TabColorChoice::Unset,
             }],
         };
         let snap = assemble(
@@ -1080,9 +1093,66 @@ mod tests {
     }
 
     #[test]
+    fn assemble_carries_the_tabs_user_color_choice() {
+        use ember_core::ids::{PaneId, SessionId, TabId};
+        use ember_core::layout::{LayoutNode, Tab, WindowTree};
+        use ember_core::tabcolor::TabColorChoice;
+        let tree = WindowTree {
+            active: 0,
+            tabs: vec![Tab {
+                id: TabId(1),
+                title: "colored".into(),
+                focus: PaneId(1),
+                root: LayoutNode::pane(PaneId(1), SessionId::new("s1")),
+                color: TabColorChoice::Color(0x112233),
+            }],
+        };
+        let snap = assemble(&[(None, (800, 600), &tree, &[false])], &|_: &SessionId| {
+            PaneSnap {
+                cwd: None,
+                last_cmd: None,
+                was_running: false,
+            }
+        });
+        assert_eq!(
+            snap.windows[0].tabs[0].color,
+            TabColorChoice::Color(0x112233)
+        );
+    }
+
+    #[test]
+    fn tabsnap_round_trips_a_color_through_json() {
+        use ember_core::tabcolor::TabColorChoice;
+        let snap = TabSnap {
+            name: "t".into(),
+            named_by_user: false,
+            splits: NodeSnap::Pane(pane("/tmp")),
+            color: TabColorChoice::Color(0x112233),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: TabSnap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn tabsnap_missing_color_field_deserializes_as_unset() {
+        // Old on-disk snapshots (pre-tab-colors) have no "color" key at all —
+        // `#[serde(default)]` must fill it with Unset rather than fail to load.
+        use ember_core::tabcolor::TabColorChoice;
+        let json = serde_json::json!({
+            "name": "old",
+            "named_by_user": false,
+            "splits": { "Pane": { "cwd": null, "last_cmd": null, "was_running": false } },
+        });
+        let snap: TabSnap = serde_json::from_value(json).unwrap();
+        assert_eq!(snap.color, TabColorChoice::Unset);
+    }
+
+    #[test]
     fn assemble_caps_last_cmd_at_1024_on_a_char_boundary() {
         use ember_core::ids::{PaneId, SessionId, TabId};
         use ember_core::layout::{LayoutNode, Tab, WindowTree};
+        use ember_core::tabcolor::TabColorChoice;
         // A multi-byte char (3 bytes each) straddling the 1024 cutoff so a
         // byte-oblivious truncation would split it.
         let long: String = "€".repeat(400); // 1200 bytes
@@ -1093,6 +1163,7 @@ mod tests {
                 title: String::new(),
                 focus: PaneId(1),
                 root: LayoutNode::pane(PaneId(1), SessionId::new("s1")),
+                color: TabColorChoice::Unset,
             }],
         };
         let snap = assemble(&[(None, (100, 100), &tree, &[false])], &|_sid| PaneSnap {
@@ -1137,6 +1208,7 @@ mod tests {
                             was_running: false,
                         })),
                     },
+                    color: ember_core::tabcolor::TabColorChoice::Unset,
                 }],
             }],
         }
@@ -1187,6 +1259,7 @@ mod tests {
     fn subsequent_assemble_carries_no_commands_once_capture_is_off() {
         use ember_core::ids::{PaneId, SessionId, TabId};
         use ember_core::layout::{LayoutNode, Tab, WindowTree};
+        use ember_core::tabcolor::TabColorChoice;
 
         let p = tmp("strip-then-reassemble");
         write_atomic(&p, &snap_with_commands()).unwrap();
@@ -1200,6 +1273,7 @@ mod tests {
                 title: String::new(),
                 focus: PaneId(1),
                 root: LayoutNode::pane(PaneId(1), sid.clone()),
+                color: TabColorChoice::Unset,
             }],
         };
 
@@ -1213,6 +1287,7 @@ mod tests {
                 cwd: Some("/a".to_string()),
                 last_cmd: Some("echo left".to_string()),
                 was_running: true,
+                last_exit: None,
             },
         );
 

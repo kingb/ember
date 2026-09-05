@@ -94,6 +94,20 @@ pub enum OscEvent {
     CurrentDir(String),
     RemoteHost(String),
     SetMark,
+    /// OSC 6 (iTerm2 tab color) — one RGB channel of the tab's background
+    /// color. Reports accumulate per session; app state holds the composed
+    /// color (design: OSC tab color is per-session app state, not persisted).
+    TabColorChannel(TabColorChan, u8),
+    /// OSC 6 reset (`1;bg;*;default`) — the shell cleared its tab color.
+    TabColorReset,
+}
+
+/// Which channel a [`OscEvent::TabColorChannel`] report sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabColorChan {
+    Red,
+    Green,
+    Blue,
 }
 
 /// Clipboard request from the session (OSC 52). The *policy* lives in

@@ -51,6 +51,9 @@ pub struct Config {
     /// launch, whether restoring asks first, and whether shell commands are
     /// captured for the restore pre-type. See [`RestoreConfig`].
     pub restore: RestoreConfig,
+    /// Tab-color regex rules + the OSC-override knob (design doc
+    /// `2026-09-04-tab-colors`). See [`TabColorsConfig`].
+    pub tab_colors: TabColorsConfig,
 }
 
 impl Default for Config {
@@ -66,8 +69,49 @@ impl Default for Config {
             osc52_read: false,
             wisp_style: WispStyleSelection::Cinder,
             restore: RestoreConfig::default(),
+            tab_colors: TabColorsConfig::default(),
         }
     }
+}
+
+/// Tab-color regex rules + the OSC-override knob (design doc
+/// `2026-09-04-tab-colors`): the fourth precedence layer `ember_core::
+/// effective_color` resolves (manual pick > OSC 6 > regex rule > none), plus
+/// the knob that swaps the top two layers. `#[serde(default)]` so a
+/// `config.toml` predating this feature (no `[tab_colors]` table at all)
+/// still loads, picking up no rules and the knob off (manual wins).
+///
+/// Rule editing is config.toml-only in v1 — the Settings overlay's "Tab
+/// color rules (N)" row is read-only, see `settings::resolve_rows`'s doc.
+/// A rule's `pattern`/`color` aren't validated here (`regex` isn't an
+/// ember-core dependency); an invalid one is skipped, never rejected, when
+/// `ember-app` compiles it (`compile_rules`) — see [`TabColorRule`]'s doc.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TabColorsConfig {
+    /// Swap `effective_color`'s top two layers so a shell's OSC 6 report
+    /// beats a manually picked color (a `TabColorChoice::PinnedDefault`
+    /// still blocks it — see `tabcolor::effective_color`'s doc). Off by
+    /// default: a manual pick always wins.
+    pub osc6_overrides_manual: bool,
+    /// Regex-to-color rules, first match wins against a tab's title. Empty
+    /// by default (no rules configured).
+    pub rules: Vec<TabColorRule>,
+}
+
+/// One regex-to-color tab-title rule (design doc `2026-09-04-tab-colors`).
+/// `pattern` is a regex matched against a tab's title; `color` is a
+/// `#rrggbb` hex string. Both are plain, unvalidated strings here —
+/// compiling a rule (parsing the regex and the color) is `ember-app`'s job
+/// (`compile_rules`, since `regex` isn't an ember-core dependency), and an
+/// invalid `pattern` or `color` is skipped there rather than rejected at
+/// config-load time: one bad rule must never fail the whole config load or
+/// drop every other rule.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TabColorRule {
+    pub pattern: String,
+    pub color: String,
 }
 
 /// Session-restore mode: whether Ember snapshots window/tab/pane state for
@@ -508,6 +552,51 @@ mod tests {
         let c: Config = toml::from_str("[restore]\nmode = \"off\"\n").unwrap();
         assert_eq!(c.restore.mode, RestoreMode::Off);
         assert!(c.restore.capture_commands);
+    }
+
+    // --- tab_colors config: defaults, roundtrip, backcompat -----------------
+
+    #[test]
+    fn tab_colors_missing_defaults_to_off_and_no_rules() {
+        let c: Config = toml::from_str("").unwrap();
+        assert!(!c.tab_colors.osc6_overrides_manual);
+        assert!(c.tab_colors.rules.is_empty());
+    }
+
+    #[test]
+    fn tab_colors_config_without_tab_colors_table_loads_unchanged() {
+        // A config.toml predating this feature (no `[tab_colors]` table at
+        // all, only unrelated sections) must still load successfully with
+        // the tab_colors defaults.
+        let c: Config = toml::from_str("[background]\nsparks = \"always\"\n").unwrap();
+        assert_eq!(c.tab_colors, TabColorsConfig::default());
+    }
+
+    #[test]
+    fn tab_colors_roundtrips_with_rules() {
+        let mut c = Config::default();
+        c.tab_colors.osc6_overrides_manual = true;
+        c.tab_colors.rules = vec![
+            TabColorRule {
+                pattern: "^ssh ".to_string(),
+                color: "#ff0000".to_string(),
+            },
+            TabColorRule {
+                pattern: "prod".to_string(),
+                color: "#00ff00".to_string(),
+            },
+        ];
+        let s = toml::to_string(&c).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn tab_colors_partial_table_fills_rules_from_default() {
+        // Only the knob set; `rules` must still default to empty.
+        let c: Config = toml::from_str("[tab_colors]\nosc6_overrides_manual = true\n").unwrap();
+        assert!(c.tab_colors.osc6_overrides_manual);
+        assert!(c.tab_colors.rules.is_empty());
     }
 
     #[test]

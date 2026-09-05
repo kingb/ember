@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use ember_core::{
     Axis, BackendControl, BackendHandle, LayoutCommand, LayoutNode, PaneId, Rect, SessionBackend,
-    SessionId, Tab, TabId, WindowTree, apply, layout,
+    SessionId, Tab, TabColorChoice, TabId, WindowTree, apply, layout,
 };
 use ember_render::headless::{self, PaneShot, Shot};
 use ember_render::{GridModel, Renderer, TabLabel};
@@ -47,6 +47,18 @@ pub struct Opts {
     /// Draw the restore-on-launch modal's `Older…` screen over the panes,
     /// with a fixture 3-entry archive list.
     pub restore_older: bool,
+    /// Draw the tab-color swatch popover (Task 3) over the panes, anchored
+    /// under tab 0 — which the fixture also puts mid-rename with an already-
+    /// set color, so one shot exercises the chip, the editor swatch, and the
+    /// popover together (`SwatchView { tab: 0, selected: 2 }`).
+    pub swatch_popover: bool,
+    /// Draw an active + an inactive colored tab pill (the redesign, items
+    /// 2/3/4): tab 0 (active) gets `SWATCHES[0]` at full strength, tab 1
+    /// (inactive) gets `SWATCHES[4]` blended toward the strip background —
+    /// so one shot shows the pill-fill redesign, the auto-contrast title
+    /// ink, and (on hover) the derived close-"✕" accent together. Forces at
+    /// least 2 tabs.
+    pub colored_tabs: bool,
     /// Split drop-zone preview on the focused pane: `(horizontal, ratio)`.
     pub split_preview: Option<(bool, f32)>,
     /// How long to let the shells produce output before capturing.
@@ -113,6 +125,8 @@ impl Default for Opts {
             confirm: false,
             restore_main: false,
             restore_older: false,
+            swatch_popover: false,
+            colored_tabs: false,
             split_preview: None,
             settle_ms: 700,
             backdrop: false,
@@ -184,6 +198,8 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--confirm" => opts.confirm = true,
             "--restore-main" => opts.restore_main = true,
             "--restore-older" => opts.restore_older = true,
+            "--swatch-popover" => opts.swatch_popover = true,
+            "--colored-tabs" => opts.colored_tabs = true,
             "--help-overlay" => opts.help_overlay = true,
             "--settings" => opts.settings = true,
             "--tab-drag" => {
@@ -252,7 +268,16 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
         }
         i += 1;
     }
-    opts.tabs = opts.tabs.max(1);
+    opts.tabs = opts.tabs.max(if opts.colored_tabs { 2 } else { 1 });
+    // `--colored-tabs` defaults to also belling the inactive colored tab
+    // (unless the caller asked for a specific `--bell-tab` of their own) —
+    // a colored tab's bell dot silently disappeared under its own pill fill
+    // (review finding: the dot drew as a sharp quad, and sharp quads all
+    // draw before any rounded one, so the pill covered it), so this fixture
+    // exercises the fix by default rather than needing a second flag.
+    if opts.colored_tabs && opts.bell_tab.is_none() {
+        opts.bell_tab = Some(1);
+    }
     Ok(opts)
 }
 
@@ -305,6 +330,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
             title: String::new(),
             root: LayoutNode::pane(p1, s1),
             focus: p1,
+            color: TabColorChoice::Unset,
         }],
         active: 0,
     };
@@ -413,7 +439,23 @@ pub fn run(opts: Opts) -> Result<String, String> {
                 t.title.clone()
             },
             active: i == tree.active,
-            editing: false,
+            // `--swatch-popover` puts tab 0 mid-rename with a color already
+            // set, so this one fixture also exercises the colored pill fill
+            // (drawn from `color` on every tab) and the rename-editor swatch
+            // (drawn only while `editing`), not just the popover itself.
+            editing: opts.swatch_popover && i == 0,
+            color: if opts.swatch_popover && i == 0 {
+                Some(ember_core::SWATCHES[2])
+            } else if opts.colored_tabs && i == 0 {
+                // Active: full-strength fill (the redesign, item 2).
+                Some(ember_core::SWATCHES[0])
+            } else if opts.colored_tabs && i == 1 {
+                // Inactive: same fixture also shows the blend-toward-strip
+                // treatment and a differently-hued tab side by side.
+                Some(ember_core::SWATCHES[4])
+            } else {
+                None
+            },
             bell: opts.bell_tab == Some(i),
         })
         .collect();
@@ -501,6 +543,10 @@ pub fn run(opts: Opts) -> Result<String, String> {
         } else {
             None
         },
+        swatch: opts.swatch_popover.then_some(ember_render::SwatchView {
+            tab: 0,
+            selected: 2,
+        }),
         hold_ring: opts.hold_ring,
         // No offline `--screenshot` flag for these (v0.4.0): both are live
         // cross-window-drag/tear-off previews with no meaningful "just render

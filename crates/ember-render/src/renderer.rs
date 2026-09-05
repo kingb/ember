@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ember_core::{GridDelta, GridDims, Rect, Rgb, SessionId, SettingsRowView};
+use ember_core::{GridDelta, GridDims, Rect, Rgb, SWATCHES, SessionId, SettingsRowView};
 use glyphon::{
     Buffer, Cache, Color, CustomGlyph, Family, FontSystem, Metrics, Resolution, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
@@ -29,11 +29,12 @@ use winit::window::Window;
 use crate::background::{ImageRenderer, SparkRenderer};
 use crate::grid_model::GridModel;
 use crate::paint::{
-    BTN_COLS, CLOSE_COLS, bell_wash, build_about, build_confirm, build_fps, build_help,
-    build_ime_preedit, build_palette, build_restore_list, build_restore_main, build_search_bar,
-    build_settings, build_tabs, debug_emit, grid_quads, hold_ring_quads, measure_cell_width,
-    morph_quads, push_backdrop, scrollbar, scrollbar_geometry, selection_quads, shape_grid,
-    spark_quads, split_preview,
+    BTN_COLS, CLOSE_COLS, SWATCH_COLS, SwatchGeom, bell_wash, build_about, build_confirm,
+    build_fps, build_help, build_ime_preedit, build_palette, build_restore_list,
+    build_restore_main, build_search_bar, build_settings, build_swatch_popover, build_tabs,
+    debug_emit, grid_quads, hold_ring_quads, measure_cell_width, morph_quads, push_backdrop,
+    scrollbar, scrollbar_geometry, selection_quads, shape_grid, spark_quads, split_preview,
+    swatch_geom, tab_area_cols, tab_segment_x,
 };
 use crate::selection::AnchoredSelection;
 
@@ -89,6 +90,11 @@ pub struct TabLabel {
     /// True when this tab has an unseen bell (a background tab belled) — draws a
     /// small amber indicator so the user can see which tab wants attention.
     pub bell: bool,
+    /// This tab's resolved color (Task 3), already run through
+    /// `ember_core::effective_color`'s full precedence ladder (manual pin >
+    /// OSC 6 > rule > unset) — `None` draws no chip at all. The renderer
+    /// never re-derives this itself; it only ever paints what it's handed.
+    pub color: Option<u32>,
 }
 
 /// A blocking confirm modal: a title, a one-line message, and two buttons.
@@ -122,6 +128,24 @@ pub enum RestoreView {
         rows: Vec<String>,
         selected: usize,
     },
+}
+
+/// The tab-color swatch popover (Task 3): a small, non-modal panel anchored
+/// under the tab it edits, offering the 12 curated `SWATCHES` plus `Default`
+/// (pins `ember_core::TabColorChoice::PinnedDefault`) and `Clear` (resets to
+/// `ember_core::TabColorChoice::Unset`) — selection order `0..12`, `12`,
+/// `13`. Opened from a click on the rename-editor's swatch or `ArrowDown`
+/// while renaming; navigated by arrows, applied by Enter, dismissed by Esc
+/// (see `WindowState::swatch_key`). `WindowState` rebuilds this on every
+/// change, same "render-ready, no `session_state` reach-in" contract as
+/// `RestoreView`.
+#[derive(Clone, Copy, Debug)]
+pub struct SwatchView {
+    /// Which tab (index into the strip) this popover is anchored under.
+    pub tab: usize,
+    /// Highlighted item: `0..12` = a `SWATCHES` cell, `12` = `Default`, `13`
+    /// = `Clear`.
+    pub selected: usize,
 }
 
 /// Static content for the About overlay (the animated glow is separate).
@@ -213,12 +237,63 @@ pub enum TabHit {
     Tab(usize),
     /// The "✕" close zone of the hovered tab at this index (left edge).
     CloseTab(usize),
+    /// The rename-editor swatch (right edge) of the tab currently being
+    /// edited at this index — clicking it opens the tab-color popover.
+    Swatch(usize),
     /// The trailing "+" button (open a new tab).
     NewTab,
     /// The trailing "?" button (toggle the shortcuts overlay).
     Help,
     /// The trailing "⚙" button (toggle the Settings overlay).
     Settings,
+}
+
+/// What a click inside the OPEN swatch popover (Task 3/4) resolves to — see
+/// [`Renderer::swatch_hit`]. Exhaustive on purpose, same reasoning as
+/// [`TabHit`]: matched only in the app, so an unhandled new region is a
+/// compile error there, not a silent no-op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwatchPopoverHit {
+    /// One of the 12 curated `SWATCHES`, by index.
+    Swatch(usize),
+    /// The `Default` row — pins `ember_core::TabColorChoice::PinnedDefault`.
+    Default,
+    /// The `Clear` row — resets to `ember_core::TabColorChoice::Unset`.
+    Clear,
+    /// Inside the panel but not over an interactive region (padding/gaps) —
+    /// the click is swallowed, not routed anywhere.
+    Blank,
+}
+
+/// Classify a click at logical `(x, y)` against the swatch popover panel
+/// described by `geom` — a curated swatch cell, the `Default`/`Clear` row,
+/// `Blank` (inside the panel but not on a live region), or `None` (missed
+/// the panel entirely). Pure geometry, mirroring [`tab_col_hit`]'s own
+/// "separately unit-testable classifier" shape; `geom` is the SAME
+/// [`SwatchGeom`] [`build_swatch_popover`] draws from (via
+/// [`crate::paint::swatch_geom`]), so this can never drift from what's on
+/// screen — the fix for this repo's known "two copies of the same layout
+/// math disagree" bug class.
+fn swatch_popover_hit(geom: &SwatchGeom, x: f32, y: f32) -> Option<SwatchPopoverHit> {
+    if x < geom.x || x >= geom.x + geom.w || y < geom.y || y >= geom.y + geom.h {
+        return None;
+    }
+    for i in 0..SWATCHES.len() {
+        let col = i % geom.cols;
+        let row = i / geom.cols;
+        let cx = geom.grid_x + col as f32 * (geom.cell + geom.gap);
+        let cy = geom.grid_y + row as f32 * (geom.cell + geom.gap);
+        if x >= cx && x < cx + geom.cell && y >= cy && y < cy + geom.cell {
+            return Some(SwatchPopoverHit::Swatch(i));
+        }
+    }
+    if y >= geom.list_y && y < geom.list_y + geom.row_h {
+        return Some(SwatchPopoverHit::Default);
+    }
+    if y >= geom.list_y + geom.row_h && y < geom.list_y + geom.row_h * 2.0 {
+        return Some(SwatchPopoverHit::Clear);
+    }
+    Some(SwatchPopoverHit::Blank)
 }
 
 /// Which strip slot a live-drag hover falls over (finding #2/#3's
@@ -236,9 +311,19 @@ pub enum StripSlot {
 }
 
 /// Resolve a tab-area column to a hit, mirroring the equal-width slot math in
-/// [`build_tabs`]. `hovered` gates the left `CLOSE_COLS` "✕" close zone (only the
-/// hovered tab exposes it). Pure so the geometry is unit-testable without a GPU.
-fn tab_col_hit(n: usize, tab_cols: usize, hovered: Option<usize>, col: usize) -> Option<TabHit> {
+/// [`build_tabs`]. `hovered` gates the left `CLOSE_COLS` "✕" close zone (only
+/// the hovered tab exposes it, and NOT while that same tab is `editing` —
+/// `build_tabs` never draws the close "✕" during a rename either); `editing`
+/// (Task 3) gates the right `SWATCH_COLS` swatch zone the same way, for
+/// whichever tab is being renamed. Pure so the geometry is unit-testable
+/// without a GPU.
+fn tab_col_hit(
+    n: usize,
+    tab_cols: usize,
+    hovered: Option<usize>,
+    editing: Option<usize>,
+    col: usize,
+) -> Option<TabHit> {
     if n == 0 {
         return None;
     }
@@ -247,7 +332,14 @@ fn tab_col_hit(n: usize, tab_cols: usize, hovered: Option<usize>, col: usize) ->
     for i in 0..n {
         let width = if i == n - 1 { tab_cols - acc } else { seg };
         if col >= acc && col < acc + width {
-            if hovered == Some(i) && width > CLOSE_COLS && col - acc < CLOSE_COLS {
+            if editing == Some(i) && width > SWATCH_COLS && col >= acc + width - SWATCH_COLS {
+                return Some(TabHit::Swatch(i));
+            }
+            if hovered == Some(i)
+                && editing != Some(i)
+                && width > CLOSE_COLS
+                && col - acc < CLOSE_COLS
+            {
                 return Some(TabHit::CloseTab(i));
             }
             return Some(TabHit::Tab(i));
@@ -606,6 +698,13 @@ pub struct Renderer {
     /// Older… screen's single multi-line buffer (header + up to 10 rows),
     /// same one-buffer-per-panel shape as the command palette.
     restore_list: Buffer,
+    /// When `Some`, the tab-color swatch popover (Task 3) is shown, anchored
+    /// under the named tab.
+    swatch: Option<SwatchView>,
+    /// The popover's hint line ("↓ open · arrows move · Enter pick · Esc close").
+    swatch_hint: Buffer,
+    /// The popover's two-line "Default\nClear" label block.
+    swatch_label: Buffer,
     /// Measured monospace advance (px) — keeps bg quads aligned with glyphs.
     cell_w: f32,
     /// Current terminal font point size (mutated by live zoom).
@@ -777,6 +876,8 @@ impl Renderer {
             Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT)),
         ];
         let restore_list = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let swatch_hint = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let swatch_label = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let fps_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let search_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let palette_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
@@ -842,6 +943,9 @@ impl Renderer {
             restore_header,
             restore_buttons,
             restore_list,
+            swatch: None,
+            swatch_hint,
+            swatch_label,
             cell_w,
             font_size,
             line_height,
@@ -1041,6 +1145,7 @@ impl Renderer {
             font_family: self.family_name.clone(),
             confirm: self.confirm.clone(),
             restore: self.restore.clone(),
+            swatch: self.swatch,
             hold_ring: self.hold_ring,
             ghost_tab: self
                 .ghost_tab
@@ -1324,7 +1429,25 @@ impl Renderer {
         if col >= tab_cols {
             return Some(TabHit::NewTab);
         }
-        tab_col_hit(self.tabs.len(), tab_cols, self.hovered_tab, col)
+        let editing = self.tabs.iter().position(|t| t.editing);
+        tab_col_hit(self.tabs.len(), tab_cols, self.hovered_tab, editing, col)
+    }
+
+    /// Hit-test a click at logical `(x, y)` against the OPEN swatch popover
+    /// (Task 3/4): `None` when the popover is closed or the click missed the
+    /// panel. Geometry comes from [`crate::paint::swatch_geom`] — the SAME
+    /// helper [`build_swatch_popover`] draws from — so this can never drift
+    /// from what's actually on screen.
+    pub fn swatch_hit(&self, x: f32, y: f32) -> Option<SwatchPopoverHit> {
+        let view = self.swatch?;
+        let sf = self.window.scale_factor() as f32;
+        let lw = self.config.width as f32 / sf;
+        let cw = self.cell_w;
+        let strip_h = CELL_HEIGHT + 2.0 * PAD;
+        let tab_cols = tab_area_cols(lw, cw);
+        let (anchor_x, anchor_w) = tab_segment_x(self.tabs.len(), tab_cols, cw, view.tab);
+        let geom = swatch_geom(anchor_x, anchor_w, strip_h, cw, lw);
+        swatch_popover_hit(&geom, x, y)
     }
 
     /// Which tab slot logical-x falls over, clamped to a valid tab index — used
@@ -1425,6 +1548,17 @@ impl Renderer {
 
     pub fn restore_shown(&self) -> bool {
         self.restore.is_some()
+    }
+
+    /// Show/hide the tab-color swatch popover (Task 3).
+    pub fn set_swatch(&mut self, view: Option<SwatchView>) {
+        self.scene_dirty = true;
+        self.swatch = view;
+        self.window.request_redraw();
+    }
+
+    pub fn swatch_shown(&self) -> bool {
+        self.swatch.is_some()
     }
 
     pub fn set_about(&mut self, info: Option<AboutInfo>) {
@@ -1909,7 +2043,7 @@ impl Renderer {
                     .ghost_tab
                     .as_ref()
                     .map(|(label, since)| (label.as_str(), since.elapsed().as_secs_f32()));
-                let close_cx = build_tabs(
+                let close_glyph = build_tabs(
                     &mut self.font_system,
                     &mut self.chrome,
                     &mut self.close_buffer,
@@ -1969,15 +2103,16 @@ impl Renderer {
                 });
                 // The hovered tab's "✕", pixel-centered in the pill's left cap. `cw/2`
                 // recenters the 1-cell glyph on the cap center; `top: PAD` matches the
-                // chrome baseline (already vertically centered in the strip).
-                if let Some(cx) = close_cx {
+                // chrome baseline (already vertically centered in the strip). Its color
+                // (Task 4) is whatever `build_tabs` derived from that tab's own fill.
+                if let Some(glyph) = &close_glyph {
                     areas.push(TextArea {
                         buffer: &self.close_buffer,
-                        left: (cx - cw * 0.5) * sf,
+                        left: (glyph.cx - cw * 0.5) * sf,
                         top: PAD * sf,
                         scale: sf,
                         bounds: full_bounds,
-                        default_color: Color::rgb(0xcc, 0xcc, 0xcc),
+                        default_color: Color::rgb(glyph.color.r, glyph.color.g, glyph.color.b),
                         custom_glyphs: &[],
                     });
                 }
@@ -2215,6 +2350,50 @@ impl Renderer {
                         });
                     }
                 }
+            }
+
+            // Tab-color swatch popover (Task 3) — non-modal, so unlike the
+            // confirm/restore overlays above it draws unconditionally
+            // alongside them rather than being mutually exclusive; in
+            // practice it only ever opens from the rename editor, which
+            // already blocks the other blocking modals from being open too.
+            if let Some(view) = self.swatch {
+                let lw = self.config.width as f32 / sf;
+                let cw = self.cell_w;
+                let strip_h = CELL_HEIGHT + 2.0 * PAD;
+                let tab_cols = tab_area_cols(lw, cw);
+                let (anchor_x, anchor_w) = tab_segment_x(self.tabs.len(), tab_cols, cw, view.tab);
+                let sl = build_swatch_popover(
+                    &mut self.font_system,
+                    &mut self.swatch_hint,
+                    &mut self.swatch_label,
+                    anchor_x,
+                    anchor_w,
+                    strip_h,
+                    view.selected,
+                    cw,
+                    lw,
+                    sf,
+                    &mut rounded,
+                );
+                overlay_areas.push(TextArea {
+                    buffer: &self.swatch_hint,
+                    left: sl.hint_origin.0 * sf,
+                    top: sl.hint_origin.1 * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(0x88, 0x88, 0x88),
+                    custom_glyphs: &[],
+                });
+                overlay_areas.push(TextArea {
+                    buffer: &self.swatch_label,
+                    left: sl.label_origin.0 * sf,
+                    top: sl.label_origin.1 * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(0xf0, 0xf0, 0xf0),
+                    custom_glyphs: &[],
+                });
             }
 
             self.quads.prepare(
@@ -2459,32 +2638,89 @@ mod tests {
         // A single-tab strip used to render (and hit-test) nothing, which
         // made "grab this window's tab" impossible once tabs became
         // draggable. The lone tab now owns the whole tab area.
-        assert_eq!(tab_col_hit(1, COLS, None, 5), Some(TabHit::Tab(0)));
-        assert_eq!(tab_col_hit(0, COLS, None, 5), None);
+        assert_eq!(tab_col_hit(1, COLS, None, None, 5), Some(TabHit::Tab(0)));
+        assert_eq!(tab_col_hit(0, COLS, None, None, 5), None);
     }
 
     #[test]
     fn plain_column_selects_its_tab() {
-        assert_eq!(tab_col_hit(N, COLS, None, 5), Some(TabHit::Tab(0)));
-        assert_eq!(tab_col_hit(N, COLS, None, 15), Some(TabHit::Tab(1)));
-        assert_eq!(tab_col_hit(N, COLS, None, 25), Some(TabHit::Tab(2)));
+        assert_eq!(tab_col_hit(N, COLS, None, None, 5), Some(TabHit::Tab(0)));
+        assert_eq!(tab_col_hit(N, COLS, None, None, 15), Some(TabHit::Tab(1)));
+        assert_eq!(tab_col_hit(N, COLS, None, None, 25), Some(TabHit::Tab(2)));
     }
 
     #[test]
     fn hovered_tab_left_zone_is_a_close() {
         // Hovering tab 1 (cols 10-19): its first CLOSE_COLS (10,11) close it...
-        assert_eq!(tab_col_hit(N, COLS, Some(1), 10), Some(TabHit::CloseTab(1)));
-        assert_eq!(tab_col_hit(N, COLS, Some(1), 11), Some(TabHit::CloseTab(1)));
+        assert_eq!(
+            tab_col_hit(N, COLS, Some(1), None, 10),
+            Some(TabHit::CloseTab(1))
+        );
+        assert_eq!(
+            tab_col_hit(N, COLS, Some(1), None, 11),
+            Some(TabHit::CloseTab(1))
+        );
         // ...but the rest of the tab still selects.
-        assert_eq!(tab_col_hit(N, COLS, Some(1), 12), Some(TabHit::Tab(1)));
+        assert_eq!(
+            tab_col_hit(N, COLS, Some(1), None, 12),
+            Some(TabHit::Tab(1))
+        );
     }
 
     #[test]
     fn close_zone_only_on_the_hovered_tab() {
         // Tab 0's left columns are NOT a close zone when tab 1 is the hovered one.
-        assert_eq!(tab_col_hit(N, COLS, Some(1), 0), Some(TabHit::Tab(0)));
+        assert_eq!(tab_col_hit(N, COLS, Some(1), None, 0), Some(TabHit::Tab(0)));
         // No hover at all → never a close.
-        assert_eq!(tab_col_hit(N, COLS, None, 10), Some(TabHit::Tab(1)));
+        assert_eq!(tab_col_hit(N, COLS, None, None, 10), Some(TabHit::Tab(1)));
+    }
+
+    #[test]
+    fn editing_tab_right_zone_is_a_swatch() {
+        // Editing tab 1 (cols 10-19): its last SWATCH_COLS (18,19) open the
+        // color popover...
+        assert_eq!(
+            tab_col_hit(N, COLS, None, Some(1), 18),
+            Some(TabHit::Swatch(1))
+        );
+        assert_eq!(
+            tab_col_hit(N, COLS, None, Some(1), 19),
+            Some(TabHit::Swatch(1))
+        );
+        // ...but the rest of the tab is still just the tab (no close zone
+        // while editing).
+        assert_eq!(
+            tab_col_hit(N, COLS, None, Some(1), 10),
+            Some(TabHit::Tab(1))
+        );
+    }
+
+    #[test]
+    fn swatch_zone_only_on_the_editing_tab() {
+        assert_eq!(tab_col_hit(N, COLS, None, Some(1), 8), Some(TabHit::Tab(0)));
+        assert_eq!(tab_col_hit(N, COLS, None, None, 18), Some(TabHit::Tab(1)));
+    }
+
+    #[test]
+    fn close_zone_is_suppressed_while_editing_that_tab() {
+        // Tab 1 both hovered AND being renamed: `build_tabs` never draws the
+        // hover "✕" there (suppressed while editing), so the hit-test must
+        // not manufacture a close either — its left columns fall through to
+        // a plain tab hit instead of `CloseTab`.
+        assert_eq!(
+            tab_col_hit(N, COLS, Some(1), Some(1), 10),
+            Some(TabHit::Tab(1))
+        );
+        assert_eq!(
+            tab_col_hit(N, COLS, Some(1), Some(1), 11),
+            Some(TabHit::Tab(1))
+        );
+        // The right-edge swatch zone still fires — hovering doesn't
+        // suppress it, only editing gates it (and this tab IS editing).
+        assert_eq!(
+            tab_col_hit(N, COLS, Some(1), Some(1), 18),
+            Some(TabHit::Swatch(1))
+        );
     }
 
     // --- tab_or_ghost_col_hit: strip slots for a live drag hover ---
@@ -2544,6 +2780,84 @@ mod tests {
         assert_eq!(
             tab_or_ghost_col_hit(1, true, COLS, 15),
             Some(StripSlot::Ghost)
+        );
+    }
+
+    // --- swatch_popover_hit: mouse hit-testing inside the open popover ----
+
+    use super::{SwatchGeom, SwatchPopoverHit, swatch_popover_hit};
+
+    /// A representative popover geometry — same shape `swatch_geom` would
+    /// produce, but with round numbers so the test math stays readable.
+    fn geom() -> SwatchGeom {
+        // 12 swatches over 4 cols = 3 rows; grid_h = 3*20 + 2*6 = 72, so the
+        // grid spans y in [70, 142) — `list_y` sits below that with room to
+        // spare, exactly like the real `swatch_geom`'s own `grid_h + 8.0` gap.
+        SwatchGeom {
+            x: 100.0,
+            y: 50.0,
+            w: 200.0,
+            h: 210.0,
+            grid_x: 110.0,
+            grid_y: 70.0,
+            cell: 20.0,
+            gap: 6.0,
+            cols: 4,
+            list_y: 150.0,
+            row_h: 15.0,
+            pad: 10.0,
+            hint_h: 19.0,
+        }
+    }
+
+    #[test]
+    fn click_outside_the_panel_misses_entirely() {
+        let g = geom();
+        assert_eq!(swatch_popover_hit(&g, 0.0, 0.0), None);
+        assert_eq!(swatch_popover_hit(&g, g.x - 1.0, g.y + 5.0), None);
+        assert_eq!(swatch_popover_hit(&g, g.x + g.w + 1.0, g.y + 5.0), None);
+        assert_eq!(swatch_popover_hit(&g, g.x + 5.0, g.y - 1.0), None);
+        assert_eq!(swatch_popover_hit(&g, g.x + 5.0, g.y + g.h), None);
+    }
+
+    #[test]
+    fn click_on_a_swatch_cell_picks_its_index() {
+        let g = geom();
+        // Cell 0 top-left corner at (grid_x, grid_y).
+        assert_eq!(
+            swatch_popover_hit(&g, g.grid_x + 2.0, g.grid_y + 2.0),
+            Some(SwatchPopoverHit::Swatch(0))
+        );
+        // Cell 5: row 1 (5 / 4 = 1), col 1 (5 % 4 = 1).
+        let cx = g.grid_x + 1.0 * (g.cell + g.gap) + 2.0;
+        let cy = g.grid_y + 1.0 * (g.cell + g.gap) + 2.0;
+        assert_eq!(
+            swatch_popover_hit(&g, cx, cy),
+            Some(SwatchPopoverHit::Swatch(5))
+        );
+    }
+
+    #[test]
+    fn click_between_cells_is_blank_not_a_swatch() {
+        let g = geom();
+        // The gap between cell 0 and cell 1, still inside the panel.
+        let gap_x = g.grid_x + g.cell + g.gap * 0.5;
+        assert_eq!(
+            swatch_popover_hit(&g, gap_x, g.grid_y + 2.0),
+            Some(SwatchPopoverHit::Blank)
+        );
+    }
+
+    #[test]
+    fn click_on_default_and_clear_rows() {
+        let g = geom();
+        assert_eq!(
+            swatch_popover_hit(&g, g.x + 20.0, g.list_y + 1.0),
+            Some(SwatchPopoverHit::Default)
+        );
+        assert_eq!(
+            swatch_popover_hit(&g, g.x + 20.0, g.list_y + g.row_h + 1.0),
+            Some(SwatchPopoverHit::Clear)
         );
     }
 

@@ -22,7 +22,8 @@ pub use grid_model::{GridModel, LinkSource, LinkSpan};
 pub use headless::CaptureError;
 pub use renderer::{
     AboutInfo, BackdropParams, CELL_HEIGHT, CELL_WIDTH, ConfirmView, ImageFit, PaneModes,
-    PaneSnapshot, RenderOutcome, Renderer, RestoreView, StripSlot, TabHit, TabLabel, VisiblePane,
+    PaneSnapshot, RenderOutcome, Renderer, RestoreView, StripSlot, SwatchPopoverHit, SwatchView,
+    TabHit, TabLabel, VisiblePane,
 };
 pub use selection::{AbsPoint, AnchoredSelection, Point, Selection, SelectionMode};
 pub use wisp::{WispRenderer, WispUnsupported};

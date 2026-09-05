@@ -61,6 +61,14 @@ pub enum ControlMsg {
     /// 1-based) or a not-found error that lists every window's titles seen,
     /// flattened in search order.
     Focus(String, Sender<String>),
+    /// Set a tab's color (Task 3): `(query, token)`, resolved by the same
+    /// cross-window title search as `Focus` (window order, then tab order),
+    /// applied via `WindowState::apply_tab_color` once `token` parses
+    /// (`#rrggbb` | `default` | `clear` | `swatch-N`). Reply is the full
+    /// JSON response line: `{"ok":true,"index":..,"title":..,"window":..}`
+    /// (matching `Focus`'s shape) or an error naming the bad token or the
+    /// same not-found shape as `Focus` when the query matches nothing.
+    SetTabColor(String, String, Sender<String>),
     /// Bring the window to the front and give it keyboard focus.
     Raise,
     /// Capture the live window to a PNG at the given path; reply is the full
@@ -388,6 +396,30 @@ mod unix {
                 match reply_rx.recv_timeout(Duration::from_secs(2)) {
                     Ok(resp) => resp, // main builds the full JSON response.
                     Err(_) => err("focus timeout"),
+                }
+            }
+            "set-tab-color" => {
+                let Some(query) = v.get("query").and_then(Value::as_str) else {
+                    return err("set-tab-color needs a query");
+                };
+                let Some(token) = v.get("token").and_then(Value::as_str) else {
+                    return err("set-tab-color needs a color token");
+                };
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if tx
+                    .send(ControlMsg::SetTabColor(
+                        query.to_string(),
+                        token.to_string(),
+                        reply_tx,
+                    ))
+                    .is_err()
+                {
+                    return err("event loop gone");
+                }
+                waker(); // wake BEFORE waiting — see dispatch docs
+                match reply_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(resp) => resp, // main builds the full JSON response.
+                    Err(_) => err("set-tab-color timeout"),
                 }
             }
             "raise" => {
@@ -723,6 +755,28 @@ mod unix {
                 }
                 serde_json::json!({"cmd":"focus","query": query})
             }
+            "set-tab-color" => {
+                // `ctl set-tab-color <query...> <token>` — the LAST arg is
+                // always the color token (never contains spaces: a hex code,
+                // `default`, `clear`, or `swatch-N`); everything before it is
+                // the (possibly multi-word, unquoted) title query, same
+                // "join the rest" convention as `focus`.
+                let parts: Vec<&str> = rest
+                    .get(1..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                if parts.len() < 2 {
+                    return Err(
+                        "set-tab-color needs a query and a color token (#rrggbb|default|clear|swatch-N)"
+                            .to_string(),
+                    );
+                }
+                let token = parts[parts.len() - 1];
+                let query = parts[..parts.len() - 1].join(" ");
+                serde_json::json!({"cmd":"set-tab-color","query": query, "token": token})
+            }
             "raise" => serde_json::json!({"cmd":"raise"}),
             "screenshot" => {
                 let path = if arg.is_empty() {
@@ -804,7 +858,7 @@ mod unix {
             }
             other => {
                 return Err(format!(
-                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window|move-tab|promote-pane|merge-tab|drag|drop-file|search|search-back|ime-preedit|ime-commit)"
+                    "unknown ctl cmd: {other} (list|type|key|chord|state|focus|set-tab-color|raise|screenshot|click|about|settings|select|copy|paste|reorder-tab|rename-tab|edit-tab|new-window|move-tab|promote-pane|merge-tab|drag|drop-file|search|search-back|ime-preedit|ime-commit)"
                 ));
             }
         };
