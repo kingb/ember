@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod backend;
+pub mod colorderive;
 pub mod command;
 pub mod config;
 pub mod focus;
@@ -23,6 +24,9 @@ pub use backend::{
     BackendControl, BackendEvent, BackendHandle, ClipboardOp, ExitStatus, FrameRx, FrameTx,
     OscEvent, PassthroughEvent, ScrollAmount, SearchHit, SessionBackend, TabColorChan,
     VtProjection, frame_channel,
+};
+pub use colorderive::{
+    INK_DARK, INK_LIGHT, blend_toward, contrast_ratio, derive_accent, ink_for, relative_luminance,
 };
 pub use command::{LayoutCommand, LayoutEffect, apply};
 pub use config::{
