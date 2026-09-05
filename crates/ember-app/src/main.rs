@@ -386,6 +386,37 @@ pub(crate) fn osc_color_of(map: &HashMap<SessionId, (u8, u8, u8)>, sid: &Session
         .map(|&(r, g, b)| ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
 }
 
+/// The set of windows owning at least one session named in `updates` or
+/// `resets` — the only windows an OSC 6 tab-color report from THIS tick
+/// needs to `sync_layout`. `TabLabel`s are baked at `set_visible` time, so
+/// without this a tab's color only visibly changes once some unrelated
+/// trigger happens to call `sync_layout` on its window. A `HashSet` return
+/// dedupes across the tick: a shell's own OSC 6 escape reports one color as
+/// three separate channel writes (R, G, B), so a single color announcement
+/// for one session would otherwise queue the same window three times — one
+/// sync per window per tick, not one per channel report. Generic over
+/// `W: Copy + Eq + Hash` (a plain integer stands in for `WindowId` in tests,
+/// since `WindowId::dummy()` can't produce distinct ids — see
+/// `window_owning_tab`'s doc).
+pub(crate) fn affected_tab_color_windows<W: Copy + Eq + std::hash::Hash>(
+    updates: &[(SessionId, TabColorChan, u8)],
+    resets: &[SessionId],
+    session_window: &HashMap<SessionId, W>,
+) -> std::collections::HashSet<W> {
+    let mut windows = std::collections::HashSet::new();
+    for (id, _, _) in updates {
+        if let Some(w) = session_window.get(id) {
+            windows.insert(*w);
+        }
+    }
+    for id in resets {
+        if let Some(w) = session_window.get(id) {
+            windows.insert(*w);
+        }
+    }
+    windows
+}
+
 // --- Tab-color regex rules (design: tab-colors, T4) -------------------------
 //
 // `ember_core::config::TabColorRule` is a plain, unvalidated `{pattern,
@@ -1227,6 +1258,10 @@ impl ApplicationHandler<EmberEvent> for App {
                 // spawn_session already printed instead of presenting a dead window.
                 std::process::exit(1);
             }
+            // Populate the rule-color cache before the very first `sync_layout`
+            // (mirrors `open_window`'s precedent) — without this, the seed
+            // tab renders colorless until some unrelated later trigger runs.
+            win.recompute_tab_rule_colors(&shared);
             win.sync_layout(&shared);
             win.apply_appearance(&shared);
             shared.window_order.push(window_id);
@@ -2105,7 +2140,23 @@ impl ApplicationHandler<EmberEvent> for App {
         }
         // OSC tab color (design decision: per-session APP state, not
         // persisted — never marks `meta_dirty`/`snapshot_dirty`; a restored
-        // shell re-announces its own color).
+        // shell re-announces its own color). Computed BEFORE the two loops
+        // below consume `tab_color_updates`/`tab_color_resets` by value: the
+        // owning window of each affected session, deduped into a `HashSet`
+        // since a shell's own OSC 6 sequence reports one color as three
+        // separate channel writes (R, G, B) — without the dedupe, one color
+        // announcement would queue the same window's `sync_layout` three
+        // times. Only the map lookup happens here (`shared`, not
+        // `self.windows`); the actual sync is deferred to below `win`'s
+        // current borrow (mirrors the `exited`/`belled`/`search_hits` routing
+        // just below), since `TabLabels` are baked at `set_visible` time and
+        // otherwise a color change stays invisible until an unrelated
+        // `sync_layout` trigger happens to fire.
+        let tab_color_dirty_windows = affected_tab_color_windows(
+            &tab_color_updates,
+            &tab_color_resets,
+            &shared.session_window,
+        );
         for (id, chan, v) in tab_color_updates {
             let current = shared.osc_tab_color.get(&id).copied();
             shared
@@ -2192,6 +2243,18 @@ impl ApplicationHandler<EmberEvent> for App {
                 .unwrap_or(focused_id);
             if let Some(w) = self.windows.get_mut(&wid) {
                 w.on_search_result(&session, hit);
+            }
+        }
+        // Repaint the strip for every window an OSC 6 tab-color report just
+        // touched (`tab_color_dirty_windows`, computed above before the
+        // update/reset loops consumed the raw reports) — no fallback to
+        // `focused_id` here, unlike the routing loops above: a session with
+        // no `session_window` entry was never dropped into a real window in
+        // the first place, so there's nothing to sync. Empty on every tick
+        // with no OSC 6 traffic, so this costs nothing when idle.
+        for wid in tab_color_dirty_windows {
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.sync_layout(shared);
             }
         }
         // Neither loop above touches the focused window through `win` (each
@@ -5630,12 +5693,13 @@ fn encode_key(
 mod tests {
     use super::{
         BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, SessionId, TabColorChan,
-        TabId, apply_command_end, bell_flash_intensity, bracket_paste, clamp_to_visible_monitor,
-        clear_captured_commands, compile_rules, compose_tab_color_channel, compute_tab_rule_colors,
-        encode_key, match_tab_title, match_tab_title_across, needs_deferred_replay,
-        next_prev_index, osc_color_of, pane_snap_for, pane_status_for, pretype_bytes,
-        queue_close_this, queue_close_window, resolve_index, resolve_restore_cwd, rule_color_for,
-        shell_escape_path, tab_display_title, url_is_openable, window_owning_tab,
+        TabId, affected_tab_color_windows, apply_command_end, bell_flash_intensity, bracket_paste,
+        clamp_to_visible_monitor, clear_captured_commands, compile_rules,
+        compose_tab_color_channel, compute_tab_rule_colors, encode_key, match_tab_title,
+        match_tab_title_across, needs_deferred_replay, next_prev_index, osc_color_of,
+        pane_snap_for, pane_status_for, pretype_bytes, queue_close_this, queue_close_window,
+        resolve_index, resolve_restore_cwd, rule_color_for, shell_escape_path, tab_display_title,
+        url_is_openable, window_owning_tab,
     };
     use ember_core::TabColorRule;
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
@@ -5905,6 +5969,61 @@ mod tests {
         assert_eq!(osc_color_of(&map, &sid), Some(0x0011_2233));
         // A session that never reported one stays absent.
         assert_eq!(osc_color_of(&map, &SessionId::new("s2")), None);
+    }
+
+    // --- affected_tab_color_windows (about_to_wait's OSC 6 repaint route) --
+    //
+    // Route under test: `about_to_wait` collects each tick's OSC 6 channel
+    // reports/resets into `tab_color_updates`/`tab_color_resets`, calls
+    // `affected_tab_color_windows(&updates, &resets, &shared.session_window)`
+    // to resolve them to owning windows BEFORE the two loops that apply them
+    // consume those vectors by value, then (after `win`'s borrow of
+    // `self.windows` ends, alongside the `exited`/`belled`/`search_hits`
+    // routing) calls `sync_layout` once per window in the returned set. Using
+    // plain `u32`s for `W` here, not `WindowId` (`WindowId::dummy()` can't
+    // produce distinct ids — see `window_owning_tab`'s doc).
+
+    #[test]
+    fn affected_tab_color_windows_dedupes_three_channel_reports_for_one_session() {
+        let sid = SessionId::new("s1");
+        let mut session_window: std::collections::HashMap<SessionId, u32> =
+            std::collections::HashMap::new();
+        session_window.insert(sid.clone(), 10);
+        // One shell's OSC 6 color announcement arrives as three separate
+        // channel reports (R, G, B) — must collapse to a single window sync.
+        let updates = vec![
+            (sid.clone(), TabColorChan::Red, 0xff),
+            (sid.clone(), TabColorChan::Green, 0x00),
+            (sid.clone(), TabColorChan::Blue, 0x22),
+        ];
+        let windows = affected_tab_color_windows(&updates, &[], &session_window);
+        assert_eq!(windows, std::collections::HashSet::from([10]));
+    }
+
+    #[test]
+    fn affected_tab_color_windows_covers_resets_and_multiple_windows() {
+        let (s1, s2, s3) = (
+            SessionId::new("s1"),
+            SessionId::new("s2"),
+            SessionId::new("s3"),
+        );
+        let mut session_window: std::collections::HashMap<SessionId, u32> =
+            std::collections::HashMap::new();
+        session_window.insert(s1.clone(), 10);
+        session_window.insert(s2.clone(), 20);
+        // s3 is deliberately left untracked (a spawn racing the drain).
+        let updates = vec![(s1.clone(), TabColorChan::Red, 5)];
+        let resets = vec![s2.clone(), s3.clone()];
+        let windows = affected_tab_color_windows(&updates, &resets, &session_window);
+        assert_eq!(windows, std::collections::HashSet::from([10, 20]));
+    }
+
+    #[test]
+    fn affected_tab_color_windows_empty_when_nothing_reported() {
+        let session_window: std::collections::HashMap<SessionId, u32> =
+            std::collections::HashMap::new();
+        let windows = affected_tab_color_windows(&[], &[], &session_window);
+        assert!(windows.is_empty());
     }
 
     // --- compile_rules / rule_color_for (design: tab-colors, T4) ----------

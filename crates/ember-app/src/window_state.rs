@@ -5897,6 +5897,44 @@ mod tests {
         assert_eq!(parse_color_token("swatch-nope"), None);
     }
 
+    // --- extract_color_token: commit_rename's title/color split ------------
+
+    #[test]
+    fn extract_color_token_table() {
+        use super::extract_color_token;
+        use ember_core::TabColorChoice;
+
+        // (buffer, expected title, expected color)
+        let cases: &[(&str, &str, Option<TabColorChoice>)] = &[
+            // First VALID token wins: a second `#rrggbb`-shaped word is left
+            // in the title untouched ("a token", singular — see the doc).
+            (
+                "my tab #ff0000 #00ff00",
+                "my tab #00ff00",
+                Some(TabColorChoice::Color(0xff0000)),
+            ),
+            // The matched token is stripped from the title, surrounding
+            // whitespace collapsed by the `split_whitespace`/`join(" ")`
+            // round trip.
+            (
+                "deploy #00ff00 staging",
+                "deploy staging",
+                Some(TabColorChoice::Color(0x00ff00)),
+            ),
+            // Unparseable `#`-word (not 6 hex digits): left in the title
+            // verbatim, color stays `None` — `parse_color_token` rejects it,
+            // so `extract_color_token` never treats it as a match.
+            ("notes #zzz", "notes #zzz", None),
+            // No `#`-word at all: title passes through unchanged, no color.
+            ("plain title", "plain title", None),
+        ];
+        for (buf, want_title, want_color) in cases {
+            let (title, color) = extract_color_token(buf);
+            assert_eq!(&title, want_title, "title mismatch for {buf:?}");
+            assert_eq!(&color, want_color, "color mismatch for {buf:?}");
+        }
+    }
+
     // --- swatch_key: the tab-color popover's keyboard classifier -----------
 
     #[test]
