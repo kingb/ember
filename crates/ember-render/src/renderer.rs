@@ -1515,11 +1515,12 @@ impl Renderer {
         let view = self.swatch.as_ref()?;
         let sf = self.window.scale_factor() as f32;
         let lw = self.config.width as f32 / sf;
+        let lh = self.config.height as f32 / sf;
         let cw = self.cell_w;
         let strip_h = CELL_HEIGHT + 2.0 * PAD;
         let tab_cols = tab_area_cols(lw, cw);
         let (anchor_x, anchor_w) = tab_segment_x(self.tabs.len(), tab_cols, cw, view.tab);
-        Some(swatch_geom(anchor_x, anchor_w, strip_h, cw, lw))
+        Some(swatch_geom(anchor_x, anchor_w, strip_h, cw, lw, lh))
     }
 
     /// Hit-test a click at logical `(x, y)` against the OPEN swatch popover
@@ -2451,6 +2452,7 @@ impl Renderer {
             // already blocks the other blocking modals from being open too.
             if let Some(view) = self.swatch.clone() {
                 let lw = self.config.width as f32 / sf;
+                let lh = self.config.height as f32 / sf;
                 let cw = self.cell_w;
                 let strip_h = CELL_HEIGHT + 2.0 * PAD;
                 let tab_cols = tab_area_cols(lw, cw);
@@ -2470,6 +2472,7 @@ impl Renderer {
                     &view.hex_buffer,
                     cw,
                     lw,
+                    lh,
                     sf,
                     &mut rounded,
                 );
@@ -2893,43 +2896,43 @@ mod tests {
 
     use super::{SwatchGeom, SwatchPopoverHit, swatch_popover_hit};
 
-    /// A representative popover geometry (popover v2) — same shape
+    /// A representative popover geometry (popover v3) — same shape
     /// `swatch_geom` would produce, but with round numbers so the test math
-    /// stays readable.
+    /// stays readable. v3's whole point: every row (hue bar, hex/preview,
+    /// Default/Clear) shares ONE content width — the grid's own width — and
+    /// sits flush left at `grid_x`, instead of a v2 sub-block independently
+    /// centered inside a wider shell.
     fn geom() -> SwatchGeom {
-        // 12 swatches over 4 cols = 3 rows; grid_h = 3*20 + 2*6 = 72, grid_w
-        // = 4*20 + 3*6 = 98, so the grid spans y in [70, 142). Below it: the
-        // hue bar, then the hex field (same, narrower width as the bar —
-        // both give up width to the enlarged preview beside them), then the
-        // Default/Clear list — each block separated by an 8px section gap.
-        // The preview is a square spanning BOTH the hue-bar row and the hex
-        // row (`2 * row_h + section_gap` — bigger than one grid cell),
-        // mirroring the real `swatch_geom`'s "one grouped control" layout.
+        // 12 swatches over 4 cols = 3 rows; grid_h = 3*20 + 2*4 = 68, grid_w
+        // = 4*20 + 3*4 = 92 — that 92 IS the content width every row below
+        // shares. Below the grid: the hue bar (full 92 wide), then the
+        // hex field + a single-cell-sized preview sharing one row, then the
+        // Default/Clear list — each block separated by an 8px gap.
         SwatchGeom {
             x: 100.0,
             y: 50.0,
-            w: 200.0,
-            h: 200.0,
-            grid_x: 110.0,
+            w: 112.0,      // content_w(92) + 2*pad(10)
+            h: 190.0,      // (list_y(200) - y(50)) + row_h(15)*2 + pad(10)
+            grid_x: 110.0, // x(100) + pad(10) — flush left, not centered
             grid_y: 70.0,
             cell: 20.0,
-            gap: 6.0,
+            gap: 4.0,
             cols: 4,
-            hue_bar_x: 110.0,
-            hue_bar_y: 150.0, // grid_y(70) + grid_h(72) + section_gap(8)
-            hue_bar_w: 54.0,  // grid_w(98) - preview_size(38) - gap(6)
-            hue_bar_h: 15.0,
-            preview_x: 170.0, // hue_bar_x(110) + hue_bar_w(54) + gap(6)
-            preview_y: 150.0,
-            preview_size: 38.0, // 2 * row_h(15) + section_gap(8)
-            hex_x: 110.0,
-            hex_y: 173.0, // hue_bar_y(150) + hue_bar_h(15) + section_gap(8)
-            hex_w: 54.0,  // matches hue_bar_w, not the full grid width
-            hex_h: 15.0,
-            list_y: 196.0, // hex_y(173) + hex_h(15) + section_gap(8)
+            hue_bar_x: 110.0, // == grid_x
+            hue_bar_y: 146.0, // grid_y(70) + grid_h(68) + gap(8)
+            hue_bar_w: 92.0,  // == the grid's own width, not narrowed
+            hue_bar_h: 18.0,
+            preview_x: 182.0,   // grid_x(110) + content_w(92) - preview_size(20)
+            preview_y: 172.0,   // == hex_y
+            preview_size: 20.0, // == cell — a peer of a grid swatch, not a slab
+            hex_x: 110.0,       // == grid_x
+            hex_y: 172.0,       // hue_bar_y(146) + hue_bar_h(18) + gap(8)
+            hex_w: 68.0,        // content_w(92) - gap(4) - preview_size(20)
+            hex_h: 20.0,        // == cell/preview_size, same row
+            list_y: 200.0,      // hex_y(172) + hex_h(20) + gap(8)
             row_h: 15.0,
             pad: 10.0,
-            hint_h: 19.0,
+            hint_h: 15.0,
         }
     }
 
@@ -3029,17 +3032,17 @@ mod tests {
     }
 
     #[test]
-    fn click_on_the_preview_from_the_hex_fields_row_still_hits_preview() {
-        // The enlarged preview (live feedback: "the hue picker shows its
-        // color and code as you choose") spans BOTH the hue-bar row and the
-        // hex-field row below it — a click on its right column, at the hex
-        // field's own y, must still resolve to `Preview`, not fall through
-        // to `HexField` (now narrower, so it no longer reaches that far
-        // right) or `Blank`.
+    fn click_just_past_the_preview_falls_back_to_the_panel_not_the_hex_field() {
+        // v3's preview is a single grid-cell-sized square at the right end
+        // of the hex/preview row, not a two-row billboard — a click just
+        // past its right edge is past the content column entirely (the
+        // preview is flush with the content width's right edge), so it
+        // must NOT resolve to `HexField` (which sits to the preview's
+        // LEFT, not right).
         let g = geom();
-        assert_eq!(
-            swatch_popover_hit(&g, g.preview_x + 2.0, g.hex_y + 2.0),
-            Some(SwatchPopoverHit::Preview)
+        assert_ne!(
+            swatch_popover_hit(&g, g.preview_x + g.preview_size + 2.0, g.preview_y + 2.0),
+            Some(SwatchPopoverHit::HexField)
         );
     }
 
@@ -3051,6 +3054,151 @@ mod tests {
         assert_eq!(
             swatch_popover_hit(&g, g.hex_x + 5.0, gap_y),
             Some(SwatchPopoverHit::Blank)
+        );
+    }
+
+    // --- swatch_geom: the real layout function (popover v3) ----------
+    //
+    // Composition fix ("the whole color modal got way too big and weird"):
+    // the panel must hug its content — one column, one width, no leftover
+    // shell — and (live screenshot follow-up) must never let that column
+    // run off the window, top/bottom/left/right.
+
+    use super::{CELL_HEIGHT, PAD, swatch_geom};
+    use crate::paint::{SWATCH_CELL, SWATCH_GAP, SWATCH_GRID_COLS, SWATCH_PAD, SWATCH_SECTION_GAP};
+    use ember_core::SWATCHES;
+
+    /// A plausible anchored call, mirroring `swatch_geom_now`'s own inputs:
+    /// a normal-sized window, the popover anchored near the left of the tab
+    /// strip, a typical terminal cell width.
+    fn real_geom(logical_w: f32, logical_h: f32) -> SwatchGeom {
+        let strip_h = CELL_HEIGHT + 2.0 * PAD;
+        swatch_geom(40.0, 120.0, strip_h, 8.0, logical_w, logical_h)
+    }
+
+    #[test]
+    fn grid_cell_centers_are_evenly_spaced_from_grid_origin() {
+        let g = real_geom(900.0, 560.0);
+        // Cell (col, row)'s top-left is `grid_(x|y) + n * (cell + gap)`, so
+        // its center is that plus half a cell — this is what both the draw
+        // loop and `swatch_popover_hit` assume every swatch cell sits at.
+        let center = |col: usize, row: usize| {
+            (
+                g.grid_x + col as f32 * (g.cell + g.gap) + g.cell * 0.5,
+                g.grid_y + row as f32 * (g.cell + g.gap) + g.cell * 0.5,
+            )
+        };
+        let (c0x, c0y) = center(0, 0);
+        let (c5x, c5y) = center(1, 1); // swatch index 5 (5 % 4 = 1, 5 / 4 = 1)
+        assert_eq!(g.grid_x, g.x + g.pad, "grid sits flush at the content pad");
+        assert!((c5x - c0x - (g.cell + g.gap)).abs() < 0.001);
+        assert!((c5y - c0y - (g.cell + g.gap)).abs() < 0.001);
+    }
+
+    #[test]
+    fn hue_bar_spans_the_full_content_column_not_half_of_it() {
+        let g = real_geom(900.0, 560.0);
+        let cols = SWATCH_GRID_COLS;
+        let grid_w = cols as f32 * SWATCH_CELL + (cols as f32 - 1.0) * SWATCH_GAP;
+        // The v2 bug this fixes: the hue bar gave up width to a beside-it
+        // preview and ended up roughly half the content column. v3's bar
+        // matches the grid's own width exactly, flush at the same x.
+        assert_eq!(g.hue_bar_w, grid_w);
+        assert_eq!(g.hue_bar_x, g.grid_x);
+    }
+
+    #[test]
+    fn preview_is_exactly_one_grid_cell_not_a_giant_slab() {
+        let g = real_geom(900.0, 560.0);
+        // The v2 bug this fixes: the preview was `2 * row_h + section_gap`
+        // tall — roughly twice a swatch cell. v3's preview is a peer of the
+        // grid's own cells.
+        assert_eq!(g.preview_size, g.cell);
+        assert_eq!(g.preview_size, SWATCH_CELL);
+        // Right-aligned on the hex row, not off past the content column.
+        assert_eq!(g.preview_x + g.preview_size, g.grid_x + (g.w - 2.0 * g.pad));
+    }
+
+    #[test]
+    fn default_and_clear_rows_span_the_full_content_width() {
+        let g = real_geom(900.0, 560.0);
+        let content_w = g.w - 2.0 * g.pad;
+        let cols = SWATCH_GRID_COLS;
+        let grid_w = cols as f32 * SWATCH_CELL + (cols as f32 - 1.0) * SWATCH_GAP;
+        // Content width is pinned to the grid's own width — Default/Clear
+        // (drawn at `grid_x .. grid_x + content_w` in `build_swatch_popover`)
+        // are therefore exactly as wide as the grid above them, not a
+        // narrower strip of naked text off in a corner.
+        assert_eq!(content_w, grid_w);
+        // The Default/Clear list's own bottom edge, plus the same padding
+        // reserved above the hint, is exactly the panel's bottom edge —
+        // relative to the panel's own `y`, not absolute zero.
+        assert_eq!(g.y + g.h, g.list_y + g.row_h * 2.0 + g.pad);
+    }
+
+    #[test]
+    fn panel_hugs_its_content_with_no_dead_space() {
+        let g = real_geom(900.0, 560.0);
+        let rows = SWATCHES.len().div_ceil(SWATCH_GRID_COLS);
+        let grid_h = rows as f32 * SWATCH_CELL + (rows as f32 - 1.0) * SWATCH_GAP;
+        // Reconstruct the expected content height the same way `swatch_geom`
+        // stacks its sections, and confirm the panel is exactly that plus
+        // padding — not the v2 bug's leftover bottom third.
+        let sg = SWATCH_SECTION_GAP;
+        let expected_h = g.pad
+            + g.hint_h
+            + sg
+            + grid_h
+            + sg
+            + g.hue_bar_h
+            + sg
+            + g.hex_h
+            + sg
+            + g.row_h * 2.0
+            + g.pad;
+        assert!(
+            (g.h - expected_h).abs() < 0.001,
+            "h={} expected={}",
+            g.h,
+            expected_h
+        );
+        let cols = SWATCH_GRID_COLS;
+        let grid_w = cols as f32 * SWATCH_CELL + (cols as f32 - 1.0) * SWATCH_GAP;
+        assert_eq!(g.w, SWATCH_PAD * 2.0 + grid_w);
+    }
+
+    #[test]
+    fn panel_x_never_crosses_the_left_or_right_window_edge() {
+        // Anchored hard against the right edge of a window that's wider
+        // than the panel but not by much — the naive centered `x` would
+        // push the panel's right edge off-screen; it must clamp to stay
+        // fully inside instead.
+        let strip_h = CELL_HEIGHT + 2.0 * PAD;
+        let g = swatch_geom(280.0, 20.0, strip_h, 8.0, 300.0, 560.0);
+        assert!(g.x >= 4.0, "x={}", g.x);
+        assert!(g.x + g.w <= 300.0 - 4.0 + 0.001, "x+w={}", g.x + g.w);
+    }
+
+    #[test]
+    fn short_window_shifts_the_panel_up_to_keep_default_clear_on_screen() {
+        // Live-screenshot follow-up: the panel used to overflow the window
+        // bottom, clipping "Default" and leaving "Clear" fully offscreen —
+        // unreachable by mouse. A short-but-adequate window (enough room
+        // for the panel if it weren't anchored under the tab strip) must
+        // shift the panel up so its bottom edge — and both list rows —
+        // stay inside the window.
+        let strip_h = CELL_HEIGHT + 2.0 * PAD;
+        let tall_enough = strip_h + 4.0 + real_geom(900.0, 10_000.0).h + 40.0;
+        let g = swatch_geom(40.0, 120.0, strip_h, 8.0, 900.0, tall_enough);
+        assert!(
+            g.y + g.h <= tall_enough,
+            "panel bottom {} exceeds window height {}",
+            g.y + g.h,
+            tall_enough
+        );
+        assert!(
+            g.list_y + g.row_h * 2.0 <= tall_enough,
+            "Default/Clear rows spill past the window bottom"
         );
     }
 

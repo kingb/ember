@@ -629,6 +629,7 @@ pub fn capture_reusing(
             &view.hex_buffer,
             cw,
             shot.logical_w,
+            shot.logical_h,
             sf,
             &mut rounded,
         ));
