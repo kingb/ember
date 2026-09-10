@@ -1389,7 +1389,7 @@ pub(crate) struct SwatchLayout {
 /// down scattered literals — the same "single geometry source" invariant
 /// this module already held for draw vs. hit-test, extended to draw vs.
 /// itself across a resize.
-pub(crate) const SWATCH_SCALE: f32 = 1.5;
+pub(crate) const SWATCH_SCALE: f32 = 2.25;
 
 /// Quad segments the hue bar sweeps hue across (`0..360` degrees, OKLCH,
 /// pinned lightness/chroma — see [`ember_core::hue_to_rgb`]).
