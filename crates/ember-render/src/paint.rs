@@ -1890,15 +1890,16 @@ pub(crate) fn build_swatch_popover(
     ));
 
     // `Default` / `Clear` rows, below the hex/preview row — drawn as two
-    // full-width "settings rows" (see `build_settings`), not naked floating
-    // text: a subtle fill is ALWAYS present (the fix for the v2 bug where
-    // an unselected row had zero visual presence, reading as disconnected
-    // labels rather than part of the panel), with the selected row's
-    // accent-tint fill + double ring drawn on top of that same subtle fill.
-    // The ring paints last (over the accent tint, itself over the subtle
-    // fill) for the same reason as always: these fills are translucent, so
-    // drawing the ring underneath would wash its near-black inner line
-    // toward whatever's beneath it instead of reading crisp.
+    // distinct rounded rows (a real gap between them; see `SWATCH_ROW_GAP`),
+    // not naked floating text: a subtle OPAQUE fill is ALWAYS present (the
+    // fix for the v2 bug where an unselected row had zero visual presence,
+    // reading as disconnected labels rather than part of the panel), with
+    // the selected row's translucent accent-tint fill + double ring drawn
+    // on top of it. The ring paints last, for two different reasons at each
+    // layer below it: drawn before the opaque base fill, the base fill
+    // would paint over it entirely; drawn before the translucent accent
+    // tint (only present when selected), the tint would wash the ring's
+    // near-black inner line instead of it reading crisp.
     let content_w = w - 2.0 * pad;
     // A small rounded radius (matches the hex field's own) instead of the
     // v3.0 square corners — now that the two rows have a real gap between
@@ -1935,8 +1936,11 @@ pub(crate) fn build_swatch_popover(
         buf.shape_until_scroll(font_system, false);
     }
 
+    // Only the hint line goes through this closure now — Default/Clear got
+    // their own buffers (shaped in the row loop above) once they stopped
+    // sharing one two-line block, so this no longer needs to size for both.
     let shape = |fs: &mut FontSystem, buf: &mut Buffer, text: &str, color: Color, width: f32| {
-        buf.set_size(fs, Some(width), Some(row_h * 2.0 + hint_h));
+        buf.set_size(fs, Some(width), Some(hint_h));
         buf.set_text(
             fs,
             text,

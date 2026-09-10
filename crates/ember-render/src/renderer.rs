@@ -3220,13 +3220,29 @@ mod tests {
     fn short_window_shifts_the_panel_up_to_keep_default_clear_on_screen() {
         // Live-screenshot follow-up: the panel used to overflow the window
         // bottom, clipping "Default" and leaving "Clear" fully offscreen —
-        // unreachable by mouse. A short-but-adequate window (enough room
-        // for the panel if it weren't anchored under the tab strip) must
-        // shift the panel up so its bottom edge — and both list rows —
-        // stay inside the window.
+        // unreachable by mouse. A short-but-adequate window must shift the
+        // panel up so its bottom edge — and both list rows — stay inside
+        // the window.
+        //
+        // "Short-but-adequate" means: too short for the panel at its usual
+        // "anchored under the tab strip" position (`strip_h + 4.0 + h`),
+        // but just tall enough for the panel once shifted flush to the top
+        // (`h + 4.0` — a 4px margin above and below, `y` pinned to the
+        // clamp's own floor). A window height AT OR ABOVE
+        // `strip_h + 4.0 + h` would make this test vacuous — the panel
+        // already fits without any shift, so deleting the clamp entirely
+        // would still pass (caught in review: an earlier version of this
+        // test did exactly that with a `+ 40.0` margin on top of
+        // `strip_h + 4.0 + h` instead of this tight `h + 4.0`).
         let strip_h = CELL_HEIGHT + 2.0 * PAD;
-        let tall_enough = strip_h + 4.0 + real_geom(900.0, 10_000.0).h + 40.0;
+        let h = real_geom(900.0, 10_000.0).h;
+        let tall_enough = h + 4.0;
+        assert!(
+            tall_enough < strip_h + 4.0 + h,
+            "test window must be too short for the panel's default anchor"
+        );
         let g = swatch_geom(40.0, 120.0, strip_h, 8.0, 900.0, tall_enough);
+        assert_eq!(g.y, 4.0, "panel should shift all the way to the top");
         assert!(
             g.y + g.h <= tall_enough,
             "panel bottom {} exceeds window height {}",
