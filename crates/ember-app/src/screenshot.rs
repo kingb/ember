@@ -58,6 +58,17 @@ pub struct Opts {
     /// a dark cell, or a Default/Clear row to check the selection ring
     /// against each.
     pub swatch_selected: usize,
+    /// Which of the popover's three regions (popover v2) has keyboard focus
+    /// — `grid` (default), `hue`, or `hex`. Lets a fixture show the hue
+    /// bar's or hex field's own focus ring/selection ring instead of the
+    /// grid's.
+    pub swatch_focus: ember_render::SwatchFocus,
+    /// The hue bar's position (degrees `0..360`) within `--swatch-popover` —
+    /// also the live-preview swatch's color source.
+    pub swatch_hue: f32,
+    /// The hex field's typed text within `--swatch-popover` (e.g. `"#3f"`
+    /// for a partial entry) — empty shows the "#______" placeholder.
+    pub swatch_hex: String,
     /// Draw an active + an inactive colored tab pill (the redesign, items
     /// 2/3/4): tab 0 (active) gets `SWATCHES[0]` at full strength, tab 1
     /// (inactive) gets `SWATCHES[4]` blended toward the strip background —
@@ -133,6 +144,9 @@ impl Default for Opts {
             restore_older: false,
             swatch_popover: false,
             swatch_selected: 2,
+            swatch_focus: ember_render::SwatchFocus::Grid,
+            swatch_hue: 210.0,
+            swatch_hex: String::new(),
             colored_tabs: false,
             split_preview: None,
             settle_ms: 700,
@@ -211,6 +225,20 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
                     .parse()
                     .map_err(|e| format!("--swatch-selected: {e}"))?
             }
+            "--swatch-focus" => {
+                opts.swatch_focus = match next()?.as_str() {
+                    "grid" => ember_render::SwatchFocus::Grid,
+                    "hue" => ember_render::SwatchFocus::HueBar,
+                    "hex" => ember_render::SwatchFocus::HexField,
+                    other => {
+                        return Err(format!("--swatch-focus expects grid|hue|hex, got {other}"));
+                    }
+                }
+            }
+            "--swatch-hue" => {
+                opts.swatch_hue = next()?.parse().map_err(|e| format!("--swatch-hue: {e}"))?
+            }
+            "--swatch-hex" => opts.swatch_hex = next()?,
             "--colored-tabs" => opts.colored_tabs = true,
             "--help-overlay" => opts.help_overlay = true,
             "--settings" => opts.settings = true,
@@ -558,6 +586,9 @@ pub fn run(opts: Opts) -> Result<String, String> {
         swatch: opts.swatch_popover.then_some(ember_render::SwatchView {
             tab: 0,
             selected: opts.swatch_selected,
+            focus: opts.swatch_focus,
+            hue: opts.swatch_hue,
+            hex_buffer: opts.swatch_hex.clone(),
         }),
         hold_ring: opts.hold_ring,
         // No offline `--screenshot` flag for these (v0.4.0): both are live

@@ -26,12 +26,12 @@ use ember_core::{
     Axis, BackendControl, BackendHandle, Direction, DropZone, GridDims, LayoutCommand,
     LayoutEffect, PaneId, Rect, RestoreMode, RowKind, SWATCHES, ScrollAmount, SessionBackend,
     SessionId, SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabColorChoice, TabId,
-    apply, drop_zone_for, effective_color, layout, remove_pane, setting_rows,
+    apply, drop_zone_for, effective_color, hue_of, hue_to_rgb, layout, remove_pane, setting_rows,
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
     AbsPoint, AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode,
-    SwatchPopoverHit, SwatchView, TabHit, TabLabel, VisiblePane,
+    SwatchFocus, SwatchPopoverHit, SwatchView, TabHit, TabLabel, VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -503,6 +503,25 @@ pub(crate) struct WindowState {
     /// The popover's current selection: `0..12` = a `SWATCHES` cell, `12` =
     /// `Default`, `13` = `Clear`. Meaningless while `swatch_open` is `None`.
     pub(crate) swatch_sel: usize,
+    /// Popover v2: which of the three regions (grid / hue bar / hex field)
+    /// currently owns keyboard input. Tab cycles it; a click on a region
+    /// also moves focus there.
+    pub(crate) swatch_focus: SwatchFocus,
+    /// Popover v2: the hue bar's current position, degrees `0..360` — also
+    /// the live-preview swatch's color source. Reset on `open_swatch` to the
+    /// tab's existing custom color's hue when it has one outside the
+    /// curated `SWATCHES`, else `0.0`.
+    pub(crate) swatch_hue: f32,
+    /// Popover v2: the custom hex field's typed text (`""`..`"#rrggbb"`).
+    /// Reset on `open_swatch` to the tab's existing custom color formatted
+    /// as hex when it's outside the curated `SWATCHES`, else empty
+    /// (placeholder-only).
+    pub(crate) swatch_hex: String,
+    /// Popover v2: the hue bar is currently being dragged (mouse down on it,
+    /// not yet released) — subsequent `CursorMoved`s keep sweeping the hue
+    /// even if the cursor slides off the bar itself (`divider_drag`/
+    /// `scrollbar_drag`'s own precedent for a press-anchored drag).
+    pub(crate) hue_drag: bool,
     /// A destructive close awaiting confirmation (a busy pane).
     pub(crate) pending_close: Option<PendingClose>,
     /// The focused confirm button: 0 = Cancel (safe default), 1 = Close/Quit.
@@ -871,15 +890,16 @@ fn extract_color_token(buf: &str) -> (String, Option<TabColorChoice>) {
 
 /// What a key press does while the tab-color swatch popover is open — the
 /// `settings_action_for_key` precedent, generalized from a settings row to
-/// the popover's 14-item grid (12 curated `SWATCHES`, then `Default`, then
-/// `Clear` — indices `0..12`, `12`, `13` respectively; see
-/// [`WindowState::swatch_key`] for how `sel` resolves `Pick`/`PinDefault`/
-/// `Clear` into an actual color). Pure and independent of `WindowState`/
-/// `Shared`, so it's unit-tested directly.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// the popover's three regions (popover v2): the 14-item grid (12 curated
+/// `SWATCHES`, then `Default`, then `Clear` — indices `0..12`, `12`, `13`
+/// respectively; see [`WindowState::swatch_key`] for how `sel` resolves
+/// `Pick`/`PinDefault`/`Clear` into an actual color), the hue bar, and the
+/// custom hex field. Pure and independent of `WindowState`/`Shared`, so it's
+/// unit-tested directly.
+#[derive(Clone, Debug, PartialEq)]
 enum SwatchAction {
-    /// Move the selection by this many grid cells (arrows); the caller wraps
-    /// the result across the 14-item grid.
+    /// Move the grid selection by this many cells (arrows, `Grid` focus);
+    /// the caller wraps the result across the 14-item grid.
     Move(i8),
     /// Enter/Space on one of the 12 curated swatch cells (`sel < 12`).
     Pick,
@@ -887,8 +907,28 @@ enum SwatchAction {
     PinDefault,
     /// Enter/Space on the `Clear` row (`sel == 13`).
     Clear,
-    /// Esc — dismiss the popover without changing the color.
+    /// Esc while `Grid` or `HueBar` is focused — dismiss the popover
+    /// entirely without changing the color.
     Close,
+    /// Tab — cycle focus forward: `Grid -> HueBar -> HexField ->` (wrapping).
+    FocusNext,
+    /// Shift+Tab — cycle focus backward.
+    FocusPrev,
+    /// Left/Right on the hue bar: step hue by this many [`HUE_STEP_DEGREES`]
+    /// units (`-1` or `1`).
+    HueStep(i32),
+    /// Enter/Space on the hue bar — apply the live-preview color.
+    ApplyHue,
+    /// A character typed while the hex field is focused — the caller
+    /// filters/accepts individual chars via [`hex_buffer_push`].
+    HexInput(String),
+    /// Backspace while the hex field is focused.
+    HexBackspace,
+    /// Enter while the hex field is focused — parse and apply the buffer.
+    HexApply,
+    /// Esc while the hex field is focused — unfocus back to the grid
+    /// WITHOUT closing the popover (distinct from `Close`).
+    HexUnfocus,
     /// Any other key: swallowed (the popover captures all input while open)
     /// but changes nothing.
     None,
@@ -904,26 +944,57 @@ const SWATCH_GRID_COLS: i8 = 4;
 /// `Clear`.
 const SWATCH_ITEM_COUNT: usize = 14;
 
+/// Degrees the hue bar sweeps per Left/Right arrow press (popover v2).
+const HUE_STEP_DEGREES: f32 = 3.0;
+
 /// Map a key press onto a [`SwatchAction`], given the current selection
 /// `sel` (needed only to route Enter/Space to `Pick`/`PinDefault`/`Clear`
-/// correctly — arrows and Esc don't consult it). See [`SwatchAction`]'s docs.
-fn swatch_key(key: &Key, sel: usize) -> SwatchAction {
-    match key {
-        Key::Named(NamedKey::Escape) => SwatchAction::Close,
-        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => {
-            if sel < SWATCHES.len() {
-                SwatchAction::Pick
-            } else if sel == SWATCHES.len() {
-                SwatchAction::PinDefault
-            } else {
-                SwatchAction::Clear
+/// correctly — arrows and Esc don't consult it), the current `focus`
+/// region, and `mods` (only Shift, to distinguish Tab from Shift+Tab,
+/// matters here — same "take `ModifiersState` directly" shape as
+/// `restore_key_action`). Tab/Shift+Tab cycle focus regardless of which
+/// region currently has it; every other key's meaning depends on `focus`.
+/// See [`SwatchAction`]'s docs.
+fn swatch_key(key: &Key, mods: ModifiersState, focus: SwatchFocus, sel: usize) -> SwatchAction {
+    if matches!(key, Key::Named(NamedKey::Tab)) {
+        return if mods.shift_key() {
+            SwatchAction::FocusPrev
+        } else {
+            SwatchAction::FocusNext
+        };
+    }
+    match focus {
+        SwatchFocus::Grid => match key {
+            Key::Named(NamedKey::Escape) => SwatchAction::Close,
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => {
+                if sel < SWATCHES.len() {
+                    SwatchAction::Pick
+                } else if sel == SWATCHES.len() {
+                    SwatchAction::PinDefault
+                } else {
+                    SwatchAction::Clear
+                }
             }
-        }
-        Key::Named(NamedKey::ArrowRight) => SwatchAction::Move(1),
-        Key::Named(NamedKey::ArrowLeft) => SwatchAction::Move(-1),
-        Key::Named(NamedKey::ArrowDown) => SwatchAction::Move(SWATCH_GRID_COLS),
-        Key::Named(NamedKey::ArrowUp) => SwatchAction::Move(-SWATCH_GRID_COLS),
-        _ => SwatchAction::None,
+            Key::Named(NamedKey::ArrowRight) => SwatchAction::Move(1),
+            Key::Named(NamedKey::ArrowLeft) => SwatchAction::Move(-1),
+            Key::Named(NamedKey::ArrowDown) => SwatchAction::Move(SWATCH_GRID_COLS),
+            Key::Named(NamedKey::ArrowUp) => SwatchAction::Move(-SWATCH_GRID_COLS),
+            _ => SwatchAction::None,
+        },
+        SwatchFocus::HueBar => match key {
+            Key::Named(NamedKey::Escape) => SwatchAction::Close,
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => SwatchAction::ApplyHue,
+            Key::Named(NamedKey::ArrowRight) => SwatchAction::HueStep(1),
+            Key::Named(NamedKey::ArrowLeft) => SwatchAction::HueStep(-1),
+            _ => SwatchAction::None,
+        },
+        SwatchFocus::HexField => match key {
+            Key::Named(NamedKey::Escape) => SwatchAction::HexUnfocus,
+            Key::Named(NamedKey::Enter) => SwatchAction::HexApply,
+            Key::Named(NamedKey::Backspace) => SwatchAction::HexBackspace,
+            Key::Character(s) => SwatchAction::HexInput(s.to_string()),
+            _ => SwatchAction::None,
+        },
     }
 }
 
@@ -934,6 +1005,66 @@ fn swatch_key(key: &Key, sel: usize) -> SwatchAction {
 fn wrap_swatch_sel(sel: usize, delta: i8) -> usize {
     let n = SWATCH_ITEM_COUNT as i32;
     (sel as i32 + delta as i32).rem_euclid(n) as usize
+}
+
+/// Cycle the popover's focus region forward (`Grid -> HueBar -> HexField ->`
+/// wrapping) or backward — [`SwatchAction::FocusNext`]/`FocusPrev`'s pure
+/// arithmetic, split out for direct unit testing alongside `swatch_key`.
+fn cycle_swatch_focus(focus: SwatchFocus, forward: bool) -> SwatchFocus {
+    use SwatchFocus::*;
+    match (focus, forward) {
+        (Grid, true) => HueBar,
+        (HueBar, true) => HexField,
+        (HexField, true) => Grid,
+        (Grid, false) => HexField,
+        (HueBar, false) => Grid,
+        (HexField, false) => HueBar,
+    }
+}
+
+/// Step the hue bar's position by `steps` [`HUE_STEP_DEGREES`] units,
+/// wrapping across the `0..360` degree circle (Left/Right never fall off
+/// either end — same wrap idiom as [`wrap_swatch_sel`]). Pure, so the
+/// wrap-at-the-seam arithmetic is directly unit-testable.
+fn step_hue(hue: f32, steps: i32) -> f32 {
+    (hue + steps as f32 * HUE_STEP_DEGREES).rem_euclid(360.0)
+}
+
+/// Apply one typed character to the hex field's buffer (popover v2),
+/// rejecting anything that can't be part of a valid `#rrggbb` token: a `#`
+/// only starts a fresh buffer (typing it once the buffer is non-empty is a
+/// no-op — the field never contains an embedded second `#`), and a hex
+/// digit is appended (case-folded to lowercase), auto-prepending the `#` if
+/// the buffer was still empty so a user can start typing digits directly
+/// without needing to type `#` first. The buffer is capped at 7 chars
+/// (`#` + 6 digits, [`parse_color_token`]'s exact expected shape) — once
+/// full, further digits are dropped rather than silently truncating from
+/// the wrong end. Any other character leaves the buffer unchanged.
+fn hex_buffer_push(buf: &str, ch: char) -> String {
+    if ch == '#' {
+        return if buf.is_empty() {
+            "#".to_string()
+        } else {
+            buf.to_string()
+        };
+    }
+    if !ch.is_ascii_hexdigit() || buf.len() >= 7 {
+        return buf.to_string();
+    }
+    let lower = ch.to_ascii_lowercase();
+    if buf.is_empty() {
+        format!("#{lower}")
+    } else {
+        format!("{buf}{lower}")
+    }
+}
+
+/// Backspace on the hex field's buffer: drop the last character (a no-op on
+/// an already-empty buffer). Pure, split out for direct unit testing.
+fn hex_buffer_backspace(buf: &str) -> String {
+    let mut s = buf.to_string();
+    s.pop();
+    s
 }
 
 /// Whether the swatch popover's anchored tab index (Task 3) is no longer a
@@ -1032,6 +1163,10 @@ impl WindowState {
             edit_buffer: String::new(),
             swatch_open: None,
             swatch_sel: 0,
+            swatch_focus: SwatchFocus::Grid,
+            swatch_hue: 0.0,
+            swatch_hex: String::new(),
+            hue_drag: false,
             pending_close: None,
             confirm_focus: 0,
             wheel_accum: 0.0,
@@ -2489,6 +2624,7 @@ impl WindowState {
         self.selecting = false;
         self.scrollbar_drag = None;
         self.divider_drag = None;
+        self.hue_drag = false;
         // A plain click (no drag) clears the selection rather than leaving a
         // one-cell one — see AnchoredSelection::is_empty_click.
         if was_selecting {
@@ -3360,6 +3496,16 @@ impl WindowState {
             };
             self.resize_split_px(shared, a_side, b_side, axis, pos - last);
             self.divider_drag = Some((a_side, b_side, axis, pos));
+        } else if self.hue_drag {
+            // The hue bar drag (popover v2): keep sweeping hue even if the
+            // cursor slides off the bar's own bounds, same "press-anchored,
+            // not bounds-anchored" idiom as `divider_drag`/`scrollbar_drag`
+            // above — `swatch_hue_drag_fraction` clamps to the bar's ends
+            // rather than dropping the drag.
+            if let Some(frac) = self.renderer.swatch_hue_drag_fraction(x as f32) {
+                self.swatch_hue = frac * 360.0;
+                self.update_swatch_view();
+            }
         } else if self.tab_drag.is_some() || shared.drag.is_some() {
             self.update_drag(shared, window_id, x, y);
         } else if let Some(sid) = self.scrollbar_drag.clone() {
@@ -4103,23 +4249,35 @@ impl WindowState {
         }
     }
 
-    /// Open the tab-color popover (Task 3), anchored under tab `i` — from a
-    /// click on the rename-editor's swatch or `ArrowDown` while renaming.
-    /// Starting selection matches the tab's current color when it's one of
-    /// the 12 curated swatches, `Default`/`Clear` for those two choices, or
-    /// swatch 0 for anything else (a manual color outside the palette, or no
-    /// color at all) — so re-opening the popover on an already-colored tab
-    /// doesn't land on an arbitrary cell.
+    /// Open the tab-color popover (Task 3, popover v2), anchored under tab
+    /// `i` — from a click on the rename-editor's swatch or `ArrowDown` while
+    /// renaming. Starting selection matches the tab's current color when
+    /// it's one of the 12 curated swatches, `Default`/`Clear` for those two
+    /// choices, or swatch 0 for anything else (a manual color outside the
+    /// palette, or no color at all) — so re-opening the popover on an
+    /// already-colored tab doesn't land on an arbitrary cell. Keyboard focus
+    /// always starts on the grid; the hue bar/hex field seed from the tab's
+    /// existing custom color when it's one NOT in the curated palette (so
+    /// reopening on a custom color shows it, rather than resetting to red).
     pub(crate) fn open_swatch(&mut self, i: usize) {
         if i >= self.tree.tabs.len() {
             return;
         }
         self.swatch_open = Some(i);
-        self.swatch_sel = match self.tree.tabs[i].color {
+        self.swatch_focus = SwatchFocus::Grid;
+        self.hue_drag = false;
+        let color = self.tree.tabs[i].color;
+        self.swatch_sel = match color {
             TabColorChoice::Color(c) => SWATCHES.iter().position(|&s| s == c).unwrap_or(0),
             TabColorChoice::PinnedDefault => SWATCHES.len(),
             TabColorChoice::Unset => SWATCHES.len() + 1,
         };
+        let custom = match color {
+            TabColorChoice::Color(c) if !SWATCHES.contains(&c) => Some(c),
+            _ => None,
+        };
+        self.swatch_hue = custom.map(|c| hue_of(c) as f32).unwrap_or(0.0);
+        self.swatch_hex = custom.map(|c| format!("#{c:06x}")).unwrap_or_default();
         self.update_swatch_view();
     }
 
@@ -4127,16 +4285,20 @@ impl WindowState {
     /// pick commits one).
     pub(crate) fn close_swatch(&mut self) {
         if self.swatch_open.take().is_some() {
+            self.hue_drag = false;
             self.update_swatch_view();
         }
     }
 
-    /// (Re)build the renderer's `SwatchView` from `self.swatch_open`/`swatch_sel`.
+    /// (Re)build the renderer's `SwatchView` from the popover's live state.
     /// No-op-safe to call with `swatch_open == None` (clears the view).
     fn update_swatch_view(&mut self) {
         let view = self.swatch_open.map(|tab| SwatchView {
             tab,
             selected: self.swatch_sel,
+            focus: self.swatch_focus,
+            hue: self.swatch_hue,
+            hex_buffer: self.swatch_hex.clone(),
         });
         self.renderer.set_swatch(view);
     }
@@ -4144,10 +4306,11 @@ impl WindowState {
     /// Route a key into the open tab-color popover (the keyboard arm sits
     /// ABOVE the rename-editor branch in `main.rs`'s dispatcher and swallows
     /// every key while open, matching the restore modal's/settings overlay's
-    /// own capture convention).
+    /// own capture convention). `swatch_key`'s routing depends on which of
+    /// the three regions (popover v2) currently has focus.
     pub(crate) fn swatch_key_input(&mut self, shared: &mut Shared, key: &Key) {
         let Some(i) = self.swatch_open else { return };
-        match swatch_key(key, self.swatch_sel) {
+        match swatch_key(key, self.modifiers, self.swatch_focus, self.swatch_sel) {
             SwatchAction::Move(delta) => {
                 self.swatch_sel = wrap_swatch_sel(self.swatch_sel, delta);
                 self.update_swatch_view();
@@ -4165,20 +4328,64 @@ impl WindowState {
                 self.close_swatch();
             }
             SwatchAction::Close => self.close_swatch(),
+            SwatchAction::FocusNext => {
+                self.swatch_focus = cycle_swatch_focus(self.swatch_focus, true);
+                self.update_swatch_view();
+            }
+            SwatchAction::FocusPrev => {
+                self.swatch_focus = cycle_swatch_focus(self.swatch_focus, false);
+                self.update_swatch_view();
+            }
+            SwatchAction::HueStep(steps) => {
+                self.swatch_hue = step_hue(self.swatch_hue, steps);
+                self.update_swatch_view();
+            }
+            SwatchAction::ApplyHue => {
+                let choice = TabColorChoice::Color(hue_to_rgb(self.swatch_hue as f64));
+                self.apply_tab_color(shared, i, choice);
+                self.close_swatch();
+            }
+            SwatchAction::HexInput(text) => {
+                for ch in text.chars().filter(|c| !c.is_control()) {
+                    self.swatch_hex = hex_buffer_push(&self.swatch_hex, ch);
+                }
+                self.update_swatch_view();
+            }
+            SwatchAction::HexBackspace => {
+                self.swatch_hex = hex_buffer_backspace(&self.swatch_hex);
+                self.update_swatch_view();
+            }
+            SwatchAction::HexApply => {
+                // Reuse the SAME token parser every other color-entry path
+                // (the rename-editor's `#rrggbb`, `ctl set-tab-color`) goes
+                // through — a malformed/incomplete buffer just parses to
+                // `None`, leaving the field focused so the user can keep
+                // typing rather than silently closing on a typo.
+                if let Some(choice) = parse_color_token(&self.swatch_hex) {
+                    self.apply_tab_color(shared, i, choice);
+                    self.close_swatch();
+                }
+            }
+            SwatchAction::HexUnfocus => {
+                self.swatch_focus = SwatchFocus::Grid;
+                self.update_swatch_view();
+            }
             SwatchAction::None => {}
         }
     }
 
     /// Route a left-click into the open tab-color popover — the mouse
     /// counterpart to [`Self::swatch_key_input`]. A hit on a curated cell
-    /// picks that color; `Default`/`Clear` apply those choices; anything
-    /// else (padding inside the panel, or a click that missed the panel
-    /// entirely) just dismisses the popover, same as `Esc`
-    /// (`SwatchAction::Close`) — no rename commit/cancel either way, so the
-    /// editor underneath stays exactly as the user left it. Panel geometry
-    /// comes from `Renderer::swatch_hit`, which reads the SAME
-    /// `paint::swatch_geom` the popover is drawn from, so a click always
-    /// lands on what's actually on screen.
+    /// picks that color; `Default`/`Clear` apply those choices; the hue bar
+    /// picks the hue under the cursor and arms a drag (further motion keeps
+    /// sweeping — see `on_cursor_moved`'s `hue_drag` branch); the hex field
+    /// just takes focus (typing is what edits it); anything else (padding
+    /// inside the panel, or a click that missed the panel entirely) just
+    /// dismisses the popover, same as `Esc` on the grid — no rename
+    /// commit/cancel either way, so the editor underneath stays exactly as
+    /// the user left it. Panel geometry comes from `Renderer::swatch_hit`,
+    /// which reads the SAME `paint::swatch_geom` the popover is drawn from,
+    /// so a click always lands on what's actually on screen.
     fn swatch_click(&mut self, shared: &mut Shared) {
         let Some(i) = self.swatch_open else { return };
         let (x, y) = self.cursor;
@@ -4194,6 +4401,16 @@ impl WindowState {
             Some(SwatchPopoverHit::Clear) => {
                 self.apply_tab_color(shared, i, TabColorChoice::Unset);
                 self.close_swatch();
+            }
+            Some(SwatchPopoverHit::HueBar(frac)) => {
+                self.swatch_focus = SwatchFocus::HueBar;
+                self.swatch_hue = frac * 360.0;
+                self.hue_drag = true;
+                self.update_swatch_view();
+            }
+            Some(SwatchPopoverHit::HexField) => {
+                self.swatch_focus = SwatchFocus::HexField;
+                self.update_swatch_view();
             }
             Some(SwatchPopoverHit::Blank) | None => self.close_swatch(),
         }
@@ -5979,63 +6196,299 @@ mod tests {
     // --- swatch_key: the tab-color popover's keyboard classifier -----------
 
     #[test]
-    fn swatch_key_enter_resolves_by_selection() {
-        use super::{SwatchAction, swatch_key};
-        use winit::keyboard::{Key, NamedKey};
+    fn swatch_key_enter_resolves_by_selection_on_the_grid() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
 
         for key in [Key::Named(NamedKey::Enter), Key::Named(NamedKey::Space)] {
-            assert_eq!(swatch_key(&key, 0), SwatchAction::Pick);
-            assert_eq!(swatch_key(&key, 11), SwatchAction::Pick);
-            assert_eq!(swatch_key(&key, 12), SwatchAction::PinDefault);
-            assert_eq!(swatch_key(&key, 13), SwatchAction::Clear);
-        }
-    }
-
-    #[test]
-    fn swatch_key_escape_closes_regardless_of_selection() {
-        use super::{SwatchAction, swatch_key};
-        use winit::keyboard::{Key, NamedKey};
-
-        for sel in [0, 5, 12, 13] {
+            let mods = ModifiersState::empty();
             assert_eq!(
-                swatch_key(&Key::Named(NamedKey::Escape), sel),
-                SwatchAction::Close
+                swatch_key(&key, mods, SwatchFocus::Grid, 0),
+                SwatchAction::Pick
+            );
+            assert_eq!(
+                swatch_key(&key, mods, SwatchFocus::Grid, 11),
+                SwatchAction::Pick
+            );
+            assert_eq!(
+                swatch_key(&key, mods, SwatchFocus::Grid, 12),
+                SwatchAction::PinDefault
+            );
+            assert_eq!(
+                swatch_key(&key, mods, SwatchFocus::Grid, 13),
+                SwatchAction::Clear
             );
         }
     }
 
     #[test]
-    fn swatch_key_arrows_move() {
-        use super::{SwatchAction, swatch_key};
-        use winit::keyboard::{Key, NamedKey};
+    fn swatch_key_escape_closes_on_grid_and_hue_bar() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        let mods = ModifiersState::empty();
+        for sel in [0, 5, 12, 13] {
+            assert_eq!(
+                swatch_key(&Key::Named(NamedKey::Escape), mods, SwatchFocus::Grid, sel),
+                SwatchAction::Close
+            );
+        }
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::Escape), mods, SwatchFocus::HueBar, 0),
+            SwatchAction::Close
+        );
+    }
+
+    #[test]
+    fn swatch_key_escape_on_hex_field_unfocuses_instead_of_closing() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
 
         assert_eq!(
-            swatch_key(&Key::Named(NamedKey::ArrowRight), 0),
+            swatch_key(
+                &Key::Named(NamedKey::Escape),
+                ModifiersState::empty(),
+                SwatchFocus::HexField,
+                0
+            ),
+            SwatchAction::HexUnfocus
+        );
+    }
+
+    #[test]
+    fn swatch_key_arrows_move_the_grid() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        let mods = ModifiersState::empty();
+        assert_eq!(
+            swatch_key(
+                &Key::Named(NamedKey::ArrowRight),
+                mods,
+                SwatchFocus::Grid,
+                0
+            ),
             SwatchAction::Move(1)
         );
         assert_eq!(
-            swatch_key(&Key::Named(NamedKey::ArrowLeft), 0),
+            swatch_key(&Key::Named(NamedKey::ArrowLeft), mods, SwatchFocus::Grid, 0),
             SwatchAction::Move(-1)
         );
         assert_eq!(
-            swatch_key(&Key::Named(NamedKey::ArrowDown), 0),
+            swatch_key(&Key::Named(NamedKey::ArrowDown), mods, SwatchFocus::Grid, 0),
             SwatchAction::Move(4)
         );
         assert_eq!(
-            swatch_key(&Key::Named(NamedKey::ArrowUp), 0),
+            swatch_key(&Key::Named(NamedKey::ArrowUp), mods, SwatchFocus::Grid, 0),
             SwatchAction::Move(-4)
         );
     }
 
     #[test]
-    fn swatch_key_unhandled_key_is_a_no_op() {
-        use super::{SwatchAction, swatch_key};
-        use winit::keyboard::{Key, NamedKey};
+    fn swatch_key_tab_cycles_focus_regardless_of_current_region() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
 
+        for focus in [
+            SwatchFocus::Grid,
+            SwatchFocus::HueBar,
+            SwatchFocus::HexField,
+        ] {
+            assert_eq!(
+                swatch_key(
+                    &Key::Named(NamedKey::Tab),
+                    ModifiersState::empty(),
+                    focus,
+                    0
+                ),
+                SwatchAction::FocusNext
+            );
+            let mut shift = ModifiersState::empty();
+            shift.set(ModifiersState::SHIFT, true);
+            assert_eq!(
+                swatch_key(&Key::Named(NamedKey::Tab), shift, focus, 0),
+                SwatchAction::FocusPrev
+            );
+        }
+    }
+
+    #[test]
+    fn swatch_key_hue_bar_arrows_step_and_enter_applies() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        let mods = ModifiersState::empty();
         assert_eq!(
-            swatch_key(&Key::Named(NamedKey::Tab), 0),
+            swatch_key(
+                &Key::Named(NamedKey::ArrowRight),
+                mods,
+                SwatchFocus::HueBar,
+                0
+            ),
+            SwatchAction::HueStep(1)
+        );
+        assert_eq!(
+            swatch_key(
+                &Key::Named(NamedKey::ArrowLeft),
+                mods,
+                SwatchFocus::HueBar,
+                0
+            ),
+            SwatchAction::HueStep(-1)
+        );
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::Enter), mods, SwatchFocus::HueBar, 0),
+            SwatchAction::ApplyHue
+        );
+        // Grid-only keys are a no-op here — the hue bar has no 14-item grid.
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::ArrowUp), mods, SwatchFocus::HueBar, 0),
             SwatchAction::None
         );
+    }
+
+    #[test]
+    fn swatch_key_hex_field_routes_typing_backspace_and_enter() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        let mods = ModifiersState::empty();
+        assert_eq!(
+            swatch_key(&Key::Character("a".into()), mods, SwatchFocus::HexField, 0),
+            SwatchAction::HexInput("a".to_string())
+        );
+        assert_eq!(
+            swatch_key(
+                &Key::Named(NamedKey::Backspace),
+                mods,
+                SwatchFocus::HexField,
+                0
+            ),
+            SwatchAction::HexBackspace
+        );
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::Enter), mods, SwatchFocus::HexField, 0),
+            SwatchAction::HexApply
+        );
+    }
+
+    #[test]
+    fn swatch_key_unhandled_key_is_a_no_op() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        assert_eq!(
+            swatch_key(
+                &Key::Named(NamedKey::F1),
+                ModifiersState::empty(),
+                SwatchFocus::Grid,
+                0
+            ),
+            SwatchAction::None
+        );
+    }
+
+    // --- cycle_swatch_focus: Tab order Grid -> HueBar -> HexField -> -------
+
+    #[test]
+    fn cycle_swatch_focus_forward_wraps() {
+        use super::{SwatchFocus, cycle_swatch_focus};
+
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::Grid, true),
+            SwatchFocus::HueBar
+        );
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::HueBar, true),
+            SwatchFocus::HexField
+        );
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::HexField, true),
+            SwatchFocus::Grid
+        );
+    }
+
+    #[test]
+    fn cycle_swatch_focus_backward_wraps() {
+        use super::{SwatchFocus, cycle_swatch_focus};
+
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::Grid, false),
+            SwatchFocus::HexField
+        );
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::HexField, false),
+            SwatchFocus::HueBar
+        );
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::HueBar, false),
+            SwatchFocus::Grid
+        );
+    }
+
+    // --- step_hue: the hue bar's arrow-key sweep, wrapping 0..360 ----------
+
+    #[test]
+    fn step_hue_moves_by_3_degrees_per_step() {
+        use super::step_hue;
+
+        assert_eq!(step_hue(0.0, 1), 3.0);
+        assert_eq!(step_hue(0.0, -1), 357.0);
+        assert_eq!(step_hue(357.0, 1), 0.0);
+        assert_eq!(step_hue(0.0, 5), 15.0);
+    }
+
+    // --- hex_buffer_push / hex_buffer_backspace: the hex field's state -----
+
+    #[test]
+    fn hex_buffer_push_prepends_hash_on_first_digit() {
+        use super::hex_buffer_push;
+
+        assert_eq!(hex_buffer_push("", '3'), "#3");
+        assert_eq!(hex_buffer_push("#3", 'f'), "#3f");
+    }
+
+    #[test]
+    fn hex_buffer_push_uppercases_fold_to_lowercase() {
+        use super::hex_buffer_push;
+
+        assert_eq!(hex_buffer_push("#3", 'F'), "#3f");
+    }
+
+    #[test]
+    fn hex_buffer_push_explicit_hash_starts_fresh_only_when_empty() {
+        use super::hex_buffer_push;
+
+        assert_eq!(hex_buffer_push("", '#'), "#");
+        // Typing '#' again mid-entry is a no-op, not a reset — the field
+        // never contains an embedded second '#'.
+        assert_eq!(hex_buffer_push("#3f", '#'), "#3f");
+    }
+
+    #[test]
+    fn hex_buffer_push_rejects_non_hex_chars() {
+        use super::hex_buffer_push;
+
+        assert_eq!(hex_buffer_push("#3", 'z'), "#3");
+        assert_eq!(hex_buffer_push("#3", ' '), "#3");
+    }
+
+    #[test]
+    fn hex_buffer_push_caps_at_seven_chars() {
+        use super::hex_buffer_push;
+
+        let full = "#ff9d3c";
+        assert_eq!(full.len(), 7);
+        assert_eq!(hex_buffer_push(full, 'a'), full);
+    }
+
+    #[test]
+    fn hex_buffer_backspace_pops_the_last_char() {
+        use super::hex_buffer_backspace;
+
+        assert_eq!(hex_buffer_backspace("#3f"), "#3");
+        assert_eq!(hex_buffer_backspace("#"), "");
+        assert_eq!(hex_buffer_backspace(""), "");
     }
 
     #[test]
