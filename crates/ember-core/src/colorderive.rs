@@ -172,6 +172,35 @@ pub fn derive_accent(pill: u32) -> u32 {
     }
 }
 
+/// Pinned OKLCH lightness/chroma for the tab-color popover's hue bar
+/// (popover v2): every hue swept at this `(L, C)` is legible-by-construction
+/// against whichever ink `ink_for` assigns it (see
+/// `hue_to_rgb_is_tab_legible_across_the_wheel` below) — the bar never needs
+/// a per-segment contrast check, unlike the curated `SWATCHES`.
+pub const HUE_BAR_L: f64 = 0.62;
+pub const HUE_BAR_C: f64 = 0.13;
+
+/// Convert a hue angle in DEGREES to a packed `0xRRGGBB` sRGB color at the
+/// pinned [`HUE_BAR_L`]/[`HUE_BAR_C`] (OKLCH). The popover's hue bar
+/// (`ember_render::paint::build_swatch_popover`) and its live preview/apply
+/// path (`ember_app::window_state`) both call this SAME fn, so the strip
+/// painted on screen and the color actually applied always agree.
+pub fn hue_to_rgb(hue_degrees: f64) -> u32 {
+    let (a, b) = lch_to_lab(HUE_BAR_C, hue_degrees.to_radians());
+    oklab_to_srgb(HUE_BAR_L, a, b)
+}
+
+/// The OKLCH hue angle (degrees, `0..360`) of a packed color — the inverse
+/// direction from [`hue_to_rgb`]. Used to seed the hue bar's marker/preview
+/// at a tab's existing custom color when the popover reopens on it, so the
+/// bar doesn't silently reset to red every time.
+pub fn hue_of(c: u32) -> f64 {
+    let (_, a, b) = srgb_to_oklab(c);
+    let (_, h) = lab_to_lch(a, b);
+    let deg = h.to_degrees();
+    if deg < 0.0 { deg + 360.0 } else { deg }
+}
+
 /// Blend `c` toward `toward` by `t` (`0.0` = `c` unchanged, `1.0` = fully
 /// `toward`), per sRGB channel — the redesign's inactive-tab pill treatment
 /// (design doc, item 2): a colored inactive tab blends its color toward the
@@ -319,6 +348,48 @@ mod tests {
                 "swatch {c:#08x}'s accent {accent:#08x} only gets {ratio:.2}:1"
             );
         }
+    }
+
+    // --- hue_to_rgb / hue_of (popover v2 hue bar) --------------------------
+
+    #[test]
+    fn hue_to_rgb_round_trips_through_hue_of() {
+        // The 8-bit sRGB pack + the "simple channel clamp" gamut approach
+        // (this module's accepted tradeoff, per `derive_accent`'s own doc)
+        // both cost a couple degrees near a channel's clip point — allow
+        // for that rather than asserting sub-degree precision.
+        for deg in [0.0, 37.0, 90.0, 180.0, 270.0, 359.0] {
+            let c = hue_to_rgb(deg);
+            let back = hue_of(c);
+            let mut diff = (deg - back).abs();
+            if diff > 180.0 {
+                diff = 360.0 - diff;
+            }
+            assert!(diff < 2.5, "hue {deg} round-tripped to {back}");
+        }
+    }
+
+    #[test]
+    fn hue_to_rgb_is_tab_legible_across_the_wheel() {
+        // Every hue at the pinned L/C clears the WCAG text-contrast minimum
+        // against whichever ink `ink_for` assigns it — "tab-legible by
+        // construction" (design intent), no per-segment check needed at
+        // paint time. Sampled every 15 degrees (worst case ~4.87:1).
+        for i in 0..24 {
+            let deg = i as f64 * 15.0;
+            let c = hue_to_rgb(deg);
+            let ink = ink_for(c);
+            let ratio = contrast_ratio(c, ink);
+            assert!(
+                ratio >= 4.5,
+                "hue {deg} only gets {ratio:.2}:1 against ink {ink:#08x}"
+            );
+        }
+    }
+
+    #[test]
+    fn hue_to_rgb_distinguishes_opposite_hues() {
+        assert_ne!(hue_to_rgb(0.0), hue_to_rgb(180.0));
     }
 
     // --- blend_toward (item 2) --------------------------------------------

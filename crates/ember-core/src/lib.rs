@@ -26,7 +26,8 @@ pub use backend::{
     VtProjection, frame_channel,
 };
 pub use colorderive::{
-    INK_DARK, INK_LIGHT, blend_toward, contrast_ratio, derive_accent, ink_for, relative_luminance,
+    HUE_BAR_C, HUE_BAR_L, INK_DARK, INK_LIGHT, blend_toward, contrast_ratio, derive_accent, hue_of,
+    hue_to_rgb, ink_for, relative_luminance,
 };
 pub use command::{LayoutCommand, LayoutEffect, apply};
 pub use config::{
