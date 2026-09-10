@@ -606,6 +606,14 @@ pub struct Renderer {
     /// Older… screen's single multi-line buffer (header + up to 10 rows),
     /// same one-buffer-per-panel shape as the command palette.
     restore_list: Buffer,
+    /// Main screen's `[Restore, Start fresh, Older…]` button rects (logical
+    /// px), for hit-testing clicks — same helper-produced rects the draw
+    /// used, per `RestoreMainLayout::buttons`'s doc. All-zero (never hit)
+    /// while the Main screen isn't shown.
+    restore_main_buttons: [[f32; 4]; 3],
+    /// Older… screen's row rects (logical px), for hit-testing clicks — see
+    /// `RestoreListLayout::rows`'s doc. Empty while that screen isn't shown.
+    restore_list_rows: Vec<[f32; 4]>,
     /// Measured monospace advance (px) — keeps bg quads aligned with glyphs.
     cell_w: f32,
     /// Current terminal font point size (mutated by live zoom).
@@ -842,6 +850,8 @@ impl Renderer {
             restore_header,
             restore_buttons,
             restore_list,
+            restore_main_buttons: [[0.0; 4]; 3],
+            restore_list_rows: Vec::new(),
             cell_w,
             font_size,
             line_height,
@@ -1425,6 +1435,21 @@ impl Renderer {
 
     pub fn restore_shown(&self) -> bool {
         self.restore.is_some()
+    }
+
+    /// Which restore-modal Main-screen button (`0` Restore, `1` Start
+    /// fresh, `2` Older…) is at logical `(x, y)`, or `None` outside all
+    /// three — mirrors `confirm_button_at`, and (unlike it) delegates the
+    /// actual point-in-rect test to the pure, unit-tested
+    /// `paint::restore_main_hit` rather than repeating it inline.
+    pub fn restore_button_at(&self, x: f32, y: f32) -> Option<u8> {
+        crate::paint::restore_main_hit(&self.restore_main_buttons, x, y)
+    }
+
+    /// Which restore-modal `Older…` row is at logical `(x, y)`, or `None`
+    /// outside every row. See [`Renderer::restore_button_at`]'s doc.
+    pub fn restore_row_at(&self, x: f32, y: f32) -> Option<usize> {
+        crate::paint::restore_list_hit(&self.restore_list_rows, x, y)
     }
 
     pub fn set_about(&mut self, info: Option<AboutInfo>) {
@@ -2148,6 +2173,14 @@ impl Renderer {
             // text into `overlay_areas` so it can't be overpainted by pane
             // glyphs underneath). Mutually exclusive with `confirm` in
             // practice.
+            //
+            // Hit rects reset here and repopulated below only for the screen
+            // actually shown, mirroring `confirm_buttons.clear()` just
+            // above: with the modal hidden (or on the other screen) they
+            // stay all-zero/empty, so `restore_button_at`/`restore_row_at`
+            // can never hit a stale rect from a screen that's no longer up.
+            self.restore_main_buttons = [[0.0; 4]; 3];
+            self.restore_list_rows.clear();
             if let Some(view) = self.restore.clone() {
                 let lw = self.config.width as f32 / sf;
                 let lh = self.config.height as f32 / sf;
@@ -2166,6 +2199,7 @@ impl Renderer {
                             sf,
                             &mut rounded,
                         );
+                        self.restore_main_buttons = rl.buttons;
                         overlay_areas.push(TextArea {
                             buffer: &self.restore_header,
                             left: rl.header_origin.0 * sf,
@@ -2192,7 +2226,7 @@ impl Renderer {
                         rows,
                         selected,
                     } => {
-                        let (left, top) = build_restore_list(
+                        let rl = build_restore_list(
                             &mut self.font_system,
                             &mut self.restore_list,
                             &header,
@@ -2204,10 +2238,11 @@ impl Renderer {
                             sf,
                             &mut rounded,
                         );
+                        self.restore_list_rows = rl.rows;
                         overlay_areas.push(TextArea {
                             buffer: &self.restore_list,
-                            left: left * sf,
-                            top: top * sf,
+                            left: rl.text_origin.0 * sf,
+                            top: rl.text_origin.1 * sf,
                             scale: sf,
                             bounds: full_bounds,
                             default_color: Color::rgb(0xf5, 0xf5, 0xdc),

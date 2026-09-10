@@ -281,7 +281,7 @@ pub fn capture_reusing(
     ];
     let mut restore_list = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut restore_main_layout: Option<crate::paint::RestoreMainLayout> = None;
-    let mut restore_list_origin: Option<(f32, f32)> = None;
+    let mut restore_list_layout: Option<crate::paint::RestoreListLayout> = None;
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
     let mut rounded: Vec<([f32; 4], [f32; 4], f32)> = Vec::new();
     let mut spark_rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
@@ -581,7 +581,7 @@ pub fn capture_reusing(
             rows,
             selected,
         }) => {
-            restore_list_origin = Some(build_restore_list(
+            restore_list_layout = Some(build_restore_list(
                 font_system,
                 &mut restore_list,
                 header,
@@ -797,11 +797,11 @@ pub fn capture_reusing(
             });
         }
     }
-    if let Some((left, top)) = restore_list_origin {
+    if let Some(rl) = &restore_list_layout {
         overlay_areas.push(TextArea {
             buffer: &restore_list,
-            left: left * sf,
-            top: top * sf,
+            left: rl.text_origin.0 * sf,
+            top: rl.text_origin.1 * sf,
             scale: sf,
             bounds: full_bounds,
             default_color: Color::rgb(0xf5, 0xf5, 0xdc),
