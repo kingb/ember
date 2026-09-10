@@ -5,7 +5,8 @@
 //! `Renderer` struct + GPU plumbing live in `renderer.rs`.
 
 use ember_core::{
-    MarkStatus, Rect, Rgb, RowKind, SWATCHES, SettingsRowView, blend_toward, derive_accent, ink_for,
+    INK_DARK, INK_LIGHT, MarkStatus, Rect, Rgb, RowKind, SWATCHES, SettingsRowView, blend_toward,
+    derive_accent, ink_for,
 };
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
 
@@ -1518,22 +1519,45 @@ pub(crate) fn build_swatch_popover(
         lin_rgba(Rgb::new(0x20, 0x22, 0x28), 1.0),
         r * sf,
     ));
+
+    // The keyboard-selection indicator (live feedback: this used to be a
+    // same-hue accent ring, `derive_accent(c)` — subtle by design, since it
+    // was tuned to *match* the cell it sits on, which is exactly wrong for
+    // "which cell is focused". Fix: an ink-based double ring, the same
+    // move that fixed the rename-editor swatch (see that ring's `ink_for`
+    // comment) — but that fix could pick ONE ink because it rings a fill it
+    // controls. Here the ring sits on top of an arbitrary curated swatch
+    // (light or dark) AND, for the Default/Clear rows, this panel's own
+    // fixed dark background — no single ink clears contrast against all of
+    // those. So lay down both: a thick near-white outer ring, then a thin
+    // near-black inner ring immediately inside it. Whatever the ring sits
+    // on, one of the two lines borders it, so the seam is always visible.
+    // Net ring is ~3px per side, up from the old accent ring's 2px.
+    let push_selection_ring = |rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
+                               rx: f32,
+                               ry: f32,
+                               rw: f32,
+                               rh: f32,
+                               r_out: f32| {
+        rounded.push((
+            scaled(rx - 3.0, ry - 3.0, rw + 6.0, rh + 6.0, sf),
+            lin_rgba(unpack_rgb(INK_LIGHT), 0.95),
+            (r_out + 3.0) * sf,
+        ));
+        rounded.push((
+            scaled(rx - 1.0, ry - 1.0, rw + 2.0, rh + 2.0, sf),
+            lin_rgba(unpack_rgb(INK_DARK), 0.95),
+            (r_out + 1.0) * sf,
+        ));
+    };
+
     for (i, &c) in SWATCHES.iter().enumerate() {
         let col = i % cols;
         let row = i / cols;
         let cx = grid_x + col as f32 * (cell + gap);
         let cy = grid_y + row as f32 * (cell + gap);
         if selected == i {
-            // Same-hue accent (item 4), derived from this swatch cell's own
-            // color — a plain white ring read as generic "selected" chrome
-            // with no relation to what picking this cell would actually
-            // color the tab.
-            let ring = unpack_rgb(derive_accent(c));
-            rounded.push((
-                scaled(cx - 2.0, cy - 2.0, cell + 4.0, cell + 4.0, sf),
-                lin_rgba(ring, 0.9),
-                4.0 * sf,
-            ));
+            push_selection_ring(rounded, cx, cy, cell, cell, 3.0);
         }
         rounded.push((
             scaled(cx, cy, cell, cell, sf),
@@ -1542,10 +1566,13 @@ pub(crate) fn build_swatch_popover(
         ));
     }
 
-    // `Default` / `Clear` rows, below the grid.
+    // `Default` / `Clear` rows, below the grid. Same double ring, drawn
+    // outset around the row's own accent-tint fill (unchanged) so the
+    // ring's high-contrast seam frames it instead of replacing it.
     for (i, _) in ["Default", "Clear"].iter().enumerate() {
         let ry = list_y + i as f32 * row_h;
         if selected == SWATCHES.len() + i {
+            push_selection_ring(rounded, x + 3.0, ry, w - 6.0, row_h, 1.0);
             rounded.push((
                 scaled(x + 3.0, ry, w - 6.0, row_h, sf),
                 lin_rgba(ACCENT, 0.28),

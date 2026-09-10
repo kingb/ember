@@ -52,6 +52,12 @@ pub struct Opts {
     /// set color, so one shot exercises the chip, the editor swatch, and the
     /// popover together (`SwatchView { tab: 0, selected: 2 }`).
     pub swatch_popover: bool,
+    /// Keyboard-selection index within `--swatch-popover`'s grid (`0..12`
+    /// for the curated swatches, `12` for `Default`, `13` for `Clear`) —
+    /// defaults to `2`, a mid-grid cell. Lets a fixture pick a light cell,
+    /// a dark cell, or a Default/Clear row to check the selection ring
+    /// against each.
+    pub swatch_selected: usize,
     /// Draw an active + an inactive colored tab pill (the redesign, items
     /// 2/3/4): tab 0 (active) gets `SWATCHES[0]` at full strength, tab 1
     /// (inactive) gets `SWATCHES[4]` blended toward the strip background —
@@ -126,6 +132,7 @@ impl Default for Opts {
             restore_main: false,
             restore_older: false,
             swatch_popover: false,
+            swatch_selected: 2,
             colored_tabs: false,
             split_preview: None,
             settle_ms: 700,
@@ -199,6 +206,11 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--restore-main" => opts.restore_main = true,
             "--restore-older" => opts.restore_older = true,
             "--swatch-popover" => opts.swatch_popover = true,
+            "--swatch-selected" => {
+                opts.swatch_selected = next()?
+                    .parse()
+                    .map_err(|e| format!("--swatch-selected: {e}"))?
+            }
             "--colored-tabs" => opts.colored_tabs = true,
             "--help-overlay" => opts.help_overlay = true,
             "--settings" => opts.settings = true,
@@ -545,7 +557,7 @@ pub fn run(opts: Opts) -> Result<String, String> {
         },
         swatch: opts.swatch_popover.then_some(ember_render::SwatchView {
             tab: 0,
-            selected: 2,
+            selected: opts.swatch_selected,
         }),
         hold_ring: opts.hold_ring,
         // No offline `--screenshot` flag for these (v0.4.0): both are live
