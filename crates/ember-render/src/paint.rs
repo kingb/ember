@@ -4,7 +4,10 @@
 //! identically. Stateless free functions over the renderer's colors/metrics; the
 //! `Renderer` struct + GPU plumbing live in `renderer.rs`.
 
-use ember_core::{MarkStatus, Rect, Rgb, RowKind, SettingsRowView};
+use ember_core::{
+    INK_DARK, INK_LIGHT, MarkStatus, Rect, Rgb, RowKind, SWATCHES, SettingsRowView, blend_toward,
+    derive_accent, ink_for,
+};
 use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping};
 
 use crate::grid_model::GridModel;
@@ -726,12 +729,80 @@ const TAB_ACTIVE: Rgb = Rgb::new(0x3a, 0x3a, 0x3d);
 /// Fill of a hovered *inactive* tab — a subtle lift between [`STRIP_BG`] and
 /// [`TAB_ACTIVE`] (iTerm-style), no accent ring so it reads as hover, not select.
 const TAB_HOVER: Rgb = Rgb::new(0x2b, 0x2b, 0x2e);
+
+/// Pack an [`Rgb`] into `0xRRGGBB` — the representation `ember_core`'s color
+/// math (`blend_toward`/`ink_for`/`derive_accent`) operates on, since a tab's
+/// `color` field is already stored that way.
+fn pack_rgb(c: Rgb) -> u32 {
+    ((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32
+}
+
+/// Unpack a `0xRRGGBB` color (a tab's resolved `color`, or a derived one)
+/// into an [`Rgb`] the quad helpers take.
+fn unpack_rgb(c: u32) -> Rgb {
+    Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8)
+}
+
+/// How far an INACTIVE, un-hovered colored tab's pill blends toward
+/// [`STRIP_BG`] (the redesign, item 2): the ACTIVE tab always renders its
+/// color at full strength, so an inactive tab needs to sit far enough back
+/// that the active one still reads as clearly the selected tab at a glance.
+///
+/// `0.68`, not the original `0.55` — review finding: at `0.55`, 3 of the 12
+/// curated `SWATCHES` (`0xE8C547`, `0xFF9D3C`, `0x3FB8AF`) blended-and-inked
+/// fell short of the WCAG 4.5:1 text-contrast minimum (as low as 3.47:1).
+/// The blend/contrast curve isn't monotonic — there's a dead zone roughly
+/// `0.05..0.65` where several swatches sit awkwardly between the two ink
+/// choices and fail badly (down to ~2.9:1) — so the only values that clear
+/// 4.5:1 for every swatch are either very close to full strength or `>=
+/// ~0.65`; `every_colored_fill_meets_wcag_text_contrast` (below) pins this
+/// against regression for both this and [`HOVER_COLOR_BLEND`].
+const INACTIVE_COLOR_BLEND: f64 = 0.68;
+
+/// How far a HOVERED, inactive colored tab's pill blends toward
+/// [`STRIP_BG`] — noticeably less than [`INACTIVE_COLOR_BLEND`] (review
+/// ruling: hover should read as a distinct, brighter step toward the tab's
+/// full color, consistent with the uncolored hover lift's brightening,
+/// while the active tab still reads strongest at full strength/`0.0`).
+///
+/// `0.03`, not some mid-range value — the same dead zone that ruled out
+/// `INACTIVE_COLOR_BLEND`'s old `0.55` also rules out most of the range
+/// between `0.0` and `INACTIVE_COLOR_BLEND`: only very-close-to-full-strength
+/// (`< ~0.045`) or very-close-to-the-inactive-default (`>= ~0.65`) clears
+/// 4.5:1 for every swatch, and only the former reads as "brighter than
+/// inactive." `0.03` sits inside that safe window with margin.
+const HOVER_COLOR_BLEND: f64 = 0.03;
+
+/// The effective on-screen fill for an INACTIVE, un-hovered tab colored `c`
+/// — `c` blended [`INACTIVE_COLOR_BLEND`] of the way toward the strip
+/// background.
+fn inactive_pill_fill(c: u32) -> Rgb {
+    unpack_rgb(blend_toward(c, pack_rgb(STRIP_BG), INACTIVE_COLOR_BLEND))
+}
+
+/// The effective on-screen fill for a HOVERED, inactive tab colored `c` —
+/// `c` blended [`HOVER_COLOR_BLEND`] of the way toward the strip background
+/// (much closer to full strength than [`inactive_pill_fill`], so hovering a
+/// colored tab still reads as a distinct lift).
+fn hover_pill_fill(c: u32) -> Rgb {
+    unpack_rgb(blend_toward(c, pack_rgb(STRIP_BG), HOVER_COLOR_BLEND))
+}
+
 /// Width (in columns) of each trailing tab-strip utility button ("+", "?", "⚙").
 pub(crate) const BTN_COLS: usize = 3;
 /// Columns reserved at the left of a *hovered* tab for the "✕ " close affordance.
 /// [`build_tabs`] draws it and [`Renderer::tab_hit`](crate::Renderer::tab_hit)
 /// must mirror this to route a click there to a close.
 pub(crate) const CLOSE_COLS: usize = 2;
+/// Columns reserved at the right of a tab being RENAMED for the color swatch
+/// affordance (Task 3) — [`build_tabs`] draws it there and
+/// [`Renderer::tab_hit`](crate::Renderer::tab_hit) mirrors this to route a
+/// click there to opening the tab-color popover instead of the rename field.
+pub(crate) const SWATCH_COLS: usize = 2;
+/// Columns in the swatch popover's curated-color grid (`build_swatch_popover`).
+/// Kept in lockstep with `ember_app::window_state::SWATCH_GRID_COLS`, which
+/// drives the same 4-wide wrap for the pure keyboard classifier.
+pub(crate) const SWATCH_GRID_COLS: usize = 4;
 
 /// Center `s` in a field `width` **display columns** wide (truncating with `…`
 /// if too long). Uses Unicode display width — a CJK title char is 2 columns —
@@ -798,6 +869,48 @@ fn pill_geom(x: f32, w: f32, strip_h: f32, cw: f32) -> (f32, f32, f32, f32, f32)
 fn pill_cap_center(x: f32, w: f32, strip_h: f32, cw: f32) -> (f32, f32) {
     let (px, inset_y, _pw, ph, radius) = pill_geom(x, w, strip_h, cw);
     (px + radius, inset_y + ph * 0.5)
+}
+
+/// Center of a pill's RIGHT rounded cap (logical px) — where the rename-editor
+/// color swatch sits (Task 3). Mirrors [`pill_cap_center`], the left-cap
+/// counterpart used for the hover "✕".
+fn pill_right_cap_center(x: f32, w: f32, strip_h: f32, cw: f32) -> (f32, f32) {
+    let (px, inset_y, pw, ph, radius) = pill_geom(x, w, strip_h, cw);
+    (px + pw - radius, inset_y + ph * 0.5)
+}
+
+/// Columns reserved for the tab area itself, given the strip's total
+/// logical width and cell width — the trailing "+"/"?"/"⚙" buttons each
+/// claim up to [`BTN_COLS`], and whatever's left over is the tab area.
+/// Mirrors [`build_tabs`]'s own `total_cols`/`plus_cols`/`help_cols`/
+/// `gear_cols` prefix math exactly; pulled out as its own helper (review
+/// finding: this prefix had drifted into three separate copies — the live
+/// renderer's popover draw, the headless popover draw, and
+/// `Renderer::swatch_hit` — any one of which could silently fall out of
+/// sync with `build_tabs` on its own) so anchoring the swatch popover
+/// (drawing OR hit-testing) always reads the exact same tab-area width.
+pub(crate) fn tab_area_cols(logical_w: f32, cw: f32) -> usize {
+    let total_cols = (logical_w / cw).floor() as usize;
+    let plus_cols = BTN_COLS.min(total_cols);
+    let help_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols));
+    let gear_cols = BTN_COLS.min(total_cols.saturating_sub(plus_cols + help_cols));
+    total_cols.saturating_sub(plus_cols + help_cols + gear_cols)
+}
+
+/// `x`/width (logical px) of tab `i`'s segment in the strip, given `n` real
+/// tabs and the columns reserved for the tab area — mirrors the (ghost-less)
+/// segment math in [`build_tabs`]'s main loop. The swatch popover only ever
+/// opens while renaming a tab, which never coexists with a cross-window drag
+/// ghost, so this doesn't need to account for one. Used to anchor
+/// [`build_swatch_popover`] under the editing tab.
+pub(crate) fn tab_segment_x(n: usize, tab_cols: usize, cw: f32, i: usize) -> (f32, f32) {
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let seg = tab_cols / n;
+    let col = seg * i.min(n - 1);
+    let width = if i == n - 1 { tab_cols - col } else { seg };
+    (col as f32 * cw, width as f32 * cw)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -910,6 +1023,19 @@ impl TabsCache {
     }
 }
 
+/// Where and in what color to draw the hovered tab's "✕" (Task 4): position
+/// is always the pill's left cap; color is the plain default gray for an
+/// uncolored tab, or a same-hue accent derived from that tab's actual
+/// on-screen fill color, so the close affordance still reads as "this tab's"
+/// close rather than a stray gray glyph floating over a colored pill.
+pub(crate) struct CloseGlyph {
+    pub cx: f32,
+    pub color: Rgb,
+}
+
+/// Plain, uncolored close-"✕" ink — unchanged from before the redesign.
+const CLOSE_DEFAULT: Rgb = Rgb::new(0xcc, 0xcc, 0xcc);
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_tabs(
     font_system: &mut FontSystem,
@@ -931,11 +1057,11 @@ pub(crate) fn build_tabs(
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
     rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
-) -> Option<f32> {
+) -> Option<CloseGlyph> {
     let strip_h = CELL_HEIGHT + 2.0 * PAD;
-    // Center-x of the hovered tab's "✕" (in the pill's left cap); `None` when no
+    // The hovered tab's "✕": where and what color to draw it; `None` when no
     // tab is hovered. The caller positions `close_buf` there.
-    let mut close_cx: Option<f32> = None;
+    let mut close_glyph: Option<CloseGlyph> = None;
     // Full-width strip background.
     out.push((
         scaled(0.0, 0.0, logical_w, strip_h, sf),
@@ -977,6 +1103,31 @@ pub(crate) fn build_tabs(
             let x = col as f32 * cw;
             let w = width as f32 * cw;
             let dragging_this = drag_slot == Some(i);
+            // The tab's own hand-picked/resolved color (Task 3), blended
+            // toward the strip background when the tab isn't active/editing
+            // (the redesign, item 2) — `None` for both an uncolored tab AND
+            // a colored one currently being dragged (the recessed gap below
+            // isn't a pill, so there's no fill to color). Hovering an
+            // inactive colored tab uses the brighter `hover_pill_fill`
+            // (review ruling) rather than the plain inactive blend, so
+            // hover still reads as a distinct lift — mirroring the
+            // uncolored `TAB_HOVER` treatment below. This is the SAME value
+            // used for the pill fill, the title ink (item 3), and the close
+            // "✕"/selection-ring accent (item 4) — computed once so all
+            // four always agree on "what color is this tab, right now."
+            let colored_fill = if dragging_this {
+                None
+            } else {
+                tab.color.map(|c| {
+                    if tab.editing || tab.active {
+                        unpack_rgb(c)
+                    } else if hovered == Some(i) {
+                        hover_pill_fill(c)
+                    } else {
+                        inactive_pill_fill(c)
+                    }
+                })
+            };
             if dragging_this {
                 // The grabbed tab's slot is a recessed "gap" (darker) — the lifted
                 // copy floats over it at the cursor (drawn after the loop).
@@ -984,29 +1135,122 @@ pub(crate) fn build_tabs(
                     scaled(x, 0.0, w, strip_h, sf),
                     lin_rgba(Rgb::new(0x0c, 0x0c, 0x0c), 1.0),
                 ));
-            } else if tab.editing {
-                // Inline rename: an accent-ringed rounded pill so it reads as an
-                // editable field.
-                push_pill(rounded, x, w, strip_h, cw, sf, TAB_ACTIVE, Some(ACCENT));
-            } else if tab.active {
-                // iTerm-style: an inset rounded pill with a subtle ember ring.
-                push_pill(rounded, x, w, strip_h, cw, sf, TAB_ACTIVE, Some(ACCENT));
+            } else if tab.editing || tab.active {
+                // Inline rename / active: an accent-ringed rounded pill so it
+                // reads as selected/editable. The redesign (item 2): a
+                // colored tab's pill fills with its color at full strength;
+                // an uncolored one keeps the plain [`TAB_ACTIVE`] fill.
+                let fill = colored_fill.unwrap_or(TAB_ACTIVE);
+                push_pill(rounded, x, w, strip_h, cw, sf, fill, Some(ACCENT));
+            } else if let Some(fill) = colored_fill {
+                // Inactive, colored (`fill` is already the hover-brightened
+                // variant when this tab is hovered — see `colored_fill`
+                // above): the blended fill, no ring — the ring is reserved
+                // for the active/editing tab so it stays the one
+                // clearly-selected pill.
+                push_pill(rounded, x, w, strip_h, cw, sf, fill, None);
             } else if hovered == Some(i) {
-                // Hover lift on an inactive tab: a subtle fill, no ring.
+                // Hover lift on an uncolored inactive tab: a subtle fill, no
+                // ring — unchanged from before the redesign.
                 push_pill(rounded, x, w, strip_h, cw, sf, TAB_HOVER, None);
             }
             // Hovering a tab (active or not) reveals a "✕" centered in the pill's
             // left rounded cap; the caller draws close_buf there. Suppressed while
-            // renaming or dragging that tab.
+            // renaming or dragging that tab. Its color (Task 4): a same-hue
+            // accent derived from this tab's actual on-screen fill when it
+            // has one, else the plain default gray.
             if hovered == Some(i) && !tab.editing && !dragging_this {
-                close_cx = Some(pill_cap_center(x, w, strip_h, cw).0);
+                let cx = pill_cap_center(x, w, strip_h, cw).0;
+                let color = match colored_fill {
+                    Some(fill) => unpack_rgb(derive_accent(pack_rgb(fill))),
+                    None => CLOSE_DEFAULT,
+                };
+                close_glyph = Some(CloseGlyph { cx, color });
+            }
+            // Rename-editor swatch (Task 3): the current effective color in
+            // the pill's right cap while renaming — filled when set, a hollow
+            // ring when `None` — click opens the popover (`TabHit::Swatch`).
+            if tab.editing && !dragging_this {
+                let (scx, scy) = pill_right_cap_center(x, w, strip_h, cw);
+                let d = 8.0;
+                match tab.color {
+                    // `rounded`, not `out` — same sharp-then-rounded layering
+                    // reason as the chip above: the editing pill fill is
+                    // itself a `rounded` quad and would otherwise cover this.
+                    //
+                    // Filled: an always-visible ring in the painted pill's
+                    // own ink color (`ink_for`, the same auto-contrast fn
+                    // the title uses — this pill's fill IS `c`, since the
+                    // `tab.editing` branch above painted it with
+                    // `unpack_rgb(c)`), then the chosen color inset inside
+                    // it — the hollow arm's outer+inset two-quad technique
+                    // below, but ring = ink instead of gray and inset =
+                    // fill instead of a cutout. Live feedback: a filled
+                    // swatch used to paint the chosen color directly on a
+                    // pill already filled with that same color, so the
+                    // picker affordance vanished exactly when the user
+                    // needed to reopen it. The ink ring clears >=4.5:1
+                    // against the pill by construction, so it stays visible
+                    // no matter which color is picked.
+                    Some(c) => {
+                        rounded.push((
+                            scaled(scx - d * 0.5, scy - d * 0.5, d, d, sf),
+                            lin_rgba(unpack_rgb(ink_for(c)), 0.9),
+                            2.0 * sf,
+                        ));
+                        let inset = 1.5;
+                        rounded.push((
+                            scaled(
+                                scx - d * 0.5 + inset,
+                                scy - d * 0.5 + inset,
+                                d - 2.0 * inset,
+                                d - 2.0 * inset,
+                                sf,
+                            ),
+                            lin_rgba(unpack_rgb(c), 1.0),
+                            1.0 * sf,
+                        ));
+                    }
+                    None => {
+                        // Hollow: a thin ring only (no fill) — an outer square
+                        // minus a slightly smaller inset one, both pushed as
+                        // opaque quads onto `rounded` so the inner one can cut
+                        // a "window" back down to the pill fill beneath it.
+                        rounded.push((
+                            scaled(scx - d * 0.5, scy - d * 0.5, d, d, sf),
+                            lin_rgba(Rgb::new(0xaa, 0xaa, 0xaa), 0.9),
+                            2.0 * sf,
+                        ));
+                        let inset = 1.5;
+                        rounded.push((
+                            scaled(
+                                scx - d * 0.5 + inset,
+                                scy - d * 0.5 + inset,
+                                d - 2.0 * inset,
+                                d - 2.0 * inset,
+                                sf,
+                            ),
+                            lin_rgba(TAB_ACTIVE, 1.0),
+                            1.0 * sf,
+                        ));
+                    }
+                }
             }
             // Unseen-bell indicator: a small amber dot in the tab's top-right.
+            // Pushed onto `rounded`, NOT `out` — the same sharp-before-rounded
+            // layering trap the old color chip fell into (the quad renderer
+            // draws every sharp `rects` quad before ANY rounded one), so a
+            // plain `rects` dot silently vanished under a colored tab's pill
+            // fill, which is itself a `rounded` quad drawn on top of
+            // everything in `out` (review finding: a colored tab lost its
+            // bell notification). `d * 0.5` radius makes it a full circle,
+            // not just rounded corners.
             if tab.bell {
                 let d = 5.0;
-                out.push((
+                rounded.push((
                     scaled(x + w - d - 4.0, 4.0, d, d, sf),
                     lin_rgba(AMBER, 0.95),
+                    d * 0.5 * sf,
                 ));
             }
             // Editing → buffer + caret; dragging → title only (no ⌘N, grabbed); else
@@ -1018,10 +1262,18 @@ pub(crate) fn build_tabs(
             } else {
                 format!("{}  ⌘{}", tab.title, i + 1)
             };
-            let fg = if tab.active || tab.editing || dragging_this {
-                Color::rgb(0xff, 0xff, 0xff)
-            } else {
-                Color::rgb(0x8a, 0x8a, 0x8a)
+            // Title ink (item 3): a colored tab auto-contrasts against its
+            // own actual on-screen fill (WCAG relative luminance, this
+            // app's near-black/near-white ink constants); an uncolored tab
+            // — including the grabbed-tab drag preview, which paints no
+            // pill at all — keeps the exact look it always had.
+            let fg = match colored_fill {
+                Some(fill) => {
+                    let ink = unpack_rgb(ink_for(pack_rgb(fill)));
+                    Color::rgb(ink.r, ink.g, ink.b)
+                }
+                None if tab.active || tab.editing || dragging_this => Color::rgb(0xff, 0xff, 0xff),
+                None => Color::rgb(0x8a, 0x8a, 0x8a),
             };
             spans.push((center(&label, width), fg));
             col += width;
@@ -1104,7 +1356,7 @@ pub(crate) fn build_tabs(
     // Shape the hover "✕" into its own buffer so the caller can pixel-center it in
     // the pill cap (the column-based chrome line can't hit that spot exactly).
     // The glyph is constant, so shape it once per zoom level, not per hover-frame.
-    if close_cx.is_some() && cache.close_cw != Some(cw_bits) {
+    if close_glyph.is_some() && cache.close_cw != Some(cw_bits) {
         close_buf.set_size(font_system, Some(cw * 2.0), Some(LINE_HEIGHT));
         close_buf.set_text(
             font_system,
@@ -1116,7 +1368,636 @@ pub(crate) fn build_tabs(
         close_buf.shape_until_scroll(font_system, false);
         cache.close_cw = Some(cw_bits);
     }
-    close_cx
+    close_glyph
+}
+
+/// Text-placement result from [`build_swatch_popover`] (logical px).
+pub(crate) struct SwatchLayout {
+    /// Origin of the hint line (see [`SWATCH_HINT`]).
+    pub hint_origin: (f32, f32),
+    /// Origin of the `Default` row's own label — a separate buffer/origin
+    /// from `Clear`'s (not one two-line block) since [`SWATCH_ROW_GAP`]
+    /// means the rows no longer sit at the text buffer's own fixed line
+    /// pitch.
+    pub default_origin: (f32, f32),
+    /// Origin of the `Clear` row's own label.
+    pub clear_origin: (f32, f32),
+    /// Origin of the hex field's text (the "#______" placeholder or the
+    /// typed value).
+    pub hex_origin: (f32, f32),
+}
+
+/// Popover v3's size knobs (live feedback: "the whole color modal got way
+/// too big and weird" — the v2 panel padded a `SWATCH_SCALE` blow-up of
+/// every box out to whatever width the hint line demanded, leaving huge
+/// dead thirds around a grid/hue/preview block that stayed small and
+/// centered inside it). v3 drops that single multiplier in favor of
+/// explicit sizes for each part — a swatch cell, a swatch gap, panel
+/// padding, the gap between stacked sections, and the hue bar's height —
+/// so the panel's content width is simply the grid's own width and every
+/// other row (hue bar, hex/preview row, Default/Clear rows) conforms to
+/// THAT, instead of a separately-centered sub-block floating inside a
+/// wider shell. One column, one width, no leftover shell around it.
+pub(crate) const SWATCH_CELL: f32 = 36.0;
+pub(crate) const SWATCH_GAP: f32 = 8.0;
+pub(crate) const SWATCH_PAD: f32 = 16.0;
+/// Vertical gap between the panel's stacked sections (hint -> grid -> hue
+/// bar -> hex/preview row -> Default/Clear rows).
+pub(crate) const SWATCH_SECTION_GAP: f32 = 10.0;
+pub(crate) const SWATCH_HUE_H: f32 = 18.0;
+/// Height of one `Default`/`Clear` row — a "settings row" (see
+/// `build_settings`): exactly one text line tall.
+pub(crate) const SWATCH_ROW_H: f32 = LINE_HEIGHT;
+/// Gap between the `Default` and `Clear` rows — the two need to read as
+/// distinct buttons (restore modal's button styling is the precedent), not
+/// one gray box with two labels, so they're no longer flush against each
+/// other. Each gets its own text buffer (see `SwatchLayout::default_origin`/
+/// `clear_origin`) since the buffer's own fixed line spacing can no longer
+/// double as the row pitch once a gap sits between them.
+pub(crate) const SWATCH_ROW_GAP: f32 = 4.0;
+
+/// Quad segments the hue bar sweeps hue across (`0..360` degrees, OKLCH,
+/// pinned lightness/chroma — see [`ember_core::hue_to_rgb`]).
+pub(crate) const SWATCH_HUE_SEGMENTS: usize = 24;
+
+/// Greedy word-wrap line count for `text` set at `cw` px/char into a column
+/// `max_w` px wide — used to size the hint line's height BEFORE it's shaped
+/// (`swatch_geom` is pure geometry, no `FontSystem`), so the panel's content
+/// width can stay pinned to the swatch grid's own width instead of widening
+/// to fit the hint on one line (the v2 bug this module is fixing). Mirrors
+/// the shaped buffer's own word-wrap closely enough for layout purposes: a
+/// word never splits mid-word (only a single word wider than `max_w` can
+/// still overflow a line, same as real word-wrap).
+pub(crate) fn wrap_line_count(text: &str, cw: f32, max_w: f32) -> usize {
+    let max_chars = ((max_w / cw).floor() as usize).max(1);
+    let mut lines = 1usize;
+    let mut cur = 0usize;
+    for word in text.split(' ') {
+        let wlen = word.chars().count();
+        if cur == 0 {
+            cur = wlen;
+            continue;
+        }
+        if cur + 1 + wlen > max_chars {
+            lines += 1;
+            cur = wlen;
+        } else {
+            cur += 1 + wlen;
+        }
+    }
+    lines
+}
+
+/// Layout geometry of the swatch popover panel (Task 3/4, popover v3) —
+/// logical px. The SINGLE source of truth for where every interactive
+/// region sits, computed once by [`swatch_geom`] and consumed by both
+/// [`build_swatch_popover`]'s drawing and
+/// [`crate::renderer::swatch_popover_hit`]'s hit-testing, so the two can
+/// never drift apart (this repo's known "two copies of the same layout math
+/// disagree" bug class — see that fn's doc).
+pub(crate) struct SwatchGeom {
+    /// Panel origin/size — the panel is content + even padding, nothing
+    /// more, and (v3) is clamped fully inside the window: `x` never crosses
+    /// the left/right edge, and `y` shifts up off its usual "under the tab"
+    /// spot if that would push the bottom past the window's bottom edge.
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Origin of the `SWATCH_GRID_COLS`-wide curated-swatch grid. Its width
+    /// (`cols * cell + (cols - 1) * gap`) is the panel's CONTENT width —
+    /// every other row (hue bar, hex/preview row, Default/Clear rows)
+    /// spans exactly this width, flush with `grid_x`, rather than being
+    /// independently centered inside a wider shell (the v2 "empty left
+    /// column" bug).
+    pub grid_x: f32,
+    pub grid_y: f32,
+    /// Side length of one swatch cell, and the gap between cells.
+    pub cell: f32,
+    pub gap: f32,
+    /// Columns in the grid (== `SWATCH_GRID_COLS`).
+    pub cols: usize,
+    /// The hue bar: a horizontal OKLCH hue sweep below the grid,
+    /// [`SWATCH_HUE_SEGMENTS`] quads wide, spanning the full content width
+    /// (`hue_bar_w == grid's width`, not narrowed for the preview beside it
+    /// — v3 moved the preview below the bar instead of beside it).
+    pub hue_bar_x: f32,
+    pub hue_bar_y: f32,
+    pub hue_bar_w: f32,
+    pub hue_bar_h: f32,
+    /// The live-preview swatch: a peer of the grid's own cells (same
+    /// `SWATCH_CELL` size, not a promoted "billboard"), right-aligned on
+    /// the hex field's row. Shows the current custom color with its
+    /// auto-ink dot.
+    pub preview_x: f32,
+    pub preview_y: f32,
+    pub preview_size: f32,
+    /// The custom hex-entry field, sharing the preview's row and taking the
+    /// remaining width to its left.
+    pub hex_x: f32,
+    pub hex_y: f32,
+    pub hex_w: f32,
+    pub hex_h: f32,
+    /// Top of the `Default` row, below the hex/preview row (the FIRST of
+    /// the two rows — `Clear` sits at `list_y + row_h + SWATCH_ROW_GAP`,
+    /// a real gap below it, not flush against it).
+    pub list_y: f32,
+    /// Height of one `Default`/`Clear` row — a "settings row" (one text
+    /// line tall; see `SWATCH_ROW_H`), not the hue bar/hex field's own
+    /// height (those are sized independently in v3).
+    pub row_h: f32,
+    /// Panel padding and hint-line height — only needed for text-buffer
+    /// sizing (not an interactive region), kept here anyway so every number
+    /// this panel's layout depends on has exactly one home.
+    pub pad: f32,
+    pub hint_h: f32,
+}
+
+/// The popover's hint line — sized against here (both for the panel's own
+/// width and the shaped hint buffer) and drawn in [`build_swatch_popover`].
+/// Trimmed to fit ONE line at the panel's content width (the full
+/// "Tab cycle · arrows move/sweep · Enter pick · Esc close" wrapped to
+/// three lines at 168px — a defect in itself). Drops the `Tab` mention
+/// (cycling sections is discoverable by clicking them) rather than wrap.
+pub(crate) const SWATCH_HINT: &str = "arrows · Enter · Esc";
+
+/// Compute the swatch popover panel's geometry, anchored under the tab at
+/// `anchor_x`/`anchor_w` (the strip segment [`tab_segment_x`] resolved for
+/// the editing tab), clamped fully inside a `logical_w` x `logical_h`
+/// window. Pure — no drawing, no text shaping — so both the paint path and
+/// the hit-test path can call it and see the identical panel.
+///
+/// Popover v3 (fixing "the whole color modal got way too big and weird"):
+/// the panel is content-first, not shell-first. The grid's own width is the
+/// content column's width; the hint line wraps INTO that width (via
+/// [`wrap_line_count`]) instead of forcing the panel wide enough for one
+/// line; the hue bar and Default/Clear rows span that same width; the
+/// preview drops to one grid cell and sits beside the hex field, not
+/// spanning two rows beside a squeezed bar. Panel height is simply the sum
+/// of the stacked sections plus padding — no leftover space anywhere.
+pub(crate) fn swatch_geom(
+    anchor_x: f32,
+    anchor_w: f32,
+    strip_h: f32,
+    cw: f32,
+    logical_w: f32,
+    logical_h: f32,
+) -> SwatchGeom {
+    let pad = SWATCH_PAD;
+    let cell = SWATCH_CELL;
+    let gap = SWATCH_GAP;
+    let cols = SWATCH_GRID_COLS;
+    let rows = SWATCHES.len().div_ceil(cols);
+    let grid_w = cols as f32 * cell + (cols as f32 - 1.0) * gap;
+    let grid_h = rows as f32 * cell + (rows as f32 - 1.0) * gap;
+    let section_gap = SWATCH_SECTION_GAP;
+    let row_h = SWATCH_ROW_H;
+
+    // The grid's own width IS the content column's width — everything else
+    // below conforms to it, rather than the panel widening to fit the hint
+    // on one line (the v2 bug). The hint wraps into it instead.
+    let content_w = grid_w;
+    let hint_lines = wrap_line_count(SWATCH_HINT, cw, content_w) as f32;
+    let hint_h = hint_lines * LINE_HEIGHT;
+
+    let hue_bar_h = SWATCH_HUE_H;
+    let preview_size = cell;
+    // The hex/preview row is exactly one cell tall — the preview is a peer
+    // of a grid swatch, not a billboard dwarfing it.
+    let hex_h = preview_size;
+
+    // Panel width = content + even padding on both sides. No hint-driven or
+    // preview-driven widening: this IS the whole content width.
+    let w = content_w + 2.0 * pad;
+    let x = (anchor_x + anchor_w * 0.5 - w * 0.5).clamp(4.0, (logical_w - w - 4.0).max(4.0));
+
+    // Stack the sections to find the content height, THEN place the panel —
+    // vertical clamp (below) needs `h` up front to decide whether "under
+    // the tab" still fits, or the panel must shift up to stay on screen.
+    let hint_top = pad;
+    let grid_top = hint_top + hint_h + section_gap;
+    let hue_top = grid_top + grid_h + section_gap;
+    let hex_top = hue_top + hue_bar_h + section_gap;
+    let list_top = hex_top + hex_h + section_gap;
+    let h = list_top + row_h * 2.0 + SWATCH_ROW_GAP + pad;
+
+    // Anchored under the tab by default, but never past the window's
+    // bottom edge: shift up until the panel fits, even if that means
+    // overlapping the tab strip on a very short window — better than
+    // clipping Default/Clear off the bottom where the mouse can't reach
+    // them.
+    let y = (strip_h + 4.0).min((logical_h - h - 4.0).max(4.0));
+
+    let grid_x = x + pad;
+    let grid_y = y + grid_top;
+    let hue_bar_x = grid_x;
+    let hue_bar_y = y + hue_top;
+    let hue_bar_w = content_w;
+    let hex_x = grid_x;
+    let hex_y = y + hex_top;
+    let preview_x = grid_x + content_w - preview_size;
+    let preview_y = hex_y;
+    let hex_w = content_w - gap - preview_size;
+    let list_y = y + list_top;
+
+    SwatchGeom {
+        x,
+        y,
+        w,
+        h,
+        grid_x,
+        grid_y,
+        cell,
+        gap,
+        cols,
+        hue_bar_x,
+        hue_bar_y,
+        hue_bar_w,
+        hue_bar_h,
+        preview_x,
+        preview_y,
+        preview_size,
+        hex_x,
+        hex_y,
+        hex_w,
+        hex_h,
+        list_y,
+        row_h,
+        pad,
+        hint_h,
+    }
+}
+
+/// Draw the tab-color swatch popover (Task 3, popover v2): a small panel
+/// anchored under the tab at `anchor_x`/`anchor_w` (the strip segment
+/// `tab_segment_x` resolved for the editing tab), offering the 12 curated
+/// `SWATCHES` in a `SWATCH_GRID_COLS`-wide grid, an OKLCH hue bar +
+/// live-preview swatch, a custom hex-entry field, then `Default`/`Clear` as
+/// two labeled rows at the bottom. Grid selection order `0..12`, `12`, `13`,
+/// matching `ember_app::window_state::swatch_key`'s indexing exactly;
+/// `focus` says which of the three regions (grid / hue bar / hex field)
+/// currently owns keyboard input, so only that region draws a focus
+/// indicator. No full-window scrim (unlike the command palette / restore
+/// modal): this is a contextual popover anchored to a specific tab, not a
+/// blocking modal, so it only dims nothing behind it — same "non-blocking
+/// overlay" register as the hover "✕" or the bell dot, just bigger.
+/// Everything rides `rounded` so it draws over pane content, same layering
+/// rule as every other overlay here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_swatch_popover(
+    font_system: &mut FontSystem,
+    hint_buf: &mut Buffer,
+    default_buf: &mut Buffer,
+    clear_buf: &mut Buffer,
+    hex_buf: &mut Buffer,
+    anchor_x: f32,
+    anchor_w: f32,
+    strip_h: f32,
+    selected: usize,
+    focus: crate::renderer::SwatchFocus,
+    hue: f32,
+    custom: u32,
+    hex_buffer: &str,
+    cw: f32,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+    rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
+) -> SwatchLayout {
+    use crate::renderer::SwatchFocus;
+
+    let geom = swatch_geom(anchor_x, anchor_w, strip_h, cw, logical_w, logical_h);
+    let SwatchGeom {
+        x,
+        y,
+        w,
+        h,
+        grid_x,
+        grid_y,
+        cell,
+        gap,
+        cols,
+        hue_bar_x,
+        hue_bar_y,
+        hue_bar_w,
+        hue_bar_h,
+        preview_x,
+        preview_y,
+        preview_size,
+        hex_x,
+        hex_y,
+        hex_w,
+        hex_h,
+        list_y,
+        row_h,
+        pad,
+        hint_h,
+    } = geom;
+
+    let r = 8.0;
+    rounded.push((
+        scaled(x - 1.5, y - 1.5, w + 3.0, h + 3.0, sf),
+        lin_rgba(ACCENT, 0.9),
+        (r + 1.5) * sf,
+    ));
+    rounded.push((
+        scaled(x, y, w, h, sf),
+        lin_rgba(Rgb::new(0x20, 0x22, 0x28), 1.0),
+        r * sf,
+    ));
+
+    // The keyboard-selection/focus indicator (live feedback: this used to be
+    // a same-hue accent ring, `derive_accent(c)` — subtle by design, since it
+    // was tuned to *match* the cell it sits on, which is exactly wrong for
+    // "which cell is focused". Fix: an ink-based double ring, the same
+    // move that fixed the rename-editor swatch (see that ring's `ink_for`
+    // comment) — but that fix could pick ONE ink because it rings a fill it
+    // controls. Here the ring sits on top of an arbitrary curated swatch
+    // (light or dark), the hue bar, the hex field, and this panel's own
+    // fixed dark background — no single ink clears contrast against all of
+    // those. So lay down both: a thick near-white outer ring, then a thin
+    // near-black inner ring immediately inside it. Whatever the ring sits
+    // on, one of the two lines borders it, so the seam is always visible.
+    // Net ring is ~3px per side, up from the old accent ring's 2px — fixed
+    // pixel widths (not tied to any panel scale knob) since v3 dropped the
+    // single `SWATCH_SCALE` multiplier in favor of explicit sizes per part.
+    let ring_out = 3.0;
+    let ring_in = 1.0;
+    let push_selection_ring = |rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
+                               rx: f32,
+                               ry: f32,
+                               rw: f32,
+                               rh: f32,
+                               r_out: f32| {
+        rounded.push((
+            scaled(
+                rx - ring_out,
+                ry - ring_out,
+                rw + 2.0 * ring_out,
+                rh + 2.0 * ring_out,
+                sf,
+            ),
+            lin_rgba(unpack_rgb(INK_LIGHT), 0.95),
+            (r_out + ring_out) * sf,
+        ));
+        rounded.push((
+            scaled(
+                rx - ring_in,
+                ry - ring_in,
+                rw + 2.0 * ring_in,
+                rh + 2.0 * ring_in,
+                sf,
+            ),
+            lin_rgba(unpack_rgb(INK_DARK), 0.95),
+            (r_out + ring_in) * sf,
+        ));
+    };
+
+    for (i, &c) in SWATCHES.iter().enumerate() {
+        let col = i % cols;
+        let row = i / cols;
+        let cx = grid_x + col as f32 * (cell + gap);
+        let cy = grid_y + row as f32 * (cell + gap);
+        if focus == SwatchFocus::Grid && selected == i {
+            push_selection_ring(rounded, cx, cy, cell, cell, 3.0);
+        }
+        rounded.push((
+            scaled(cx, cy, cell, cell, sf),
+            lin_rgba(unpack_rgb(c), 1.0),
+            3.0 * sf,
+        ));
+    }
+
+    // The hue bar's focus ring, drawn BEFORE the segments below (not after,
+    // like it looks like it should read) — `push_selection_ring` draws
+    // OUTSET around the given rect, same as the grid cells, and the grid
+    // relies on its own swatch fill being drawn AFTER its ring to cover the
+    // ring's interior, leaving only the outer double-line visible. The hue
+    // bar needs the identical order: ring first, then segments on top,
+    // or the ring's near-solid inner line would paint over the whole bar
+    // instead of just framing it.
+    if focus == SwatchFocus::HueBar {
+        push_selection_ring(rounded, hue_bar_x, hue_bar_y, hue_bar_w, hue_bar_h, 1.0);
+    }
+    // The hue bar (popover v2): `SWATCH_HUE_SEGMENTS` solid quads sweeping
+    // hue 0..360 at a pinned OKLCH lightness/chroma — legible-by-
+    // construction (`ember_core::hue_to_rgb`'s doc), so no per-segment
+    // contrast check is needed here.
+    let seg_w = hue_bar_w / SWATCH_HUE_SEGMENTS as f32;
+    for i in 0..SWATCH_HUE_SEGMENTS {
+        let seg_hue = (i as f64 + 0.5) / SWATCH_HUE_SEGMENTS as f64 * 360.0;
+        let seg_color = unpack_rgb(ember_core::hue_to_rgb(seg_hue));
+        rounded.push((
+            scaled(
+                hue_bar_x + i as f32 * seg_w,
+                hue_bar_y,
+                seg_w + 0.5,
+                hue_bar_h,
+                sf,
+            ),
+            lin_rgba(seg_color, 1.0),
+            0.0,
+        ));
+    }
+    // The current-hue marker: a thin ink-double-lined scrubber, same visual
+    // language as the selection ring, positioned at `hue`'s fraction across
+    // the bar. Always drawn (not just while focused) so the live preview
+    // cell beside it always has a visible "why" on the bar itself.
+    {
+        let marker_w = 3.0;
+        let frac = (hue as f64 / 360.0).clamp(0.0, 1.0) as f32;
+        let marker_x = (hue_bar_x + frac * hue_bar_w - marker_w * 0.5)
+            .clamp(hue_bar_x, hue_bar_x + hue_bar_w - marker_w);
+        rounded.push((
+            scaled(
+                marker_x - 1.0,
+                hue_bar_y - 2.0,
+                marker_w + 2.0,
+                hue_bar_h + 4.0,
+                sf,
+            ),
+            lin_rgba(unpack_rgb(INK_DARK), 0.9),
+            1.0 * sf,
+        ));
+        rounded.push((
+            scaled(marker_x, hue_bar_y - 1.0, marker_w, hue_bar_h + 2.0, sf),
+            lin_rgba(unpack_rgb(INK_LIGHT), 0.95),
+            1.0 * sf,
+        ));
+    }
+
+    // The live-preview swatch (popover v2 added it; v3 sized it back down to
+    // one grid cell — the "giant slab" it grew into was itself a defect):
+    // paints `custom` directly, NOT `hue_to_rgb(hue)` recomputed here —
+    // `custom` is the
+    // popover's single source of truth for "the color you're choosing"
+    // (`ember_app::window_state`'s `swatch_custom`), which after a complete
+    // hex commit can legitimately differ from the bar's own pinned-L/C
+    // projection of `hue` (see `SwatchView::custom`'s doc). A small ink dot
+    // makes the auto-contrast pick visible right where it's chosen, not just
+    // once applied to a tab.
+    //
+    // While the hex field holds a PARTIAL edit (some digits typed, not yet a
+    // complete `#rrggbb`), `custom` is deliberately stale — the last
+    // complete color, per the design's own call ("partial entries keep the
+    // last complete preview and dim") — so the fill/dot are drawn at reduced
+    // alpha as a "this isn't confirmed by your typing yet" cue, rather than
+    // reading as if the partial buffer were itself a finished pick.
+    let hex_digit_count = hex_buffer
+        .strip_prefix('#')
+        .unwrap_or(hex_buffer)
+        .chars()
+        .count();
+    let hex_is_partial = hex_digit_count > 0 && hex_digit_count < 6;
+    let preview_alpha = if hex_is_partial { 0.55 } else { 1.0 };
+    rounded.push((
+        scaled(preview_x, preview_y, preview_size, preview_size, sf),
+        lin_rgba(unpack_rgb(custom), preview_alpha),
+        3.0 * sf,
+    ));
+    {
+        let dot_d = preview_size * 0.34;
+        let dot_color = unpack_rgb(ink_for(custom));
+        rounded.push((
+            scaled(
+                preview_x + (preview_size - dot_d) * 0.5,
+                preview_y + (preview_size - dot_d) * 0.5,
+                dot_d,
+                dot_d,
+                sf,
+            ),
+            lin_rgba(dot_color, 0.95 * preview_alpha),
+            dot_d * 0.5 * sf,
+        ));
+    }
+
+    // The custom hex-entry field (popover v2): a filled box (always visible,
+    // reads as a text field regardless of focus), ring-highlighted while
+    // focused, holding the "#______" placeholder or the typed value. The
+    // ring is drawn BEFORE the fill (not after) — the same ordering trap
+    // `2ad4878` fixed for the hue bar: the ring's inner line is nearly as
+    // large as the field itself, so drawing it after the (opaque) fill would
+    // paint over almost the whole field instead of just framing it. This one
+    // only looked right before the fix because the fill color (0x16181c) is
+    // nearly indistinguishable from the ring's own INK_DARK inner line.
+    if focus == SwatchFocus::HexField {
+        push_selection_ring(rounded, hex_x, hex_y, hex_w, hex_h, 1.0);
+    }
+    rounded.push((
+        scaled(hex_x, hex_y, hex_w, hex_h, sf),
+        lin_rgba(Rgb::new(0x16, 0x18, 0x1c), 1.0),
+        4.0 * sf,
+    ));
+
+    // `Default` / `Clear` rows, below the hex/preview row — drawn as two
+    // distinct rounded rows (a real gap between them; see `SWATCH_ROW_GAP`),
+    // not naked floating text: a subtle OPAQUE fill is ALWAYS present (the
+    // fix for the v2 bug where an unselected row had zero visual presence,
+    // reading as disconnected labels rather than part of the panel), with
+    // the selected row's translucent accent-tint fill + double ring drawn
+    // on top of it. The ring paints last, for two different reasons at each
+    // layer below it: drawn before the opaque base fill, the base fill
+    // would paint over it entirely; drawn before the translucent accent
+    // tint (only present when selected), the tint would wash the ring's
+    // near-black inner line instead of it reading crisp.
+    let content_w = w - 2.0 * pad;
+    // A small rounded radius (matches the hex field's own) instead of the
+    // v3.0 square corners — now that the two rows have a real gap between
+    // them, rounding reinforces "two buttons" rather than "one strip".
+    let row_r = 4.0;
+    let row_bufs: [&mut Buffer; 2] = [default_buf, clear_buf];
+    for (i, buf) in row_bufs.into_iter().enumerate() {
+        let ry = list_y + i as f32 * (row_h + SWATCH_ROW_GAP);
+        rounded.push((
+            scaled(grid_x, ry, content_w, row_h, sf),
+            lin_rgba(Rgb::new(0x2c, 0x2e, 0x35), 1.0),
+            row_r * sf,
+        ));
+        let row_selected = focus == SwatchFocus::Grid && selected == SWATCHES.len() + i;
+        if row_selected {
+            rounded.push((
+                scaled(grid_x, ry, content_w, row_h, sf),
+                lin_rgba(ACCENT, 0.28),
+                row_r * sf,
+            ));
+            push_selection_ring(rounded, grid_x, ry, content_w, row_h, row_r);
+        }
+        let label = if i == 0 { "Default" } else { "Clear" };
+        buf.set_size(font_system, Some(content_w - 8.0), Some(row_h));
+        buf.set_text(
+            font_system,
+            label,
+            &Attrs::new()
+                .family(Family::Monospace)
+                .color(Color::rgb(0xf0, 0xf0, 0xf0)),
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(font_system, false);
+    }
+
+    // Only the hint line goes through this closure now — Default/Clear got
+    // their own buffers (shaped in the row loop above) once they stopped
+    // sharing one two-line block, so this no longer needs to size for both.
+    let shape = |fs: &mut FontSystem, buf: &mut Buffer, text: &str, color: Color, width: f32| {
+        buf.set_size(fs, Some(width), Some(hint_h));
+        buf.set_text(
+            fs,
+            text,
+            &Attrs::new().family(Family::Monospace).color(color),
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(fs, false);
+    };
+    shape(
+        font_system,
+        hint_buf,
+        SWATCH_HINT,
+        Color::rgb(0x88, 0x88, 0x88),
+        w - 2.0 * pad,
+    );
+    // Hex field text: "#" plus whatever's been typed, underscore-padded to
+    // 6 digits so the field always reads as "type 6 hex digits", not just a
+    // bare "#" that grows as you type. Two colors, not one: the typed
+    // portion (including the leading "#") is dim placeholder gray until at
+    // least one digit is typed, then bright; the underscore padding stays
+    // dim regardless, so it always reads as "not yet typed" instead of
+    // matching the typed digits' brightness once any exist.
+    let hex_digits = hex_buffer.strip_prefix('#').unwrap_or(hex_buffer);
+    let typed = format!("#{hex_digits}");
+    let underscore_pad = "_".repeat(6usize.saturating_sub(hex_digits.chars().count()));
+    let typed_color = if hex_digits.is_empty() {
+        Color::rgb(0x77, 0x77, 0x7a)
+    } else {
+        Color::rgb(0xf0, 0xf0, 0xf0)
+    };
+    let pad_color = Color::rgb(0x55, 0x55, 0x58);
+    hex_buf.set_size(font_system, Some(hex_w - 12.0), Some(row_h * 2.0 + hint_h));
+    hex_buf.set_rich_text(
+        font_system,
+        [
+            (
+                typed.as_str(),
+                Attrs::new().family(Family::Monospace).color(typed_color),
+            ),
+            (
+                underscore_pad.as_str(),
+                Attrs::new().family(Family::Monospace).color(pad_color),
+            ),
+        ],
+        &Attrs::new().family(Family::Monospace),
+        Shaping::Advanced,
+        None,
+    );
+    hex_buf.shape_until_scroll(font_system, false);
+
+    SwatchLayout {
+        hint_origin: (grid_x, y + pad),
+        default_origin: (grid_x + 8.0, list_y),
+        clear_origin: (grid_x + 8.0, list_y + row_h + SWATCH_ROW_GAP),
+        hex_origin: (hex_x + 6.0, hex_y + (hex_h - LINE_HEIGHT) * 0.5),
+    }
 }
 
 /// Build the cheat-sheet overlay: a full scrim + a centered panel (accent border)
@@ -2251,6 +3132,7 @@ mod tests {
                 active: i == 0,
                 editing: false,
                 bell: false,
+                color: None,
             })
             .collect();
         let mut run = |cache: &mut TabsCache, reset: bool| {
@@ -2520,6 +3402,62 @@ mod tests {
         let a = ghost_pill_quads(0.0, 120.0, 34.0, 8.0, 1.0, 0.0)[0].1[3];
         let b = ghost_pill_quads(0.0, 120.0, 34.0, 8.0, 1.0, 1.0)[0].1[3];
         assert!((a - b).abs() > 0.001, "expected the flicker to vary with t");
+    }
+
+    // --- inactive_pill_fill / hover_pill_fill: item 3's WCAG floor applies
+    // to what's ACTUALLY painted, not just the raw swatch (review finding:
+    // the original 0.55 inactive blend put 3 of 12 swatches below 4.5:1) ---
+
+    use super::{hover_pill_fill, inactive_pill_fill, pack_rgb};
+    use ember_core::{SWATCHES, contrast_ratio, ink_for};
+
+    #[test]
+    fn every_inactive_blend_meets_wcag_text_contrast() {
+        for &c in SWATCHES.iter() {
+            let fill = pack_rgb(inactive_pill_fill(c));
+            let ink = ink_for(fill);
+            let ratio = contrast_ratio(fill, ink);
+            assert!(
+                ratio >= 4.5,
+                "swatch {c:#08x}'s inactive fill {fill:#08x} only gets {ratio:.2}:1 against ink {ink:#08x}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_hover_blend_meets_wcag_text_contrast() {
+        for &c in SWATCHES.iter() {
+            let fill = pack_rgb(hover_pill_fill(c));
+            let ink = ink_for(fill);
+            let ratio = contrast_ratio(fill, ink);
+            assert!(
+                ratio >= 4.5,
+                "swatch {c:#08x}'s hover fill {fill:#08x} only gets {ratio:.2}:1 against ink {ink:#08x}"
+            );
+        }
+    }
+
+    #[test]
+    fn hover_blend_is_brighter_than_the_plain_inactive_blend() {
+        // The review's ruling: hovering a colored inactive tab should read
+        // as noticeably closer to the tab's full color than the plain
+        // inactive treatment — assert the hover fill's luminance is always
+        // at least as far from the strip background as the inactive fill's
+        // (i.e. hover sits between inactive and full strength, never past
+        // either end).
+        use ember_core::relative_luminance;
+        for &c in SWATCHES.iter() {
+            let raw_l = relative_luminance(c);
+            let inactive_l = relative_luminance(pack_rgb(inactive_pill_fill(c)));
+            let hover_l = relative_luminance(pack_rgb(hover_pill_fill(c)));
+            let d_inactive = (raw_l - inactive_l).abs();
+            let d_hover = (raw_l - hover_l).abs();
+            assert!(
+                d_hover < d_inactive,
+                "swatch {c:#08x}: hover ({hover_l:.3}) isn't closer to the raw \
+                 color ({raw_l:.3}) than inactive ({inactive_l:.3})"
+            );
+        }
     }
 }
 

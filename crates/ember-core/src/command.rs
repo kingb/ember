@@ -8,6 +8,7 @@ use crate::focus::{Direction, focus_dir};
 use crate::geom::Rect;
 use crate::ids::{PaneId, SessionId, TabId};
 use crate::layout::{Axis, LayoutNode, Tab, WindowTree, layout, remove_pane};
+use crate::tabcolor::TabColorChoice;
 
 /// A multiplexer mutation (design §8 variant list). Data-only + serde so it can
 /// ride the backend bus later; `#[non_exhaustive]` so adding a variant is a minor
@@ -109,6 +110,7 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
                 title: String::new(),
                 root: LayoutNode::pane(pane, session.clone()),
                 focus: pane,
+                color: TabColorChoice::Unset,
             });
             tree.active = 0;
             let _ = &session; // geometry is reconciled by the app, not signaled
@@ -206,6 +208,7 @@ pub fn apply(tree: &mut WindowTree, cmd: LayoutCommand, viewport: Rect) -> Vec<L
                 title: String::new(),
                 root: LayoutNode::pane(pane, session.clone()),
                 focus: pane,
+                color: TabColorChoice::Unset,
             });
             tree.active = tree.tabs.len() - 1;
             let _ = &session; // geometry reconciled by the app
@@ -286,6 +289,7 @@ mod tests {
                 title: "one".into(),
                 root: LayoutNode::pane(PaneId(1), SessionId::new("s1")),
                 focus: PaneId(1),
+                color: TabColorChoice::Unset,
             }],
             active: 0,
         }

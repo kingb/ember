@@ -6,6 +6,7 @@
 
 use crate::ids::{PaneId, SessionId, TabId};
 use crate::layout::{Axis, LayoutNode, Tab, WindowTree, remove_pane};
+use crate::tabcolor::TabColorChoice;
 
 /// All windows' tab trees + which window has focus. Index = window number
 /// (stable order, 0-based internally; the UI/ctl show 1-based).
@@ -350,6 +351,7 @@ fn move_pane(
                 title,
                 root: leaf,
                 focus: p,
+                color: TabColorChoice::Unset,
             };
             windows.trees[dw].tabs.push(new_tab);
             windows.trees[dw].active = windows.trees[dw].tabs.len() - 1;
@@ -370,6 +372,7 @@ fn move_pane(
                 title,
                 root: leaf,
                 focus: p,
+                color: TabColorChoice::Unset,
             };
             let new_index = windows.trees.len();
             windows.trees.push(WindowTree {
@@ -594,6 +597,7 @@ mod tests {
             title: String::new(),
             root,
             focus: PaneId(first),
+            color: TabColorChoice::Unset,
         }
     }
 
@@ -609,6 +613,7 @@ mod tests {
                         title: String::new(),
                         root: p(id),
                         focus: PaneId(id),
+                        color: TabColorChoice::Unset,
                     })
                     .collect(),
                 active: 0,

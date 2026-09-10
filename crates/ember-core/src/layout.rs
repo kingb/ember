@@ -402,6 +402,8 @@ pub struct Tab {
     pub title: String,
     pub root: LayoutNode,
     pub focus: PaneId,
+    #[serde(default)]
+    pub color: crate::tabcolor::TabColorChoice,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -494,6 +496,7 @@ mod tests {
                     title: format!("t{i}"),
                     root: p(i),
                     focus: PaneId(i),
+                    color: crate::tabcolor::TabColorChoice::Unset,
                 })
                 .collect(),
             active: 0,

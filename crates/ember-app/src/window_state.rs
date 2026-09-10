@@ -24,14 +24,14 @@ use std::time::{Duration, Instant};
 
 use ember_core::{
     Axis, BackendControl, BackendHandle, Direction, DropZone, GridDims, LayoutCommand,
-    LayoutEffect, PaneId, Rect, RestoreMode, RowKind, ScrollAmount, SessionBackend, SessionId,
-    SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabId, apply, drop_zone_for, layout,
-    remove_pane, setting_rows,
+    LayoutEffect, PaneId, Rect, RestoreMode, RowKind, SWATCHES, ScrollAmount, SessionBackend,
+    SessionId, SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabColorChoice, TabId,
+    apply, drop_zone_for, effective_color, hue_of, hue_to_rgb, layout, remove_pane, setting_rows,
 };
 use ember_platform::PlatformBackend;
 use ember_render::{
-    AbsPoint, AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode, TabHit,
-    TabLabel, VisiblePane,
+    AbsPoint, AnchoredSelection, ConfirmView, ImageFit, Point, Renderer, SelectionMode,
+    SwatchFocus, SwatchPopoverHit, SwatchView, TabHit, TabLabel, VisiblePane,
 };
 use ember_session::{LocalPty, LocalPtyConfig};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -42,9 +42,11 @@ use crate::control::ControlMsg;
 use crate::session_state;
 use crate::{
     ControlClose, DEFAULT_COLS, DEFAULT_ROWS, DragState, DropHover, MULTI_CLICK, PAD, PendingClose,
-    Shared, about_info, bell_flash_intensity, bracket_paste, dims_for_rect, ember_glow, encode_key,
-    help_lines, inset, load_backdrop_image, named_key, parse_chord, resolve_window_index,
-    shell_escape_path, step_selectable_row, tab_display_title, url_is_openable,
+    Shared, about_info, bell_flash_intensity, bracket_paste, compile_rules,
+    compute_tab_rule_colors, dims_for_rect, ember_glow, encode_key, help_lines, inset,
+    load_backdrop_image, named_key, osc_color_of, pane_status_for, parse_chord,
+    resolve_window_index, shell_escape_path, step_selectable_row, tab_display_title,
+    url_is_openable,
 };
 #[cfg(target_os = "linux")]
 use crate::{alt_digit_tab, linux_chord_translate};
@@ -494,6 +496,49 @@ pub(crate) struct WindowState {
     /// Inline tab rename in progress: the tab index + the live edit buffer.
     pub(crate) editing_tab: Option<usize>,
     pub(crate) edit_buffer: String,
+    /// Tab-color swatch popover (Task 3): `Some(tab index)` while open,
+    /// anchored under that tab. Opened from a click on the rename-editor's
+    /// own swatch or `ArrowDown` while renaming — see `open_swatch`.
+    pub(crate) swatch_open: Option<usize>,
+    /// The popover's current selection: `0..12` = a `SWATCHES` cell, `12` =
+    /// `Default`, `13` = `Clear`. Meaningless while `swatch_open` is `None`.
+    pub(crate) swatch_sel: usize,
+    /// Popover v2: which of the three regions (grid / hue bar / hex field)
+    /// currently owns keyboard input. Tab cycles it; a click on a region
+    /// also moves focus there.
+    pub(crate) swatch_focus: SwatchFocus,
+    /// Popover v2: the hue bar's current position, degrees `0..360` — also
+    /// the live-preview swatch's color source. Reset on `open_swatch` to the
+    /// tab's existing custom color's hue when it has one outside the
+    /// curated `SWATCHES`, else `0.0`.
+    pub(crate) swatch_hue: f32,
+    /// Popover v2: the custom hex field's typed text (`""`..`"#rrggbb"`).
+    /// Reset on `open_swatch` to the tab's existing custom color formatted
+    /// as hex when it's outside the curated `SWATCHES`, else empty
+    /// (placeholder-only).
+    pub(crate) swatch_hex: String,
+    /// Popover v2 (live feedback: "the hue picker shows its color and code as
+    /// you choose"): the ONE current "custom color" value the hue bar, the
+    /// live-preview box, and the hex field are three views of. Kept in sync
+    /// on every change to either side — a hue change (`hue_preview`)
+    /// overwrites this AND `swatch_hex`; a complete, valid hex commit
+    /// (`hex_buffer_commit`) overwrites this AND `swatch_hue` (best-effort,
+    /// via `hue_of`) — so the preview box always paints THIS value, never a
+    /// value independently recomputed from `swatch_hue` alone (the two can
+    /// briefly disagree in OKLCH lightness/chroma right after a hex commit,
+    /// since a typed hex isn't necessarily on the hue bar's pinned L/C
+    /// curve; only the hue marker's position is a lossy projection of it).
+    /// A partial (incomplete) hex edit leaves this untouched, which is what
+    /// makes the preview "keep showing the last complete color" while
+    /// typing. Seeded on `open_swatch` from the tab's existing custom color,
+    /// or `hue_to_rgb(0.0)` when there isn't one (matching `swatch_hue`'s
+    /// own `0.0` default).
+    pub(crate) swatch_custom: u32,
+    /// Popover v2: the hue bar is currently being dragged (mouse down on it,
+    /// not yet released) — subsequent `CursorMoved`s keep sweeping the hue
+    /// even if the cursor slides off the bar itself (`divider_drag`/
+    /// `scrollbar_drag`'s own precedent for a press-anchored drag).
+    pub(crate) hue_drag: bool,
     /// A destructive close awaiting confirmation (a busy pane).
     pub(crate) pending_close: Option<PendingClose>,
     /// The focused confirm button: 0 = Cancel (safe default), 1 = Close/Quit.
@@ -566,6 +611,17 @@ pub(crate) struct WindowState {
     /// time. Never pruned when a tab closes: a `TabId` is never reused
     /// within a window's lifetime, so a stale entry is inert.
     pub(crate) named_tabs: std::collections::HashSet<TabId>,
+    /// Per-tab regex-rule color cache (design: tab-colors, T4) — `Shared::
+    /// tab_color_rules` matched against each tab's title, keyed by `TabId`.
+    /// Core's `Tab` has no such field (same reasoning as `named_tabs`: this
+    /// is app-side derived state, and `regex` isn't an ember-core
+    /// dependency). Recomputed via [`Self::recompute_tab_rule_colors`] only
+    /// at the four event sites that can change what it should hold — rename
+    /// commit, an auto/programmatic title change, a Settings adjustment, and
+    /// config load — never per-`sync_layout`/per-frame; `sync_layout` only
+    /// ever reads it. A tab absent here (not yet touched by any of those
+    /// four triggers) resolves to `None`, same as an empty rule set would.
+    pub(crate) tab_rule_colors: std::collections::HashMap<TabId, Option<u32>>,
     /// The restore-on-launch modal (Task 8), if this window's the one
     /// showing it — set once at startup (`restore.mode == Ask` + a loaded
     /// snapshot), never re-armed later in the session. `None` on every
@@ -775,6 +831,311 @@ fn settings_action_for_key(key: &Key, selected_kind: Option<RowKind>) -> Setting
     }
 }
 
+/// A tab's own live OSC 6 color: its own focused pane's session's entry in
+/// `shared.osc_tab_color`, if any. Every tab carries its own `root`/`focus`,
+/// so this is re-derived PER TAB rather than reusing a window's overall
+/// focused session (which is scoped to the ACTIVE tab only) — the shared
+/// half of the OSC layer lookup `sync_layout`'s `TabLabel` build and
+/// `tabs_summary_json`'s `"color"` field both need (cheap: a handful of
+/// leaves per tab, once per call, never per frame beyond that).
+fn tab_osc_color(tab: &Tab, shared: &Shared) -> Option<u32> {
+    tab.root
+        .leaves()
+        .into_iter()
+        .find(|(p, _)| *p == tab.focus)
+        .and_then(|(_, sid)| osc_color_of(&shared.osc_tab_color, &sid))
+}
+
+/// Format an effective tab color (an [`effective_color`] result) as the
+/// `ctl state` JSON's `"#rrggbb"` string; `None` (serialized as `null`) for
+/// an uncolored tab. Pure formatting only — the four-layer composition
+/// itself happens at the call site, via `effective_color`.
+pub(crate) fn color_hex(color: Option<u32>) -> Option<String> {
+    color.map(|c| format!("#{:06x}", c & 0x00ff_ffff))
+}
+
+/// Parse a `commit_rename`/`ctl set-tab-color` color token into a
+/// [`TabColorChoice`](ember_core::TabColorChoice). Accepts `#rrggbb` (exactly
+/// 6 hex digits after the `#`, case-insensitive), `default` (pins the theme's
+/// default — [`ember_core::TabColorChoice::PinnedDefault`]), `clear` (back to
+/// [`ember_core::TabColorChoice::Unset`]), or `swatch-N` (0-based index into
+/// [`ember_core::SWATCHES`]). Anything else — a malformed hex, an
+/// out-of-range swatch index, an unrecognized word — is `None`; callers treat
+/// that as "not a color token" rather than an error (e.g. `commit_rename`
+/// leaves a non-matching `#...` substring in the title untouched).
+pub(crate) fn parse_color_token(tok: &str) -> Option<TabColorChoice> {
+    let t = tok.trim();
+    if let Some(hex) = t.strip_prefix('#') {
+        if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let v = u32::from_str_radix(hex, 16).ok()?;
+            return Some(TabColorChoice::Color(v));
+        }
+        return None;
+    }
+    match t {
+        "default" => Some(TabColorChoice::PinnedDefault),
+        "clear" => Some(TabColorChoice::Unset),
+        _ => {
+            let idx: usize = t.strip_prefix("swatch-")?.parse().ok()?;
+            SWATCHES.get(idx).map(|c| TabColorChoice::Color(*c))
+        }
+    }
+}
+
+/// Find a `#rrggbb` color token as a whole word anywhere in a rename
+/// buffer, strip it (and the surrounding whitespace) out of the title, and
+/// parse it. Only a `#`-prefixed word counts — a word like `default` typed
+/// as an ordinary title word must NOT silently pin the tab's default color,
+/// so this deliberately doesn't reuse `parse_color_token`'s `default`/
+/// `clear`/`swatch-N` forms, only its `#rrggbb` hex path. The first matching
+/// token wins; the title keeps every other word verbatim (including a
+/// second `#rrggbb`-shaped word, if any — "a token", singular).
+fn extract_color_token(buf: &str) -> (String, Option<TabColorChoice>) {
+    let mut color = None;
+    let mut words: Vec<&str> = Vec::new();
+    for word in buf.split_whitespace() {
+        if color.is_none() && word.starts_with('#') {
+            if let Some(c) = parse_color_token(word) {
+                color = Some(c);
+                continue;
+            }
+        }
+        words.push(word);
+    }
+    (words.join(" "), color)
+}
+
+/// What a key press does while the tab-color swatch popover is open — the
+/// `settings_action_for_key` precedent, generalized from a settings row to
+/// the popover's three regions (popover v2): the 14-item grid (12 curated
+/// `SWATCHES`, then `Default`, then `Clear` — indices `0..12`, `12`, `13`
+/// respectively; see [`WindowState::swatch_key`] for how `sel` resolves
+/// `Pick`/`PinDefault`/`Clear` into an actual color), the hue bar, and the
+/// custom hex field. Pure and independent of `WindowState`/`Shared`, so it's
+/// unit-tested directly.
+#[derive(Clone, Debug, PartialEq)]
+enum SwatchAction {
+    /// Move the grid selection by this many cells (arrows, `Grid` focus);
+    /// the caller wraps the result across the 14-item grid.
+    Move(i8),
+    /// Enter/Space on one of the 12 curated swatch cells (`sel < 12`).
+    Pick,
+    /// Enter/Space on the `Default` row (`sel == 12`).
+    PinDefault,
+    /// Enter/Space on the `Clear` row (`sel == 13`).
+    Clear,
+    /// Esc while `Grid` or `HueBar` is focused — dismiss the popover
+    /// entirely without changing the color.
+    Close,
+    /// Tab — cycle focus forward: `Grid -> HueBar -> HexField ->` (wrapping).
+    FocusNext,
+    /// Shift+Tab — cycle focus backward.
+    FocusPrev,
+    /// Left/Right on the hue bar: step hue by this many [`HUE_STEP_DEGREES`]
+    /// units (`-1` or `1`).
+    HueStep(i32),
+    /// Enter/Space on the hue bar — apply the live-preview color.
+    ApplyHue,
+    /// A character typed while the hex field is focused — the caller
+    /// filters/accepts individual chars via [`hex_buffer_push`].
+    HexInput(String),
+    /// Backspace while the hex field is focused.
+    HexBackspace,
+    /// Enter while the hex field is focused — parse and apply the buffer.
+    HexApply,
+    /// Esc while the hex field is focused — unfocus back to the grid
+    /// WITHOUT closing the popover (distinct from `Close`).
+    HexUnfocus,
+    /// Any other key: swallowed (the popover captures all input while open)
+    /// but changes nothing.
+    None,
+}
+
+/// Number of columns in the swatch popover's curated-color grid — arrow
+/// Up/Down step by this many items. Must match [`crate::paint::SWATCH_COLS`]
+/// (kept as separate constants: this one drives pure keyboard logic tested
+/// without a GPU context, that one drives the actual quad layout).
+const SWATCH_GRID_COLS: i8 = 4;
+
+/// Total selectable items in the popover: 12 curated `SWATCHES` + `Default` +
+/// `Clear`.
+const SWATCH_ITEM_COUNT: usize = 14;
+
+/// Degrees the hue bar sweeps per Left/Right arrow press (popover v2).
+const HUE_STEP_DEGREES: f32 = 3.0;
+
+/// Map a key press onto a [`SwatchAction`], given the current selection
+/// `sel` (needed only to route Enter/Space to `Pick`/`PinDefault`/`Clear`
+/// correctly — arrows and Esc don't consult it), the current `focus`
+/// region, and `mods` (only Shift, to distinguish Tab from Shift+Tab,
+/// matters here — same "take `ModifiersState` directly" shape as
+/// `restore_key_action`). Tab/Shift+Tab cycle focus regardless of which
+/// region currently has it; every other key's meaning depends on `focus`.
+/// See [`SwatchAction`]'s docs.
+fn swatch_key(key: &Key, mods: ModifiersState, focus: SwatchFocus, sel: usize) -> SwatchAction {
+    if matches!(key, Key::Named(NamedKey::Tab)) {
+        return if mods.shift_key() {
+            SwatchAction::FocusPrev
+        } else {
+            SwatchAction::FocusNext
+        };
+    }
+    match focus {
+        SwatchFocus::Grid => match key {
+            Key::Named(NamedKey::Escape) => SwatchAction::Close,
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => {
+                if sel < SWATCHES.len() {
+                    SwatchAction::Pick
+                } else if sel == SWATCHES.len() {
+                    SwatchAction::PinDefault
+                } else {
+                    SwatchAction::Clear
+                }
+            }
+            Key::Named(NamedKey::ArrowRight) => SwatchAction::Move(1),
+            Key::Named(NamedKey::ArrowLeft) => SwatchAction::Move(-1),
+            Key::Named(NamedKey::ArrowDown) => SwatchAction::Move(SWATCH_GRID_COLS),
+            Key::Named(NamedKey::ArrowUp) => SwatchAction::Move(-SWATCH_GRID_COLS),
+            _ => SwatchAction::None,
+        },
+        SwatchFocus::HueBar => match key {
+            Key::Named(NamedKey::Escape) => SwatchAction::Close,
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => SwatchAction::ApplyHue,
+            Key::Named(NamedKey::ArrowRight) => SwatchAction::HueStep(1),
+            Key::Named(NamedKey::ArrowLeft) => SwatchAction::HueStep(-1),
+            _ => SwatchAction::None,
+        },
+        SwatchFocus::HexField => match key {
+            Key::Named(NamedKey::Escape) => SwatchAction::HexUnfocus,
+            Key::Named(NamedKey::Enter) => SwatchAction::HexApply,
+            Key::Named(NamedKey::Backspace) => SwatchAction::HexBackspace,
+            Key::Character(s) => SwatchAction::HexInput(s.to_string()),
+            _ => SwatchAction::None,
+        },
+    }
+}
+
+/// Apply a [`SwatchAction::Move`] delta to `sel`, wrapping across the
+/// popover's 14-item grid (arrows never fall off either end). Pure, split
+/// out of [`WindowState::swatch_key_input`] so the wrap arithmetic is
+/// directly unit-testable alongside `swatch_key` itself.
+fn wrap_swatch_sel(sel: usize, delta: i8) -> usize {
+    let n = SWATCH_ITEM_COUNT as i32;
+    (sel as i32 + delta as i32).rem_euclid(n) as usize
+}
+
+/// Cycle the popover's focus region forward (`Grid -> HueBar -> HexField ->`
+/// wrapping) or backward — [`SwatchAction::FocusNext`]/`FocusPrev`'s pure
+/// arithmetic, split out for direct unit testing alongside `swatch_key`.
+fn cycle_swatch_focus(focus: SwatchFocus, forward: bool) -> SwatchFocus {
+    use SwatchFocus::*;
+    match (focus, forward) {
+        (Grid, true) => HueBar,
+        (HueBar, true) => HexField,
+        (HexField, true) => Grid,
+        (Grid, false) => HexField,
+        (HueBar, false) => Grid,
+        (HexField, false) => HueBar,
+    }
+}
+
+/// Step the hue bar's position by `steps` [`HUE_STEP_DEGREES`] units,
+/// wrapping across the `0..360` degree circle (Left/Right never fall off
+/// either end — same wrap idiom as [`wrap_swatch_sel`]). Pure, so the
+/// wrap-at-the-seam arithmetic is directly unit-testable.
+fn step_hue(hue: f32, steps: i32) -> f32 {
+    (hue + steps as f32 * HUE_STEP_DEGREES).rem_euclid(360.0)
+}
+
+/// Apply one typed character to the hex field's buffer (popover v2),
+/// rejecting anything that can't be part of a valid `#rrggbb` token: a `#`
+/// only starts a fresh buffer (typing it once the buffer is non-empty is a
+/// no-op — the field never contains an embedded second `#`), and a hex
+/// digit is appended (case-folded to lowercase), auto-prepending the `#` if
+/// the buffer was still empty so a user can start typing digits directly
+/// without needing to type `#` first. The buffer is capped at 7 chars
+/// (`#` + 6 digits, [`parse_color_token`]'s exact expected shape) — once
+/// full, further digits are dropped rather than silently truncating from
+/// the wrong end. Any other character leaves the buffer unchanged.
+fn hex_buffer_push(buf: &str, ch: char) -> String {
+    if ch == '#' {
+        return if buf.is_empty() {
+            "#".to_string()
+        } else {
+            buf.to_string()
+        };
+    }
+    if !ch.is_ascii_hexdigit() || buf.len() >= 7 {
+        return buf.to_string();
+    }
+    let lower = ch.to_ascii_lowercase();
+    if buf.is_empty() {
+        format!("#{lower}")
+    } else {
+        format!("{buf}{lower}")
+    }
+}
+
+/// Backspace on the hex field's buffer: drop the last character (a no-op on
+/// an already-empty buffer). Pure, split out for direct unit testing.
+fn hex_buffer_backspace(buf: &str) -> String {
+    let mut s = buf.to_string();
+    s.pop();
+    s
+}
+
+/// The hue-change -> hex-text sync (live feedback: "the hue picker shows its
+/// color and code as you choose", item 1): given the hue bar's new position,
+/// the exact custom color it now previews (`hue_to_rgb`) and that color's
+/// `#rrggbb` text, ready to drop straight into `swatch_hex` as if typed.
+/// Every hue-bar mutation path (arrow-key `HueStep`, a click on the bar, a
+/// drag over it) calls this so the hex field's text and the preview box's
+/// fill can never drift from what the bar itself is showing. Pure, so the
+/// sync itself is directly unit-testable without a live `WindowState`.
+pub(crate) fn hue_preview(hue: f32) -> (u32, String) {
+    let color = hue_to_rgb(hue as f64);
+    (color, format!("#{color:06x}"))
+}
+
+/// The hex-commit -> hue-marker sync (live feedback, item 3): if `buf` is a
+/// COMPLETE, valid `#rrggbb` hex color, returns the parsed color and a
+/// best-effort hue for it ([`hue_of`] — the same pinned-lightness/chroma
+/// projection [`WindowState::open_swatch`] already uses to seed the bar from
+/// an existing custom color), so the caller can move the hue bar's marker to
+/// roughly track a typed color. Reuses [`parse_color_token`] — the SAME
+/// `#rrggbb` parser the hex field's own Enter/`HexApply` path (and every
+/// other color-entry surface) goes through — rather than a second
+/// hex-validation copy that could disagree with it.
+///
+/// Returns `None` for anything short of a complete color: an empty buffer, a
+/// partial one still mid-typed (e.g. `"#3f"`), or (unreachable via
+/// `hex_buffer_push`'s own filtering, but harmless here) a malformed one.
+/// Callers leave `swatch_custom`/`swatch_hue` untouched on `None` — the
+/// design's explicit call that a partial edit keeps showing the last
+/// complete preview rather than snapping to some intermediate non-color.
+pub(crate) fn hex_buffer_commit(buf: &str) -> Option<(u32, f32)> {
+    match parse_color_token(buf)? {
+        TabColorChoice::Color(c) => Some((c, hue_of(c) as f32)),
+        _ => None,
+    }
+}
+
+/// Whether the swatch popover's anchored tab index (Task 3) is no longer a
+/// valid slot among `tab_count` tabs. `sync_layout` (called after every
+/// tab-structural mutation this file makes) uses this as a backstop: the
+/// mutation sites that can shrink or reorder the tab list (`do_close`,
+/// `ControlMsg::ReorderTab`, `drag_tab_to`, `resolve_drag_drop`'s same-window
+/// reorder, `apply_move`'s touched-window loop) already call `close_swatch`
+/// explicitly, since a same-length reorder leaves the index in-bounds but
+/// pointing at a DIFFERENT tab — this out-of-bounds check alone can't catch
+/// that case, only a shrink. Kept as a pure, directly-testable fn rather
+/// than inlined, since building a live `WindowState`/`Renderer` to exercise
+/// `sync_layout` itself isn't practical in this crate's test harness (same
+/// reasoning as `settings_action_for_key`'s doc).
+fn swatch_open_is_stale(open: Option<usize>, tab_count: usize) -> bool {
+    open.is_some_and(|i| i >= tab_count)
+}
+
 /// Find the `SettingRow` in `ember_core`'s static table whose label matches
 /// `label` exactly — what `adjust_setting` looks up to call the row's own
 /// `adjust` fn. Pure (no `Shared`/`WindowState`), so the label-matching
@@ -853,6 +1214,13 @@ impl WindowState {
             last_tab_click: None,
             editing_tab: None,
             edit_buffer: String::new(),
+            swatch_open: None,
+            swatch_sel: 0,
+            swatch_focus: SwatchFocus::Grid,
+            swatch_hue: 0.0,
+            swatch_hex: String::new(),
+            swatch_custom: hue_to_rgb(0.0),
+            hue_drag: false,
             pending_close: None,
             confirm_focus: 0,
             wheel_accum: 0.0,
@@ -867,6 +1235,7 @@ impl WindowState {
             exclusion_applied: false,
             hidden_for_carry: false,
             named_tabs: std::collections::HashSet::new(),
+            tab_rule_colors: std::collections::HashMap::new(),
             restore_prompt: None,
         }
     }
@@ -1101,6 +1470,18 @@ impl WindowState {
                 return None;
             }
         }
+        // Route injected keys into the open tab-color popover (Task 3, for
+        // tests), mirroring the real keyboard path — checked before the
+        // rename-editor's own ctl routing further below for the same reason
+        // the live keyboard arm sits above `rename_key`'s.
+        if self.swatch_open.is_some() {
+            if let ControlMsg::Key(name) = &msg {
+                if let Some(k) = named_key(name) {
+                    self.swatch_key_input(shared, &k);
+                }
+                return None;
+            }
+        }
         // Mirror the keyboard: the restore-on-launch modal captures input
         // (Left/Right/Tab/Up/Down navigate, Enter activates, Esc backs out,
         // a printable key or a whole `Type` types through — see
@@ -1224,6 +1605,9 @@ impl WindowState {
             // so the match stays exhaustive.
             ControlMsg::State(_) => {}
             ControlMsg::Focus(..) => {}
+            // Same reasoning as `Focus` — resolves across every window, not
+            // just this one.
+            ControlMsg::SetTabColor(..) => {}
             ControlMsg::Raise => self.raise_window(),
             ControlMsg::Screenshot(path, reply) => {
                 let resp = match self.renderer.capture_to_png(std::path::Path::new(&path)) {
@@ -1294,6 +1678,12 @@ impl WindowState {
                 }
             }
             ControlMsg::ReorderTab(from, to) => {
+                // A reorder leaves every affected tab's raw index pointing at
+                // a DIFFERENT tab than before — unlike a close, the swatch
+                // popover's anchor index would still be in-bounds, so it'd
+                // silently open, still look valid, and color the wrong tab.
+                // Close it rather than try to follow the reorder.
+                self.close_swatch();
                 let vp = self.viewport();
                 apply(&mut self.tree, LayoutCommand::MoveTab { from, to }, vp);
                 self.sync_layout(shared);
@@ -1311,6 +1701,10 @@ impl WindowState {
                         },
                         vp,
                     );
+                    // Auto/programmatic title change (design: tab-colors
+                    // recompute trigger #2) — a `ctl` rename, not the
+                    // interactive editor `commit_rename` covers.
+                    self.recompute_tab_rule_colors(shared);
                     self.sync_layout(shared);
                     shared.snapshot_dirty = true;
                 }
@@ -1341,8 +1735,18 @@ impl WindowState {
 
     /// The `tabs` array shape shared by `ctl state`'s per-window `windows[]`
     /// entries and its top-level (focused-window) fields: every tab's
-    /// 1-based `index`/`active`/displayed `title`/`sessions`.
-    pub(crate) fn tabs_summary_json(&self) -> Vec<serde_json::Value> {
+    /// 1-based `index`/`active`/displayed `title`/`sessions`/`color`.
+    ///
+    /// `color` (design: tab-colors, T5) is the tab's EFFECTIVE color —
+    /// `ember_core::effective_color`'s full precedence ladder (manual pin >
+    /// OSC 6 > regex rule > unset), same composition `sync_layout` runs to
+    /// build the renderer's `TabLabel` — as `"#rrggbb"`, or `null` for an
+    /// uncolored tab. Needs `shared` (the live OSC-color map and the
+    /// `osc6_overrides_manual` knob) and `self.tab_rule_colors` (the rule
+    /// cache), so both call sites — `state_json` below, for the focused
+    /// window, and `build_state_json` in `main.rs`, for every OTHER
+    /// window's `windows[]` entry — hand those through.
+    pub(crate) fn tabs_summary_json(&self, shared: &Shared) -> Vec<serde_json::Value> {
         self.tree
             .tabs
             .iter()
@@ -1350,23 +1754,71 @@ impl WindowState {
             .map(|(i, t)| {
                 let sessions: Vec<String> =
                     t.root.leaves().iter().map(|(_, s)| s.0.clone()).collect();
+                let osc = tab_osc_color(t, shared);
+                let rule = self.tab_rule_colors.get(&t.id).copied().flatten();
+                let color = effective_color(
+                    t.color,
+                    osc,
+                    rule,
+                    shared.config.tab_colors.osc6_overrides_manual,
+                );
                 serde_json::json!({
                     "index": i + 1,
                     "active": i == self.tree.active,
                     "title": tab_display_title(&t.title, i),
                     "sessions": sessions,
+                    "color": color_hex(color),
                 })
             })
             .collect()
     }
 
     /// A JSON snapshot of the live app for the debug control surface: scale,
-    /// surface size, tabs, and the active tab's panes (dims/cursor/styles/text).
+    /// surface size, tabs, and the active tab's panes (dims/cursor/styles/
+    /// text/busy/last_exit).
     ///
     /// This describes ONE window. The App-level multi-window `ctl state`
     /// builder (`build_state_json` in `main.rs`) uses this for the focused
     /// window's top-level (compatibility) fields, and `tabs_summary_json` for
     /// every OTHER window's lighter `windows[]` entry.
+    ///
+    /// The Stream-Deck-facing contract (design: tab-colors, T5) — every field
+    /// a poller can read, and what it means:
+    /// - `scale_factor`, `surface`: display scale and the window's pixel size.
+    /// - `tabs[]`: `index` (1-based), `active`, `title`, `sessions` (ids),
+    ///   `color` (`"#rrggbb"` or `null` — the tab's EFFECTIVE color; see
+    ///   `tabs_summary_json`'s doc for the precedence it composes).
+    /// - `active_tab`, `focus_pane`: the focused tab's 0-based index and the
+    ///   focused pane's id within it.
+    /// - `bracketed_paste`: whether the focused pane's shell has bracketed
+    ///   paste (DEC 2004) enabled.
+    /// - `panes[]`: one entry per pane in the active tab — `session`/`pane`
+    ///   ids, `focused`, `dims` (`[cols, rows]`), `cursor`
+    ///   (`{row, col, visible}`), `styles_known`, `text` (the pane's visible
+    ///   grid text), `busy` (a command is currently running — shell
+    ///   integration's OSC 633;E seen with no matching `CommandEnd` yet), and
+    ///   `last_exit` (the MOST RECENTLY FINISHED command's exit code, from
+    ///   its `CommandEnd` report — `null` until the pane's first command
+    ///   completes. Same `$?` semantics as a shell prompt: it keeps showing
+    ///   the previous command's exit code while `busy` is true for the next
+    ///   one, and only changes when THAT command's own `CommandEnd` arrives —
+    ///   except a CODE-LESS `CommandEnd` itself, which clears `last_exit`
+    ///   back to `null`, per `apply_command_end`'s doc in `main.rs`).
+    ///   BOTH `busy` and `last_exit` require the shell to have shell
+    ///   integration installed AND the "Capture commands" setting on:
+    ///   `busy` only ever becomes `true` from a `CommandLine` report, which
+    ///   `main.rs`'s event loop collects only when `capture_commands` is
+    ///   set, so with it off `busy` reads `false` for every pane, always.
+    ///   `last_exit` follows the same shell-integration dependency (no
+    ///   `CommandEnd` ever arrives without it) and in practice also tracks
+    ///   `capture_commands` in the common case, since it can only update an
+    ///   ALREADY-EXISTING `PaneMeta` entry (`CommandEnd`'s handler never
+    ///   creates one) and the entries that matter here are the ones
+    ///   `CommandLine` creates — so with "Capture commands" off, expect
+    ///   `null` there too. With neither shell integration nor the setting
+    ///   on, both fields read `false`/`null` for every pane. Any of
+    ///   `dims`/`cursor`/`styles_known`/`text` is `null` when the pane has
+    ///   no snapshot yet (a shell that hasn't painted its first frame).
     pub(crate) fn state_json(&self, shared: &Shared) -> String {
         let sf = self.renderer.window().scale_factor();
         let tab = self.active_tab();
@@ -1377,6 +1829,7 @@ impl WindowState {
             .iter()
             .map(|(pane, sess)| {
                 let snap = self.renderer.pane_snapshot(sess);
+                let (busy, last_exit) = pane_status_for(shared.pane_meta.get(sess));
                 serde_json::json!({
                     "session": sess.0,
                     "pane": pane.0,
@@ -1387,6 +1840,8 @@ impl WindowState {
                     })),
                     "styles_known": snap.as_ref().map(|s| s.styles_known),
                     "text": snap.as_ref().map(|s| s.text.clone()),
+                    "busy": busy,
+                    "last_exit": last_exit,
                 })
             })
             .collect();
@@ -1397,7 +1852,7 @@ impl WindowState {
         // Every tab, not just the active one — external tools map a name to a
         // tab index with this (`index` is 1-based, matching `cmd+N` and
         // `ctl focus`). `title` is the strip's displayed title, same rule.
-        let tabs = self.tabs_summary_json();
+        let tabs = self.tabs_summary_json(shared);
         serde_json::json!({
             "scale_factor": sf,
             "surface": [self.px.0, self.px.1],
@@ -1420,10 +1875,27 @@ impl WindowState {
         }
     }
 
+    /// Rebuild [`Self::tab_rule_colors`] for every tab in this window against
+    /// `shared.tab_color_rules` — the ONLY place that cache is written.
+    /// Called at each of the four trigger sites named on the field's doc
+    /// (rename commit, auto/programmatic title change, Settings adjustment,
+    /// config load); `sync_layout` — which runs far more often, on every
+    /// resize/focus/drag change too — only ever reads it, so a regex never
+    /// re-runs on a tab whose title hasn't changed.
+    pub(crate) fn recompute_tab_rule_colors(&mut self, shared: &Shared) {
+        self.tab_rule_colors = compute_tab_rule_colors(&self.tree.tabs, &shared.tab_color_rules);
+    }
+
     /// Recompute the active tab's tiling, hand it to the renderer, and resize each
     /// session's PTY whose grid dims changed. Idempotent; the single source of
     /// truth for "what's on screen and how big each shell is."
     pub(crate) fn sync_layout(&mut self, shared: &Shared) {
+        // Backstop for the swatch popover's raw-index anchor (Task 3 review
+        // fix) — see `swatch_open_is_stale`'s doc for why this alone doesn't
+        // cover every case and why the mutation sites also close it directly.
+        if swatch_open_is_stale(self.swatch_open, self.tree.tabs.len()) {
+            self.close_swatch();
+        }
         if self.tree.tabs.is_empty() {
             return;
         }
@@ -1509,6 +1981,18 @@ impl WindowState {
             .filter(|(_, t)| Some(t.id) != excluded_tab)
             .map(|(i, t)| {
                 let editing = editing_tab == Some(i);
+                let osc = tab_osc_color(t, shared);
+                // The rule layer is a cache lookup, not a fresh regex match —
+                // see `tab_rule_colors`'s and `recompute_tab_rule_colors`'s
+                // docs for why matching doesn't happen here, on every
+                // `sync_layout` call.
+                let rule = self.tab_rule_colors.get(&t.id).copied().flatten();
+                let color = effective_color(
+                    t.color,
+                    osc,
+                    rule,
+                    shared.config.tab_colors.osc6_overrides_manual,
+                );
                 TabLabel {
                     title: if editing {
                         self.edit_buffer.clone()
@@ -1518,6 +2002,7 @@ impl WindowState {
                     active: i == active,
                     editing,
                     bell: belled.contains(&t.id),
+                    color,
                 }
             })
             .collect();
@@ -1947,6 +2432,12 @@ impl WindowState {
             vp,
         );
         self.apply_effects(shared, effects);
+        // Fresh-tab recompute (design: tab-colors): a rule can match the
+        // tab's starting title (empty, or a catch-all like `.*`), and this
+        // is the one choke point every non-restore, non-split new-tab path
+        // (Cmd+T, ctl new-tab, `new_tab`) funnels through — without this the
+        // tab would render colorless until an unrelated later trigger ran.
+        self.recompute_tab_rule_colors(shared);
         self.sync_layout(shared);
         shared.snapshot_dirty = true;
         true
@@ -2187,6 +2678,7 @@ impl WindowState {
         self.selecting = false;
         self.scrollbar_drag = None;
         self.divider_drag = None;
+        self.hue_drag = false;
         // A plain click (no drag) clears the selection rather than leaving a
         // one-cell one — see AnchoredSelection::is_empty_click.
         if was_selecting {
@@ -2212,6 +2704,19 @@ impl WindowState {
     }
 
     pub(crate) fn left_click(&mut self, shared: &mut Shared) {
+        // While the swatch popover is open, it captures EVERY click (mouse
+        // parity with `swatch_key_input`'s keyboard capture): a hit on a
+        // curated cell/`Default`/`Clear` applies that pick, anything else —
+        // padding inside the panel, or genuinely outside it — dismisses the
+        // popover WITHOUT touching the rename underneath (mirrors Esc's
+        // `SwatchAction::Close`, which also leaves the rename editor open).
+        // Must run before every other branch below: the popover can only
+        // ever be open while a tab is `editing`, and none of those other
+        // branches know to leave that rename alone.
+        if self.swatch_open.is_some() {
+            self.swatch_click(shared);
+            return;
+        }
         // A click on an About-overlay link button (Docs/GitHub) opens the URL
         // rather than dismissing the overlay.
         if self.about {
@@ -2245,11 +2750,24 @@ impl WindowState {
             // as an ordinary click.
             self.renderer.set_split_preview(None);
         }
+        let (x, y) = self.cursor;
+        let hit = self.renderer.tab_hit(x as f32, y as f32);
+        // Clicking the rename-editor's own swatch (Task 3) opens the popover
+        // WITHOUT touching the rename underneath it — this must run before
+        // `commit_rename` below, which would otherwise end the rename first
+        // and make this exact same click resolve as a plain `TabHit::Tab`
+        // instead (the swatch zone only exists while that tab is `editing`).
+        if let Some(TabHit::Swatch(i)) = hit {
+            self.open_swatch(i);
+            return;
+        }
+        // (The popover itself is handled by the early `swatch_click` return
+        // above — by construction `self.swatch_open` is `None` past this
+        // point.)
         // Any click commits an in-progress tab rename first.
         let was_editing = self.editing_tab.is_some();
         self.commit_rename(shared);
-        let (x, y) = self.cursor;
-        if let Some(hit) = self.renderer.tab_hit(x as f32, y as f32) {
+        if let Some(hit) = hit {
             match hit {
                 TabHit::Tab(i) => {
                     // Second click on the same tab (and we weren't just committing a
@@ -2298,6 +2816,9 @@ impl WindowState {
                 TabHit::NewTab => self.new_tab(shared),
                 TabHit::Help => self.toggle_help(),
                 TabHit::Settings => self.toggle_settings(shared),
+                // Handled by the early return above, before `commit_rename`
+                // — kept here only so this match stays exhaustive.
+                TabHit::Swatch(_) => {}
             }
             return;
         }
@@ -2959,6 +3480,10 @@ impl WindowState {
                 if let Some(d) = self.tab_drag.as_mut() {
                     d.tab = slot;
                 }
+                // Same reasoning as `ReorderTab`: a live reorder shifts
+                // indices without changing tab count, which the swatch
+                // popover's raw-index anchor can't detect on its own.
+                self.close_swatch();
                 let vp = self.viewport();
                 apply(
                     &mut self.tree,
@@ -3025,6 +3550,19 @@ impl WindowState {
             };
             self.resize_split_px(shared, a_side, b_side, axis, pos - last);
             self.divider_drag = Some((a_side, b_side, axis, pos));
+        } else if self.hue_drag {
+            // The hue bar drag (popover v2): keep sweeping hue even if the
+            // cursor slides off the bar's own bounds, same "press-anchored,
+            // not bounds-anchored" idiom as `divider_drag`/`scrollbar_drag`
+            // above — `swatch_hue_drag_fraction` clamps to the bar's ends
+            // rather than dropping the drag.
+            if let Some(frac) = self.renderer.swatch_hue_drag_fraction(x as f32) {
+                self.swatch_hue = frac * 360.0;
+                let (color, hex) = hue_preview(self.swatch_hue);
+                self.swatch_custom = color;
+                self.swatch_hex = hex;
+                self.update_swatch_view();
+            }
         } else if self.tab_drag.is_some() || shared.drag.is_some() {
             self.update_drag(shared, window_id, x, y);
         } else if let Some(sid) = self.scrollbar_drag.clone() {
@@ -3529,6 +4067,9 @@ impl WindowState {
                     }
                     let to = insert_at.min(self.tree.tabs.len() - 1);
                     if to != src_tab {
+                        // Same reasoning as `ReorderTab`/`drag_tab_to`: a
+                        // reorder shifts indices without changing tab count.
+                        self.close_swatch();
                         let vp = self.viewport();
                         apply(
                             &mut self.tree,
@@ -3688,14 +4229,18 @@ impl WindowState {
 
     /// Commit the in-progress rename (Enter / click away) → sets the tab title
     /// and, since this is the interactive "user typed a name" path, marks the
-    /// tab as user-named for the session snapshot (`named_tabs`).
+    /// tab as user-named for the session snapshot (`named_tabs`). A `#rrggbb`
+    /// token anywhere in the typed name (Task 3) is stripped out of the title
+    /// and applied as the tab's manual color via `apply_tab_color` instead of
+    /// being kept as literal text — e.g. renaming to `deploy #ff9d3c` titles
+    /// the tab "deploy" and colors it amber.
     pub(crate) fn commit_rename(&mut self, shared: &mut Shared) {
         let Some(i) = self.editing_tab.take() else {
             return;
         };
+        let (title, color) = extract_color_token(&self.edit_buffer);
         if let Some(t) = self.tree.tabs.get(i) {
             let id = t.id;
-            let title = self.edit_buffer.clone();
             let vp = self.viewport();
             apply(
                 &mut self.tree,
@@ -3706,7 +4251,17 @@ impl WindowState {
             shared.snapshot_dirty = true;
         }
         self.edit_buffer.clear();
-        self.sync_layout(shared);
+        // Rename commit (design: tab-colors recompute trigger #1): the
+        // title just changed, so the rule-color cache for this window needs
+        // refreshing before the next `sync_layout` reads it.
+        self.recompute_tab_rule_colors(shared);
+        if let Some(choice) = color {
+            // `apply_tab_color` calls `sync_layout` itself, so it also covers
+            // the rename's own redraw — no separate `sync_layout` needed below.
+            self.apply_tab_color(shared, i, choice);
+        } else {
+            self.sync_layout(shared);
+        }
     }
 
     /// Discard the in-progress rename (Esc).
@@ -3722,6 +4277,17 @@ impl WindowState {
         match key {
             Key::Named(NamedKey::Enter) => self.commit_rename(shared),
             Key::Named(NamedKey::Escape) => self.cancel_rename(shared),
+            // Opens the tab-color popover (Task 3) without touching the
+            // in-progress rename underneath it — mirrors clicking the
+            // editor's own swatch (`TabHit::Swatch`, handled in `left_click`).
+            // Discoverability for this gesture lives in the popover's own
+            // hint row once it's open, per the project's "obvious-in-UI
+            // first" tenet.
+            Key::Named(NamedKey::ArrowDown) => {
+                if let Some(i) = self.editing_tab {
+                    self.open_swatch(i);
+                }
+            }
             Key::Named(NamedKey::Backspace) => {
                 self.edit_buffer.pop();
                 self.sync_layout(shared);
@@ -3737,6 +4303,219 @@ impl WindowState {
                 self.sync_layout(shared);
             }
             _ => {}
+        }
+    }
+
+    /// Open the tab-color popover (Task 3, popover v2), anchored under tab
+    /// `i` — from a click on the rename-editor's swatch or `ArrowDown` while
+    /// renaming. Starting selection matches the tab's current color when
+    /// it's one of the 12 curated swatches, `Default`/`Clear` for those two
+    /// choices, or swatch 0 for anything else (a manual color outside the
+    /// palette, or no color at all) — so re-opening the popover on an
+    /// already-colored tab doesn't land on an arbitrary cell. Keyboard focus
+    /// always starts on the grid; the hue bar/hex field seed from the tab's
+    /// existing custom color when it's one NOT in the curated palette (so
+    /// reopening on a custom color shows it, rather than resetting to red).
+    pub(crate) fn open_swatch(&mut self, i: usize) {
+        if i >= self.tree.tabs.len() {
+            return;
+        }
+        self.swatch_open = Some(i);
+        self.swatch_focus = SwatchFocus::Grid;
+        self.hue_drag = false;
+        let color = self.tree.tabs[i].color;
+        self.swatch_sel = match color {
+            TabColorChoice::Color(c) => SWATCHES.iter().position(|&s| s == c).unwrap_or(0),
+            TabColorChoice::PinnedDefault => SWATCHES.len(),
+            TabColorChoice::Unset => SWATCHES.len() + 1,
+        };
+        let custom = match color {
+            TabColorChoice::Color(c) if !SWATCHES.contains(&c) => Some(c),
+            _ => None,
+        };
+        self.swatch_hue = custom.map(|c| hue_of(c) as f32).unwrap_or(0.0);
+        self.swatch_hex = custom.map(|c| format!("#{c:06x}")).unwrap_or_default();
+        self.swatch_custom = custom.unwrap_or_else(|| hue_to_rgb(self.swatch_hue as f64));
+        self.update_swatch_view();
+    }
+
+    /// Close the popover without changing the tab's color (Esc, or after a
+    /// pick commits one).
+    pub(crate) fn close_swatch(&mut self) {
+        if self.swatch_open.take().is_some() {
+            self.hue_drag = false;
+            self.update_swatch_view();
+        }
+    }
+
+    /// (Re)build the renderer's `SwatchView` from the popover's live state.
+    /// No-op-safe to call with `swatch_open == None` (clears the view).
+    fn update_swatch_view(&mut self) {
+        let view = self.swatch_open.map(|tab| SwatchView {
+            tab,
+            selected: self.swatch_sel,
+            focus: self.swatch_focus,
+            hue: self.swatch_hue,
+            hex_buffer: self.swatch_hex.clone(),
+            custom: self.swatch_custom,
+        });
+        self.renderer.set_swatch(view);
+    }
+
+    /// Route a key into the open tab-color popover (the keyboard arm sits
+    /// ABOVE the rename-editor branch in `main.rs`'s dispatcher and swallows
+    /// every key while open, matching the restore modal's/settings overlay's
+    /// own capture convention). `swatch_key`'s routing depends on which of
+    /// the three regions (popover v2) currently has focus.
+    pub(crate) fn swatch_key_input(&mut self, shared: &mut Shared, key: &Key) {
+        let Some(i) = self.swatch_open else { return };
+        match swatch_key(key, self.modifiers, self.swatch_focus, self.swatch_sel) {
+            SwatchAction::Move(delta) => {
+                self.swatch_sel = wrap_swatch_sel(self.swatch_sel, delta);
+                self.update_swatch_view();
+            }
+            SwatchAction::Pick => {
+                self.apply_tab_color(shared, i, TabColorChoice::Color(SWATCHES[self.swatch_sel]));
+                self.close_swatch();
+            }
+            SwatchAction::PinDefault => {
+                self.apply_tab_color(shared, i, TabColorChoice::PinnedDefault);
+                self.close_swatch();
+            }
+            SwatchAction::Clear => {
+                self.apply_tab_color(shared, i, TabColorChoice::Unset);
+                self.close_swatch();
+            }
+            SwatchAction::Close => self.close_swatch(),
+            SwatchAction::FocusNext => {
+                self.swatch_focus = cycle_swatch_focus(self.swatch_focus, true);
+                self.update_swatch_view();
+            }
+            SwatchAction::FocusPrev => {
+                self.swatch_focus = cycle_swatch_focus(self.swatch_focus, false);
+                self.update_swatch_view();
+            }
+            SwatchAction::HueStep(steps) => {
+                self.swatch_hue = step_hue(self.swatch_hue, steps);
+                let (color, hex) = hue_preview(self.swatch_hue);
+                self.swatch_custom = color;
+                self.swatch_hex = hex;
+                self.update_swatch_view();
+            }
+            SwatchAction::ApplyHue => {
+                let choice = TabColorChoice::Color(self.swatch_custom);
+                self.apply_tab_color(shared, i, choice);
+                self.close_swatch();
+            }
+            SwatchAction::HexInput(text) => {
+                for ch in text.chars().filter(|c| !c.is_control()) {
+                    self.swatch_hex = hex_buffer_push(&self.swatch_hex, ch);
+                }
+                if let Some((color, hue)) = hex_buffer_commit(&self.swatch_hex) {
+                    self.swatch_custom = color;
+                    self.swatch_hue = hue;
+                }
+                self.update_swatch_view();
+            }
+            SwatchAction::HexBackspace => {
+                self.swatch_hex = hex_buffer_backspace(&self.swatch_hex);
+                if let Some((color, hue)) = hex_buffer_commit(&self.swatch_hex) {
+                    self.swatch_custom = color;
+                    self.swatch_hue = hue;
+                }
+                self.update_swatch_view();
+            }
+            SwatchAction::HexApply => {
+                // Reuse the SAME token parser every other color-entry path
+                // (the rename-editor's `#rrggbb`, `ctl set-tab-color`) goes
+                // through — a malformed/incomplete buffer just parses to
+                // `None`, leaving the field focused so the user can keep
+                // typing rather than silently closing on a typo.
+                if let Some(choice) = parse_color_token(&self.swatch_hex) {
+                    self.apply_tab_color(shared, i, choice);
+                    self.close_swatch();
+                }
+            }
+            SwatchAction::HexUnfocus => {
+                self.swatch_focus = SwatchFocus::Grid;
+                self.update_swatch_view();
+            }
+            SwatchAction::None => {}
+        }
+    }
+
+    /// Route a left-click into the open tab-color popover — the mouse
+    /// counterpart to [`Self::swatch_key_input`]. A hit on a curated cell
+    /// picks that color; `Default`/`Clear` apply those choices; the hue bar
+    /// picks the hue under the cursor and arms a drag (further motion keeps
+    /// sweeping — see `on_cursor_moved`'s `hue_drag` branch); the live-
+    /// preview swatch applies the currently-previewed hue (the only mouse
+    /// commit for a hue pick — missing this region would mean a click on
+    /// the preview falls through to `Blank` and discards the pick instead);
+    /// the hex field just takes focus (typing is what edits it); anything
+    /// else (padding inside the panel, or a click that missed the panel
+    /// entirely) just dismisses the popover, same as `Esc` on the grid — no
+    /// rename commit/cancel either way, so the editor underneath stays
+    /// exactly as the user left it. Panel geometry comes from
+    /// `Renderer::swatch_hit`, which reads the SAME `paint::swatch_geom` the
+    /// popover is drawn from, so a click always lands on what's actually on
+    /// screen.
+    fn swatch_click(&mut self, shared: &mut Shared) {
+        let Some(i) = self.swatch_open else { return };
+        let (x, y) = self.cursor;
+        match self.renderer.swatch_hit(x as f32, y as f32) {
+            Some(SwatchPopoverHit::Swatch(idx)) => {
+                self.apply_tab_color(shared, i, TabColorChoice::Color(SWATCHES[idx]));
+                self.close_swatch();
+            }
+            Some(SwatchPopoverHit::Default) => {
+                self.apply_tab_color(shared, i, TabColorChoice::PinnedDefault);
+                self.close_swatch();
+            }
+            Some(SwatchPopoverHit::Clear) => {
+                self.apply_tab_color(shared, i, TabColorChoice::Unset);
+                self.close_swatch();
+            }
+            Some(SwatchPopoverHit::HueBar(frac)) => {
+                self.swatch_focus = SwatchFocus::HueBar;
+                self.swatch_hue = frac * 360.0;
+                let (color, hex) = hue_preview(self.swatch_hue);
+                self.swatch_custom = color;
+                self.swatch_hex = hex;
+                self.hue_drag = true;
+                self.update_swatch_view();
+            }
+            Some(SwatchPopoverHit::Preview) => {
+                // A hue pick otherwise has no mouse commit — Enter on the
+                // hue bar is the only other way to apply it. Same path as
+                // `SwatchAction::ApplyHue`: apply the currently-previewed
+                // color and close, rather than falling through to `Blank`
+                // (which would dismiss the popover and discard the pick).
+                let choice = TabColorChoice::Color(self.swatch_custom);
+                self.apply_tab_color(shared, i, choice);
+                self.close_swatch();
+            }
+            Some(SwatchPopoverHit::HexField) => {
+                self.swatch_focus = SwatchFocus::HexField;
+                self.update_swatch_view();
+            }
+            Some(SwatchPopoverHit::Blank) | None => self.close_swatch(),
+        }
+    }
+
+    /// Set tab `tab_idx`'s color and redraw. The single mutation point for
+    /// every tab-color path — the rename-editor's `#rrggbb` token, the
+    /// swatch popover, and `ctl set-tab-color` all funnel through this.
+    pub(crate) fn apply_tab_color(
+        &mut self,
+        shared: &mut Shared,
+        tab_idx: usize,
+        choice: TabColorChoice,
+    ) {
+        if let Some(t) = self.tree.tabs.get_mut(tab_idx) {
+            t.color = choice;
+            shared.snapshot_dirty = true;
+            self.sync_layout(shared);
         }
     }
 
@@ -4215,6 +4994,18 @@ impl WindowState {
 
     /// Actually perform a (possibly confirmed) close. Returns true to exit.
     pub(crate) fn do_close(&mut self, shared: &mut Shared, kind: PendingClose) -> bool {
+        // A pane close can dissolve its tab (the last-pane case) and a tab
+        // close always removes one — either way, every tab AFTER the
+        // closed one shifts down an index. The swatch popover (Task 3) is
+        // anchored by raw index, so it must not survive this: left open, a
+        // later Enter would silently color whichever tab slid into that now-
+        // stale slot instead of the one the user actually opened it on.
+        // Closing unconditionally here (rather than only on the branch that
+        // actually removes a tab) is deliberately conservative — cheap
+        // no-op when nothing was open, and `do_close` is the single choke
+        // point both `PendingClose::Pane` and `PendingClose::Tab` funnel
+        // through, so this covers Cmd+W (Pane) and `ctl` tab-close alike.
+        self.close_swatch();
         match kind {
             PendingClose::Pane => {
                 self.close_focused(shared);
@@ -4634,11 +5425,28 @@ impl WindowState {
         }
         self.apply_appearance(shared);
         shared.set_developer_mode(shared.config.developer_mode);
-        let mut relayout = self.renderer.set_font_size(shared.config.font.size);
-        relayout |= self.renderer.set_family(shared.config.font.family.clone());
-        if relayout {
-            self.sync_layout(shared);
-        }
+        // Settings toggle change (design: tab-colors recompute trigger #3):
+        // rebuild the compiled rules from the just-saved config, then this
+        // window's per-tab cache against them — cheap even when the row
+        // that actually fired had nothing to do with tab colors, matching
+        // every other live side effect above ("cheap no-op when unchanged").
+        shared.tab_color_rules = compile_rules(&shared.config.tab_colors.rules);
+        self.recompute_tab_rule_colors(shared);
+        // This method only has `&mut self` (the window whose Settings
+        // overlay is open) — every OTHER open window's own rule-color cache
+        // and rendered strip would otherwise stay stale until its own next
+        // rename/resize/settings-adjustment. Flag it; `about_to_wait`'s tail
+        // is the one place that has `self.windows` fully free to broadcast
+        // the recompute+resync to every window (mirrors `snapshot_dirty`'s
+        // "flag now, flush once windows are free" pattern).
+        shared.tab_colors_broadcast_pending = true;
+        let _ = self.renderer.set_font_size(shared.config.font.size);
+        let _ = self.renderer.set_family(shared.config.font.family.clone());
+        // Unconditional (not just the old `if relayout`): a tab-color
+        // setting change needs `sync_layout` to actually repaint the strip,
+        // and `sync_layout`'s own dims_cache/etc. checks already make a
+        // redundant call cheap.
+        self.sync_layout(shared);
     }
 
     /// Push the current config's appearance (campfire backdrop + ember sparks) to
@@ -5378,5 +6186,525 @@ mod tests {
         // never a static-table label — the lookup must return `None`, not
         // panic, so `adjust_setting` just skips mutation for it.
         assert!(find_setting_row_by_label("Delete saved sessions (4)…").is_none());
+    }
+
+    // --- parse_color_token: commit_rename / ctl set-tab-color tokens -------
+
+    #[test]
+    fn parse_color_token_hex_happy_path() {
+        use super::parse_color_token;
+        use ember_core::TabColorChoice;
+
+        assert_eq!(
+            parse_color_token("#ff9d3c"),
+            Some(TabColorChoice::Color(0xff9d3c))
+        );
+        // Case-insensitive hex digits.
+        assert_eq!(
+            parse_color_token("#FF9D3C"),
+            Some(TabColorChoice::Color(0xff9d3c))
+        );
+    }
+
+    #[test]
+    fn parse_color_token_rejects_bad_hex() {
+        use super::parse_color_token;
+
+        assert_eq!(parse_color_token("#fff"), None); // too short
+        assert_eq!(parse_color_token("#gggggg"), None); // not hex digits
+        assert_eq!(parse_color_token("#ff9d3c1"), None); // too long
+        assert_eq!(parse_color_token("nothash"), None);
+    }
+
+    #[test]
+    fn parse_color_token_default_and_clear() {
+        use super::parse_color_token;
+        use ember_core::TabColorChoice;
+
+        assert_eq!(
+            parse_color_token("default"),
+            Some(TabColorChoice::PinnedDefault)
+        );
+        assert_eq!(parse_color_token("clear"), Some(TabColorChoice::Unset));
+    }
+
+    #[test]
+    fn parse_color_token_swatch_index() {
+        use super::parse_color_token;
+        use ember_core::TabColorChoice;
+
+        assert_eq!(
+            parse_color_token("swatch-3"),
+            Some(TabColorChoice::Color(ember_core::SWATCHES[3]))
+        );
+        // Out of range (SWATCHES has exactly 12 entries, 0..=11).
+        assert_eq!(parse_color_token("swatch-12"), None);
+        assert_eq!(parse_color_token("swatch-nope"), None);
+    }
+
+    // --- extract_color_token: commit_rename's title/color split ------------
+
+    #[test]
+    fn extract_color_token_table() {
+        use super::extract_color_token;
+        use ember_core::TabColorChoice;
+
+        // (buffer, expected title, expected color)
+        let cases: &[(&str, &str, Option<TabColorChoice>)] = &[
+            // First VALID token wins: a second `#rrggbb`-shaped word is left
+            // in the title untouched ("a token", singular — see the doc).
+            (
+                "my tab #ff0000 #00ff00",
+                "my tab #00ff00",
+                Some(TabColorChoice::Color(0xff0000)),
+            ),
+            // The matched token is stripped from the title, surrounding
+            // whitespace collapsed by the `split_whitespace`/`join(" ")`
+            // round trip.
+            (
+                "deploy #00ff00 staging",
+                "deploy staging",
+                Some(TabColorChoice::Color(0x00ff00)),
+            ),
+            // Unparseable `#`-word (not 6 hex digits): left in the title
+            // verbatim, color stays `None` — `parse_color_token` rejects it,
+            // so `extract_color_token` never treats it as a match.
+            ("notes #zzz", "notes #zzz", None),
+            // No `#`-word at all: title passes through unchanged, no color.
+            ("plain title", "plain title", None),
+        ];
+        for (buf, want_title, want_color) in cases {
+            let (title, color) = extract_color_token(buf);
+            assert_eq!(&title, want_title, "title mismatch for {buf:?}");
+            assert_eq!(&color, want_color, "color mismatch for {buf:?}");
+        }
+    }
+
+    // --- swatch_key: the tab-color popover's keyboard classifier -----------
+
+    #[test]
+    fn swatch_key_enter_resolves_by_selection_on_the_grid() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        for key in [Key::Named(NamedKey::Enter), Key::Named(NamedKey::Space)] {
+            let mods = ModifiersState::empty();
+            assert_eq!(
+                swatch_key(&key, mods, SwatchFocus::Grid, 0),
+                SwatchAction::Pick
+            );
+            assert_eq!(
+                swatch_key(&key, mods, SwatchFocus::Grid, 11),
+                SwatchAction::Pick
+            );
+            assert_eq!(
+                swatch_key(&key, mods, SwatchFocus::Grid, 12),
+                SwatchAction::PinDefault
+            );
+            assert_eq!(
+                swatch_key(&key, mods, SwatchFocus::Grid, 13),
+                SwatchAction::Clear
+            );
+        }
+    }
+
+    #[test]
+    fn swatch_key_escape_closes_on_grid_and_hue_bar() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        let mods = ModifiersState::empty();
+        for sel in [0, 5, 12, 13] {
+            assert_eq!(
+                swatch_key(&Key::Named(NamedKey::Escape), mods, SwatchFocus::Grid, sel),
+                SwatchAction::Close
+            );
+        }
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::Escape), mods, SwatchFocus::HueBar, 0),
+            SwatchAction::Close
+        );
+    }
+
+    #[test]
+    fn swatch_key_escape_on_hex_field_unfocuses_instead_of_closing() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        assert_eq!(
+            swatch_key(
+                &Key::Named(NamedKey::Escape),
+                ModifiersState::empty(),
+                SwatchFocus::HexField,
+                0
+            ),
+            SwatchAction::HexUnfocus
+        );
+    }
+
+    #[test]
+    fn swatch_key_arrows_move_the_grid() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        let mods = ModifiersState::empty();
+        assert_eq!(
+            swatch_key(
+                &Key::Named(NamedKey::ArrowRight),
+                mods,
+                SwatchFocus::Grid,
+                0
+            ),
+            SwatchAction::Move(1)
+        );
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::ArrowLeft), mods, SwatchFocus::Grid, 0),
+            SwatchAction::Move(-1)
+        );
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::ArrowDown), mods, SwatchFocus::Grid, 0),
+            SwatchAction::Move(4)
+        );
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::ArrowUp), mods, SwatchFocus::Grid, 0),
+            SwatchAction::Move(-4)
+        );
+    }
+
+    #[test]
+    fn swatch_key_tab_cycles_focus_regardless_of_current_region() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        for focus in [
+            SwatchFocus::Grid,
+            SwatchFocus::HueBar,
+            SwatchFocus::HexField,
+        ] {
+            assert_eq!(
+                swatch_key(
+                    &Key::Named(NamedKey::Tab),
+                    ModifiersState::empty(),
+                    focus,
+                    0
+                ),
+                SwatchAction::FocusNext
+            );
+            let mut shift = ModifiersState::empty();
+            shift.set(ModifiersState::SHIFT, true);
+            assert_eq!(
+                swatch_key(&Key::Named(NamedKey::Tab), shift, focus, 0),
+                SwatchAction::FocusPrev
+            );
+        }
+    }
+
+    #[test]
+    fn swatch_key_hue_bar_arrows_step_and_enter_applies() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        let mods = ModifiersState::empty();
+        assert_eq!(
+            swatch_key(
+                &Key::Named(NamedKey::ArrowRight),
+                mods,
+                SwatchFocus::HueBar,
+                0
+            ),
+            SwatchAction::HueStep(1)
+        );
+        assert_eq!(
+            swatch_key(
+                &Key::Named(NamedKey::ArrowLeft),
+                mods,
+                SwatchFocus::HueBar,
+                0
+            ),
+            SwatchAction::HueStep(-1)
+        );
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::Enter), mods, SwatchFocus::HueBar, 0),
+            SwatchAction::ApplyHue
+        );
+        // Grid-only keys are a no-op here — the hue bar has no 14-item grid.
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::ArrowUp), mods, SwatchFocus::HueBar, 0),
+            SwatchAction::None
+        );
+    }
+
+    #[test]
+    fn swatch_key_hex_field_routes_typing_backspace_and_enter() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        let mods = ModifiersState::empty();
+        assert_eq!(
+            swatch_key(&Key::Character("a".into()), mods, SwatchFocus::HexField, 0),
+            SwatchAction::HexInput("a".to_string())
+        );
+        assert_eq!(
+            swatch_key(
+                &Key::Named(NamedKey::Backspace),
+                mods,
+                SwatchFocus::HexField,
+                0
+            ),
+            SwatchAction::HexBackspace
+        );
+        assert_eq!(
+            swatch_key(&Key::Named(NamedKey::Enter), mods, SwatchFocus::HexField, 0),
+            SwatchAction::HexApply
+        );
+    }
+
+    #[test]
+    fn swatch_key_unhandled_key_is_a_no_op() {
+        use super::{SwatchAction, SwatchFocus, swatch_key};
+        use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+        assert_eq!(
+            swatch_key(
+                &Key::Named(NamedKey::F1),
+                ModifiersState::empty(),
+                SwatchFocus::Grid,
+                0
+            ),
+            SwatchAction::None
+        );
+    }
+
+    // --- cycle_swatch_focus: Tab order Grid -> HueBar -> HexField -> -------
+
+    #[test]
+    fn cycle_swatch_focus_forward_wraps() {
+        use super::{SwatchFocus, cycle_swatch_focus};
+
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::Grid, true),
+            SwatchFocus::HueBar
+        );
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::HueBar, true),
+            SwatchFocus::HexField
+        );
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::HexField, true),
+            SwatchFocus::Grid
+        );
+    }
+
+    #[test]
+    fn cycle_swatch_focus_backward_wraps() {
+        use super::{SwatchFocus, cycle_swatch_focus};
+
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::Grid, false),
+            SwatchFocus::HexField
+        );
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::HexField, false),
+            SwatchFocus::HueBar
+        );
+        assert_eq!(
+            cycle_swatch_focus(SwatchFocus::HueBar, false),
+            SwatchFocus::Grid
+        );
+    }
+
+    // --- step_hue: the hue bar's arrow-key sweep, wrapping 0..360 ----------
+
+    #[test]
+    fn step_hue_moves_by_3_degrees_per_step() {
+        use super::step_hue;
+
+        assert_eq!(step_hue(0.0, 1), 3.0);
+        assert_eq!(step_hue(0.0, -1), 357.0);
+        assert_eq!(step_hue(357.0, 1), 0.0);
+        assert_eq!(step_hue(0.0, 5), 15.0);
+    }
+
+    // --- hex_buffer_push / hex_buffer_backspace: the hex field's state -----
+
+    #[test]
+    fn hex_buffer_push_prepends_hash_on_first_digit() {
+        use super::hex_buffer_push;
+
+        assert_eq!(hex_buffer_push("", '3'), "#3");
+        assert_eq!(hex_buffer_push("#3", 'f'), "#3f");
+    }
+
+    #[test]
+    fn hex_buffer_push_uppercases_fold_to_lowercase() {
+        use super::hex_buffer_push;
+
+        assert_eq!(hex_buffer_push("#3", 'F'), "#3f");
+    }
+
+    #[test]
+    fn hex_buffer_push_explicit_hash_starts_fresh_only_when_empty() {
+        use super::hex_buffer_push;
+
+        assert_eq!(hex_buffer_push("", '#'), "#");
+        // Typing '#' again mid-entry is a no-op, not a reset — the field
+        // never contains an embedded second '#'.
+        assert_eq!(hex_buffer_push("#3f", '#'), "#3f");
+    }
+
+    #[test]
+    fn hex_buffer_push_rejects_non_hex_chars() {
+        use super::hex_buffer_push;
+
+        assert_eq!(hex_buffer_push("#3", 'z'), "#3");
+        assert_eq!(hex_buffer_push("#3", ' '), "#3");
+    }
+
+    #[test]
+    fn hex_buffer_push_caps_at_seven_chars() {
+        use super::hex_buffer_push;
+
+        let full = "#ff9d3c";
+        assert_eq!(full.len(), 7);
+        assert_eq!(hex_buffer_push(full, 'a'), full);
+    }
+
+    #[test]
+    fn hex_buffer_backspace_pops_the_last_char() {
+        use super::hex_buffer_backspace;
+
+        assert_eq!(hex_buffer_backspace("#3f"), "#3");
+        assert_eq!(hex_buffer_backspace("#"), "");
+        assert_eq!(hex_buffer_backspace(""), "");
+    }
+
+    // --- hue_preview / hex_buffer_commit: the popover's value-sync ---------
+    // (live feedback: "the hue picker shows its color and code as you
+    // choose" — one custom-color value, two views: the hue bar/preview box
+    // on one side, the hex field's text on the other, each pushing the other
+    // in sync whenever it changes.)
+
+    #[test]
+    fn hue_preview_matches_hue_to_rgb_and_its_own_hex_text() {
+        use super::hue_preview;
+        use ember_core::hue_to_rgb;
+
+        for deg in [0.0_f32, 37.0, 90.0, 180.0, 270.0, 359.0] {
+            let (color, hex) = hue_preview(deg);
+            assert_eq!(
+                color,
+                hue_to_rgb(deg as f64),
+                "hue {deg} preview color should be the SAME hue_to_rgb result \
+                 the bar itself paints"
+            );
+            assert_eq!(hex, format!("#{color:06x}"), "hue {deg} hex text");
+        }
+    }
+
+    #[test]
+    fn hue_preview_zero_is_hue_to_rgb_zero_hex() {
+        use super::hue_preview;
+        use ember_core::hue_to_rgb;
+
+        // Concrete regression pin, not just the round-trip property above:
+        // this is the popover's own hue==0.0 default.
+        let (color, hex) = hue_preview(0.0);
+        assert_eq!(color, hue_to_rgb(0.0));
+        assert_eq!(hex, format!("#{:06x}", hue_to_rgb(0.0)));
+    }
+
+    #[test]
+    fn hex_buffer_commit_parses_a_complete_hex_and_projects_its_hue() {
+        use super::hex_buffer_commit;
+        use ember_core::hue_of;
+
+        let (color, hue) = hex_buffer_commit("#ff9d3c").expect("complete hex commits");
+        assert_eq!(color, 0xff9d3c);
+        assert_eq!(hue, hue_of(0xff9d3c) as f32);
+    }
+
+    #[test]
+    fn hex_buffer_commit_is_none_for_a_partial_buffer() {
+        use super::hex_buffer_commit;
+
+        // Still mid-typing — must NOT commit, so the caller keeps showing
+        // the last complete preview instead of snapping to a non-color.
+        assert_eq!(hex_buffer_commit(""), None);
+        assert_eq!(hex_buffer_commit("#"), None);
+        assert_eq!(hex_buffer_commit("#3"), None);
+        assert_eq!(hex_buffer_commit("#3f9"), None);
+    }
+
+    #[test]
+    fn hex_buffer_commit_is_none_for_a_malformed_buffer() {
+        use super::hex_buffer_commit;
+
+        // Unreachable via `hex_buffer_push`'s own filtering in practice, but
+        // `hex_buffer_commit` should still reject rather than panic/parse
+        // garbage — it reuses `parse_color_token`'s own validation.
+        assert_eq!(hex_buffer_commit("#gggggg"), None);
+        assert_eq!(hex_buffer_commit("#ff9d3c1"), None);
+        assert_eq!(hex_buffer_commit("not-a-hex"), None);
+    }
+
+    #[test]
+    fn wrap_swatch_sel_wraps_across_the_14_item_grid() {
+        use super::wrap_swatch_sel;
+
+        assert_eq!(wrap_swatch_sel(13, 1), 0); // Right past Clear wraps to swatch 0
+        assert_eq!(wrap_swatch_sel(0, -1), 13); // Left before swatch 0 wraps to Clear
+        assert_eq!(wrap_swatch_sel(0, -4), 10); // Up from row 0 wraps to the bottom
+        assert_eq!(wrap_swatch_sel(13, 4), 3); // Down from Clear wraps to row 0
+    }
+
+    // --- swatch_open_is_stale: the popover's raw-index anchor going bad on
+    // a tab close/reorder (review fix) -----------------------------------
+
+    #[test]
+    fn swatch_open_is_stale_when_index_is_out_of_bounds() {
+        use super::swatch_open_is_stale;
+
+        // Anchored on tab 2 of a 3-tab window; tab 2 (and only tab 2) closes
+        // — 2 tabs remain, so index 2 is now out of bounds.
+        assert!(swatch_open_is_stale(Some(2), 2));
+        // Anchored on tab 0; unrelated tab elsewhere closes — 0 is still valid.
+        assert!(!swatch_open_is_stale(Some(0), 2));
+        // Every tab closes.
+        assert!(swatch_open_is_stale(Some(0), 0));
+    }
+
+    #[test]
+    fn swatch_open_is_stale_is_false_when_closed_or_in_bounds() {
+        use super::swatch_open_is_stale;
+
+        assert!(!swatch_open_is_stale(None, 0));
+        assert!(!swatch_open_is_stale(None, 5));
+        assert!(!swatch_open_is_stale(Some(4), 5)); // last valid index
+    }
+
+    // --- color_hex: the `ctl state` tab "color" field's pure formatting
+    // half (design: tab-colors, T5) --------------------------------------
+
+    #[test]
+    fn color_hex_formats_an_effective_color_as_lowercase_rrggbb() {
+        use super::color_hex;
+
+        assert_eq!(color_hex(Some(0xFF8800)), Some("#ff8800".to_string()));
+        assert_eq!(color_hex(Some(0x000000)), Some("#000000".to_string()));
+    }
+
+    #[test]
+    fn color_hex_pads_short_values_to_six_digits() {
+        use super::color_hex;
+
+        // A component-heavy zero red byte must not shrink the string.
+        assert_eq!(color_hex(Some(0x0000ff)), Some("#0000ff".to_string()));
+    }
+
+    #[test]
+    fn color_hex_is_none_for_an_uncolored_tab() {
+        use super::color_hex;
+
+        assert_eq!(color_hex(None), None);
     }
 }

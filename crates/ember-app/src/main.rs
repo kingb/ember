@@ -30,14 +30,16 @@ use control::{ControlMsg, MoveTabTarget, PromotePaneTarget};
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims,
     LayoutCommand, LayoutNode, MoveEffect, MoveError, OscEvent, PaneId, Rect, RowKind,
-    ScrollAmount, SessionId, SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab, TabId,
-    WispStyle, WispStyleSelection, apply, resolve_rows,
+    ScrollAmount, SessionId, SettingsRowView, SparksMode, SurfaceDest, SurfaceRef, Tab,
+    TabColorChan, TabColorChoice, TabColorRule, TabId, WispStyle, WispStyleSelection, apply,
+    resolve_rows,
 };
 use ember_platform::{MenuAction, PlatformBackend};
 use ember_render::{
     BackdropParams, CELL_HEIGHT, CELL_WIDTH, RenderOutcome, Renderer, TabHit, WispRenderer,
     WispUnsupported,
 };
+use regex::Regex;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -268,11 +270,22 @@ struct App {
 /// whether that command is still running (no matching `CommandEnd` yet).
 /// Feeds `session_state::assemble`'s `meta` closure — never logged, never
 /// read back out except into a `PaneSnap` for the on-disk snapshot.
+///
+/// `last_exit` (design: tab-colors' `ctl state` surface, T5) is the exit
+/// code from that same `CommandEnd` report, if the shell sent one — set
+/// alongside `was_running = false` and never persisted (it rides only the
+/// `ctl state` JSON via `pane_status_for`, not `PaneSnap`/the on-disk
+/// snapshot): a restored pane has no prior command to report an exit for.
+/// A CODE-LESS `CommandEnd` (the shell didn't report one) still overwrites
+/// `last_exit` with `None` — see `apply_command_end` — deliberately
+/// clearing whatever a PRIOR command left behind rather than leaving a
+/// stale exit code visible for a command that never reported its own.
 #[derive(Default, Clone, Debug)]
 pub(crate) struct PaneMeta {
     cwd: Option<String>,
     last_cmd: Option<String>,
     was_running: bool,
+    last_exit: Option<i32>,
 }
 
 /// Build one session's `PaneSnap` from its live `PaneMeta`, honoring the
@@ -300,6 +313,32 @@ pub(crate) fn pane_snap_for(
     }
 }
 
+/// Build one session's `("busy", "last_exit")` pair for `ctl state`'s
+/// per-pane JSON (design: tab-colors, T5), from its live `PaneMeta` — the
+/// `ctl`-facing sibling of `pane_snap_for` above, which builds the ON-DISK
+/// `PaneSnap` instead. `busy` is `PaneMeta::was_running` under its
+/// Stream-Deck-facing name; `last_exit` never rides the snapshot (see
+/// `PaneMeta::last_exit`'s doc), only this. Pure and unit-testable without
+/// `Shared`/`WindowState`; `window_state::WindowState::state_json` is a
+/// thin wrapper around this.
+pub(crate) fn pane_status_for(meta: Option<&PaneMeta>) -> (bool, Option<i32>) {
+    (
+        meta.map(|m| m.was_running).unwrap_or(false),
+        meta.and_then(|m| m.last_exit),
+    )
+}
+
+/// Apply one `CommandEnd` report to a pane's live metadata: the command is
+/// no longer running, and `last_exit` becomes exactly what `CommandEnd`
+/// reported — including `None` for a code-less report, which DELIBERATELY
+/// clears any exit code a PRIOR command left behind (see `PaneMeta::
+/// last_exit`'s doc). Pure and unit-testable without `Shared`; the
+/// `cmd_ends` application loop above is a thin wrapper around this.
+fn apply_command_end(meta: &mut PaneMeta, code: Option<i32>) {
+    meta.was_running = false;
+    meta.last_exit = code;
+}
+
 /// Clear `last_cmd` on every tracked pane. The other half of "belt and
 /// braces": `session_state::strip_commands` scrubs the on-disk FILE at the
 /// instant "Capture commands" is toggled off, but never touches
@@ -311,6 +350,170 @@ pub(crate) fn clear_captured_commands(pane_meta: &mut HashMap<SessionId, PaneMet
     for meta in pane_meta.values_mut() {
         meta.last_cmd = None;
     }
+}
+
+/// Fold one OSC 6 channel report into a session's accumulated tab color.
+/// OSC tab color is per-session APP state, not persisted (design decision: a
+/// restored shell re-announces its own color, so there's nothing to save) —
+/// this only ever touches `Shared::osc_tab_color`, never `pane_meta` or the
+/// snapshot. A session with no entry yet initializes the other two channels
+/// to 0, then sets the reported one. Pure over the tuple so it's
+/// unit-testable without `Shared`.
+pub(crate) fn compose_tab_color_channel(
+    current: Option<(u8, u8, u8)>,
+    chan: TabColorChan,
+    value: u8,
+) -> (u8, u8, u8) {
+    let (mut r, mut g, mut b) = current.unwrap_or((0, 0, 0));
+    match chan {
+        TabColorChan::Red => r = value,
+        TabColorChan::Green => g = value,
+        TabColorChan::Blue => b = value,
+    }
+    (r, g, b)
+}
+
+/// Compose a session's accumulated OSC 6 channels into a packed `0xRRGGBB`
+/// color, or `None` if the session has never reported one (never touched, or
+/// reset via `OscEvent::TabColorReset`). Pure over the map so it's
+/// unit-testable without `Shared`.
+///
+/// Read by `WindowState::sync_layout` (Task 3) as the `osc` layer of
+/// `ember_core::effective_color`'s precedence ladder when it builds each
+/// frame's `TabLabel`s.
+pub(crate) fn osc_color_of(map: &HashMap<SessionId, (u8, u8, u8)>, sid: &SessionId) -> Option<u32> {
+    map.get(sid)
+        .map(|&(r, g, b)| ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
+}
+
+/// The set of windows owning at least one session named in `updates` or
+/// `resets` — the only windows an OSC 6 tab-color report from THIS tick
+/// needs to `sync_layout`. `TabLabel`s are baked at `set_visible` time, so
+/// without this a tab's color only visibly changes once some unrelated
+/// trigger happens to call `sync_layout` on its window. A `HashSet` return
+/// dedupes across the tick: a shell's own OSC 6 escape reports one color as
+/// three separate channel writes (R, G, B), so a single color announcement
+/// for one session would otherwise queue the same window three times — one
+/// sync per window per tick, not one per channel report. Generic over
+/// `W: Copy + Eq + Hash` (a plain integer stands in for `WindowId` in tests,
+/// since `WindowId::dummy()` can't produce distinct ids — see
+/// `window_owning_tab`'s doc).
+pub(crate) fn affected_tab_color_windows<W: Copy + Eq + std::hash::Hash>(
+    updates: &[(SessionId, TabColorChan, u8)],
+    resets: &[SessionId],
+    session_window: &HashMap<SessionId, W>,
+) -> std::collections::HashSet<W> {
+    let mut windows = std::collections::HashSet::new();
+    for (id, _, _) in updates {
+        if let Some(w) = session_window.get(id) {
+            windows.insert(*w);
+        }
+    }
+    for id in resets {
+        if let Some(w) = session_window.get(id) {
+            windows.insert(*w);
+        }
+    }
+    windows
+}
+
+// --- Tab-color regex rules (design: tab-colors, T4) -------------------------
+//
+// `ember_core::config::TabColorRule` is a plain, unvalidated `{pattern,
+// color}` pair (`regex` isn't an ember-core dependency, so it can't compile
+// or validate either field itself). This is the ember-app-side compiled
+// form: `compile_rules` turns the config's `Vec<TabColorRule>` into
+// `Shared.tab_color_rules`, skipping (never panicking on) an invalid regex
+// or unparseable color, and `rule_color_for` is the actual first-match-wins
+// resolver `WindowState::recompute_tab_rule_colors` calls per tab.
+
+/// One `TabColorRule` with its pattern compiled and its color parsed —
+/// built once by `compile_rules`, not on every match.
+pub(crate) struct CompiledRule {
+    regex: Regex,
+    color: u32,
+}
+
+static INVALID_RULE_LOGGED: std::sync::Once = std::sync::Once::new();
+
+/// Log an invalid tab-color rule exactly once for the process lifetime, then
+/// swallow every subsequent one — a typo'd regex or color must never spam
+/// the log on every recompute, and must never be the other rules' problem
+/// (mirrors `session_state::log_write_failure_once`'s pattern).
+fn log_invalid_rule_once(msg: &str) {
+    INVALID_RULE_LOGGED.call_once(|| {
+        eprintln!("[ember] {msg}");
+    });
+}
+
+/// Parse a rule's `color` field: `#rrggbb`, exactly 6 hex digits after the
+/// `#` (case-insensitive). Standalone rather than reusing
+/// `window_state::parse_color_token`: a rule's color is always a literal
+/// hex color, never `default`/`clear`/`swatch-N`.
+fn parse_rule_color(s: &str) -> Option<u32> {
+    let hex = s.trim().strip_prefix('#')?;
+    if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        None
+    }
+}
+
+/// Compile every configured rule, skipping one with an invalid regex or an
+/// unparseable color rather than panicking or dropping the rest — see the
+/// module-level doc above. Called on config load and whenever the config
+/// changes (a Settings adjustment) — never per-frame.
+pub(crate) fn compile_rules(rules: &[TabColorRule]) -> Vec<CompiledRule> {
+    rules
+        .iter()
+        .filter_map(|r| {
+            let regex = match Regex::new(&r.pattern) {
+                Ok(re) => re,
+                Err(e) => {
+                    log_invalid_rule_once(&format!(
+                        "tab color rule skipped: invalid pattern {:?}: {e}",
+                        r.pattern
+                    ));
+                    return None;
+                }
+            };
+            let Some(color) = parse_rule_color(&r.color) else {
+                log_invalid_rule_once(&format!(
+                    "tab color rule skipped: invalid color {:?} for pattern {:?}",
+                    r.color, r.pattern
+                ));
+                return None;
+            };
+            Some(CompiledRule { regex, color })
+        })
+        .collect()
+}
+
+/// First-match-wins regex color for `title` against `rules` — the third
+/// `ember_core::effective_color` precedence layer (manual pick > OSC 6 >
+/// regex rule > none). `None` if no rule matches (including an empty
+/// `rules` slice).
+pub(crate) fn rule_color_for(title: &str, rules: &[CompiledRule]) -> Option<u32> {
+    rules
+        .iter()
+        .find(|r| r.regex.is_match(title))
+        .map(|r| r.color)
+}
+
+/// Rebuild the whole `TabId -> rule color` cache for `tabs` against `rules` —
+/// the pure core of `WindowState::recompute_tab_rule_colors`, pulled out
+/// here (rather than inlined against `self.tree.tabs`/`shared.tab_color_rules`)
+/// so it's unit-testable without a live `WindowState`/`Renderer`: this is
+/// exactly what runs whether the trigger is a rename, a fresh tab, a moved-
+/// or promoted-in tab carrying its (possibly restored) title, a Settings
+/// adjustment, or a config load — the recompute itself never cares which.
+pub(crate) fn compute_tab_rule_colors(
+    tabs: &[Tab],
+    rules: &[CompiledRule],
+) -> HashMap<TabId, Option<u32>> {
+    tabs.iter()
+        .map(|t| (t.id, rule_color_for(&t.title, rules)))
+        .collect()
 }
 
 /// Process-wide state that is not tied to any one window: the running sessions,
@@ -394,6 +597,32 @@ pub(crate) struct Shared {
     /// `SessionId` is never reused, and `assemble` only ever looks one up
     /// for a pane that's still a live leaf in some window's tree.
     pub(crate) pane_meta: std::collections::HashMap<SessionId, PaneMeta>,
+    /// Live per-session OSC 6 (iTerm2 tab color), composed from whichever
+    /// channel reports have arrived so far — a session absent here has never
+    /// reported one. Per-session APP state, not persisted: a restored shell
+    /// re-announces its own tab color, so this is never read by
+    /// `session_state::assemble` and never marks `snapshot_dirty`. A dead
+    /// `SessionId` is never reused, so entries are never pruned on exit
+    /// (matches `cwd_by_session`'s convention).
+    pub(crate) osc_tab_color: std::collections::HashMap<SessionId, (u8, u8, u8)>,
+    /// Compiled tab-color regex rules (`config.tab_colors.rules`, compiled
+    /// by `compile_rules`) — the rule layer of `ember_core::effective_color`.
+    /// Rebuilt on config load and on every Settings adjustment; never
+    /// per-frame. `WindowState::recompute_tab_rule_colors` reads this to
+    /// fill each window's own per-tab rule-color cache (see that method's
+    /// doc for why the per-tab result is cached rather than matched fresh
+    /// in `sync_layout`).
+    pub(crate) tab_color_rules: Vec<CompiledRule>,
+    /// Set by `WindowState::adjust_setting` on every Settings adjustment
+    /// (that method only has `&mut self` — the window whose overlay is
+    /// open — so it can't itself reach every other open window). Flushed
+    /// once by `about_to_wait`'s tail, the same "flag now, flush once
+    /// `self.windows` is fully free" pattern `snapshot_dirty` uses:
+    /// recomputes + re-syncs EVERY window so a knob flip (or a future
+    /// config.toml rule edit picked up by a reload) is visible everywhere,
+    /// not just in the window whose Settings overlay happened to be open.
+    /// Event-driven — set once per adjustment, never per frame.
+    pub(crate) tab_colors_broadcast_pending: bool,
     /// The debounced session-snapshot writer thread's handle, or `None` when
     /// no state path resolved at startup (`session_state::state_path()`) —
     /// every dirty-marking site and `session_dirty` itself must treat that
@@ -909,6 +1138,9 @@ impl ApplicationHandler<EmberEvent> for App {
             return;
         }
         let config = config::load();
+        // Compile the tab-color rules once here, at config load — see
+        // `Shared::tab_color_rules`'s doc for the other recompute triggers.
+        let tab_color_rules = compile_rules(&config.tab_colors.rules);
         let restore_on = config.restore.mode != ember_core::RestoreMode::Off;
         // Session-restore (Task 8): what happens to the very first window
         // depends on `restore.mode` + whether a snapshot actually loaded.
@@ -948,6 +1180,9 @@ impl ApplicationHandler<EmberEvent> for App {
             titles: std::collections::HashMap::new(),
             cwd_by_session: std::collections::HashMap::new(),
             pane_meta: std::collections::HashMap::new(),
+            osc_tab_color: std::collections::HashMap::new(),
+            tab_color_rules,
+            tab_colors_broadcast_pending: false,
             snapshots: restore_on
                 .then(|| session_state::state_path().map(session_state::SnapshotWriter::spawn))
                 .flatten(),
@@ -1006,6 +1241,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     title: String::new(),
                     root: LayoutNode::pane(pane, session.clone()),
                     focus: pane,
+                    color: TabColorChoice::Unset,
                 }],
                 active: 0,
             };
@@ -1022,6 +1258,10 @@ impl ApplicationHandler<EmberEvent> for App {
                 // spawn_session already printed instead of presenting a dead window.
                 std::process::exit(1);
             }
+            // Populate the rule-color cache before the very first `sync_layout`
+            // (mirrors `open_window`'s precedent) — without this, the seed
+            // tab renders colorless until some unrelated later trigger runs.
+            win.recompute_tab_rule_colors(&shared);
             win.sync_layout(&shared);
             win.apply_appearance(&shared);
             shared.window_order.push(window_id);
@@ -1383,6 +1623,17 @@ impl ApplicationHandler<EmberEvent> for App {
                 // combos (Cmd+W etc. stay shortcuts; Cmd+F reopens/no-ops).
                 if win.search_open && !win.modifiers.super_key() {
                     win.search_key(shared, &key.logical_key);
+                    return;
+                }
+                // The tab-color swatch popover (Task 3) captures all input
+                // while open — sits ABOVE the rename branch below since it
+                // can be open while that tab is still mid-rename underneath
+                // it (opened via that same rename's `ArrowDown`), and must
+                // intercept arrows/Enter/Esc before `rename_key` ever sees
+                // them. Same Cmd-bypass convention as every other capturing
+                // branch here.
+                if win.swatch_open.is_some() && !win.modifiers.super_key() {
+                    win.swatch_key_input(shared, &key.logical_key);
                     return;
                 }
                 // Inline tab rename captures typing, but NOT Cmd combos — those
@@ -1801,13 +2052,19 @@ impl ApplicationHandler<EmberEvent> for App {
         // snapshot). Collected here rather than applied in-loop for the same
         // reason `cwd_updates` is: this loop borrows `shared.sessions`.
         let mut cmd_updates: Vec<(SessionId, String)> = Vec::new();
-        let mut cmd_ends: Vec<SessionId> = Vec::new();
+        let mut cmd_ends: Vec<(SessionId, Option<i32>)> = Vec::new();
         // OSC 133;A prompt-start reports — the latch a restored pane's
         // `Shared::pretype` entry (Task 8) waits on before it's safe to type
         // its saved command. Collected here (not applied in-loop) for the
         // same reason `cwd_updates`/`cmd_updates` are: this loop borrows
         // `shared.sessions`.
         let mut prompt_starts: Vec<SessionId> = Vec::new();
+        // OSC 6 (iTerm2 tab color) channel reports and resets. Collected here
+        // rather than applied in-loop for the same reason `cwd_updates` is:
+        // this loop borrows `shared.sessions`. Per-session APP state, not
+        // persisted — this never touches `pane_meta`/`snapshot_dirty`.
+        let mut tab_color_updates: Vec<(SessionId, TabColorChan, u8)> = Vec::new();
+        let mut tab_color_resets: Vec<SessionId> = Vec::new();
         for (id, handle) in &shared.sessions {
             while let Ok(event) = handle.events.try_recv() {
                 match event {
@@ -1832,11 +2089,17 @@ impl ApplicationHandler<EmberEvent> for App {
                             cmd_updates.push((id.clone(), cmd));
                         }
                     }
-                    BackendEvent::Osc(OscEvent::CommandEnd(_)) => {
-                        cmd_ends.push(id.clone());
+                    BackendEvent::Osc(OscEvent::CommandEnd(code)) => {
+                        cmd_ends.push((id.clone(), code));
                     }
                     BackendEvent::Osc(OscEvent::PromptStart) => {
                         prompt_starts.push(id.clone());
+                    }
+                    BackendEvent::Osc(OscEvent::TabColorChannel(chan, v)) => {
+                        tab_color_updates.push((id.clone(), chan, v));
+                    }
+                    BackendEvent::Osc(OscEvent::TabColorReset) => {
+                        tab_color_resets.push(id.clone());
                     }
                     _ => {}
                 }
@@ -1869,11 +2132,39 @@ impl ApplicationHandler<EmberEvent> for App {
             meta.was_running = true;
             meta_dirty = true;
         }
-        for id in cmd_ends {
+        for (id, code) in cmd_ends {
             if let Some(meta) = shared.pane_meta.get_mut(&id) {
-                meta.was_running = false;
+                apply_command_end(meta, code);
                 meta_dirty = true;
             }
+        }
+        // OSC tab color (design decision: per-session APP state, not
+        // persisted — never marks `meta_dirty`/`snapshot_dirty`; a restored
+        // shell re-announces its own color). Computed BEFORE the two loops
+        // below consume `tab_color_updates`/`tab_color_resets` by value: the
+        // owning window of each affected session, deduped into a `HashSet`
+        // since a shell's own OSC 6 sequence reports one color as three
+        // separate channel writes (R, G, B) — without the dedupe, one color
+        // announcement would queue the same window's `sync_layout` three
+        // times. Only the map lookup happens here (`shared`, not
+        // `self.windows`); the actual sync is deferred to below `win`'s
+        // current borrow (mirrors the `exited`/`belled`/`search_hits` routing
+        // just below), since `TabLabels` are baked at `set_visible` time and
+        // otherwise a color change stays invisible until an unrelated
+        // `sync_layout` trigger happens to fire.
+        let tab_color_dirty_windows = affected_tab_color_windows(
+            &tab_color_updates,
+            &tab_color_resets,
+            &shared.session_window,
+        );
+        for (id, chan, v) in tab_color_updates {
+            let current = shared.osc_tab_color.get(&id).copied();
+            shared
+                .osc_tab_color
+                .insert(id, compose_tab_color_channel(current, chan, v));
+        }
+        for id in tab_color_resets {
+            shared.osc_tab_color.remove(&id);
         }
         // Pre-type latch (Task 9): a restored pane's saved command types
         // itself into the shell's edit buffer, unsent, the moment that
@@ -1952,6 +2243,18 @@ impl ApplicationHandler<EmberEvent> for App {
                 .unwrap_or(focused_id);
             if let Some(w) = self.windows.get_mut(&wid) {
                 w.on_search_result(&session, hit);
+            }
+        }
+        // Repaint the strip for every window an OSC 6 tab-color report just
+        // touched (`tab_color_dirty_windows`, computed above before the
+        // update/reset loops consumed the raw reports) — no fallback to
+        // `focused_id` here, unlike the routing loops above: a session with
+        // no `session_window` entry was never dropped into a real window in
+        // the first place, so there's nothing to sync. Empty on every tick
+        // with no OSC 6 traffic, so this costs nothing when idle.
+        for wid in tab_color_dirty_windows {
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.sync_layout(shared);
             }
         }
         // Neither loop above touches the focused window through `win` (each
@@ -2078,6 +2381,13 @@ impl ApplicationHandler<EmberEvent> for App {
             }
             if let ControlMsg::Focus(query, reply) = cmd {
                 deferred_windows.push(DeferredWindowAction::Focus(query, reply));
+                continue;
+            }
+            // `set-tab-color` (Task 3): same reasoning as `focus` just above
+            // — it resolves the tab by the identical cross-window title
+            // search, so it needs every window too.
+            if let ControlMsg::SetTabColor(query, token, reply) = cmd {
+                deferred_windows.push(DeferredWindowAction::SetTabColor(query, token, reply));
                 continue;
             }
             // `ctl drag`: press/motion*/release must all run as one
@@ -2578,6 +2888,11 @@ impl ApplicationHandler<EmberEvent> for App {
                     );
                     let _ = reply.send(resp);
                 }
+                DeferredWindowAction::SetTabColor(query, token, reply) => {
+                    let resp =
+                        set_tab_color_across_windows(&mut self.windows, shared, &query, &token);
+                    let _ = reply.send(resp);
+                }
                 DeferredWindowAction::Drag {
                     window,
                     x1,
@@ -2635,6 +2950,21 @@ impl ApplicationHandler<EmberEvent> for App {
                 shared.snapshot_dirty = false;
             }
         }
+
+        // Tab-color Settings-adjustment broadcast: same "flag now, flush
+        // once `self.windows` is fully free" reasoning as the snapshot flush
+        // right above — `WindowState::adjust_setting` only has `&mut self`,
+        // so it can't itself reach every OTHER open window. Gated on the
+        // flag: a tick with no settings change doesn't pay for a walk over
+        // every window, and this only ever fires once per adjustment, never
+        // per frame.
+        if shared.tab_colors_broadcast_pending {
+            for w in self.windows.values_mut() {
+                w.recompute_tab_rule_colors(shared);
+                w.sync_layout(shared);
+            }
+            shared.tab_colors_broadcast_pending = false;
+        }
     }
 }
 
@@ -2691,6 +3021,10 @@ enum DeferredWindowAction {
     /// on) any window, not just the one `win` currently borrows. Resolved at
     /// the tail by `focus_across_windows`.
     Focus(String, std::sync::mpsc::Sender<String>),
+    /// `ctl set-tab-color` (Task 3): `(query, token)`, resolved by the exact
+    /// same cross-window title search as `Focus` — see
+    /// `set_tab_color_across_windows`.
+    SetTabColor(String, String, std::sync::mpsc::Sender<String>),
     /// `ctl drag`: synthesize a full press→motion*→release (or →Escape, if
     /// `cancel`) gesture on `window`, through the exact same `WindowState`
     /// methods a real mouse hits. Resolved at the tail by `run_ctl_drag`.
@@ -2820,6 +3154,12 @@ fn open_window(
 
     let mut win = WindowState::new(renderer, tree);
     win.px = px;
+    // Populate the rule-color cache before the very first `sync_layout` —
+    // this window's tree can already carry titled tabs (a move/promote's
+    // `WindowOpened` effect, or a carried title restored by core's
+    // `move_surface`), and without this the strip would render them
+    // colorless until some unrelated later trigger ran.
+    win.recompute_tab_rule_colors(shared);
     win.sync_layout(shared);
     win.apply_appearance(shared);
     win.renderer.window().request_redraw();
@@ -2860,6 +3200,7 @@ fn open_new_window(
             title: String::new(),
             root: LayoutNode::pane(pane, session.clone()),
             focus: pane,
+            color: TabColorChoice::Unset,
         }],
         active: 0,
     };
@@ -3134,6 +3475,7 @@ fn spawn_restored_window(
             title: String::new(),
             root: LayoutNode::pane(pane, session.clone()),
             focus: pane,
+            color: TabColorChoice::Unset,
         }],
         active: 0,
     };
@@ -3277,6 +3619,17 @@ fn replay_restored_window(
         if tab_snap.named_by_user {
             win.named_tabs.insert(tid);
         }
+        // Restore the tab's own color choice (design: tab-colors) — the
+        // user's manual pick is the ONLY color layer `TabSnap` carries; OSC
+        // 6 and regex-rule colors are deliberately NOT restored here (a
+        // restored shell re-announces its own OSC color, and
+        // `recompute_tab_rule_colors` below re-derives the rule layer from
+        // the just-restored title against the CURRENT config). Set directly
+        // rather than via `apply_tab_color`: that also marks
+        // `snapshot_dirty` and calls `sync_layout` per tab, both redundant
+        // here since this whole function's tail already does both once for
+        // the entire window after every tab is built.
+        win.tree.tabs[tab_idx].color = tab_snap.color;
         // Splits: replay `ops` (pre-order, parent-index-addressed — see
         // `split_ops`'s doc) through `split_pane_with_cwd`, tracking each
         // new pane's id by creation order so later ops can address it.
@@ -3322,6 +3675,12 @@ fn replay_restored_window(
     if !win.tree.tabs.is_empty() {
         win.tree.active = win_snap.focused_tab.min(win.tree.tabs.len() - 1);
     }
+    // Auto/programmatic title change (design: tab-colors recompute trigger
+    // #2): every tab just got its saved title (if any) via `RenameTab`
+    // above, none of it through the interactive editor `commit_rename`
+    // covers — refresh once for the whole window before the `sync_layout`
+    // right below reads the cache.
+    win.recompute_tab_rule_colors(shared);
     win.sync_layout(shared);
     win.apply_appearance(shared);
     true
@@ -4115,6 +4474,22 @@ fn apply_move(
     }
     for wid in touched {
         if let Some(w) = windows.get_mut(&wid) {
+            // Every surface-mobility gesture that reaches here (move-tab,
+            // promote-pane, merge-tab, a real cross-window drag-drop)
+            // replaced `w.tree` wholesale above, which can insert, remove,
+            // or reorder tabs in either the source or destination window
+            // without going through any of `WindowState`'s own tab-mutating
+            // methods. The swatch popover (Task 3) is anchored by raw
+            // index in whichever window had it open, so it can't safely
+            // assume its anchor still points at the same tab — close it.
+            w.close_swatch();
+            // Tab-color recompute trigger: a move/promote/merge replaces
+            // `w.tree` wholesale above without going through any of
+            // `WindowState`'s own title-mutating methods, so nothing else
+            // would refresh this window's rule-color cache — a rule-colored
+            // tab carried into (or left behind in) this window would
+            // otherwise render colorless until an unrelated later trigger.
+            w.recompute_tab_rule_colors(shared);
             w.sync_layout(shared);
             w.renderer.window().request_redraw();
         }
@@ -4777,7 +5152,7 @@ fn build_state_json(
                     "id": i + 1,
                     "focused": Some(*wid) == focused_window,
                     "active_tab": w.tree.active,
-                    "tabs": w.tabs_summary_json(),
+                    "tabs": w.tabs_summary_json(shared),
                 });
                 if let Ok(pos) = win.inner_position() {
                     let size = win.inner_size();
@@ -4850,6 +5225,61 @@ fn focus_across_windows(
                 // Focused event corrects this if the user switches away
                 // meanwhile.
                 *focused_window = Some(wid);
+            }
+            serde_json::json!({
+                "ok": true, "index": ti + 1, "title": title, "window": wi + 1,
+            })
+            .to_string()
+        }
+        None => {
+            let titles: Vec<String> = window_titles.into_iter().flatten().collect();
+            serde_json::json!({
+                "ok": false, "error": "no tab title matches", "titles": titles,
+            })
+            .to_string()
+        }
+    }
+}
+
+/// `ctl set-tab-color <query> <token>` (Task 3): resolves `query` by the
+/// exact same cross-window title search `focus_across_windows` uses (see
+/// `match_tab_title_across`), then applies `token` (parsed by
+/// `window_state::parse_color_token`) to that tab via `apply_tab_color`.
+/// Unlike `Focus`, a match here does NOT raise/select the window — setting a
+/// color is a background op, not a "come look at this" gesture. The reply
+/// shape mirrors `Focus`'s on success (`index`/`title`/`window`, all
+/// 1-based) so scripts can reuse the same parsing either way.
+fn set_tab_color_across_windows(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    query: &str,
+    token: &str,
+) -> String {
+    let Some(choice) = window_state::parse_color_token(token) else {
+        return serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "set-tab-color: bad color token {token:?} (expected #rrggbb|default|clear|swatch-N)"
+            ),
+        })
+        .to_string();
+    };
+    let window_titles: Vec<Vec<String>> = shared
+        .window_order
+        .iter()
+        .map(|wid| {
+            windows
+                .get(wid)
+                .map(WindowState::tab_titles)
+                .unwrap_or_default()
+        })
+        .collect();
+    match match_tab_title_across(&window_titles, query) {
+        Some((wi, ti)) => {
+            let title = window_titles[wi][ti].clone();
+            let wid = shared.window_order[wi];
+            if let Some(w) = windows.get_mut(&wid) {
+                w.apply_tab_color(shared, ti, choice);
             }
             serde_json::json!({
                 "ok": true, "index": ti + 1, "title": title, "window": wi + 1,
@@ -5262,13 +5692,16 @@ fn encode_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, SessionId, TabId,
-        bell_flash_intensity, bracket_paste, clamp_to_visible_monitor, clear_captured_commands,
-        encode_key, match_tab_title, match_tab_title_across, needs_deferred_replay,
-        next_prev_index, pane_snap_for, pretype_bytes, queue_close_this, queue_close_window,
-        resolve_index, resolve_restore_cwd, shell_escape_path, tab_display_title, url_is_openable,
-        window_owning_tab,
+        BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, SessionId, TabColorChan,
+        TabId, affected_tab_color_windows, apply_command_end, bell_flash_intensity, bracket_paste,
+        clamp_to_visible_monitor, clear_captured_commands, compile_rules,
+        compose_tab_color_channel, compute_tab_rule_colors, encode_key, match_tab_title,
+        match_tab_title_across, needs_deferred_replay, next_prev_index, osc_color_of,
+        pane_snap_for, pane_status_for, pretype_bytes, queue_close_this, queue_close_window,
+        resolve_index, resolve_restore_cwd, rule_color_for, shell_escape_path, tab_display_title,
+        url_is_openable, window_owning_tab,
     };
+    use ember_core::TabColorRule;
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
 
     fn enc(key: Key, mods: ModifiersState) -> Option<Vec<u8>> {
@@ -5389,6 +5822,7 @@ mod tests {
             cwd: Some("/tmp".to_string()),
             last_cmd: Some("echo hi".to_string()),
             was_running: true,
+            last_exit: None,
         };
         let snap = pane_snap_for(Some(&meta), true);
         assert_eq!(snap.cwd.as_deref(), Some("/tmp"));
@@ -5405,6 +5839,7 @@ mod tests {
             cwd: Some("/tmp".to_string()),
             last_cmd: Some("echo hi".to_string()),
             was_running: true,
+            last_exit: None,
         };
         let snap = pane_snap_for(Some(&meta), false);
         assert_eq!(snap.cwd.as_deref(), Some("/tmp"));
@@ -5420,6 +5855,58 @@ mod tests {
         assert!(!snap.was_running);
     }
 
+    // --- pane_status_for (ctl state's "busy"/"last_exit", T5) --------------
+
+    #[test]
+    fn pane_status_for_reports_busy_and_no_exit_while_a_command_runs() {
+        let meta = PaneMeta {
+            cwd: None,
+            last_cmd: Some("sleep 100".to_string()),
+            was_running: true,
+            last_exit: None,
+        };
+        assert_eq!(pane_status_for(Some(&meta)), (true, None));
+    }
+
+    #[test]
+    fn pane_status_for_reports_not_busy_and_the_exit_code_after_command_end() {
+        let meta = PaneMeta {
+            cwd: None,
+            last_cmd: Some("false".to_string()),
+            was_running: false,
+            last_exit: Some(1),
+        };
+        assert_eq!(pane_status_for(Some(&meta)), (false, Some(1)));
+    }
+
+    #[test]
+    fn pane_status_for_handles_no_meta_at_all() {
+        assert_eq!(pane_status_for(None), (false, None));
+    }
+
+    // --- apply_command_end (the cmd_ends application loop's pure half) -----
+
+    #[test]
+    fn command_end_without_a_code_clears_a_previously_held_exit_code() {
+        // A held exit code from a FINISHED command must not survive a
+        // second, code-less `CommandEnd` for a later command — that would
+        // misreport the later command as having exited with the earlier
+        // one's code.
+        let mut meta = PaneMeta {
+            cwd: None,
+            last_cmd: Some("false".to_string()),
+            was_running: false,
+            last_exit: None,
+        };
+        apply_command_end(&mut meta, Some(1));
+        assert_eq!(meta.last_exit, Some(1));
+        assert!(!meta.was_running);
+
+        apply_command_end(&mut meta, None);
+        assert_eq!(meta.last_exit, None);
+        assert!(!meta.was_running);
+    }
+
     #[test]
     fn clear_captured_commands_clears_last_cmd_but_keeps_cwd_and_was_running() {
         let mut pane_meta = std::collections::HashMap::new();
@@ -5429,6 +5916,7 @@ mod tests {
                 cwd: Some("/a".to_string()),
                 last_cmd: Some("echo left".to_string()),
                 was_running: true,
+                last_exit: None,
             },
         );
         pane_meta.insert(
@@ -5437,6 +5925,7 @@ mod tests {
                 cwd: Some("/b".to_string()),
                 last_cmd: None,
                 was_running: false,
+                last_exit: Some(0),
             },
         );
         clear_captured_commands(&mut pane_meta);
@@ -5446,6 +5935,234 @@ mod tests {
         assert_eq!(pane_meta[&SessionId::new("s1")].cwd.as_deref(), Some("/a"));
         assert!(pane_meta[&SessionId::new("s1")].was_running);
         assert_eq!(pane_meta[&SessionId::new("s2")].cwd.as_deref(), Some("/b"));
+    }
+
+    // --- compose_tab_color_channel / osc_color_of (OSC 6 accumulation) --
+
+    #[test]
+    fn compose_tab_color_channel_defaults_other_channels_to_zero_on_first_touch() {
+        assert_eq!(
+            compose_tab_color_channel(None, TabColorChan::Green, 200),
+            (0, 200, 0)
+        );
+    }
+
+    #[test]
+    fn compose_tab_color_channel_updates_only_the_reported_channel() {
+        let after_red = compose_tab_color_channel(None, TabColorChan::Red, 10);
+        assert_eq!(after_red, (10, 0, 0));
+        let after_green = compose_tab_color_channel(Some(after_red), TabColorChan::Green, 20);
+        assert_eq!(after_green, (10, 20, 0));
+        let after_blue = compose_tab_color_channel(Some(after_green), TabColorChan::Blue, 30);
+        assert_eq!(after_blue, (10, 20, 30));
+        // Re-reporting red doesn't disturb green/blue.
+        let after_red_again = compose_tab_color_channel(Some(after_blue), TabColorChan::Red, 99);
+        assert_eq!(after_red_again, (99, 20, 30));
+    }
+
+    #[test]
+    fn osc_color_of_packs_rgb_and_is_none_when_absent() {
+        let mut map = std::collections::HashMap::new();
+        let sid = SessionId::new("s1");
+        assert_eq!(osc_color_of(&map, &sid), None);
+        map.insert(sid.clone(), (0x11, 0x22, 0x33));
+        assert_eq!(osc_color_of(&map, &sid), Some(0x0011_2233));
+        // A session that never reported one stays absent.
+        assert_eq!(osc_color_of(&map, &SessionId::new("s2")), None);
+    }
+
+    // --- affected_tab_color_windows (about_to_wait's OSC 6 repaint route) --
+    //
+    // Route under test: `about_to_wait` collects each tick's OSC 6 channel
+    // reports/resets into `tab_color_updates`/`tab_color_resets`, calls
+    // `affected_tab_color_windows(&updates, &resets, &shared.session_window)`
+    // to resolve them to owning windows BEFORE the two loops that apply them
+    // consume those vectors by value, then (after `win`'s borrow of
+    // `self.windows` ends, alongside the `exited`/`belled`/`search_hits`
+    // routing) calls `sync_layout` once per window in the returned set. Using
+    // plain `u32`s for `W` here, not `WindowId` (`WindowId::dummy()` can't
+    // produce distinct ids — see `window_owning_tab`'s doc).
+
+    #[test]
+    fn affected_tab_color_windows_dedupes_three_channel_reports_for_one_session() {
+        let sid = SessionId::new("s1");
+        let mut session_window: std::collections::HashMap<SessionId, u32> =
+            std::collections::HashMap::new();
+        session_window.insert(sid.clone(), 10);
+        // One shell's OSC 6 color announcement arrives as three separate
+        // channel reports (R, G, B) — must collapse to a single window sync.
+        let updates = vec![
+            (sid.clone(), TabColorChan::Red, 0xff),
+            (sid.clone(), TabColorChan::Green, 0x00),
+            (sid.clone(), TabColorChan::Blue, 0x22),
+        ];
+        let windows = affected_tab_color_windows(&updates, &[], &session_window);
+        assert_eq!(windows, std::collections::HashSet::from([10]));
+    }
+
+    #[test]
+    fn affected_tab_color_windows_covers_resets_and_multiple_windows() {
+        let (s1, s2, s3) = (
+            SessionId::new("s1"),
+            SessionId::new("s2"),
+            SessionId::new("s3"),
+        );
+        let mut session_window: std::collections::HashMap<SessionId, u32> =
+            std::collections::HashMap::new();
+        session_window.insert(s1.clone(), 10);
+        session_window.insert(s2.clone(), 20);
+        // s3 is deliberately left untracked (a spawn racing the drain).
+        let updates = vec![(s1.clone(), TabColorChan::Red, 5)];
+        let resets = vec![s2.clone(), s3.clone()];
+        let windows = affected_tab_color_windows(&updates, &resets, &session_window);
+        assert_eq!(windows, std::collections::HashSet::from([10, 20]));
+    }
+
+    #[test]
+    fn affected_tab_color_windows_empty_when_nothing_reported() {
+        let session_window: std::collections::HashMap<SessionId, u32> =
+            std::collections::HashMap::new();
+        let windows = affected_tab_color_windows(&[], &[], &session_window);
+        assert!(windows.is_empty());
+    }
+
+    // --- compile_rules / rule_color_for (design: tab-colors, T4) ----------
+
+    fn rule(pattern: &str, color: &str) -> TabColorRule {
+        TabColorRule {
+            pattern: pattern.to_string(),
+            color: color.to_string(),
+        }
+    }
+
+    #[test]
+    fn rule_color_for_first_match_wins() {
+        let compiled = compile_rules(&[rule("prod", "#ff0000"), rule("^ssh ", "#00ff00")]);
+        // Both patterns match "ssh prod-box"; the first rule in the list wins.
+        assert_eq!(rule_color_for("ssh prod-box", &compiled), Some(0x00ff_0000));
+    }
+
+    #[test]
+    fn rule_color_for_falls_through_to_a_later_rule() {
+        let compiled = compile_rules(&[rule("^ssh ", "#00ff00"), rule("prod", "#ff0000")]);
+        assert_eq!(
+            rule_color_for("just-prod-here", &compiled),
+            Some(0x00ff_0000)
+        );
+    }
+
+    #[test]
+    fn rule_color_for_none_when_nothing_matches() {
+        let compiled = compile_rules(&[rule("^ssh ", "#00ff00")]);
+        assert_eq!(rule_color_for("zsh", &compiled), None);
+    }
+
+    #[test]
+    fn rule_color_for_none_with_no_rules_configured() {
+        let compiled = compile_rules(&[]);
+        assert_eq!(rule_color_for("anything", &compiled), None);
+    }
+
+    #[test]
+    fn compile_rules_skips_an_invalid_regex_without_panicking() {
+        // Unbalanced group — not a valid regex.
+        let compiled = compile_rules(&[rule("(unterminated", "#ff0000"), rule("ok", "#00ff00")]);
+        assert_eq!(compiled.len(), 1, "the invalid rule must be dropped");
+        assert_eq!(rule_color_for("ok", &compiled), Some(0x0000_ff00));
+    }
+
+    #[test]
+    fn compile_rules_skips_an_unparseable_color_without_panicking() {
+        let compiled = compile_rules(&[rule("ok", "not-a-color"), rule("also-ok", "#123456")]);
+        assert_eq!(compiled.len(), 1, "the bad-color rule must be dropped");
+        assert_eq!(rule_color_for("also-ok", &compiled), Some(0x0012_3456));
+    }
+
+    #[test]
+    fn compile_rules_keeps_the_other_rules_when_one_is_invalid() {
+        let compiled = compile_rules(&[
+            rule("a", "#111111"),
+            rule("(bad", "#222222"),
+            rule("c", "#333333"),
+        ]);
+        assert_eq!(compiled.len(), 2);
+        assert_eq!(rule_color_for("a", &compiled), Some(0x0011_1111));
+        assert_eq!(rule_color_for("c", &compiled), Some(0x0033_3333));
+    }
+
+    // --- compute_tab_rule_colors: the pure core of every recompute trigger -
+
+    /// Builds a minimal `Tab` with just an id and a title — every other
+    /// field is irrelevant to `compute_tab_rule_colors` (it only reads
+    /// `id`/`title`), mirroring `split_replay_that_default_window_size_
+    /// refuses_succeeds_at_the_saved_size`'s "no live `WindowState`/
+    /// `Renderer` needed" pure-seam pattern.
+    fn tab(id: u64, title: &str) -> ember_core::Tab {
+        use ember_core::{LayoutNode, PaneId, SessionId, TabColorChoice, TabId};
+        let pane = PaneId(id);
+        ember_core::Tab {
+            id: TabId(id),
+            title: title.to_string(),
+            root: LayoutNode::pane(pane, SessionId::new(format!("s{id}"))),
+            focus: pane,
+            color: TabColorChoice::Unset,
+        }
+    }
+
+    #[test]
+    fn compute_tab_rule_colors_matches_each_tab_by_its_own_title() {
+        let compiled = compile_rules(&[rule("^ssh ", "#00ff00"), rule("prod", "#ff0000")]);
+        let tabs = [tab(1, "ssh prod-box"), tab(2, "just-prod"), tab(3, "zsh")];
+        let cache = compute_tab_rule_colors(&tabs, &compiled);
+        assert_eq!(cache.len(), 3);
+        // Tab 1 matches BOTH rules; first-in-list wins (rule_color_for's
+        // own contract), not the more "specific"-looking one.
+        assert_eq!(cache[&TabId(1)], Some(0x0000_ff00));
+        assert_eq!(cache[&TabId(2)], Some(0x00ff_0000));
+        assert_eq!(cache[&TabId(3)], None);
+    }
+
+    #[test]
+    fn compute_tab_rule_colors_is_empty_for_an_empty_tab_list() {
+        let compiled = compile_rules(&[rule(".*", "#123456")]);
+        assert!(compute_tab_rule_colors(&[], &compiled).is_empty());
+    }
+
+    #[test]
+    fn compute_tab_rule_colors_none_for_every_tab_with_no_rules_configured() {
+        let tabs = [tab(1, "anything"), tab(2, "")];
+        let cache = compute_tab_rule_colors(&tabs, &[]);
+        assert_eq!(cache[&TabId(1)], None);
+        assert_eq!(cache[&TabId(2)], None);
+    }
+
+    #[test]
+    fn compute_tab_rule_colors_colors_a_fresh_tabs_default_empty_title() {
+        // Issue: a fresh tab (Cmd+T / ctl new-tab) starts titled `""` — a
+        // catch-all rule must still color it immediately, not just once it's
+        // renamed.
+        let compiled = compile_rules(&[rule(".*", "#abcdef")]);
+        let cache = compute_tab_rule_colors(&[tab(1, "")], &compiled);
+        assert_eq!(cache[&TabId(1)], Some(0x00ab_cdef));
+    }
+
+    #[test]
+    fn compute_tab_rule_colors_picks_up_a_tab_carried_in_from_another_window() {
+        // The `apply_move` scenario: a destination window's OWN pre-existing
+        // tabs are joined by one more, carrying its `TabId` (and, per core's
+        // "carried title" rule, possibly a title restored from context)
+        // across from wherever it moved/was promoted from. Recomputing
+        // against the post-move tab list (exactly what `apply_move`'s
+        // touched-window loop and `open_window`'s `WindowOpened` path do)
+        // must produce an entry for that arriving tab too, not just the
+        // tabs this window already had before the move.
+        let compiled = compile_rules(&[rule("prod", "#ff0000")]);
+        let pre_existing = tab(1, "scratch");
+        let carried_in = tab(2, "prod-box"); // arrived via move/promote
+        let cache = compute_tab_rule_colors(&[pre_existing, carried_in], &compiled);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache[&TabId(1)], None);
+        assert_eq!(cache[&TabId(2)], Some(0x00ff_0000));
     }
 
     // --- split-replay acceptance is viewport-size-dependent (Task 8 fix) --
@@ -5471,7 +6188,8 @@ mod tests {
     #[test]
     fn split_replay_that_default_window_size_refuses_succeeds_at_the_saved_size() {
         use ember_core::{
-            Axis, LayoutCommand, LayoutNode, PaneId, Rect, SessionId, Tab, TabId, WindowTree, apply,
+            Axis, LayoutCommand, LayoutNode, PaneId, Rect, SessionId, Tab, TabColorChoice, TabId,
+            WindowTree, apply,
         };
 
         let chrome = ember_render::Renderer::chrome_height() as f64;
@@ -5496,6 +6214,7 @@ mod tests {
                     title: String::new(),
                     root: LayoutNode::pane(p0, SessionId::new("s0")),
                     focus: p0,
+                    color: TabColorChoice::Unset,
                 }],
                 active: 0,
             };
