@@ -1373,18 +1373,35 @@ pub(crate) fn build_tabs(
 
 /// Text-placement result from [`build_swatch_popover`] (logical px).
 pub(crate) struct SwatchLayout {
-    /// Origin of the hint line ("↓ open · arrows move · Enter pick · Esc close").
+    /// Origin of the hint line ("Tab cycle · arrows move/sweep · Enter pick
+    /// · Esc close").
     pub hint_origin: (f32, f32),
     /// Origin of the two-line "Default\nClear" label block.
     pub label_origin: (f32, f32),
+    /// Origin of the hex field's text (the "#______" placeholder or the
+    /// typed value).
+    pub hex_origin: (f32, f32),
 }
 
-/// Layout geometry of the swatch popover panel (Task 3/4) — logical px. The
-/// SINGLE source of truth for where every interactive region sits, computed
-/// once by [`swatch_geom`] and consumed by both [`build_swatch_popover`]'s
-/// drawing and [`crate::renderer::swatch_popover_hit`]'s hit-testing, so the
-/// two can never drift apart (this repo's known "two copies of the same
-/// layout math disagree" bug class — see that fn's doc).
+/// Popover v2's size knob (live feedback: "the tab-color picker gets
+/// bigger"). Every swatch cell/gap/pad/row in [`swatch_geom`] derives from
+/// this ONE constant, so the popover can be resized again without hunting
+/// down scattered literals — the same "single geometry source" invariant
+/// this module already held for draw vs. hit-test, extended to draw vs.
+/// itself across a resize.
+pub(crate) const SWATCH_SCALE: f32 = 1.5;
+
+/// Quad segments the hue bar sweeps hue across (`0..360` degrees, OKLCH,
+/// pinned lightness/chroma — see [`ember_core::hue_to_rgb`]).
+pub(crate) const SWATCH_HUE_SEGMENTS: usize = 24;
+
+/// Layout geometry of the swatch popover panel (Task 3/4, popover v2) —
+/// logical px. The SINGLE source of truth for where every interactive
+/// region sits, computed once by [`swatch_geom`] and consumed by both
+/// [`build_swatch_popover`]'s drawing and
+/// [`crate::renderer::swatch_popover_hit`]'s hit-testing, so the two can
+/// never drift apart (this repo's known "two copies of the same layout math
+/// disagree" bug class — see that fn's doc).
 pub(crate) struct SwatchGeom {
     /// Panel origin/size.
     pub x: f32,
@@ -1399,9 +1416,26 @@ pub(crate) struct SwatchGeom {
     pub gap: f32,
     /// Columns in the grid (== `SWATCH_GRID_COLS`).
     pub cols: usize,
-    /// Top of the `Default`/`Clear` row list, below the grid.
+    /// The hue bar (popover v2): a horizontal OKLCH hue sweep below the
+    /// grid, [`SWATCH_HUE_SEGMENTS`] quads wide.
+    pub hue_bar_x: f32,
+    pub hue_bar_y: f32,
+    pub hue_bar_w: f32,
+    pub hue_bar_h: f32,
+    /// The live-preview swatch beside the hue bar (same row) — shows the
+    /// color under the current hue, with its auto-ink glyph.
+    pub preview_x: f32,
+    pub preview_y: f32,
+    pub preview_size: f32,
+    /// The custom hex-entry field (popover v2), below the hue bar/preview row.
+    pub hex_x: f32,
+    pub hex_y: f32,
+    pub hex_w: f32,
+    pub hex_h: f32,
+    /// Top of the `Default`/`Clear` row list, below the hex field.
     pub list_y: f32,
-    /// Height of one `Default`/`Clear` row.
+    /// Height of one `Default`/`Clear` row (also the hue bar/hex field row
+    /// height — every non-grid row in this panel shares one height).
     pub row_h: f32,
     /// Panel padding and hint-line height — only needed for text-buffer
     /// sizing (not an interactive region), kept here anyway so every number
@@ -1412,7 +1446,7 @@ pub(crate) struct SwatchGeom {
 
 /// The popover's hint line — sized against here (both for the panel's own
 /// width and the shaped hint buffer) and drawn in [`build_swatch_popover`].
-pub(crate) const SWATCH_HINT: &str = "↓ open · arrows move · Enter pick · Esc close";
+pub(crate) const SWATCH_HINT: &str = "Tab cycle · arrows move/sweep · Enter pick · Esc close";
 
 /// Compute the swatch popover panel's geometry, anchored under the tab at
 /// `anchor_x`/`anchor_w` (the strip segment [`tab_segment_x`] resolved for
@@ -1425,22 +1459,29 @@ pub(crate) fn swatch_geom(
     cw: f32,
     logical_w: f32,
 ) -> SwatchGeom {
-    let pad = 10.0;
-    let cell = 20.0;
-    let gap = 6.0;
+    let pad = 10.0 * SWATCH_SCALE;
+    let cell = 20.0 * SWATCH_SCALE;
+    let gap = 6.0 * SWATCH_SCALE;
     let cols = SWATCH_GRID_COLS;
     let rows = SWATCHES.len().div_ceil(cols);
     let grid_w = cols as f32 * cell + (cols as f32 - 1.0) * gap;
     let grid_h = rows as f32 * cell + (rows as f32 - 1.0) * gap;
-    let row_h = LINE_HEIGHT;
-    let hint_h = LINE_HEIGHT + 4.0;
+    // Every non-grid row (Default/Clear, and popover v2's hue bar/preview/hex
+    // field) shares this height, scaled the same as everything else here.
+    let row_h = LINE_HEIGHT * SWATCH_SCALE;
+    let hint_h = LINE_HEIGHT * SWATCH_SCALE + 4.0 * SWATCH_SCALE;
+    // Vertical gap between the panel's stacked sections (grid -> hue bar ->
+    // hex field -> Default/Clear) — was a fixed `8.0` pre-v2; scaled like
+    // everything else so the extra rows don't read cramped at the bigger size.
+    let section_gap = 8.0 * SWATCH_SCALE;
     // Wide enough for either the swatch grid or the hint line on ONE row —
     // the hint is long, so without this the panel would stay grid-width and
     // the hint would wrap onto extra lines this layout doesn't reserve
     // space for, overlapping the grid below it.
-    let hint_w = SWATCH_HINT.chars().count() as f32 * cw + 4.0;
-    let w = (grid_w + 2.0 * pad).max(150.0).max(hint_w + 2.0 * pad);
-    let h = pad + hint_h + grid_h + 8.0 + row_h * 2.0 + pad;
+    let hint_w = SWATCH_HINT.chars().count() as f32 * cw + 4.0 * SWATCH_SCALE;
+    let w = (grid_w + 2.0 * pad)
+        .max(150.0 * SWATCH_SCALE)
+        .max(hint_w + 2.0 * pad);
     let x = (anchor_x + anchor_w * 0.5 - w * 0.5).clamp(4.0, (logical_w - w - 4.0).max(4.0));
     let y = strip_h + 4.0;
     // Centered, not left-aligned: the panel is often wider than the grid
@@ -1448,7 +1489,29 @@ pub(crate) fn swatch_geom(
     // would read as lopsided.
     let grid_x = x + (w - grid_w) * 0.5;
     let grid_y = y + pad + hint_h;
-    let list_y = grid_y + grid_h + 8.0;
+
+    // Popover v2's hue bar + live-preview swatch, same row, below the grid.
+    // The preview is a square `control_h` on a side (the row's own height —
+    // it needs to be tall enough to read as a swatch, not just a text row),
+    // sitting at the row's right edge; the bar fills the rest of `grid_w`.
+    let control_h = row_h;
+    let preview_size = control_h;
+    let hue_bar_x = grid_x;
+    let hue_bar_y = grid_y + grid_h + section_gap;
+    let hue_bar_w = grid_w - preview_size - gap;
+    let hue_bar_h = control_h;
+    let preview_x = hue_bar_x + hue_bar_w + gap;
+    let preview_y = hue_bar_y;
+
+    // Popover v2's custom hex-entry field, below the hue bar/preview row.
+    let hex_x = grid_x;
+    let hex_y = hue_bar_y + control_h + section_gap;
+    let hex_w = grid_w;
+    let hex_h = control_h;
+
+    let list_y = hex_y + hex_h + section_gap;
+    let h = (list_y - y) + row_h * 2.0 + pad;
+
     SwatchGeom {
         x,
         y,
@@ -1459,6 +1522,17 @@ pub(crate) fn swatch_geom(
         cell,
         gap,
         cols,
+        hue_bar_x,
+        hue_bar_y,
+        hue_bar_w,
+        hue_bar_h,
+        preview_x,
+        preview_y,
+        preview_size,
+        hex_x,
+        hex_y,
+        hex_w,
+        hex_h,
         list_y,
         row_h,
         pad,
@@ -1466,31 +1540,41 @@ pub(crate) fn swatch_geom(
     }
 }
 
-/// Draw the tab-color swatch popover (Task 3): a small panel anchored under
-/// the tab at `anchor_x`/`anchor_w` (the strip segment `tab_segment_x`
-/// resolved for the editing tab), offering the 12 curated `SWATCHES` in a
-/// `SWATCH_GRID_COLS`-wide grid, then `Default`/`Clear` as two labeled rows
-/// below — selection order `0..12`, `12`, `13`, matching
-/// `ember_app::window_state::swatch_key`'s indexing exactly. No full-window
-/// scrim (unlike the command palette / restore modal): this is a contextual
-/// popover anchored to a specific tab, not a blocking modal, so it only dims
-/// nothing behind it — same "non-blocking overlay" register as the hover "✕"
-/// or the bell dot, just bigger. Everything rides `rounded` so it draws over
-/// pane content, same layering rule as every other overlay here.
+/// Draw the tab-color swatch popover (Task 3, popover v2): a small panel
+/// anchored under the tab at `anchor_x`/`anchor_w` (the strip segment
+/// `tab_segment_x` resolved for the editing tab), offering the 12 curated
+/// `SWATCHES` in a `SWATCH_GRID_COLS`-wide grid, an OKLCH hue bar +
+/// live-preview swatch, a custom hex-entry field, then `Default`/`Clear` as
+/// two labeled rows at the bottom. Grid selection order `0..12`, `12`, `13`,
+/// matching `ember_app::window_state::swatch_key`'s indexing exactly;
+/// `focus` says which of the three regions (grid / hue bar / hex field)
+/// currently owns keyboard input, so only that region draws a focus
+/// indicator. No full-window scrim (unlike the command palette / restore
+/// modal): this is a contextual popover anchored to a specific tab, not a
+/// blocking modal, so it only dims nothing behind it — same "non-blocking
+/// overlay" register as the hover "✕" or the bell dot, just bigger.
+/// Everything rides `rounded` so it draws over pane content, same layering
+/// rule as every other overlay here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_swatch_popover(
     font_system: &mut FontSystem,
     hint_buf: &mut Buffer,
     label_buf: &mut Buffer,
+    hex_buf: &mut Buffer,
     anchor_x: f32,
     anchor_w: f32,
     strip_h: f32,
     selected: usize,
+    focus: crate::renderer::SwatchFocus,
+    hue: f32,
+    hex_buffer: &str,
     cw: f32,
     logical_w: f32,
     sf: f32,
     rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
 ) -> SwatchLayout {
+    use crate::renderer::SwatchFocus;
+
     let geom = swatch_geom(anchor_x, anchor_w, strip_h, cw, logical_w);
     let SwatchGeom {
         x,
@@ -1502,6 +1586,17 @@ pub(crate) fn build_swatch_popover(
         cell,
         gap,
         cols,
+        hue_bar_x,
+        hue_bar_y,
+        hue_bar_w,
+        hue_bar_h,
+        preview_x,
+        preview_y,
+        preview_size,
+        hex_x,
+        hex_y,
+        hex_w,
+        hex_h,
         list_y,
         row_h,
         pad,
@@ -1520,19 +1615,23 @@ pub(crate) fn build_swatch_popover(
         r * sf,
     ));
 
-    // The keyboard-selection indicator (live feedback: this used to be a
-    // same-hue accent ring, `derive_accent(c)` — subtle by design, since it
+    // The keyboard-selection/focus indicator (live feedback: this used to be
+    // a same-hue accent ring, `derive_accent(c)` — subtle by design, since it
     // was tuned to *match* the cell it sits on, which is exactly wrong for
     // "which cell is focused". Fix: an ink-based double ring, the same
     // move that fixed the rename-editor swatch (see that ring's `ink_for`
     // comment) — but that fix could pick ONE ink because it rings a fill it
     // controls. Here the ring sits on top of an arbitrary curated swatch
-    // (light or dark) AND, for the Default/Clear rows, this panel's own
+    // (light or dark), the hue bar, the hex field, and this panel's own
     // fixed dark background — no single ink clears contrast against all of
     // those. So lay down both: a thick near-white outer ring, then a thin
     // near-black inner ring immediately inside it. Whatever the ring sits
     // on, one of the two lines borders it, so the seam is always visible.
-    // Net ring is ~3px per side, up from the old accent ring's 2px.
+    // Net ring is ~3px per side, up from the old accent ring's 2px. Scaled
+    // by `SWATCH_SCALE` alongside everything else (popover v2) so it still
+    // reads clearly at the bigger cell size.
+    let ring_out = 3.0 * SWATCH_SCALE;
+    let ring_in = 1.0 * SWATCH_SCALE;
     let push_selection_ring = |rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
                                rx: f32,
                                ry: f32,
@@ -1540,14 +1639,26 @@ pub(crate) fn build_swatch_popover(
                                rh: f32,
                                r_out: f32| {
         rounded.push((
-            scaled(rx - 3.0, ry - 3.0, rw + 6.0, rh + 6.0, sf),
+            scaled(
+                rx - ring_out,
+                ry - ring_out,
+                rw + 2.0 * ring_out,
+                rh + 2.0 * ring_out,
+                sf,
+            ),
             lin_rgba(unpack_rgb(INK_LIGHT), 0.95),
-            (r_out + 3.0) * sf,
+            (r_out + ring_out) * sf,
         ));
         rounded.push((
-            scaled(rx - 1.0, ry - 1.0, rw + 2.0, rh + 2.0, sf),
+            scaled(
+                rx - ring_in,
+                ry - ring_in,
+                rw + 2.0 * ring_in,
+                rh + 2.0 * ring_in,
+                sf,
+            ),
             lin_rgba(unpack_rgb(INK_DARK), 0.95),
-            (r_out + 1.0) * sf,
+            (r_out + ring_in) * sf,
         ));
     };
 
@@ -1556,7 +1667,7 @@ pub(crate) fn build_swatch_popover(
         let row = i / cols;
         let cx = grid_x + col as f32 * (cell + gap);
         let cy = grid_y + row as f32 * (cell + gap);
-        if selected == i {
+        if focus == SwatchFocus::Grid && selected == i {
             push_selection_ring(rounded, cx, cy, cell, cell, 3.0);
         }
         rounded.push((
@@ -1566,12 +1677,99 @@ pub(crate) fn build_swatch_popover(
         ));
     }
 
-    // `Default` / `Clear` rows, below the grid. Same double ring, drawn
+    // The hue bar (popover v2): `SWATCH_HUE_SEGMENTS` solid quads sweeping
+    // hue 0..360 at a pinned OKLCH lightness/chroma — legible-by-
+    // construction (`ember_core::hue_to_rgb`'s doc), so no per-segment
+    // contrast check is needed here.
+    let seg_w = hue_bar_w / SWATCH_HUE_SEGMENTS as f32;
+    for i in 0..SWATCH_HUE_SEGMENTS {
+        let seg_hue = (i as f64 + 0.5) / SWATCH_HUE_SEGMENTS as f64 * 360.0;
+        let seg_color = unpack_rgb(ember_core::hue_to_rgb(seg_hue));
+        rounded.push((
+            scaled(
+                hue_bar_x + i as f32 * seg_w,
+                hue_bar_y,
+                seg_w + 0.5,
+                hue_bar_h,
+                sf,
+            ),
+            lin_rgba(seg_color, 1.0),
+            0.0,
+        ));
+    }
+    if focus == SwatchFocus::HueBar {
+        push_selection_ring(rounded, hue_bar_x, hue_bar_y, hue_bar_w, hue_bar_h, 1.0);
+    }
+    // The current-hue marker: a thin ink-double-lined scrubber, same visual
+    // language as the selection ring, positioned at `hue`'s fraction across
+    // the bar. Always drawn (not just while focused) so the live preview
+    // cell beside it always has a visible "why" on the bar itself.
+    {
+        let marker_w = 3.0 * SWATCH_SCALE;
+        let frac = (hue as f64 / 360.0).clamp(0.0, 1.0) as f32;
+        let marker_x = (hue_bar_x + frac * hue_bar_w - marker_w * 0.5)
+            .clamp(hue_bar_x, hue_bar_x + hue_bar_w - marker_w);
+        rounded.push((
+            scaled(
+                marker_x - 1.0,
+                hue_bar_y - 2.0,
+                marker_w + 2.0,
+                hue_bar_h + 4.0,
+                sf,
+            ),
+            lin_rgba(unpack_rgb(INK_DARK), 0.9),
+            1.0 * sf,
+        ));
+        rounded.push((
+            scaled(marker_x, hue_bar_y - 1.0, marker_w, hue_bar_h + 2.0, sf),
+            lin_rgba(unpack_rgb(INK_LIGHT), 0.95),
+            1.0 * sf,
+        ));
+    }
+
+    // The live-preview swatch (popover v2): the color under the current hue,
+    // with a small ink dot so the auto-contrast pick is visible right where
+    // it's chosen, not just once applied to a tab.
+    let preview_color = ember_core::hue_to_rgb(hue as f64);
+    rounded.push((
+        scaled(preview_x, preview_y, preview_size, preview_size, sf),
+        lin_rgba(unpack_rgb(preview_color), 1.0),
+        3.0 * sf,
+    ));
+    {
+        let dot_d = preview_size * 0.34;
+        let dot_color = unpack_rgb(ink_for(preview_color));
+        rounded.push((
+            scaled(
+                preview_x + (preview_size - dot_d) * 0.5,
+                preview_y + (preview_size - dot_d) * 0.5,
+                dot_d,
+                dot_d,
+                sf,
+            ),
+            lin_rgba(dot_color, 0.95),
+            dot_d * 0.5 * sf,
+        ));
+    }
+
+    // The custom hex-entry field (popover v2): a filled box (always visible,
+    // reads as a text field regardless of focus), ring-highlighted while
+    // focused, holding the "#______" placeholder or the typed value.
+    rounded.push((
+        scaled(hex_x, hex_y, hex_w, hex_h, sf),
+        lin_rgba(Rgb::new(0x16, 0x18, 0x1c), 1.0),
+        4.0 * sf,
+    ));
+    if focus == SwatchFocus::HexField {
+        push_selection_ring(rounded, hex_x, hex_y, hex_w, hex_h, 1.0);
+    }
+
+    // `Default` / `Clear` rows, below the hex field. Same double ring, drawn
     // outset around the row's own accent-tint fill (unchanged) so the
     // ring's high-contrast seam frames it instead of replacing it.
     for (i, _) in ["Default", "Clear"].iter().enumerate() {
         let ry = list_y + i as f32 * row_h;
-        if selected == SWATCHES.len() + i {
+        if focus == SwatchFocus::Grid && selected == SWATCHES.len() + i {
             push_selection_ring(rounded, x + 3.0, ry, w - 6.0, row_h, 1.0);
             rounded.push((
                 scaled(x + 3.0, ry, w - 6.0, row_h, sf),
@@ -1606,10 +1804,27 @@ pub(crate) fn build_swatch_popover(
         Color::rgb(0xf0, 0xf0, 0xf0),
         w - 2.0 * pad,
     );
+    // Hex field text: "#" plus whatever's been typed, underscore-padded to
+    // 6 digits so the field always reads as "type 6 hex digits", not just a
+    // bare "#" that grows as you type. Dim placeholder gray until at least
+    // one digit is typed, then the bright "has content" color.
+    let hex_digits = hex_buffer.strip_prefix('#').unwrap_or(hex_buffer);
+    let mut hex_display = String::from("#");
+    hex_display.push_str(hex_digits);
+    for _ in hex_digits.chars().count()..6 {
+        hex_display.push('_');
+    }
+    let hex_color = if hex_digits.is_empty() {
+        Color::rgb(0x77, 0x77, 0x7a)
+    } else {
+        Color::rgb(0xf0, 0xf0, 0xf0)
+    };
+    shape(font_system, hex_buf, &hex_display, hex_color, hex_w - 12.0);
 
     SwatchLayout {
         hint_origin: (x + pad, y + pad),
         label_origin: (x + pad, list_y),
+        hex_origin: (hex_x + 6.0, hex_y + (hex_h - LINE_HEIGHT) * 0.5),
     }
 }
 
