@@ -1762,28 +1762,38 @@ pub(crate) fn build_swatch_popover(
 
     // The custom hex-entry field (popover v2): a filled box (always visible,
     // reads as a text field regardless of focus), ring-highlighted while
-    // focused, holding the "#______" placeholder or the typed value.
+    // focused, holding the "#______" placeholder or the typed value. The
+    // ring is drawn BEFORE the fill (not after) — the same ordering trap
+    // `2ad4878` fixed for the hue bar: the ring's inner line is nearly as
+    // large as the field itself, so drawing it after the (opaque) fill would
+    // paint over almost the whole field instead of just framing it. This one
+    // only looked right before the fix because the fill color (0x16181c) is
+    // nearly indistinguishable from the ring's own INK_DARK inner line.
+    if focus == SwatchFocus::HexField {
+        push_selection_ring(rounded, hex_x, hex_y, hex_w, hex_h, 1.0);
+    }
     rounded.push((
         scaled(hex_x, hex_y, hex_w, hex_h, sf),
         lin_rgba(Rgb::new(0x16, 0x18, 0x1c), 1.0),
         4.0 * sf,
     ));
-    if focus == SwatchFocus::HexField {
-        push_selection_ring(rounded, hex_x, hex_y, hex_w, hex_h, 1.0);
-    }
 
     // `Default` / `Clear` rows, below the hex field. Same double ring, drawn
-    // outset around the row's own accent-tint fill (unchanged) so the
-    // ring's high-contrast seam frames it instead of replacing it.
+    // OVER the row's own accent-tint fill (opposite order from the grid
+    // cells/hue bar/hex field above): this fill is translucent (0.28 alpha),
+    // not opaque, so drawing the ring first would leave the tint sitting on
+    // top of it, washing the ring's near-black inner line toward ACCENT
+    // instead of reading crisp. Painting the ring last keeps its double-line
+    // seam sharp regardless of what it frames.
     for (i, _) in ["Default", "Clear"].iter().enumerate() {
         let ry = list_y + i as f32 * row_h;
         if focus == SwatchFocus::Grid && selected == SWATCHES.len() + i {
-            push_selection_ring(rounded, x + 3.0, ry, w - 6.0, row_h, 1.0);
             rounded.push((
                 scaled(x + 3.0, ry, w - 6.0, row_h, sf),
                 lin_rgba(ACCENT, 0.28),
                 0.0,
             ));
+            push_selection_ring(rounded, x + 3.0, ry, w - 6.0, row_h, 1.0);
         }
     }
 
@@ -1814,20 +1824,38 @@ pub(crate) fn build_swatch_popover(
     );
     // Hex field text: "#" plus whatever's been typed, underscore-padded to
     // 6 digits so the field always reads as "type 6 hex digits", not just a
-    // bare "#" that grows as you type. Dim placeholder gray until at least
-    // one digit is typed, then the bright "has content" color.
+    // bare "#" that grows as you type. Two colors, not one: the typed
+    // portion (including the leading "#") is dim placeholder gray until at
+    // least one digit is typed, then bright; the underscore padding stays
+    // dim regardless, so it always reads as "not yet typed" instead of
+    // matching the typed digits' brightness once any exist.
     let hex_digits = hex_buffer.strip_prefix('#').unwrap_or(hex_buffer);
-    let mut hex_display = String::from("#");
-    hex_display.push_str(hex_digits);
-    for _ in hex_digits.chars().count()..6 {
-        hex_display.push('_');
-    }
-    let hex_color = if hex_digits.is_empty() {
+    let typed = format!("#{hex_digits}");
+    let underscore_pad = "_".repeat(6usize.saturating_sub(hex_digits.chars().count()));
+    let typed_color = if hex_digits.is_empty() {
         Color::rgb(0x77, 0x77, 0x7a)
     } else {
         Color::rgb(0xf0, 0xf0, 0xf0)
     };
-    shape(font_system, hex_buf, &hex_display, hex_color, hex_w - 12.0);
+    let pad_color = Color::rgb(0x55, 0x55, 0x58);
+    hex_buf.set_size(font_system, Some(hex_w - 12.0), Some(row_h * 2.0 + hint_h));
+    hex_buf.set_rich_text(
+        font_system,
+        [
+            (
+                typed.as_str(),
+                Attrs::new().family(Family::Monospace).color(typed_color),
+            ),
+            (
+                underscore_pad.as_str(),
+                Attrs::new().family(Family::Monospace).color(pad_color),
+            ),
+        ],
+        &Attrs::new().family(Family::Monospace),
+        Shaping::Advanced,
+        None,
+    );
+    hex_buf.shape_until_scroll(font_system, false);
 
     SwatchLayout {
         hint_origin: (x + pad, y + pad),

@@ -4378,14 +4378,18 @@ impl WindowState {
     /// counterpart to [`Self::swatch_key_input`]. A hit on a curated cell
     /// picks that color; `Default`/`Clear` apply those choices; the hue bar
     /// picks the hue under the cursor and arms a drag (further motion keeps
-    /// sweeping — see `on_cursor_moved`'s `hue_drag` branch); the hex field
-    /// just takes focus (typing is what edits it); anything else (padding
-    /// inside the panel, or a click that missed the panel entirely) just
-    /// dismisses the popover, same as `Esc` on the grid — no rename
-    /// commit/cancel either way, so the editor underneath stays exactly as
-    /// the user left it. Panel geometry comes from `Renderer::swatch_hit`,
-    /// which reads the SAME `paint::swatch_geom` the popover is drawn from,
-    /// so a click always lands on what's actually on screen.
+    /// sweeping — see `on_cursor_moved`'s `hue_drag` branch); the live-
+    /// preview swatch applies the currently-previewed hue (the only mouse
+    /// commit for a hue pick — missing this region would mean a click on
+    /// the preview falls through to `Blank` and discards the pick instead);
+    /// the hex field just takes focus (typing is what edits it); anything
+    /// else (padding inside the panel, or a click that missed the panel
+    /// entirely) just dismisses the popover, same as `Esc` on the grid — no
+    /// rename commit/cancel either way, so the editor underneath stays
+    /// exactly as the user left it. Panel geometry comes from
+    /// `Renderer::swatch_hit`, which reads the SAME `paint::swatch_geom` the
+    /// popover is drawn from, so a click always lands on what's actually on
+    /// screen.
     fn swatch_click(&mut self, shared: &mut Shared) {
         let Some(i) = self.swatch_open else { return };
         let (x, y) = self.cursor;
@@ -4407,6 +4411,16 @@ impl WindowState {
                 self.swatch_hue = frac * 360.0;
                 self.hue_drag = true;
                 self.update_swatch_view();
+            }
+            Some(SwatchPopoverHit::Preview) => {
+                // A hue pick otherwise has no mouse commit — Enter on the
+                // hue bar is the only other way to apply it. Same path as
+                // `SwatchAction::ApplyHue`: apply the currently-previewed
+                // color and close, rather than falling through to `Blank`
+                // (which would dismiss the popover and discard the pick).
+                let choice = TabColorChoice::Color(hue_to_rgb(self.swatch_hue as f64));
+                self.apply_tab_color(shared, i, choice);
+                self.close_swatch();
             }
             Some(SwatchPopoverHit::HexField) => {
                 self.swatch_focus = SwatchFocus::HexField;

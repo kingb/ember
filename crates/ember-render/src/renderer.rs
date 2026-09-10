@@ -289,6 +289,10 @@ pub enum SwatchPopoverHit {
     /// The hue bar, at this fraction (`0.0..=1.0`) across its width —
     /// `fraction * 360.0` is the hue under the cursor.
     HueBar(f32),
+    /// The live-preview swatch beside the hue bar — clicking it applies the
+    /// currently-previewed hue, the same commit path as Enter on the bar
+    /// (a hue pick otherwise has no mouse commit at all).
+    Preview,
     /// The custom hex-entry field.
     HexField,
     /// Inside the panel but not over an interactive region (padding/gaps) —
@@ -298,8 +302,9 @@ pub enum SwatchPopoverHit {
 
 /// Classify a click at logical `(x, y)` against the swatch popover panel
 /// described by `geom` — a curated swatch cell, the `Default`/`Clear` row,
-/// the hue bar, the hex field, `Blank` (inside the panel but not on a live
-/// region), or `None` (missed the panel entirely). Pure geometry, mirroring
+/// the hue bar, the live-preview swatch, the hex field, `Blank` (inside the
+/// panel but not on a live region), or `None` (missed the panel entirely).
+/// Pure geometry, mirroring
 /// [`tab_col_hit`]'s own "separately unit-testable classifier" shape; `geom`
 /// is the SAME [`SwatchGeom`] [`build_swatch_popover`] draws from (via
 /// [`crate::paint::swatch_geom`]), so this can never drift from what's on
@@ -325,6 +330,13 @@ fn swatch_popover_hit(geom: &SwatchGeom, x: f32, y: f32) -> Option<SwatchPopover
     {
         let frac = ((x - geom.hue_bar_x) / geom.hue_bar_w).clamp(0.0, 1.0);
         return Some(SwatchPopoverHit::HueBar(frac));
+    }
+    if x >= geom.preview_x
+        && x < geom.preview_x + geom.preview_size
+        && y >= geom.preview_y
+        && y < geom.preview_y + geom.preview_size
+    {
+        return Some(SwatchPopoverHit::Preview);
     }
     if x >= geom.hex_x
         && x < geom.hex_x + geom.hex_w
@@ -2986,6 +2998,19 @@ mod tests {
         assert_eq!(
             swatch_popover_hit(&g, g.hex_x + 5.0, g.hex_y + 2.0),
             Some(SwatchPopoverHit::HexField)
+        );
+    }
+
+    #[test]
+    fn click_on_the_preview_swatch_applies_not_dismisses() {
+        let g = geom();
+        // The preview swatch sits beside the hue bar, same row — a hue pick
+        // otherwise has no mouse commit (Enter was the only way to apply),
+        // and a miss here used to fall through to Blank, which dismisses
+        // the popover and discards the picked hue.
+        assert_eq!(
+            swatch_popover_hit(&g, g.preview_x + 2.0, g.preview_y + 2.0),
+            Some(SwatchPopoverHit::Preview)
         );
     }
 
