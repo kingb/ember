@@ -1373,11 +1373,15 @@ pub(crate) fn build_tabs(
 
 /// Text-placement result from [`build_swatch_popover`] (logical px).
 pub(crate) struct SwatchLayout {
-    /// Origin of the hint line ("Tab cycle · arrows move/sweep · Enter pick
-    /// · Esc close").
+    /// Origin of the hint line (see [`SWATCH_HINT`]).
     pub hint_origin: (f32, f32),
-    /// Origin of the two-line "Default\nClear" label block.
-    pub label_origin: (f32, f32),
+    /// Origin of the `Default` row's own label — a separate buffer/origin
+    /// from `Clear`'s (not one two-line block) since [`SWATCH_ROW_GAP`]
+    /// means the rows no longer sit at the text buffer's own fixed line
+    /// pitch.
+    pub default_origin: (f32, f32),
+    /// Origin of the `Clear` row's own label.
+    pub clear_origin: (f32, f32),
     /// Origin of the hex field's text (the "#______" placeholder or the
     /// typed value).
     pub hex_origin: (f32, f32),
@@ -1402,10 +1406,15 @@ pub(crate) const SWATCH_PAD: f32 = 16.0;
 pub(crate) const SWATCH_SECTION_GAP: f32 = 10.0;
 pub(crate) const SWATCH_HUE_H: f32 = 18.0;
 /// Height of one `Default`/`Clear` row — a "settings row" (see
-/// `build_settings`), not a chunky button: exactly one text line tall, so a
-/// single multi-line label buffer's own line spacing lines up with the two
-/// row rects without a second buffer.
+/// `build_settings`): exactly one text line tall.
 pub(crate) const SWATCH_ROW_H: f32 = LINE_HEIGHT;
+/// Gap between the `Default` and `Clear` rows — the two need to read as
+/// distinct buttons (restore modal's button styling is the precedent), not
+/// one gray box with two labels, so they're no longer flush against each
+/// other. Each gets its own text buffer (see `SwatchLayout::default_origin`/
+/// `clear_origin`) since the buffer's own fixed line spacing can no longer
+/// double as the row pitch once a gap sits between them.
+pub(crate) const SWATCH_ROW_GAP: f32 = 4.0;
 
 /// Quad segments the hue bar sweeps hue across (`0..360` degrees, OKLCH,
 /// pinned lightness/chroma — see [`ember_core::hue_to_rgb`]).
@@ -1489,7 +1498,9 @@ pub(crate) struct SwatchGeom {
     pub hex_y: f32,
     pub hex_w: f32,
     pub hex_h: f32,
-    /// Top of the `Default`/`Clear` row list, below the hex/preview row.
+    /// Top of the `Default` row, below the hex/preview row (the FIRST of
+    /// the two rows — `Clear` sits at `list_y + row_h + SWATCH_ROW_GAP`,
+    /// a real gap below it, not flush against it).
     pub list_y: f32,
     /// Height of one `Default`/`Clear` row — a "settings row" (one text
     /// line tall; see `SWATCH_ROW_H`), not the hue bar/hex field's own
@@ -1504,7 +1515,11 @@ pub(crate) struct SwatchGeom {
 
 /// The popover's hint line — sized against here (both for the panel's own
 /// width and the shaped hint buffer) and drawn in [`build_swatch_popover`].
-pub(crate) const SWATCH_HINT: &str = "Tab cycle · arrows move/sweep · Enter pick · Esc close";
+/// Trimmed to fit ONE line at the panel's content width (the full
+/// "Tab cycle · arrows move/sweep · Enter pick · Esc close" wrapped to
+/// three lines at 168px — a defect in itself). Drops the `Tab` mention
+/// (cycling sections is discoverable by clicking them) rather than wrap.
+pub(crate) const SWATCH_HINT: &str = "arrows · Enter · Esc";
 
 /// Compute the swatch popover panel's geometry, anchored under the tab at
 /// `anchor_x`/`anchor_w` (the strip segment [`tab_segment_x`] resolved for
@@ -1564,7 +1579,7 @@ pub(crate) fn swatch_geom(
     let hue_top = grid_top + grid_h + section_gap;
     let hex_top = hue_top + hue_bar_h + section_gap;
     let list_top = hex_top + hex_h + section_gap;
-    let h = list_top + row_h * 2.0 + pad;
+    let h = list_top + row_h * 2.0 + SWATCH_ROW_GAP + pad;
 
     // Anchored under the tab by default, but never past the window's
     // bottom edge: shift up until the panel fits, even if that means
@@ -1632,7 +1647,8 @@ pub(crate) fn swatch_geom(
 pub(crate) fn build_swatch_popover(
     font_system: &mut FontSystem,
     hint_buf: &mut Buffer,
-    label_buf: &mut Buffer,
+    default_buf: &mut Buffer,
+    clear_buf: &mut Buffer,
     hex_buf: &mut Buffer,
     anchor_x: f32,
     anchor_w: f32,
@@ -1884,21 +1900,39 @@ pub(crate) fn build_swatch_popover(
     // drawing the ring underneath would wash its near-black inner line
     // toward whatever's beneath it instead of reading crisp.
     let content_w = w - 2.0 * pad;
-    for (i, _) in ["Default", "Clear"].iter().enumerate() {
-        let ry = list_y + i as f32 * row_h;
+    // A small rounded radius (matches the hex field's own) instead of the
+    // v3.0 square corners — now that the two rows have a real gap between
+    // them, rounding reinforces "two buttons" rather than "one strip".
+    let row_r = 4.0;
+    let row_bufs: [&mut Buffer; 2] = [default_buf, clear_buf];
+    for (i, buf) in row_bufs.into_iter().enumerate() {
+        let ry = list_y + i as f32 * (row_h + SWATCH_ROW_GAP);
         rounded.push((
             scaled(grid_x, ry, content_w, row_h, sf),
             lin_rgba(Rgb::new(0x2c, 0x2e, 0x35), 1.0),
-            0.0,
+            row_r * sf,
         ));
-        if focus == SwatchFocus::Grid && selected == SWATCHES.len() + i {
+        let row_selected = focus == SwatchFocus::Grid && selected == SWATCHES.len() + i;
+        if row_selected {
             rounded.push((
                 scaled(grid_x, ry, content_w, row_h, sf),
                 lin_rgba(ACCENT, 0.28),
-                0.0,
+                row_r * sf,
             ));
-            push_selection_ring(rounded, grid_x, ry, content_w, row_h, 1.0);
+            push_selection_ring(rounded, grid_x, ry, content_w, row_h, row_r);
         }
+        let label = if i == 0 { "Default" } else { "Clear" };
+        buf.set_size(font_system, Some(content_w - 8.0), Some(row_h));
+        buf.set_text(
+            font_system,
+            label,
+            &Attrs::new()
+                .family(Family::Monospace)
+                .color(Color::rgb(0xf0, 0xf0, 0xf0)),
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(font_system, false);
     }
 
     let shape = |fs: &mut FontSystem, buf: &mut Buffer, text: &str, color: Color, width: f32| {
@@ -1918,13 +1952,6 @@ pub(crate) fn build_swatch_popover(
         SWATCH_HINT,
         Color::rgb(0x88, 0x88, 0x88),
         w - 2.0 * pad,
-    );
-    shape(
-        font_system,
-        label_buf,
-        "Default\nClear\n",
-        Color::rgb(0xf0, 0xf0, 0xf0),
-        content_w - 8.0,
     );
     // Hex field text: "#" plus whatever's been typed, underscore-padded to
     // 6 digits so the field always reads as "type 6 hex digits", not just a
@@ -1963,7 +1990,8 @@ pub(crate) fn build_swatch_popover(
 
     SwatchLayout {
         hint_origin: (grid_x, y + pad),
-        label_origin: (grid_x + 8.0, list_y),
+        default_origin: (grid_x + 8.0, list_y),
+        clear_origin: (grid_x + 8.0, list_y + row_h + SWATCH_ROW_GAP),
         hex_origin: (hex_x + 6.0, hex_y + (hex_h - LINE_HEIGHT) * 0.5),
     }
 }

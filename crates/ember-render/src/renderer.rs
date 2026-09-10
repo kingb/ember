@@ -359,9 +359,12 @@ fn swatch_popover_hit(geom: &SwatchGeom, x: f32, y: f32) -> Option<SwatchPopover
     if y >= geom.list_y && y < geom.list_y + geom.row_h {
         return Some(SwatchPopoverHit::Default);
     }
-    if y >= geom.list_y + geom.row_h && y < geom.list_y + geom.row_h * 2.0 {
+    let clear_y = geom.list_y + geom.row_h + crate::paint::SWATCH_ROW_GAP;
+    if y >= clear_y && y < clear_y + geom.row_h {
         return Some(SwatchPopoverHit::Clear);
     }
+    // The gap between the two rows (and anywhere else inside the panel that
+    // isn't a live region) falls through to `Blank`.
     Some(SwatchPopoverHit::Blank)
 }
 
@@ -770,11 +773,14 @@ pub struct Renderer {
     /// When `Some`, the tab-color swatch popover (Task 3) is shown, anchored
     /// under the named tab.
     swatch: Option<SwatchView>,
-    /// The popover's hint line ("Tab cycle · arrows move/sweep · Enter pick
-    /// · Esc close").
+    /// The popover's hint line (see `paint::SWATCH_HINT`).
     swatch_hint: Buffer,
-    /// The popover's two-line "Default\nClear" label block.
-    swatch_label: Buffer,
+    /// The popover's `Default` row label — its own buffer, not shared with
+    /// `Clear`'s, since the two rows sit a real gap apart (`SWATCH_ROW_GAP`)
+    /// rather than at one text buffer's fixed line pitch.
+    swatch_default: Buffer,
+    /// The popover's `Clear` row label.
+    swatch_clear: Buffer,
     /// The popover's custom hex-entry field text (popover v2).
     swatch_hex: Buffer,
     /// Measured monospace advance (px) — keeps bg quads aligned with glyphs.
@@ -949,7 +955,8 @@ impl Renderer {
         ];
         let restore_list = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let swatch_hint = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-        let swatch_label = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let swatch_default = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        let swatch_clear = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let swatch_hex = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let fps_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         let search_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
@@ -1018,7 +1025,8 @@ impl Renderer {
             restore_list,
             swatch: None,
             swatch_hint,
-            swatch_label,
+            swatch_default,
+            swatch_clear,
             swatch_hex,
             cell_w,
             font_size,
@@ -2460,7 +2468,8 @@ impl Renderer {
                 let sl = build_swatch_popover(
                     &mut self.font_system,
                     &mut self.swatch_hint,
-                    &mut self.swatch_label,
+                    &mut self.swatch_default,
+                    &mut self.swatch_clear,
                     &mut self.swatch_hex,
                     anchor_x,
                     anchor_w,
@@ -2486,9 +2495,18 @@ impl Renderer {
                     custom_glyphs: &[],
                 });
                 overlay_areas.push(TextArea {
-                    buffer: &self.swatch_label,
-                    left: sl.label_origin.0 * sf,
-                    top: sl.label_origin.1 * sf,
+                    buffer: &self.swatch_default,
+                    left: sl.default_origin.0 * sf,
+                    top: sl.default_origin.1 * sf,
+                    scale: sf,
+                    bounds: full_bounds,
+                    default_color: Color::rgb(0xf0, 0xf0, 0xf0),
+                    custom_glyphs: &[],
+                });
+                overlay_areas.push(TextArea {
+                    buffer: &self.swatch_clear,
+                    left: sl.clear_origin.0 * sf,
+                    top: sl.clear_origin.1 * sf,
                     scale: sf,
                     bounds: full_bounds,
                     default_color: Color::rgb(0xf0, 0xf0, 0xf0),
@@ -2912,7 +2930,7 @@ mod tests {
             x: 100.0,
             y: 50.0,
             w: 112.0,      // content_w(92) + 2*pad(10)
-            h: 190.0,      // (list_y(200) - y(50)) + row_h(15)*2 + pad(10)
+            h: 194.0,      // (list_y(200) - y(50)) + row_h(15)*2 + row_gap(4) + pad(10)
             grid_x: 110.0, // x(100) + pad(10) — flush left, not centered
             grid_y: 70.0,
             cell: 20.0,
@@ -2981,9 +2999,24 @@ mod tests {
             swatch_popover_hit(&g, g.x + 20.0, g.list_y + 1.0),
             Some(SwatchPopoverHit::Default)
         );
+        // Clear starts a real `SWATCH_ROW_GAP` below Default's own bottom
+        // edge now (the two read as distinct buttons, not one strip).
+        let clear_y = g.list_y + g.row_h + crate::paint::SWATCH_ROW_GAP;
         assert_eq!(
-            swatch_popover_hit(&g, g.x + 20.0, g.list_y + g.row_h + 1.0),
+            swatch_popover_hit(&g, g.x + 20.0, clear_y + 1.0),
             Some(SwatchPopoverHit::Clear)
+        );
+    }
+
+    #[test]
+    fn click_in_the_gap_between_default_and_clear_is_blank() {
+        // The gap that visually separates the two rows must not belong to
+        // either row's hit region.
+        let g = geom();
+        let gap_y = g.list_y + g.row_h + crate::paint::SWATCH_ROW_GAP * 0.5;
+        assert_eq!(
+            swatch_popover_hit(&g, g.x + 20.0, gap_y),
+            Some(SwatchPopoverHit::Blank)
         );
     }
 
@@ -3065,7 +3098,9 @@ mod tests {
     // run off the window, top/bottom/left/right.
 
     use super::{CELL_HEIGHT, PAD, swatch_geom};
-    use crate::paint::{SWATCH_CELL, SWATCH_GAP, SWATCH_GRID_COLS, SWATCH_PAD, SWATCH_SECTION_GAP};
+    use crate::paint::{
+        SWATCH_CELL, SWATCH_GAP, SWATCH_GRID_COLS, SWATCH_PAD, SWATCH_ROW_GAP, SWATCH_SECTION_GAP,
+    };
     use ember_core::SWATCHES;
 
     /// A plausible anchored call, mirroring `swatch_geom_now`'s own inputs:
@@ -3130,10 +3165,11 @@ mod tests {
         // are therefore exactly as wide as the grid above them, not a
         // narrower strip of naked text off in a corner.
         assert_eq!(content_w, grid_w);
-        // The Default/Clear list's own bottom edge, plus the same padding
+        // The Default/Clear list's own bottom edge (two rows plus the real
+        // gap between them, see `SWATCH_ROW_GAP`), plus the same padding
         // reserved above the hint, is exactly the panel's bottom edge —
         // relative to the panel's own `y`, not absolute zero.
-        assert_eq!(g.y + g.h, g.list_y + g.row_h * 2.0 + g.pad);
+        assert_eq!(g.y + g.h, g.list_y + g.row_h * 2.0 + SWATCH_ROW_GAP + g.pad);
     }
 
     #[test]
@@ -3155,6 +3191,7 @@ mod tests {
             + g.hex_h
             + sg
             + g.row_h * 2.0
+            + SWATCH_ROW_GAP
             + g.pad;
         assert!(
             (g.h - expected_h).abs() < 0.001,

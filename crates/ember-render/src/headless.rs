@@ -288,7 +288,8 @@ pub fn capture_reusing(
     let mut restore_main_layout: Option<crate::paint::RestoreMainLayout> = None;
     let mut restore_list_origin: Option<(f32, f32)> = None;
     let mut swatch_hint = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
-    let mut swatch_label = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut swatch_default = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+    let mut swatch_clear = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut swatch_hex = Buffer::new(font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
     let mut swatch_layout: Option<crate::paint::SwatchLayout> = None;
     let mut rects: Vec<([f32; 4], [f32; 4])> = Vec::new();
@@ -617,7 +618,8 @@ pub fn capture_reusing(
         swatch_layout = Some(build_swatch_popover(
             font_system,
             &mut swatch_hint,
-            &mut swatch_label,
+            &mut swatch_default,
+            &mut swatch_clear,
             &mut swatch_hex,
             anchor_x,
             anchor_w,
@@ -857,9 +859,18 @@ pub fn capture_reusing(
             custom_glyphs: &[],
         });
         overlay_areas.push(TextArea {
-            buffer: &swatch_label,
-            left: sl.label_origin.0 * sf,
-            top: sl.label_origin.1 * sf,
+            buffer: &swatch_default,
+            left: sl.default_origin.0 * sf,
+            top: sl.default_origin.1 * sf,
+            scale: sf,
+            bounds: full_bounds,
+            default_color: Color::rgb(0xf0, 0xf0, 0xf0),
+            custom_glyphs: &[],
+        });
+        overlay_areas.push(TextArea {
+            buffer: &swatch_clear,
+            left: sl.clear_origin.0 * sf,
+            top: sl.clear_origin.1 * sf,
             scale: sf,
             bounds: full_bounds,
             default_color: Color::rgb(0xf0, 0xf0, 0xf0),
