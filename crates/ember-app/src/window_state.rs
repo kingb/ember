@@ -517,6 +517,23 @@ pub(crate) struct WindowState {
     /// as hex when it's outside the curated `SWATCHES`, else empty
     /// (placeholder-only).
     pub(crate) swatch_hex: String,
+    /// Popover v2 (live feedback: "the hue picker shows its color and code as
+    /// you choose"): the ONE current "custom color" value the hue bar, the
+    /// live-preview box, and the hex field are three views of. Kept in sync
+    /// on every change to either side — a hue change (`hue_preview`)
+    /// overwrites this AND `swatch_hex`; a complete, valid hex commit
+    /// (`hex_buffer_commit`) overwrites this AND `swatch_hue` (best-effort,
+    /// via `hue_of`) — so the preview box always paints THIS value, never a
+    /// value independently recomputed from `swatch_hue` alone (the two can
+    /// briefly disagree in OKLCH lightness/chroma right after a hex commit,
+    /// since a typed hex isn't necessarily on the hue bar's pinned L/C
+    /// curve; only the hue marker's position is a lossy projection of it).
+    /// A partial (incomplete) hex edit leaves this untouched, which is what
+    /// makes the preview "keep showing the last complete color" while
+    /// typing. Seeded on `open_swatch` from the tab's existing custom color,
+    /// or `hue_to_rgb(0.0)` when there isn't one (matching `swatch_hue`'s
+    /// own `0.0` default).
+    pub(crate) swatch_custom: u32,
     /// Popover v2: the hue bar is currently being dragged (mouse down on it,
     /// not yet released) — subsequent `CursorMoved`s keep sweeping the hue
     /// even if the cursor slides off the bar itself (`divider_drag`/
@@ -1067,6 +1084,42 @@ fn hex_buffer_backspace(buf: &str) -> String {
     s
 }
 
+/// The hue-change -> hex-text sync (live feedback: "the hue picker shows its
+/// color and code as you choose", item 1): given the hue bar's new position,
+/// the exact custom color it now previews (`hue_to_rgb`) and that color's
+/// `#rrggbb` text, ready to drop straight into `swatch_hex` as if typed.
+/// Every hue-bar mutation path (arrow-key `HueStep`, a click on the bar, a
+/// drag over it) calls this so the hex field's text and the preview box's
+/// fill can never drift from what the bar itself is showing. Pure, so the
+/// sync itself is directly unit-testable without a live `WindowState`.
+pub(crate) fn hue_preview(hue: f32) -> (u32, String) {
+    let color = hue_to_rgb(hue as f64);
+    (color, format!("#{color:06x}"))
+}
+
+/// The hex-commit -> hue-marker sync (live feedback, item 3): if `buf` is a
+/// COMPLETE, valid `#rrggbb` hex color, returns the parsed color and a
+/// best-effort hue for it ([`hue_of`] — the same pinned-lightness/chroma
+/// projection [`WindowState::open_swatch`] already uses to seed the bar from
+/// an existing custom color), so the caller can move the hue bar's marker to
+/// roughly track a typed color. Reuses [`parse_color_token`] — the SAME
+/// `#rrggbb` parser the hex field's own Enter/`HexApply` path (and every
+/// other color-entry surface) goes through — rather than a second
+/// hex-validation copy that could disagree with it.
+///
+/// Returns `None` for anything short of a complete color: an empty buffer, a
+/// partial one still mid-typed (e.g. `"#3f"`), or (unreachable via
+/// `hex_buffer_push`'s own filtering, but harmless here) a malformed one.
+/// Callers leave `swatch_custom`/`swatch_hue` untouched on `None` — the
+/// design's explicit call that a partial edit keeps showing the last
+/// complete preview rather than snapping to some intermediate non-color.
+pub(crate) fn hex_buffer_commit(buf: &str) -> Option<(u32, f32)> {
+    match parse_color_token(buf)? {
+        TabColorChoice::Color(c) => Some((c, hue_of(c) as f32)),
+        _ => None,
+    }
+}
+
 /// Whether the swatch popover's anchored tab index (Task 3) is no longer a
 /// valid slot among `tab_count` tabs. `sync_layout` (called after every
 /// tab-structural mutation this file makes) uses this as a backstop: the
@@ -1166,6 +1219,7 @@ impl WindowState {
             swatch_focus: SwatchFocus::Grid,
             swatch_hue: 0.0,
             swatch_hex: String::new(),
+            swatch_custom: hue_to_rgb(0.0),
             hue_drag: false,
             pending_close: None,
             confirm_focus: 0,
@@ -3504,6 +3558,9 @@ impl WindowState {
             // rather than dropping the drag.
             if let Some(frac) = self.renderer.swatch_hue_drag_fraction(x as f32) {
                 self.swatch_hue = frac * 360.0;
+                let (color, hex) = hue_preview(self.swatch_hue);
+                self.swatch_custom = color;
+                self.swatch_hex = hex;
                 self.update_swatch_view();
             }
         } else if self.tab_drag.is_some() || shared.drag.is_some() {
@@ -4278,6 +4335,7 @@ impl WindowState {
         };
         self.swatch_hue = custom.map(|c| hue_of(c) as f32).unwrap_or(0.0);
         self.swatch_hex = custom.map(|c| format!("#{c:06x}")).unwrap_or_default();
+        self.swatch_custom = custom.unwrap_or_else(|| hue_to_rgb(self.swatch_hue as f64));
         self.update_swatch_view();
     }
 
@@ -4299,6 +4357,7 @@ impl WindowState {
             focus: self.swatch_focus,
             hue: self.swatch_hue,
             hex_buffer: self.swatch_hex.clone(),
+            custom: self.swatch_custom,
         });
         self.renderer.set_swatch(view);
     }
@@ -4338,10 +4397,13 @@ impl WindowState {
             }
             SwatchAction::HueStep(steps) => {
                 self.swatch_hue = step_hue(self.swatch_hue, steps);
+                let (color, hex) = hue_preview(self.swatch_hue);
+                self.swatch_custom = color;
+                self.swatch_hex = hex;
                 self.update_swatch_view();
             }
             SwatchAction::ApplyHue => {
-                let choice = TabColorChoice::Color(hue_to_rgb(self.swatch_hue as f64));
+                let choice = TabColorChoice::Color(self.swatch_custom);
                 self.apply_tab_color(shared, i, choice);
                 self.close_swatch();
             }
@@ -4349,10 +4411,18 @@ impl WindowState {
                 for ch in text.chars().filter(|c| !c.is_control()) {
                     self.swatch_hex = hex_buffer_push(&self.swatch_hex, ch);
                 }
+                if let Some((color, hue)) = hex_buffer_commit(&self.swatch_hex) {
+                    self.swatch_custom = color;
+                    self.swatch_hue = hue;
+                }
                 self.update_swatch_view();
             }
             SwatchAction::HexBackspace => {
                 self.swatch_hex = hex_buffer_backspace(&self.swatch_hex);
+                if let Some((color, hue)) = hex_buffer_commit(&self.swatch_hex) {
+                    self.swatch_custom = color;
+                    self.swatch_hue = hue;
+                }
                 self.update_swatch_view();
             }
             SwatchAction::HexApply => {
@@ -4409,6 +4479,9 @@ impl WindowState {
             Some(SwatchPopoverHit::HueBar(frac)) => {
                 self.swatch_focus = SwatchFocus::HueBar;
                 self.swatch_hue = frac * 360.0;
+                let (color, hex) = hue_preview(self.swatch_hue);
+                self.swatch_custom = color;
+                self.swatch_hex = hex;
                 self.hue_drag = true;
                 self.update_swatch_view();
             }
@@ -4418,7 +4491,7 @@ impl WindowState {
                 // `SwatchAction::ApplyHue`: apply the currently-previewed
                 // color and close, rather than falling through to `Blank`
                 // (which would dismiss the popover and discard the pick).
-                let choice = TabColorChoice::Color(hue_to_rgb(self.swatch_hue as f64));
+                let choice = TabColorChoice::Color(self.swatch_custom);
                 self.apply_tab_color(shared, i, choice);
                 self.close_swatch();
             }
@@ -6503,6 +6576,75 @@ mod tests {
         assert_eq!(hex_buffer_backspace("#3f"), "#3");
         assert_eq!(hex_buffer_backspace("#"), "");
         assert_eq!(hex_buffer_backspace(""), "");
+    }
+
+    // --- hue_preview / hex_buffer_commit: the popover's value-sync ---------
+    // (live feedback: "the hue picker shows its color and code as you
+    // choose" — one custom-color value, two views: the hue bar/preview box
+    // on one side, the hex field's text on the other, each pushing the other
+    // in sync whenever it changes.)
+
+    #[test]
+    fn hue_preview_matches_hue_to_rgb_and_its_own_hex_text() {
+        use super::hue_preview;
+        use ember_core::hue_to_rgb;
+
+        for deg in [0.0_f32, 37.0, 90.0, 180.0, 270.0, 359.0] {
+            let (color, hex) = hue_preview(deg);
+            assert_eq!(
+                color,
+                hue_to_rgb(deg as f64),
+                "hue {deg} preview color should be the SAME hue_to_rgb result \
+                 the bar itself paints"
+            );
+            assert_eq!(hex, format!("#{color:06x}"), "hue {deg} hex text");
+        }
+    }
+
+    #[test]
+    fn hue_preview_zero_is_hue_to_rgb_zero_hex() {
+        use super::hue_preview;
+        use ember_core::hue_to_rgb;
+
+        // Concrete regression pin, not just the round-trip property above:
+        // this is the popover's own hue==0.0 default.
+        let (color, hex) = hue_preview(0.0);
+        assert_eq!(color, hue_to_rgb(0.0));
+        assert_eq!(hex, format!("#{:06x}", hue_to_rgb(0.0)));
+    }
+
+    #[test]
+    fn hex_buffer_commit_parses_a_complete_hex_and_projects_its_hue() {
+        use super::hex_buffer_commit;
+        use ember_core::hue_of;
+
+        let (color, hue) = hex_buffer_commit("#ff9d3c").expect("complete hex commits");
+        assert_eq!(color, 0xff9d3c);
+        assert_eq!(hue, hue_of(0xff9d3c) as f32);
+    }
+
+    #[test]
+    fn hex_buffer_commit_is_none_for_a_partial_buffer() {
+        use super::hex_buffer_commit;
+
+        // Still mid-typing — must NOT commit, so the caller keeps showing
+        // the last complete preview instead of snapping to a non-color.
+        assert_eq!(hex_buffer_commit(""), None);
+        assert_eq!(hex_buffer_commit("#"), None);
+        assert_eq!(hex_buffer_commit("#3"), None);
+        assert_eq!(hex_buffer_commit("#3f9"), None);
+    }
+
+    #[test]
+    fn hex_buffer_commit_is_none_for_a_malformed_buffer() {
+        use super::hex_buffer_commit;
+
+        // Unreachable via `hex_buffer_push`'s own filtering in practice, but
+        // `hex_buffer_commit` should still reject rather than panic/parse
+        // garbage — it reuses `parse_color_token`'s own validation.
+        assert_eq!(hex_buffer_commit("#gggggg"), None);
+        assert_eq!(hex_buffer_commit("#ff9d3c1"), None);
+        assert_eq!(hex_buffer_commit("not-a-hex"), None);
     }
 
     #[test]

@@ -625,6 +625,7 @@ pub fn capture_reusing(
             view.selected,
             view.focus,
             view.hue,
+            view.custom,
             &view.hex_buffer,
             cw,
             shot.logical_w,

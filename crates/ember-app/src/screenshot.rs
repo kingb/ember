@@ -589,6 +589,15 @@ pub fn run(opts: Opts) -> Result<String, String> {
             focus: opts.swatch_focus,
             hue: opts.swatch_hue,
             hex_buffer: opts.swatch_hex.clone(),
+            // Same value-sync rule the live app's `WindowState` follows
+            // (`window_state::hex_buffer_commit`): a COMPLETE, valid typed
+            // hex wins (the exact color, not a hue-bar reconstruction of
+            // it); a partial/empty one falls back to the hue bar's own
+            // preview (`hue_to_rgb(swatch_hue)`) — the "last complete
+            // preview" a `--swatch-hex` fixture that's mid-typed shows.
+            custom: crate::window_state::hex_buffer_commit(&opts.swatch_hex)
+                .map(|(c, _)| c)
+                .unwrap_or_else(|| ember_core::hue_to_rgb(opts.swatch_hue as f64)),
         }),
         hold_ring: opts.hold_ring,
         // No offline `--screenshot` flag for these (v0.4.0): both are live

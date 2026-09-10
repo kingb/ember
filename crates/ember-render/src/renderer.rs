@@ -172,6 +172,16 @@ pub struct SwatchView {
     /// The custom hex field's current typed text (`""`..`"#rrggbb"`), shown
     /// underscore-padded as the field's content.
     pub hex_buffer: String,
+    /// The current "custom color" (live feedback: "the hue picker shows its
+    /// color and code as you choose") — the ONE value the hue bar, the
+    /// live-preview box, and `hex_buffer`'s text are three views of. Painted
+    /// by the preview box directly, rather than recomputed from `hue` at
+    /// paint time: after a complete hex commit this can briefly differ from
+    /// `hue_to_rgb(hue)` (a typed color isn't necessarily on the bar's
+    /// pinned lightness/chroma curve — only `hue`'s marker position is a
+    /// lossy best-effort projection of it), and the preview must show the
+    /// EXACT typed color, not that projection.
+    pub custom: u32,
 }
 
 /// Static content for the About overlay (the animated glow is separate).
@@ -289,9 +299,10 @@ pub enum SwatchPopoverHit {
     /// The hue bar, at this fraction (`0.0..=1.0`) across its width —
     /// `fraction * 360.0` is the hue under the cursor.
     HueBar(f32),
-    /// The live-preview swatch beside the hue bar — clicking it applies the
-    /// currently-previewed hue, the same commit path as Enter on the bar
-    /// (a hue pick otherwise has no mouse commit at all).
+    /// The live-preview swatch, now enlarged and spanning both the hue-bar
+    /// and hex-field rows — clicking it applies the currently-previewed
+    /// custom color, the same commit path as Enter on the bar (a hue pick
+    /// otherwise has no mouse commit at all).
     Preview,
     /// The custom hex-entry field.
     HexField,
@@ -2455,6 +2466,7 @@ impl Renderer {
                     view.selected,
                     view.focus,
                     view.hue,
+                    view.custom,
                     &view.hex_buffer,
                     cw,
                     lw,
@@ -2887,10 +2899,12 @@ mod tests {
     fn geom() -> SwatchGeom {
         // 12 swatches over 4 cols = 3 rows; grid_h = 3*20 + 2*6 = 72, grid_w
         // = 4*20 + 3*6 = 98, so the grid spans y in [70, 142). Below it: the
-        // hue bar + preview swatch (grid_w wide, `preview_size` carved off
-        // the right for the preview), the hex field, then the Default/Clear
-        // list — each block separated by an 8px section gap, mirroring the
-        // real `swatch_geom`'s own layout.
+        // hue bar, then the hex field (same, narrower width as the bar —
+        // both give up width to the enlarged preview beside them), then the
+        // Default/Clear list — each block separated by an 8px section gap.
+        // The preview is a square spanning BOTH the hue-bar row and the hex
+        // row (`2 * row_h + section_gap` — bigger than one grid cell),
+        // mirroring the real `swatch_geom`'s "one grouped control" layout.
         SwatchGeom {
             x: 100.0,
             y: 50.0,
@@ -2903,14 +2917,14 @@ mod tests {
             cols: 4,
             hue_bar_x: 110.0,
             hue_bar_y: 150.0, // grid_y(70) + grid_h(72) + section_gap(8)
-            hue_bar_w: 77.0,  // grid_w(98) - preview_size(15) - gap(6)
+            hue_bar_w: 54.0,  // grid_w(98) - preview_size(38) - gap(6)
             hue_bar_h: 15.0,
-            preview_x: 193.0, // hue_bar_x(110) + hue_bar_w(77) + gap(6)
+            preview_x: 170.0, // hue_bar_x(110) + hue_bar_w(54) + gap(6)
             preview_y: 150.0,
-            preview_size: 15.0,
+            preview_size: 38.0, // 2 * row_h(15) + section_gap(8)
             hex_x: 110.0,
             hex_y: 173.0, // hue_bar_y(150) + hue_bar_h(15) + section_gap(8)
-            hex_w: 98.0,
+            hex_w: 54.0,  // matches hue_bar_w, not the full grid width
             hex_h: 15.0,
             list_y: 196.0, // hex_y(173) + hex_h(15) + section_gap(8)
             row_h: 15.0,
@@ -3010,6 +3024,21 @@ mod tests {
         // the popover and discards the picked hue.
         assert_eq!(
             swatch_popover_hit(&g, g.preview_x + 2.0, g.preview_y + 2.0),
+            Some(SwatchPopoverHit::Preview)
+        );
+    }
+
+    #[test]
+    fn click_on_the_preview_from_the_hex_fields_row_still_hits_preview() {
+        // The enlarged preview (live feedback: "the hue picker shows its
+        // color and code as you choose") spans BOTH the hue-bar row and the
+        // hex-field row below it — a click on its right column, at the hex
+        // field's own y, must still resolve to `Preview`, not fall through
+        // to `HexField` (now narrower, so it no longer reaches that far
+        // right) or `Blank`.
+        let g = geom();
+        assert_eq!(
+            swatch_popover_hit(&g, g.preview_x + 2.0, g.hex_y + 2.0),
             Some(SwatchPopoverHit::Preview)
         );
     }

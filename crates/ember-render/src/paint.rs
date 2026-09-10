@@ -1422,8 +1422,13 @@ pub(crate) struct SwatchGeom {
     pub hue_bar_y: f32,
     pub hue_bar_w: f32,
     pub hue_bar_h: f32,
-    /// The live-preview swatch beside the hue bar (same row) — shows the
-    /// color under the current hue, with its auto-ink glyph.
+    /// The live-preview swatch (live feedback: "the hue picker shows its
+    /// color and code as you choose" — promoted to a prominent, unmissable
+    /// size): a square spanning the FULL height of the hue-bar row AND the
+    /// hex-field row below it (`2 * row_h + section_gap`), sitting at their
+    /// shared right edge — so bar + box + hex read as one grouped control,
+    /// not three loose widgets. Shows the current custom color with its
+    /// auto-ink dot.
     pub preview_x: f32,
     pub preview_y: f32,
     pub preview_size: f32,
@@ -1490,12 +1495,17 @@ pub(crate) fn swatch_geom(
     let grid_x = x + (w - grid_w) * 0.5;
     let grid_y = y + pad + hint_h;
 
-    // Popover v2's hue bar + live-preview swatch, same row, below the grid.
-    // The preview is a square `control_h` on a side (the row's own height —
-    // it needs to be tall enough to read as a swatch, not just a text row),
-    // sitting at the row's right edge; the bar fills the rest of `grid_w`.
+    // Popover v2's hue bar + live-preview swatch, below the grid. Live
+    // feedback ("the hue picker shows its color and code as you choose"):
+    // the preview used to be a single-row-tall square beside the bar — too
+    // easy to miss as "the thing you're choosing". Promoted here to a square
+    // spanning the hue bar's row AND the hex field's row stacked below it
+    // (`2 * control_h + section_gap` — bigger than one curated-swatch grid
+    // cell), sitting at their shared right edge, so the hue bar and hex
+    // field both narrow to make room and the three read as one grouped
+    // control: sweep/type on the left, unmissable result on the right.
     let control_h = row_h;
-    let preview_size = control_h;
+    let preview_size = control_h * 2.0 + section_gap;
     let hue_bar_x = grid_x;
     let hue_bar_y = grid_y + grid_h + section_gap;
     let hue_bar_w = grid_w - preview_size - gap;
@@ -1503,10 +1513,12 @@ pub(crate) fn swatch_geom(
     let preview_x = hue_bar_x + hue_bar_w + gap;
     let preview_y = hue_bar_y;
 
-    // Popover v2's custom hex-entry field, below the hue bar/preview row.
+    // Popover v2's custom hex-entry field, below the hue bar/preview row —
+    // matches the hue bar's (now narrower) width, rather than the full grid
+    // width, so it doesn't run underneath the enlarged preview beside it.
     let hex_x = grid_x;
     let hex_y = hue_bar_y + control_h + section_gap;
-    let hex_w = grid_w;
+    let hex_w = hue_bar_w;
     let hex_h = control_h;
 
     let list_y = hex_y + hex_h + section_gap;
@@ -1567,6 +1579,7 @@ pub(crate) fn build_swatch_popover(
     selected: usize,
     focus: crate::renderer::SwatchFocus,
     hue: f32,
+    custom: u32,
     hex_buffer: &str,
     cw: f32,
     logical_w: f32,
@@ -1735,18 +1748,37 @@ pub(crate) fn build_swatch_popover(
         ));
     }
 
-    // The live-preview swatch (popover v2): the color under the current hue,
-    // with a small ink dot so the auto-contrast pick is visible right where
-    // it's chosen, not just once applied to a tab.
-    let preview_color = ember_core::hue_to_rgb(hue as f64);
+    // The live-preview swatch (popover v2, enlarged — live feedback: "the hue
+    // picker shows its color and code as you choose"): paints `custom`
+    // directly, NOT `hue_to_rgb(hue)` recomputed here — `custom` is the
+    // popover's single source of truth for "the color you're choosing"
+    // (`ember_app::window_state`'s `swatch_custom`), which after a complete
+    // hex commit can legitimately differ from the bar's own pinned-L/C
+    // projection of `hue` (see `SwatchView::custom`'s doc). A small ink dot
+    // makes the auto-contrast pick visible right where it's chosen, not just
+    // once applied to a tab.
+    //
+    // While the hex field holds a PARTIAL edit (some digits typed, not yet a
+    // complete `#rrggbb`), `custom` is deliberately stale — the last
+    // complete color, per the design's own call ("partial entries keep the
+    // last complete preview and dim") — so the fill/dot are drawn at reduced
+    // alpha as a "this isn't confirmed by your typing yet" cue, rather than
+    // reading as if the partial buffer were itself a finished pick.
+    let hex_digit_count = hex_buffer
+        .strip_prefix('#')
+        .unwrap_or(hex_buffer)
+        .chars()
+        .count();
+    let hex_is_partial = hex_digit_count > 0 && hex_digit_count < 6;
+    let preview_alpha = if hex_is_partial { 0.55 } else { 1.0 };
     rounded.push((
         scaled(preview_x, preview_y, preview_size, preview_size, sf),
-        lin_rgba(unpack_rgb(preview_color), 1.0),
+        lin_rgba(unpack_rgb(custom), preview_alpha),
         3.0 * sf,
     ));
     {
         let dot_d = preview_size * 0.34;
-        let dot_color = unpack_rgb(ink_for(preview_color));
+        let dot_color = unpack_rgb(ink_for(custom));
         rounded.push((
             scaled(
                 preview_x + (preview_size - dot_d) * 0.5,
@@ -1755,7 +1787,7 @@ pub(crate) fn build_swatch_popover(
                 dot_d,
                 sf,
             ),
-            lin_rgba(dot_color, 0.95),
+            lin_rgba(dot_color, 0.95 * preview_alpha),
             dot_d * 0.5 * sf,
         ));
     }
