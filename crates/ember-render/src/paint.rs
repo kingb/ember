@@ -1176,11 +1176,40 @@ pub(crate) fn build_tabs(
                     // `rounded`, not `out` — same sharp-then-rounded layering
                     // reason as the chip above: the editing pill fill is
                     // itself a `rounded` quad and would otherwise cover this.
-                    Some(c) => rounded.push((
-                        scaled(scx - d * 0.5, scy - d * 0.5, d, d, sf),
-                        lin_rgba(Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8), 1.0),
-                        2.0 * sf,
-                    )),
+                    //
+                    // Filled: an always-visible ring in the painted pill's
+                    // own ink color (`ink_for`, the same auto-contrast fn
+                    // the title uses — this pill's fill IS `c`, since the
+                    // `tab.editing` branch above painted it with
+                    // `unpack_rgb(c)`), then the chosen color inset inside
+                    // it — the hollow arm's outer+inset two-quad technique
+                    // below, but ring = ink instead of gray and inset =
+                    // fill instead of a cutout. Live feedback: a filled
+                    // swatch used to paint the chosen color directly on a
+                    // pill already filled with that same color, so the
+                    // picker affordance vanished exactly when the user
+                    // needed to reopen it. The ink ring clears >=4.5:1
+                    // against the pill by construction, so it stays visible
+                    // no matter which color is picked.
+                    Some(c) => {
+                        rounded.push((
+                            scaled(scx - d * 0.5, scy - d * 0.5, d, d, sf),
+                            lin_rgba(unpack_rgb(ink_for(c)), 0.9),
+                            2.0 * sf,
+                        ));
+                        let inset = 1.5;
+                        rounded.push((
+                            scaled(
+                                scx - d * 0.5 + inset,
+                                scy - d * 0.5 + inset,
+                                d - 2.0 * inset,
+                                d - 2.0 * inset,
+                                sf,
+                            ),
+                            lin_rgba(unpack_rgb(c), 1.0),
+                            1.0 * sf,
+                        ));
+                    }
                     None => {
                         // Hollow: a thin ring only (no fill) — an outer square
                         // minus a slightly smaller inset one, both pushed as
