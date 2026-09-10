@@ -1677,6 +1677,17 @@ pub(crate) fn build_swatch_popover(
         ));
     }
 
+    // The hue bar's focus ring, drawn BEFORE the segments below (not after,
+    // like it looks like it should read) — `push_selection_ring` draws
+    // OUTSET around the given rect, same as the grid cells, and the grid
+    // relies on its own swatch fill being drawn AFTER its ring to cover the
+    // ring's interior, leaving only the outer double-line visible. The hue
+    // bar needs the identical order: ring first, then segments on top,
+    // or the ring's near-solid inner line would paint over the whole bar
+    // instead of just framing it.
+    if focus == SwatchFocus::HueBar {
+        push_selection_ring(rounded, hue_bar_x, hue_bar_y, hue_bar_w, hue_bar_h, 1.0);
+    }
     // The hue bar (popover v2): `SWATCH_HUE_SEGMENTS` solid quads sweeping
     // hue 0..360 at a pinned OKLCH lightness/chroma — legible-by-
     // construction (`ember_core::hue_to_rgb`'s doc), so no per-segment
@@ -1696,9 +1707,6 @@ pub(crate) fn build_swatch_popover(
             lin_rgba(seg_color, 1.0),
             0.0,
         ));
-    }
-    if focus == SwatchFocus::HueBar {
-        push_selection_ring(rounded, hue_bar_x, hue_bar_y, hue_bar_w, hue_bar_h, 1.0);
     }
     // The current-hue marker: a thin ink-double-lined scrubber, same visual
     // language as the selection ring, positioned at `hue`'s fraction across
