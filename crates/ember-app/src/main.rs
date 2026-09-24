@@ -1268,15 +1268,47 @@ impl ApplicationHandler<EmberEvent> for App {
                 );
                 if button == MouseButton::Left {
                     let was_dragging = shared.drag.is_some() || win.tab_drag.is_some();
-                    let ended = win.left_release(shared, id);
-                    // A pane drop only STAGES its move (`WindowState::
-                    // pending_move`) — run it through the same canonical
-                    // `apply_move` path `ctl drag` (`run_ctl_drag`) and every
-                    // other surface-mobility gesture uses, right here: `win`
-                    // isn't touched again in this arm, so its borrow of
-                    // `self.windows` ends at the `take()` below, freeing
-                    // `self.windows` for `apply_move` to reborrow whole.
-                    let pending = win.pending_move.take();
+                    // Routing fix: a release always resolves against the
+                    // drag's SOURCE window, never blindly whichever window
+                    // the OS delivered the event to. On Wayland winit has no
+                    // implicit pointer grab (unlike macOS/X11's — see
+                    // `update_cross_window_drag`'s doc), so a cross-window
+                    // carry's release can land on the TARGET window
+                    // instead of the source that tore the surface off;
+                    // trusting `id` there ran `resolve_drag_drop` as a
+                    // method on the wrong `WindowState` and skipped the
+                    // real source's carried-exclusion cleanup, leaving it
+                    // hidden forever ("alive but invisible"). `win`'s
+                    // borrow of `self.windows` ends at its last use in
+                    // EITHER arm below, so both can freely reborrow
+                    // `self.windows` afterward — the same NLL shape
+                    // `apply_move`'s other callers already rely on.
+                    let drag_source = shared.drag.as_ref().map(|d| d.source_window);
+                    let (ended, pending) = match route_release(drag_source, id) {
+                        ReleaseRouting::Misrouted {
+                            resolve_for,
+                            hover_from,
+                        } => {
+                            let (x, y) = win.cursor;
+                            resolve_misrouted_release(
+                                &mut self.windows,
+                                shared,
+                                resolve_for,
+                                hover_from,
+                                x,
+                                y,
+                            )
+                        }
+                        ReleaseRouting::OnSource | ReleaseRouting::NotDragging => {
+                            let ended = win.left_release(shared, id);
+                            // A pane drop only STAGES its move (`WindowState::
+                            // pending_move`) — run it through the same canonical
+                            // `apply_move` path `ctl drag` (`run_ctl_drag`) and
+                            // every other surface-mobility gesture uses.
+                            let pending = win.pending_move.take();
+                            (ended, pending)
+                        }
+                    };
                     if was_dragging {
                         // Every window's incoming-drop/preview visual is
                         // stale the instant the drag resolves. The ctl-drag
@@ -1315,17 +1347,22 @@ impl ApplicationHandler<EmberEvent> for App {
                             Err(e) => eprintln!("[ember] drag drop rejected: {e}"),
                         }
                     }
-                    // Fix 2: a window whose carried-surface exclusion is
-                    // still hidden (`hidden_for_carry`) gets its OS re-show
-                    // deferred here — AFTER `apply_move` — so a
-                    // sole-tab window that's about to be destroyed by this
-                    // very move (its only tab moved out → `WindowClosed`)
-                    // never flashes back on screen first. A window
-                    // `apply_move` closed is already gone from
-                    // `self.windows`, so it's silently skipped below —
-                    // exactly the point.
+                    // Fix 2 + invariant backstop: every window's carried
+                    // exclusion gets cleared/its OS re-show applied here —
+                    // AFTER `apply_move` — so a sole-tab window that's about
+                    // to be destroyed by this very move (its only tab moved
+                    // out → `WindowClosed`) never flashes back on screen
+                    // first. A window `apply_move` closed is already gone
+                    // from `self.windows`, so it's silently skipped below —
+                    // exactly the point. Sweeping EVERY window (not just the
+                    // drag's recorded source) rather than only re-showing
+                    // deferred `hidden_for_carry` ones is deliberate: it's
+                    // what makes "alive but invisible" structurally
+                    // impossible even when resolution ran against the wrong
+                    // `WindowState` (the exact routing bug fixed above) —
+                    // see `ensure_carry_exclusion_cleared`'s doc.
                     for w in self.windows.values_mut() {
-                        w.finish_carry_reshow();
+                        w.ensure_carry_exclusion_cleared(shared);
                     }
                 }
             }
@@ -3391,26 +3428,139 @@ fn cancel_drag_everywhere(windows: &mut HashMap<WindowId, WindowState>, shared: 
         // already handles that path); a missing source here is a no-op.
         if let Some(w) = windows.get_mut(&drag.source_window) {
             // Carry-time source vanish: "pops back exactly where
-            // it was" — re-show the OS window / restore the filtered
-            // layout BEFORE the pour-out below repaints over it, so the
-            // very first frame of the pour-out is already showing the
-            // real, restored content, not a stale exclusion.
-            w.clear_carried_exclusion(shared);
-            // Fix 2: a cancel never closes the source
-            // window (unlike a completed move, where the whole point of
-            // deferring the re-show is that the window might be about to
-            // die) — so unlike the drop paths, re-show it immediately
-            // rather than leaving it deferred.
-            w.finish_carry_reshow();
+            // it was" — clear/re-show BEFORE the pour-out below repaints
+            // over it, so the very first frame of the pour-out is already
+            // showing the real, restored content, not a stale exclusion.
+            // Fix 2: a cancel never closes the source window (unlike a
+            // completed move, where the whole point of deferring the
+            // re-show is that the window might be about to die) — so
+            // unlike the drop paths, `ensure_carry_exclusion_cleared`'s
+            // re-show lands immediately rather than staying deferred.
+            w.ensure_carry_exclusion_cleared(shared);
             let rect = w.viewport();
             let grab = w.cursor;
             w.start_pour_out(shared, rect, grab);
+        }
+        // Invariant backstop: sweep every OTHER window too. Only the
+        // recorded source should ever have a live carried exclusion for
+        // this drag, but "alive but invisible" must be structurally
+        // impossible even for event-routing/compositor behavior this code
+        // hasn't modeled — see the identical sweep after a real drop
+        // (`App::window_event`'s `MouseInput` release arm) and the `ctl
+        // drag` tail (`finish_ctl_drag_tail`).
+        for (wid, w) in windows.iter_mut() {
+            if *wid != drag.source_window {
+                w.ensure_carry_exclusion_cleared(shared);
+            }
         }
         clear_all_drag_visuals(windows);
         for w in windows.values_mut() {
             w.renderer.window().request_redraw();
         }
     }
+}
+
+/// The release-owner decision a `MouseInput::Released` needs once a drag
+/// might be live: which `WindowState` the drop must resolve against, and
+/// which window's coordinate space `drag.hover` should be recomputed
+/// against, if either differs from a plain same-window release. Extracted
+/// as its own pure function (no `WindowState`/`HashMap` involved) so the
+/// exact routing decision — the fix for the Wayland "release misdelivered
+/// to the target window instead of the source" bug — has a seam to unit
+/// test without spinning up real windows.
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseRouting {
+    /// No live drag: this release isn't drag-related at all.
+    NotDragging,
+    /// The release landed on the drag's own source window — resolve
+    /// directly against it (`win.left_release`), trusting the hover
+    /// `update_drag_hover`/`update_cross_window_drag` already kept live.
+    OnSource,
+    /// The release landed on a DIFFERENT window than the drag's recorded
+    /// source (no implicit pointer grab on Wayland — see
+    /// `update_cross_window_drag`'s doc for why this can happen at all):
+    /// resolve against `resolve_for` (always the source — the only place
+    /// `pending_move`/the carried exclusion actually live), but recompute
+    /// `drag.hover` fresh against `hover_from` (the window that actually
+    /// received the event) first, via `resolve_misrouted_release`.
+    Misrouted {
+        resolve_for: WindowId,
+        hover_from: WindowId,
+    },
+}
+
+/// Decide `ReleaseRouting` for a `MouseInput::Released` delivered to
+/// `event_window`, given the live drag's source (`None` if no drag is
+/// live). Pure and total: every `(drag_source, event_window)` pair maps to
+/// exactly one `ReleaseRouting`.
+fn route_release(drag_source: Option<WindowId>, event_window: WindowId) -> ReleaseRouting {
+    match drag_source {
+        None => ReleaseRouting::NotDragging,
+        Some(source) if source == event_window => ReleaseRouting::OnSource,
+        Some(source) => ReleaseRouting::Misrouted {
+            resolve_for: source,
+            hover_from: event_window,
+        },
+    }
+}
+
+/// Resolve a `MouseInput::Released` the OS delivered to `event_window` —
+/// NOT `drag.source_window` — while a drag is live: the release-routing
+/// half of the Wayland cross-window carry fix. Wayland's `wl_pointer` has
+/// no implicit grab (unlike macOS/X11 — see `update_cross_window_drag`'s
+/// doc, which documents the "release always lands on the source" premise
+/// this function stops relying on): once the pointer is over a different
+/// top-level window, the compositor is free to hand that window the
+/// release instead of the source. Trusting the event's window as the
+/// drag's owner ran `resolve_drag_drop` as a method on the WRONG
+/// `WindowState` — the real source's `pending_move` was never set and its
+/// carried-exclusion cleanup never ran, leaving it hidden forever ("alive
+/// but invisible").
+///
+/// The fix has two parts: resolve the drop against the SOURCE window's own
+/// `WindowState` (the only place `pending_move`/the carried exclusion
+/// actually live — `resolve_drag_release` requires this), but recompute
+/// `drag.hover` FRESH against `event_window` first, via the same
+/// `hover_at` a live cross-window drag tick already uses to preview a
+/// target (`update_cross_window_drag`, right above). `drag.hover` can't be
+/// trusted as-is here: it only ever gets updated by the SOURCE's own
+/// `CursorMoved`/`update_cross_window_drag` calls, which never fire for
+/// `event_window` (its own `CursorMoved`s early-return out of
+/// `update_drag_hover` once source/window mismatch), so it's frozen at
+/// whatever it was before the compositor handed the pointer to
+/// `event_window` — exactly the "silent no-op" the investigation traced.
+/// `(x, y)` are `event_window`'s own local logical px (its `WindowState::
+/// cursor`, kept live by its own real `CursorMoved`s regardless of drag
+/// ownership).
+fn resolve_misrouted_release(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    source: WindowId,
+    event_window: WindowId,
+    x: f64,
+    y: f64,
+) -> (DragEnded, Option<(SurfaceRef, SurfaceDest)>) {
+    let Some(mut drag) = shared.drag.take() else {
+        return (DragEnded::None, None);
+    };
+    drag.hover = windows
+        .get(&event_window)
+        .and_then(|w| w.hover_at(event_window, x, y, false));
+    let Some(src_win) = windows.get_mut(&source) else {
+        // The source window vanished mid-drag through some other path
+        // (`clear_drag_on_window_close` clears `shared.drag` itself when
+        // its own source closes, so this shouldn't happen) — stay honest
+        // rather than panic if it ever does.
+        shared.wisp_end_drag();
+        return (DragEnded::Cancel, None);
+    };
+    // `window_id` here is the SOURCE's own id, not `event_window`'s — see
+    // `resolve_drag_release`'s doc for why that's the parameter's actual
+    // meaning (it names the window `self`/`src_win` IS, not whichever
+    // window the OS event was addressed to).
+    let ended = src_win.resolve_drag_release(shared, source, drag);
+    let pending = src_win.pending_move.take();
+    (ended, pending)
 }
 
 /// The session ids `src` currently names, resolved against the SOURCE
@@ -4500,12 +4650,15 @@ fn finish_ctl_drag_tail(
             }
         }
     }
-    // Fix 2: see the identical comment at the real-mouse
-    // release site (`App::window_event`'s `MouseInput` release arm) — same
-    // reasoning, same "after apply_move, regardless of whether pending was
-    // Some" placement.
+    // Fix 2 + invariant backstop: see the identical comment/sweep at the
+    // real-mouse release site (`App::window_event`'s `MouseInput` release
+    // arm) — same reasoning, same "after apply_move, regardless of whether
+    // pending was Some" placement. `ctl drag` can't itself misroute a
+    // release (`window` here is always the fixed press window, never a
+    // different one an OS event could misdeliver to), but this sweep stays
+    // in lockstep with the real-mouse path rather than a weaker copy.
     for w in windows.values_mut() {
-        w.finish_carry_reshow();
+        w.ensure_carry_exclusion_cleared(shared);
     }
     let mut reply = serde_json::json!({
         "ok": true,
@@ -5262,14 +5415,15 @@ fn encode_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, SessionId, TabId,
-        bell_flash_intensity, bracket_paste, clamp_to_visible_monitor, clear_captured_commands,
-        encode_key, match_tab_title, match_tab_title_across, needs_deferred_replay,
-        next_prev_index, pane_snap_for, pretype_bytes, queue_close_this, queue_close_window,
-        resolve_index, resolve_restore_cwd, shell_escape_path, tab_display_title, url_is_openable,
-        window_owning_tab,
+        BELL_FLASH_SECS, DeferredMoveOp, DeferredWindowAction, PaneMeta, ReleaseRouting, SessionId,
+        TabId, bell_flash_intensity, bracket_paste, clamp_to_visible_monitor,
+        clear_captured_commands, encode_key, match_tab_title, match_tab_title_across,
+        needs_deferred_replay, next_prev_index, pane_snap_for, pretype_bytes, queue_close_this,
+        queue_close_window, resolve_index, resolve_restore_cwd, route_release, shell_escape_path,
+        tab_display_title, url_is_openable, window_owning_tab,
     };
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
+    use winit::window::WindowId;
 
     fn enc(key: Key, mods: ModifiersState) -> Option<Vec<u8>> {
         encode_key(&key, mods, false, false)
@@ -6010,5 +6164,63 @@ mod tests {
         // a panic or a wrong guess.
         let by_window: Vec<(u32, Vec<TabId>)> = vec![(10, vec![TabId(1)]), (20, vec![TabId(2)])];
         assert_eq!(window_owning_tab(&by_window, TabId(99)), None);
+    }
+
+    // --- route_release (Wayland cross-window drop-routing fix) ---------
+    //
+    // `MouseInput::Released` used to trust whichever window the OS
+    // delivered the event to as a live drag's owner. On Wayland (no
+    // implicit pointer grab) the release can land on the drag's TARGET
+    // window instead of its recorded `source_window`; resolving the drop
+    // against the wrong `WindowState` skipped the real source's
+    // carried-exclusion cleanup and left it hidden forever ("alive but
+    // invisible" — the field bug this fix addresses). `route_release` is
+    // the pure decision these three cases boil down to.
+
+    #[test]
+    fn route_release_with_no_live_drag_is_not_dragging() {
+        let a = WindowId::from(1u64);
+        assert_eq!(route_release(None, a), ReleaseRouting::NotDragging);
+    }
+
+    #[test]
+    fn route_release_on_the_drags_own_source_resolves_there() {
+        let a = WindowId::from(1u64);
+        assert_eq!(route_release(Some(a), a), ReleaseRouting::OnSource);
+    }
+
+    #[test]
+    fn route_release_on_a_different_window_still_resolves_against_the_source() {
+        // The misdelivery case: the OS handed the release to `b`, but the
+        // drag's source is `a` -- the drop must still resolve against `a`
+        // (`resolve_for`), with the hover recomputed fresh against `b`
+        // (`hover_from`), not silently dropped or resolved against the
+        // wrong window.
+        let a = WindowId::from(1u64);
+        let b = WindowId::from(2u64);
+        assert_eq!(
+            route_release(Some(a), b),
+            ReleaseRouting::Misrouted {
+                resolve_for: a,
+                hover_from: b,
+            }
+        );
+    }
+
+    #[test]
+    fn route_release_is_symmetric_in_which_window_is_named_source() {
+        // Swapping which window is "the source" and which received the
+        // event swaps resolve_for/hover_from accordingly -- routing isn't
+        // hardcoded to a particular WindowId, only to the relationship
+        // between the two.
+        let a = WindowId::from(1u64);
+        let b = WindowId::from(2u64);
+        assert_eq!(
+            route_release(Some(b), a),
+            ReleaseRouting::Misrouted {
+                resolve_for: b,
+                hover_from: a,
+            }
+        );
     }
 }
