@@ -402,6 +402,20 @@ enum CarriedExclusion {
     WholeWindow,
 }
 
+/// Whether a window's carried-exclusion bookkeeping is orphaned and needs
+/// [`WindowState::clear_carried_exclusion`] — armed (about to apply) or
+/// already applied (its OS window possibly hidden right now). Pulled out of
+/// [`WindowState::ensure_carry_exclusion_cleared`] as its own pure
+/// predicate, the invariant backstop's actual "is there anything to clear
+/// here" check, so it has a testable seam that doesn't need a real
+/// `WindowState`/renderer to spin up.
+fn carry_exclusion_needs_clearing(
+    exclusion_applied: bool,
+    carried_exclusion: Option<CarriedExclusion>,
+) -> bool {
+    exclusion_applied || carried_exclusion.is_some()
+}
+
 /// Everything tied to a single window and its surface.
 pub(crate) struct WindowState {
     pub(crate) renderer: Renderer,
@@ -2165,11 +2179,13 @@ impl WindowState {
         }
         let mut ended = DragEnded::None;
         if let Some(drag) = shared.drag.take() {
-            ended = self.resolve_drag_drop(shared, window_id, drag);
-            // Task 5: end the wisp's fade-out here too — this is the ONLY
-            // release path shared by both a real mouse-up and `ctl drag`'s
-            // synthesized one (`run_ctl_drag` calls this same method).
-            shared.wisp_end_drag();
+            // Task 5: `resolve_drag_release` ends the wisp's fade-out too —
+            // this is the ONLY release path shared by a real mouse-up, `ctl
+            // drag`'s synthesized one (`run_ctl_drag` calls this same
+            // method), AND a release misdelivered to a different window
+            // (`resolve_misrouted_release`, `main.rs`, reuses the same
+            // wrapper against the SOURCE window's own `WindowState`).
+            ended = self.resolve_drag_release(shared, window_id, drag);
         } else if let Some(d) = self.tab_drag.take() {
             self.renderer.set_tab_drag(None);
             ended = if d.active {
@@ -2733,6 +2749,28 @@ impl WindowState {
             self.renderer.window().set_visible(true);
             self.hidden_for_carry = false;
         }
+    }
+
+    /// Invariant backstop: no drag-end path may leave this window's carried
+    /// exclusion armed, or its OS window hidden for a carry that's already
+    /// over. Safe to call on EVERY window after ANY drag resolution (a
+    /// drop, a cancel, or a release misdelivered to a different window) —
+    /// `carried_exclusion`/`exclusion_applied` are only ever armed on a
+    /// window while it IS a live drag's own source (`begin_carried_
+    /// exclusion`, set once per tear-off), and this always runs after
+    /// `shared.drag` has already been taken, so there is never a
+    /// genuinely live drag left to protect; a window with nothing armed
+    /// no-ops through both calls below. This is what makes "alive but
+    /// invisible" — a window `apply_carried_exclusion` hid whose matching
+    /// `clear_carried_exclusion` never ran, because resolution happened to
+    /// run against a DIFFERENT window's `WindowState` — structurally
+    /// impossible, independent of whatever specific routing bug caused it
+    /// (the release-routing fix this backstop ships alongside included).
+    pub(crate) fn ensure_carry_exclusion_cleared(&mut self, shared: &Shared) {
+        if carry_exclusion_needs_clearing(self.exclusion_applied, self.carried_exclusion) {
+            self.clear_carried_exclusion(shared);
+        }
+        self.finish_carry_reshow();
     }
 
     /// Record what strip chip (if any) a live drag is hovering on THIS
@@ -3672,6 +3710,31 @@ impl WindowState {
                 DragEnded::Move
             }
         }
+    }
+
+    /// Resolve a drag THIS window is the source of (`self` must already BE
+    /// `drag.source_window`'s `WindowState` — `resolve_drag_drop`'s doc
+    /// explains why that's load-bearing), pairing it with the matching wisp
+    /// teardown. `window_id` must be this window's own id: for an ordinary
+    /// same-window release that's simply the id the OS delivered the event
+    /// to (`left_release`'s caller); for a release the OS misdelivered to a
+    /// DIFFERENT window, the caller must still pass THIS (source) window's
+    /// own id, never the event's — see `resolve_drag_drop`'s "Strip hover on
+    /// the SOURCE's own window" check, which compares `drag.hover`'s window
+    /// against exactly this parameter. One shared wrapper (rather than two
+    /// copies of `resolve_drag_drop` + `wisp_end_drag`) so same-window and
+    /// misrouted releases can't drift apart: `left_release` uses this for
+    /// the normal case, `main.rs`'s `resolve_misrouted_release` reuses it
+    /// against the source's own `WindowState` for the misdelivered one.
+    pub(crate) fn resolve_drag_release(
+        &mut self,
+        shared: &mut Shared,
+        window_id: WindowId,
+        drag: DragState,
+    ) -> DragEnded {
+        let ended = self.resolve_drag_drop(shared, window_id, drag);
+        shared.wisp_end_drag();
+        ended
     }
 
     /// Begin inline rename of tab `i` (double-click); seeds the buffer with its title.
@@ -4933,7 +4996,10 @@ impl WindowState {
 
 #[cfg(test)]
 mod tests {
-    use super::{TEAR_OFF_THRESHOLD, strip_band_exit};
+    use super::{
+        CarriedExclusion, TEAR_OFF_THRESHOLD, TabId, carry_exclusion_needs_clearing,
+        strip_band_exit,
+    };
 
     #[test]
     fn strip_band_exit_stays_false_inside_the_band() {
@@ -5437,5 +5503,53 @@ mod tests {
         // never a static-table label — the lookup must return `None`, not
         // panic, so `adjust_setting` just skips mutation for it.
         assert!(find_setting_row_by_label("Delete saved sessions (4)…").is_none());
+    }
+
+    // --- carry_exclusion_needs_clearing (invariant backstop) -----------
+    //
+    // `ensure_carry_exclusion_cleared` must treat a window's carried
+    // exclusion as orphaned -- and force it clear -- whenever EITHER half
+    // of its bookkeeping is still live: armed but not yet applied, or
+    // applied (meaning the OS window may actually be hidden right now).
+    // This is the exact predicate that makes "alive but invisible"
+    // structurally impossible even for a drag-end path this code hasn't
+    // modeled, independent of the release-routing fix it ships alongside.
+
+    #[test]
+    fn carry_exclusion_needs_clearing_is_false_with_nothing_armed() {
+        assert!(!carry_exclusion_needs_clearing(false, None));
+    }
+
+    #[test]
+    fn carry_exclusion_needs_clearing_is_true_once_applied() {
+        // The OS window may be hidden right now (`WholeWindow`, applied) --
+        // this must never be treated as "nothing to do".
+        assert!(carry_exclusion_needs_clearing(
+            true,
+            Some(CarriedExclusion::WholeWindow)
+        ));
+    }
+
+    #[test]
+    fn carry_exclusion_needs_clearing_is_true_when_armed_but_not_yet_applied() {
+        // Torn off, but the suck-in animation hasn't finished yet
+        // (`apply_carried_exclusion` gates on `!self.morph_live()`) --
+        // `exclusion_applied` is still false, but `carried_exclusion` is
+        // Some: this is still orphaned state if the drag ends here.
+        assert!(carry_exclusion_needs_clearing(
+            false,
+            Some(CarriedExclusion::Tab(TabId(7)))
+        ));
+    }
+
+    #[test]
+    fn carry_exclusion_needs_clearing_covers_every_carried_exclusion_variant() {
+        for ex in [
+            CarriedExclusion::Pane(super::PaneId(1)),
+            CarriedExclusion::Tab(TabId(1)),
+            CarriedExclusion::WholeWindow,
+        ] {
+            assert!(carry_exclusion_needs_clearing(true, Some(ex)));
+        }
     }
 }
