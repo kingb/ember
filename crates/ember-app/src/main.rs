@@ -1197,13 +1197,26 @@ impl ApplicationHandler<EmberEvent> for App {
             } => match button {
                 MouseButton::Left => {
                     let (x, y) = win.cursor;
-                    // The restore modal is keyboard-only (Task 8: no mouse
-                    // hit-testing for its buttons/rows) — swallow a click
-                    // rather than let it fall through to the panes/tabs
-                    // underneath, same "stays modal" intent as the
-                    // confirm-modal click guard just below.
+                    // The restore modal (Task 8): a click on a button/row
+                    // focuses + activates it, same as Enter on it
+                    // (`WindowState::restore_click` reuses `restore_key`'s
+                    // own activation paths so the two can't diverge); a
+                    // click anywhere else is a deliberate no-op, same
+                    // "stays modal" intent as the confirm-modal click guard
+                    // just below (mirrored here for the same reason).
                     if win.restore_prompt.is_some() {
-                        // no-op: click doesn't resolve or dismiss the modal
+                        if let Some(action) = win.restore_click(x as f32, y as f32) {
+                            resolve_restore_action(
+                                &mut self.windows,
+                                shared,
+                                &mut self.focused_window,
+                                event_loop,
+                                id,
+                                action,
+                            );
+                        } else {
+                            win.renderer.window().request_redraw();
+                        }
                     } else if win.pending_close.is_some() {
                         if let Some(idx) = win.renderer.confirm_button_at(x as f32, y as f32) {
                             let kind = win.pending_close;

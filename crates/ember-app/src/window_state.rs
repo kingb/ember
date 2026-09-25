@@ -4360,7 +4360,7 @@ impl WindowState {
             return Some(RestoreAction::StartFreshAndType(text));
         }
         match prompt {
-            RestorePrompt::Main { snap, focus } => match key_action {
+            RestorePrompt::Main { focus, .. } => match key_action {
                 RestoreKeyAction::Back => {
                     self.restore_prompt = None;
                     self.update_restore_view();
@@ -4376,30 +4376,10 @@ impl WindowState {
                     self.update_restore_view();
                     None
                 }
-                RestoreKeyAction::Activate => match *focus {
-                    0 => {
-                        let snapshot = snap.clone();
-                        self.restore_prompt = None;
-                        self.update_restore_view();
-                        Some(RestoreAction::Restore {
-                            snapshot,
-                            archive_current: false,
-                        })
-                    }
-                    1 => {
-                        self.restore_prompt = None;
-                        self.update_restore_view();
-                        Some(RestoreAction::StartFresh)
-                    }
-                    _ => {
-                        let list = session_state::state_path()
-                            .and_then(|p| p.parent().map(session_state::list_archives))
-                            .unwrap_or_default();
-                        self.restore_prompt = Some(RestorePrompt::Older { list, sel: 0 });
-                        self.update_restore_view();
-                        None
-                    }
-                },
+                RestoreKeyAction::Activate => {
+                    let idx = *focus;
+                    self.activate_restore_main_button(idx)
+                }
                 // Up/Down have no meaning on `Main`; `TypeThrough` is fully
                 // handled above before this match ever runs.
                 _ => None,
@@ -4422,19 +4402,98 @@ impl WindowState {
                     None
                 }
                 RestoreKeyAction::Activate => {
-                    let entry = list.get(*sel).cloned()?;
-                    let snapshot = session_state::load_archive(&entry.path)?;
-                    self.restore_prompt = None;
-                    self.update_restore_view();
-                    Some(RestoreAction::Restore {
-                        snapshot,
-                        archive_current: true,
-                    })
+                    let idx = *sel;
+                    self.activate_restore_row(idx)
                 }
                 // Left/Right have no meaning on `Older`; `TypeThrough` is
                 // fully handled above before this match ever runs.
                 _ => None,
             },
+        }
+    }
+
+    /// Activate `Main`'s button `idx` (`0` Restore, `1` Start fresh, `2`
+    /// Older…) — the shared action-construction body for both `restore_key`'s
+    /// `Enter` (via `focus`) and `restore_click`'s mouse hit (via
+    /// `restore_button_at`), so the two input paths can never build a
+    /// different [`RestoreAction`] for what is supposed to be the same
+    /// button. `None` if the modal isn't showing `Main` (defensive — both
+    /// callers already checked).
+    fn activate_restore_main_button(&mut self, idx: u8) -> Option<RestoreAction> {
+        let RestorePrompt::Main { snap, .. } = self.restore_prompt.as_ref()? else {
+            return None;
+        };
+        match idx {
+            0 => {
+                let snapshot = snap.clone();
+                self.restore_prompt = None;
+                self.update_restore_view();
+                Some(RestoreAction::Restore {
+                    snapshot,
+                    archive_current: false,
+                })
+            }
+            1 => {
+                self.restore_prompt = None;
+                self.update_restore_view();
+                Some(RestoreAction::StartFresh)
+            }
+            _ => {
+                let list = session_state::state_path()
+                    .and_then(|p| p.parent().map(session_state::list_archives))
+                    .unwrap_or_default();
+                self.restore_prompt = Some(RestorePrompt::Older { list, sel: 0 });
+                self.update_restore_view();
+                None
+            }
+        }
+    }
+
+    /// Activate `Older…`'s row `idx` — the shared action-construction body
+    /// for both `restore_key`'s `Enter` (via `sel`) and `restore_click`'s
+    /// mouse hit (via `restore_row_at`). `None` if the modal isn't showing
+    /// `Older` or `idx` is out of range (an empty archive list's single
+    /// reserved hit row, see `restore_list_geometry`'s doc, lands here).
+    fn activate_restore_row(&mut self, idx: usize) -> Option<RestoreAction> {
+        let RestorePrompt::Older { list, .. } = self.restore_prompt.as_ref()? else {
+            return None;
+        };
+        let entry = list.get(idx).cloned()?;
+        let snapshot = session_state::load_archive(&entry.path)?;
+        self.restore_prompt = None;
+        self.update_restore_view();
+        Some(RestoreAction::Restore {
+            snapshot,
+            archive_current: true,
+        })
+    }
+
+    /// Handle a left click at logical `(x, y)` while the restore modal is
+    /// open: hit-test against the renderer's helper-produced rects
+    /// (`restore_button_at`/`restore_row_at` — the exact numbers
+    /// `build_restore_main`/`build_restore_list` last drew), and if it lands
+    /// on a button/row, focus/select it AND activate it, reusing
+    /// `restore_key`'s own activation methods so a click and an Enter on the
+    /// same button always do the same thing. A click that misses everything
+    /// (including the panel background) is a deliberate no-op — the modal
+    /// doesn't dismiss on an outside click, only Esc/a button choice closes
+    /// it.
+    pub(crate) fn restore_click(&mut self, x: f32, y: f32) -> Option<RestoreAction> {
+        match self.restore_prompt.as_ref()? {
+            RestorePrompt::Main { .. } => {
+                let idx = self.renderer.restore_button_at(x, y)?;
+                if let Some(RestorePrompt::Main { focus, .. }) = self.restore_prompt.as_mut() {
+                    *focus = idx;
+                }
+                self.activate_restore_main_button(idx)
+            }
+            RestorePrompt::Older { .. } => {
+                let idx = self.renderer.restore_row_at(x, y)?;
+                if let Some(RestorePrompt::Older { sel, .. }) = self.restore_prompt.as_mut() {
+                    *sel = idx;
+                }
+                self.activate_restore_row(idx)
+            }
         }
     }
 

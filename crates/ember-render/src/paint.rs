@@ -1976,6 +1976,11 @@ pub(crate) struct RestoreMainLayout {
     pub header_origin: (f32, f32),
     /// `[Restore, Start fresh, Older…]` label text origins, in that order.
     pub button_origins: [(f32, f32); 3],
+    /// `[Restore, Start fresh, Older…]` button hit rects (logical px, `[x, y,
+    /// w, h]`), in that order — lifted straight from [`restore_main_geometry`]
+    /// so the mouse hit-test (`restore_main_hit`) can never see numbers the
+    /// draw didn't also use.
+    pub buttons: [[f32; 4]; 3],
 }
 
 /// The restore-modal Main screen's three fixed button labels, in `focused`
@@ -1983,27 +1988,27 @@ pub(crate) struct RestoreMainLayout {
 /// handling (Left/Right/Tab cycles `focused` through these same 3 slots).
 pub(crate) const RESTORE_MAIN_LABELS: [&str; 3] = ["Restore", "Start fresh", "Older…"];
 
-/// Draw the restore-on-launch modal's Main screen: a scrim + centered
-/// rounded panel with the header line ("Restore N windows, M tabs (from
-/// <age>)?") and three buttons (Restore / Start fresh / Older…). Mirrors
-/// [`build_confirm`]'s panel/button visual language (ember ring on the
-/// focused button, same scrim/panel colors) generalized from two buttons to
-/// three; the first (Restore) is ember-tinted as the primary action instead
-/// of only the confirm slot being tinted. Everything rides `rounded` so the
-/// modal draws over all content, same layering rule as `build_confirm`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_restore_main(
-    font_system: &mut FontSystem,
-    header_buf: &mut Buffer,
-    btn_bufs: &mut [Buffer; 3],
+/// Pure geometry for the restore-modal Main screen: the panel rect and its
+/// three button rects, all logical px. Needs only the header text (for panel
+/// sizing) and cell width/screen size — no `FontSystem`/`Buffer`, so it's
+/// cheap to call from a unit test. The single source of truth for this
+/// modal's layout: [`build_restore_main`] (draw) and `restore_main_hit`
+/// (mouse hit-test) both consume its output rather than each computing their
+/// own copy of this math — this repo's known layout-drift class, closed the
+/// same way `ConfirmLayout`/`confirm_button_at` already closed it for the
+/// close-confirm modal.
+pub(crate) struct RestoreMainGeometry {
+    pub panel: [f32; 4],
+    /// `[Restore, Start fresh, Older…]` rects, in that order.
+    pub buttons: [[f32; 4]; 3],
+}
+
+pub(crate) fn restore_main_geometry(
     header: &str,
-    focused: usize,
     cw: f32,
     logical_w: f32,
     logical_h: f32,
-    sf: f32,
-    rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
-) -> RestoreMainLayout {
+) -> RestoreMainGeometry {
     let pad = 20.0;
     let btn_h = 30.0;
     let btn_gap = 10.0;
@@ -2025,6 +2030,49 @@ pub(crate) fn build_restore_main(
     let x = ((logical_w - w) * 0.5).max(0.0);
     let y = ((logical_h - h) * 0.5).max(4.0);
 
+    // Buttons: centered as one row, Restore first (leftmost, primary/ember-tinted).
+    let by = y + h - pad - btn_h;
+    let start_x = x + (w - btn_total_w) * 0.5;
+    let mut bx = start_x;
+    let mut buttons = [[0.0; 4]; 3];
+    for (i, &bw) in widths.iter().enumerate() {
+        buttons[i] = [bx, by, bw, btn_h];
+        bx += bw + btn_gap;
+    }
+
+    RestoreMainGeometry {
+        panel: [x, y, w, h],
+        buttons,
+    }
+}
+
+/// Draw the restore-on-launch modal's Main screen: a scrim + centered
+/// rounded panel with the header line ("Restore N windows, M tabs (from
+/// <age>)?") and three buttons (Restore / Start fresh / Older…). Mirrors
+/// [`build_confirm`]'s panel/button visual language (ember ring on the
+/// focused button, same scrim/panel colors) generalized from two buttons to
+/// three; the first (Restore) is ember-tinted as the primary action instead
+/// of only the confirm slot being tinted. Everything rides `rounded` so the
+/// modal draws over all content, same layering rule as `build_confirm`. All
+/// placement comes from [`restore_main_geometry`] — this function only
+/// shapes text and pushes the quads at the rects it returns.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_restore_main(
+    font_system: &mut FontSystem,
+    header_buf: &mut Buffer,
+    btn_bufs: &mut [Buffer; 3],
+    header: &str,
+    focused: usize,
+    cw: f32,
+    logical_w: f32,
+    logical_h: f32,
+    sf: f32,
+    rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
+) -> RestoreMainLayout {
+    let pad = 20.0;
+    let geo = restore_main_geometry(header, cw, logical_w, logical_h);
+    let [x, y, w, h] = geo.panel;
+
     // Scrim (radius 0), then the panel (rounded, ember ring border).
     rounded.push((
         scaled(0.0, 0.0, logical_w, logical_h, sf),
@@ -2043,12 +2091,8 @@ pub(crate) fn build_restore_main(
         r * sf,
     ));
 
-    // Buttons: centered as one row, Restore first (leftmost, primary/ember-tinted).
-    let by = y + h - pad - btn_h;
-    let start_x = x + (w - btn_total_w) * 0.5;
-    let mut bx = start_x;
     let mut origins = [(0.0, 0.0); 3];
-    for (i, &bw) in widths.iter().enumerate() {
+    for (i, &[bx, by, bw, btn_h]) in geo.buttons.iter().enumerate() {
         if focused == i {
             rounded.push((
                 scaled(bx - 1.5, by - 1.5, bw + 3.0, btn_h + 3.0, sf),
@@ -2067,7 +2111,6 @@ pub(crate) fn build_restore_main(
             bx + (bw - label.chars().count() as f32 * cw) * 0.5,
             by + (btn_h - LINE_HEIGHT) * 0.5,
         );
-        bx += bw + btn_gap;
     }
 
     let shape = |fs: &mut FontSystem, buf: &mut Buffer, text: &str, color: Color, width: f32| {
@@ -2094,12 +2137,69 @@ pub(crate) fn build_restore_main(
         } else {
             Color::rgb(0xf0, 0xf0, 0xf0)
         };
-        shape(font_system, buf, RESTORE_MAIN_LABELS[i], color, widths[i]);
+        shape(
+            font_system,
+            buf,
+            RESTORE_MAIN_LABELS[i],
+            color,
+            geo.buttons[i][2],
+        );
     }
 
     RestoreMainLayout {
         header_origin: (x + pad, y + pad),
         button_origins: origins,
+        buttons: geo.buttons,
+    }
+}
+
+/// Text-placement result from [`build_restore_list`] (logical px).
+pub(crate) struct RestoreListLayout {
+    pub text_origin: (f32, f32),
+    /// One hit rect per shown row (up to 10), logical px `[x, y, w, h]`,
+    /// same rects the `selected` highlight bar is drawn at — lifted from
+    /// [`restore_list_geometry`] so `restore_list_hit` can never drift from
+    /// the draw.
+    pub rows: Vec<[f32; 4]>,
+}
+
+/// Pure geometry for the restore-modal `Older…` screen: the panel rect and
+/// one rect per shown row (up to 10, `row_count.clamp(1, 10)` — same clamp
+/// `build_restore_list` uses so an empty archive list still reserves one row
+/// for its "(no archived sessions)" line), all logical px. No
+/// `FontSystem`/`Buffer` needed, so a unit test can call this directly.
+/// Shared by [`build_restore_list`] (draw) and `restore_list_hit` (mouse
+/// hit-test) — see [`restore_main_geometry`]'s doc for why this split
+/// exists.
+pub(crate) struct RestoreListGeometry {
+    pub panel: [f32; 4],
+    pub rows: Vec<[f32; 4]>,
+}
+
+pub(crate) fn restore_list_geometry(
+    row_count: usize,
+    cw: f32,
+    logical_w: f32,
+    logical_h: f32,
+) -> RestoreListGeometry {
+    let ipad = 10.0;
+    let cols = 56usize;
+    let w = (cols as f32 * cw + 2.0 * ipad).min(logical_w - 24.0);
+    let shown = row_count.clamp(1, 10);
+    let h = (shown as f32 + 2.0) * LINE_HEIGHT + 2.0 * ipad;
+    let x = ((logical_w - w) * 0.5).max(0.0);
+    let y = (logical_h * 0.18).max(44.0);
+
+    let rows = (0..shown)
+        .map(|i| {
+            let ry = y + ipad + (i as f32 + 2.0) * LINE_HEIGHT;
+            [x + 3.0, ry, w - 6.0, LINE_HEIGHT]
+        })
+        .collect();
+
+    RestoreListGeometry {
+        panel: [x, y, w, h],
+        rows,
     }
 }
 
@@ -2108,8 +2208,9 @@ pub(crate) fn build_restore_main(
 /// `"<age> · N windows, M tabs"`), the header question kept on screen above
 /// them, and a highlight on `selected`. Structurally `build_palette` minus
 /// the live query line — same single-multi-line-buffer/selected-row-highlight
-/// shape, just seeded with a static header instead of live query text.
-/// Returns the text origin for the caller's one `TextArea`.
+/// shape, just seeded with a static header instead of live query text. All
+/// placement comes from [`restore_list_geometry`]; this function only shapes
+/// text and pushes the quads at the rects it returns.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_restore_list(
     font_system: &mut FontSystem,
@@ -2122,17 +2223,11 @@ pub(crate) fn build_restore_list(
     logical_h: f32,
     sf: f32,
     rounded: &mut Vec<([f32; 4], [f32; 4], f32)>,
-) -> (f32, f32) {
+) -> RestoreListLayout {
     let ipad = 10.0;
-    let cols = 56usize;
-    let w = (cols as f32 * cw + 2.0 * ipad).min(logical_w - 24.0);
-    // At least one row of height so an empty archive list still shows its
-    // "(no archived sessions)" line (an invisible captured overlay reads as
-    // "the app stopped responding").
-    let shown = rows.len().clamp(1, 10);
-    let h = (shown as f32 + 2.0) * LINE_HEIGHT + 2.0 * ipad;
-    let x = ((logical_w - w) * 0.5).max(0.0);
-    let y = (logical_h * 0.18).max(44.0);
+    let geo = restore_list_geometry(rows.len(), cw, logical_w, logical_h);
+    let [x, y, w, h] = geo.panel;
+    let shown = geo.rows.len();
 
     rounded.push((
         scaled(0.0, 0.0, logical_w, logical_h, sf),
@@ -2150,12 +2245,8 @@ pub(crate) fn build_restore_list(
         0.0,
     ));
     if !rows.is_empty() && selected < shown {
-        let ry = y + ipad + (selected as f32 + 2.0) * LINE_HEIGHT;
-        rounded.push((
-            scaled(x + 3.0, ry, w - 6.0, LINE_HEIGHT, sf),
-            lin_rgba(ACCENT, 0.28),
-            0.0,
-        ));
+        let [rx, ry, rw, rh] = geo.rows[selected];
+        rounded.push((scaled(rx, ry, rw, rh, sf), lin_rgba(ACCENT, 0.28), 0.0));
     }
     let mut text = format!("{header}\n\n");
     for r in rows.iter().take(shown) {
@@ -2176,7 +2267,34 @@ pub(crate) fn build_restore_list(
         None,
     );
     buf.shape_until_scroll(font_system, false);
-    (x + ipad, y + ipad)
+    RestoreListLayout {
+        text_origin: (x + ipad, y + ipad),
+        rows: geo.rows,
+    }
+}
+
+/// What a mouse click at logical `(x, y)` hits on the restore-modal Main
+/// screen, given its button rects (from [`restore_main_geometry`] /
+/// [`RestoreMainLayout::buttons`]) — `None` when the click lands outside all
+/// three. Mirrors `settings_action_for_key`'s shape: a pure, independently
+/// unit-tested function rather than a `Renderer`/`WindowState` method.
+pub(crate) fn restore_main_hit(buttons: &[[f32; 4]; 3], x: f32, y: f32) -> Option<u8> {
+    buttons
+        .iter()
+        .position(|r| point_in_rect(x, y, r))
+        .map(|i| i as u8)
+}
+
+/// What a mouse click at logical `(x, y)` hits on the restore-modal
+/// `Older…` screen, given its row rects (from [`restore_list_geometry`] /
+/// [`RestoreListLayout::rows`]) — `None` when the click lands outside every
+/// row. See [`restore_main_hit`]'s doc for why this is a free pure function.
+pub(crate) fn restore_list_hit(rows: &[[f32; 4]], x: f32, y: f32) -> Option<usize> {
+    rows.iter().position(|r| point_in_rect(x, y, r))
+}
+
+fn point_in_rect(x: f32, y: f32, r: &[f32; 4]) -> bool {
+    x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]
 }
 
 #[cfg(test)]
@@ -2548,5 +2666,108 @@ mod spark_tests {
         let tail = &q[TRAIL_SEGMENTS - 1];
         assert!(tail.0[2] < head.0[2], "tail segment should be smaller");
         assert!(tail.1[3] < head.1[3], "tail segment should be dimmer");
+    }
+}
+
+/// The restore-modal geometry + mouse hit-test: `restore_main_geometry`/
+/// `restore_list_geometry` are what the fix's draw and click paths both
+/// consume (see their doc comments), so testing them here covers both at
+/// once — a passing `clicking_a_button_center_hits_that_button` proves the
+/// hit-test agrees with the exact rects the modal is drawn at.
+#[cfg(test)]
+mod restore_hit_tests {
+    use super::{restore_list_geometry, restore_list_hit, restore_main_geometry, restore_main_hit};
+
+    const CW: f32 = 8.0;
+    const LOGICAL_W: f32 = 1000.0;
+    const LOGICAL_H: f32 = 700.0;
+    const HEADER: &str = "Restore 2 windows, 5 tabs (from 3 hours ago)?";
+
+    fn rect_center(r: [f32; 4]) -> (f32, f32) {
+        (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0)
+    }
+
+    #[test]
+    fn main_buttons_sit_left_to_right_inside_the_panel() {
+        let geo = restore_main_geometry(HEADER, CW, LOGICAL_W, LOGICAL_H);
+        let [px, py, pw, ph] = geo.panel;
+        for &[bx, by, bw, bh] in &geo.buttons {
+            assert!(
+                bx >= px && bx + bw <= px + pw,
+                "button escapes the panel horizontally"
+            );
+            assert!(
+                by >= py && by + bh <= py + ph,
+                "button escapes the panel vertically"
+            );
+        }
+        assert!(geo.buttons[0][0] < geo.buttons[1][0]);
+        assert!(geo.buttons[1][0] < geo.buttons[2][0]);
+    }
+
+    #[test]
+    fn clicking_a_button_center_hits_that_button() {
+        let geo = restore_main_geometry(HEADER, CW, LOGICAL_W, LOGICAL_H);
+        for i in 0..3u8 {
+            let (cx, cy) = rect_center(geo.buttons[i as usize]);
+            assert_eq!(restore_main_hit(&geo.buttons, cx, cy), Some(i));
+        }
+    }
+
+    #[test]
+    fn clicking_between_buttons_or_off_panel_misses() {
+        let geo = restore_main_geometry(HEADER, CW, LOGICAL_W, LOGICAL_H);
+        // The gap between button 0 and button 1.
+        let gap_x = geo.buttons[0][0] + geo.buttons[0][2] + 1.0;
+        let gap_y = geo.buttons[0][1] + geo.buttons[0][3] / 2.0;
+        assert!(
+            gap_x < geo.buttons[1][0],
+            "test assumes a real gap between buttons"
+        );
+        assert_eq!(restore_main_hit(&geo.buttons, gap_x, gap_y), None);
+        // Far outside the whole modal.
+        assert_eq!(restore_main_hit(&geo.buttons, 2.0, 2.0), None);
+    }
+
+    #[test]
+    fn list_rows_stack_top_to_bottom_inside_the_panel() {
+        let geo = restore_list_geometry(4, CW, LOGICAL_W, LOGICAL_H);
+        assert_eq!(geo.rows.len(), 4);
+        let [px, py, pw, ph] = geo.panel;
+        for &[rx, ry, rw, rh] in &geo.rows {
+            assert!(rx >= px && rx + rw <= px + pw);
+            assert!(ry >= py && ry + rh <= py + ph);
+        }
+        for pair in geo.rows.windows(2) {
+            assert!(pair[0][1] < pair[1][1], "rows should stack downward");
+        }
+    }
+
+    #[test]
+    fn clicking_a_row_center_hits_that_row() {
+        let geo = restore_list_geometry(5, CW, LOGICAL_W, LOGICAL_H);
+        for i in 0..5 {
+            let (cx, cy) = rect_center(geo.rows[i]);
+            assert_eq!(restore_list_hit(&geo.rows, cx, cy), Some(i));
+        }
+    }
+
+    #[test]
+    fn clicking_above_or_below_the_list_misses() {
+        let geo = restore_list_geometry(3, CW, LOGICAL_W, LOGICAL_H);
+        let [px, py, ..] = geo.panel;
+        assert_eq!(restore_list_hit(&geo.rows, px + 5.0, py + 1.0), None);
+        assert_eq!(restore_list_hit(&geo.rows, 2.0, 2.0), None);
+    }
+
+    #[test]
+    fn an_empty_archive_list_still_reserves_one_hit_row() {
+        // `build_restore_list` shows a "(no archived sessions)" line even
+        // with zero archives (`shown = row_count.clamp(1, 10)`); the
+        // classifier doesn't know the list is empty, so a click there must
+        // stay safe for the caller — `WindowState::activate_restore_row`'s
+        // own `list.get(idx)?` is what actually no-ops it.
+        let geo = restore_list_geometry(0, CW, LOGICAL_W, LOGICAL_H);
+        assert_eq!(geo.rows.len(), 1);
     }
 }
