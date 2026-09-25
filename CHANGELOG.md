@@ -6,6 +6,22 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-25
+
+### Fixed
+
+- The restore prompt shown on launch now responds to the mouse. In 0.6.0 its
+  Restore, Start fresh, and Older buttons, and the rows in the Older list,
+  could only be chosen from the keyboard. Clicking one now does exactly what
+  pressing Enter on it does.
+- Dragging a pane into another window could leave the source window hidden
+  for good on some Linux setups, reported on Ubuntu under Wayland
+  ([#18](https://github.com/kingb/ember/issues/18)). Ember now resolves every
+  drop against the window the drag started from, whichever window receives
+  the mouse release, and after any drag ends it checks that no window was
+  left hidden by it. This fixes the mechanism traced from the report;
+  confirmation on an affected Wayland setup is still pending.
+
 ## [0.6.0] - 2026-09-02
 
 ### Added
@@ -347,7 +363,8 @@ this first release:
   created owner-only, use no fixed or predictable paths, and return
   JSON-encoded errors rather than leaking internal state.
 
-[Unreleased]: https://github.com/kingb/ember/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/kingb/ember/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/kingb/ember/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/kingb/ember/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/kingb/ember/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/kingb/ember/compare/v0.4.1...v0.4.2
