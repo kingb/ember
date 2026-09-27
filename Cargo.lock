@@ -714,6 +714,8 @@ dependencies = [
  "ember-core",
  "libc",
  "portable-pty",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
