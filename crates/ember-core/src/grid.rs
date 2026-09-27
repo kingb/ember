@@ -211,6 +211,7 @@ pub struct GridDelta {
     /// Snapshot of the engine's bracketed-paste mode (DEC 2004) as of this drain —
     /// terminal state, like `cursor`, not damage. Lets the app wrap pastes in
     /// `ESC[200~`…`ESC[201~` only when the app asked for it. Latest-wins on merge.
+    #[serde(default)]
     pub bracketed_paste: bool,
     /// Scrollback viewport state (terminal state, latest-wins on merge): how many
     /// lines the display is scrolled **up** from the live bottom (`0` = at bottom),
@@ -222,6 +223,7 @@ pub struct GridDelta {
     pub alt_screen: bool,
     /// The app has enabled mouse reporting — the wheel should go to it as mouse
     /// events, not be translated to arrow keys.
+    #[serde(default)]
     pub mouse_reporting: bool,
     /// Application cursor keys (DECCKM, mode ?1): arrows must be sent as
     /// `ESC O A`… instead of `CSI A`…. Latest-wins on merge; defaulted so
@@ -235,6 +237,7 @@ pub struct GridDelta {
     /// `(visible_row, status)` — recomputed each drain from the marks' absolute
     /// history lines + `display_offset`, so they scroll with the content. Latest-
     /// wins on merge (terminal state, not damage).
+    #[serde(default)]
     pub marks: Vec<(u16, MarkStatus)>,
 }
 

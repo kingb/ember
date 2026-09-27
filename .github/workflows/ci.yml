@@ -59,6 +59,15 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all --all-features
+      # Cross-producer conformance against the shared gridwire corpus, pinned in
+      # conformance/GRIDWIRE_REV. The final grep proves the test ran and passed,
+      # so a renamed or filtered-out test can't pass this step by running nothing.
+      - name: Grid conformance (gridwire corpus)
+        run: |
+          scripts/conformance/fetch-grid-corpus.sh
+          cargo test -p ember-session --test grid_conformance -- --ignored --nocapture \
+            | tee "$RUNNER_TEMP/grid-conformance.log"
+          grep -q 'grid conformance: all [0-9]* corpus cases agree' "$RUNNER_TEMP/grid-conformance.log"
       - name: Bench (compile gate)
         run: cargo bench --all --no-run
 
