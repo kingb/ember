@@ -1018,7 +1018,7 @@ impl WindowState {
     ) -> bool {
         let mut cfg = LocalPtyConfig::new(id.clone(), dims);
         cfg.shell_integration = shared.config.shell_integration;
-        cfg.osc52_read = shared.config.osc52_read;
+        cfg.osc52_read = std::sync::Arc::clone(&shared.osc52_read_gate);
         cfg.cwd = cwd.map(std::path::PathBuf::from);
         let handle = match LocalPty::spawn(cfg) {
             Ok(h) => h,
@@ -4756,6 +4756,10 @@ impl WindowState {
         }
         self.apply_appearance(shared);
         shared.set_developer_mode(shared.config.developer_mode);
+        shared.osc52_read_gate.store(
+            shared.config.osc52_read,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut relayout = self.renderer.set_font_size(shared.config.font.size);
         relayout |= self.renderer.set_family(shared.config.font.family.clone());
         if relayout {

@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- A Settings toggle for clipboard reads: "Programs can read clipboard", in the
+  Terminal section. It is the same `osc52_read` switch that config.toml
+  offers, now one keypress away, for when you want nvim or tmux over
+  SSH to paste from your local clipboard. Any program in the terminal can read
+  what you copied while it is on, so it stays off by default. Changes apply
+  at once, including in panes that are already open.
+
 ### Fixed
 
 - OSC 52 clipboard reads now work as documented. Since 0.5.0, a program

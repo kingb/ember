@@ -344,6 +344,11 @@ pub(crate) struct Shared {
     pub(crate) control_server: Option<control::ControlServer>,
     /// User config (the Settings overlay reads + mutates it).
     pub(crate) config: Config,
+    /// The live OSC 52 read gate every pane's session shares (see
+    /// `LocalPtyConfig::osc52_read`). Mirrors `config.osc52_read`: seeded from
+    /// it here and updated whenever a setting changes, so turning reads off
+    /// reaches panes that are already open.
+    pub(crate) osc52_read_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Backdrop animation clock.
     pub(crate) backdrop_since: Instant,
     /// Native menu bar (macOS); inert elsewhere. Kept alive for the app's life.
@@ -936,6 +941,9 @@ impl ApplicationHandler<EmberEvent> for App {
             next_tab: 2,
             control_rx: self.control_rx.take(),
             control_server: self.control_server.take(),
+            osc52_read_gate: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                config.osc52_read,
+            )),
             config,
             backdrop_since: Instant::now(),
             menu: ember_platform::build_menu(),

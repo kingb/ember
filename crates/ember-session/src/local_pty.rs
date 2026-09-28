@@ -39,8 +39,10 @@ pub struct LocalPtyConfig {
     pub shell_integration: bool,
     /// Answer OSC 52 clipboard READ requests with real clipboard contents.
     /// Off = reply with an empty payload (the safe default; see the config
-    /// knob's doc in ember-core).
-    pub osc52_read: bool,
+    /// knob's doc in ember-core). A shared, live gate: the app holds one and
+    /// hands every pane a clone, and each read checks it at that moment, so
+    /// turning the setting off takes effect in panes that are already open.
+    pub osc52_read: Arc<AtomicBool>,
 }
 
 impl LocalPtyConfig {
@@ -52,7 +54,7 @@ impl LocalPtyConfig {
             args: Vec::new(),
             cwd: None,
             shell_integration: true,
-            osc52_read: false,
+            osc52_read: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -224,8 +226,11 @@ enum Ev {
 struct EmberListener {
     events: Sender<BackendEvent>,
     outbox: Arc<Mutex<Vec<u8>>>,
-    /// See [`LocalPtyConfig::osc52_read`].
-    osc52_read: bool,
+    /// See [`LocalPtyConfig::osc52_read`]. Checked per request, never cached.
+    osc52_read: Arc<AtomicBool>,
+    /// Where a permitted read gets the clipboard's text. The system clipboard
+    /// in production; a fixed value in tests.
+    read_clipboard: fn() -> String,
     /// For answering OSC 10/11 color queries (nvim's background detection
     /// blocks on this at startup). Static defaults — good enough for queries.
     palette: crate::palette::Palette,
@@ -256,11 +261,8 @@ impl EventListener for EmberListener {
             // data-exfiltration surface, so gated (default off = empty reply,
             // which unblocks well-behaved clients instead of hanging them).
             AlacEvent::ClipboardLoad(_, format) => {
-                let text = if self.osc52_read {
-                    arboard::Clipboard::new()
-                        .ok()
-                        .and_then(|mut c| c.get_text().ok())
-                        .unwrap_or_default()
+                let text = if self.osc52_read.load(Ordering::Relaxed) {
+                    (self.read_clipboard)()
                 } else {
                     String::new()
                 };
@@ -298,6 +300,14 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, itx: SyncSender<Ev>) {
     }
 }
 
+/// The system clipboard's text, or empty if it can't be read.
+fn system_clipboard_text() -> String {
+    arboard::Clipboard::new()
+        .ok()
+        .and_then(|mut c| c.get_text().ok())
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emulation_loop(
     dims: GridDims,
@@ -308,7 +318,7 @@ fn emulation_loop(
     master: Box<dyn portable_pty::MasterPty + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     busy: Arc<AtomicBool>,
-    osc52_read: bool,
+    osc52_read: Arc<AtomicBool>,
 ) {
     // The shell is its own process-group leader; when a foreground command runs,
     // the PTY's foreground pgrp differs from the shell pid. Recompute after each
@@ -324,6 +334,7 @@ fn emulation_loop(
         events: event_tx.clone(),
         outbox: Arc::clone(&outbox),
         osc52_read,
+        read_clipboard: system_clipboard_text,
         palette: crate::palette::Palette::dark(),
     };
     let mut proj = AlacrittyProjection::new(dims, listener);
@@ -508,7 +519,8 @@ mod tests {
         let l = EmberListener {
             events: tx,
             outbox: Arc::clone(&outbox),
-            osc52_read: false,
+            osc52_read: Arc::new(AtomicBool::new(false)),
+            read_clipboard: || panic!("the clipboard must not be read while reads are off"),
             palette: crate::palette::Palette::dark(),
         };
         l.send_event(AlacEvent::ClipboardLoad(
@@ -533,7 +545,8 @@ mod tests {
         let listener = EmberListener {
             events: tx,
             outbox: Arc::clone(&outbox),
-            osc52_read: false,
+            osc52_read: Arc::new(AtomicBool::new(false)),
+            read_clipboard: || panic!("the clipboard must not be read while reads are off"),
             palette: crate::palette::Palette::dark(),
         };
         let mut proj = AlacrittyProjection::new(GridDims::new(80, 24), listener);
@@ -542,6 +555,44 @@ mod tests {
         assert_eq!(
             got, "\x1b]52;c;\x07",
             "an OSC 52 read must reach the listener and get the empty reply, not silence"
+        );
+    }
+
+    /// The setting is live: flipping the shared gate changes the answer for a
+    /// pane that's already running, in both directions, and nothing is read
+    /// from the clipboard while it's off.
+    #[test]
+    fn osc52_read_gate_is_live_in_a_running_pane() {
+        let (tx, _rx) = mpsc::channel();
+        let outbox = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(AtomicBool::new(false));
+        let listener = EmberListener {
+            events: tx,
+            outbox: Arc::clone(&outbox),
+            osc52_read: Arc::clone(&gate),
+            read_clipboard: || "secret".to_string(),
+            palette: crate::palette::Palette::dark(),
+        };
+        let mut proj = AlacrittyProjection::new(GridDims::new(80, 24), listener);
+        let mut read = || {
+            outbox.lock().unwrap().clear();
+            proj.advance(b"\x1b]52;c;?\x07");
+            String::from_utf8(outbox.lock().unwrap().clone()).unwrap()
+        };
+
+        assert_eq!(read(), "\x1b]52;c;\x07", "off: an empty reply");
+        gate.store(true, Ordering::Relaxed);
+        // "secret" in base64, as the engine formats it.
+        assert_eq!(
+            read(),
+            "\x1b]52;c;c2VjcmV0\x07",
+            "on: the clipboard's contents"
+        );
+        gate.store(false, Ordering::Relaxed);
+        assert_eq!(
+            read(),
+            "\x1b]52;c;\x07",
+            "off again: empty, with no restart"
         );
     }
 

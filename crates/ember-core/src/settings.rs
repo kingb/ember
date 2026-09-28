@@ -301,6 +301,12 @@ fn fmt_option_as_meta(c: &Config) -> String {
 fn adjust_option_as_meta(c: &mut Config, _dir: f32) {
     c.option_as_meta = !c.option_as_meta;
 }
+fn fmt_osc52_read(c: &Config) -> String {
+    on_off(c.osc52_read)
+}
+fn adjust_osc52_read(c: &mut Config, _dir: f32) {
+    c.osc52_read = !c.osc52_read;
+}
 
 // --- Session restore ---------------------------------------------------------
 
@@ -467,6 +473,18 @@ pub fn setting_rows() -> &'static [SettingRow] {
             help: Help::Inline(
                 "macOS: Opt+key sends ESC key (readline/emacs Meta) instead of composing accented \
                  characters. Takes effect immediately.",
+            ),
+        },
+        SettingRow {
+            label: "Programs can read clipboard",
+            kind: RowKind::Toggle,
+            format: fmt_osc52_read,
+            adjust: Some(adjust_osc52_read),
+            help: Help::Inline(
+                "Lets programs ask for your clipboard's contents (OSC 52), so nvim or tmux over \
+                 SSH can paste from your local clipboard. Any program running in the terminal \
+                 can then read what you copied, so leave it off unless you need it. Off answers \
+                 with nothing. Takes effect immediately, in open panes too.",
             ),
         },
         SettingRow {
@@ -796,6 +814,21 @@ mod tests {
         (row("Option acts as Meta").adjust.unwrap())(&mut c, 1.0);
         assert_ne!(c.option_as_meta, before.option_as_meta);
         assert_eq!(c.shell_integration, before.shell_integration);
+    }
+
+    #[test]
+    fn clipboard_read_toggle_is_off_by_default_and_mutates_only_osc52_read() {
+        let mut c = Config::default();
+        assert!(!c.osc52_read, "reading the clipboard must stay opt-in");
+        assert_eq!(fmt_osc52_read(&c), on_off(false));
+        let before = c.clone();
+        (row("Programs can read clipboard").adjust.unwrap())(&mut c, 1.0);
+        assert!(c.osc52_read);
+        assert_eq!(fmt_osc52_read(&c), on_off(true));
+        assert_eq!(c.option_as_meta, before.option_as_meta);
+        assert_eq!(c.shell_integration, before.shell_integration);
+        (row("Programs can read clipboard").adjust.unwrap())(&mut c, 1.0);
+        assert!(!c.osc52_read, "the toggle turns it back off");
     }
 
     #[test]
