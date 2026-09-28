@@ -522,6 +522,29 @@ mod tests {
         );
     }
 
+    /// The same promise, through the real path: the read's escape bytes go into
+    /// the engine, not a synthetic event into the listener. The engine has its
+    /// own OSC 52 gate ahead of the listener, and its default drops reads, which
+    /// left the pane silent while the listener-only test above kept passing.
+    #[test]
+    fn osc52_read_through_the_engine_replies_empty() {
+        let (tx, _rx) = mpsc::channel();
+        let outbox = Arc::new(Mutex::new(Vec::new()));
+        let listener = EmberListener {
+            events: tx,
+            outbox: Arc::clone(&outbox),
+            osc52_read: false,
+            palette: crate::palette::Palette::dark(),
+        };
+        let mut proj = AlacrittyProjection::new(GridDims::new(80, 24), listener);
+        proj.advance(b"\x1b]52;c;?\x07");
+        let got = String::from_utf8(outbox.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            got, "\x1b]52;c;\x07",
+            "an OSC 52 read must reach the listener and get the empty reply, not silence"
+        );
+    }
+
     /// Reconstruct row 0's text from the frame lane until `needle` appears or we
     /// time out. Proves the full path: shell → PTY → engine → projection → lane.
     #[test]
