@@ -12,7 +12,7 @@ use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
+use alacritty_terminal::term::{Config, Osc52, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape as AlacCursorShape, Processor};
 use ember_core::{
     Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, MarkStatus,
@@ -129,7 +129,16 @@ enum Scanned {
 impl<L: EventListener> AlacrittyProjection<L> {
     pub fn new(dims: GridDims, listener: L) -> Self {
         let size = TermSize::new(dims.columns as usize, dims.screen_lines as usize);
-        let term = Term::new(Config::default(), &size, listener);
+        // The engine has its own OSC 52 gate ahead of the listener, and its
+        // default (`OnlyCopy`) drops reads there, so a read would get no reply
+        // at all. Let both through: the listener is the one gate on clipboard
+        // contents (`osc52_read`, off by default = an empty reply), which is
+        // what keeps a well-behaved program from hanging on its query.
+        let config = Config {
+            osc52: Osc52::CopyPaste,
+            ..Config::default()
+        };
+        let term = Term::new(config, &size, listener);
         Self {
             term,
             parser: Processor::new(),

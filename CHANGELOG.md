@@ -6,6 +6,16 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- OSC 52 clipboard reads now work as documented. Since 0.5.0, a program
+  asking for the clipboard's contents got no reply at all: the request was
+  dropped before Ember's own setting was consulted, so `osc52_read = true`
+  had no effect, and with it off a program waiting for an answer could hang.
+  Ember now answers every read: with the clipboard's contents when
+  `osc52_read = true`, and with an empty reply otherwise (still the default),
+  so nothing is shared unless you opt in.
+
 ## [0.6.1] - 2026-09-25
 
 ### Fixed
