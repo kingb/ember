@@ -39,7 +39,8 @@ pub struct Config {
     /// the clipboard's CONTENTS. A data-exfiltration surface (any program in
     /// the terminal can quietly read what you copied), so OFF by default -
     /// the request is answered with an empty payload. Copy direction (OSC 52
-    /// write) is always on. config.toml only.
+    /// write) is always on. Also the Settings toggle "Programs can read
+    /// clipboard" (Terminal section), which applies to open panes at once.
     pub osc52_read: bool,
     /// Which of the wisp's visual styles to draw — see [`WispStyleSelection`].
     /// Orthogonal to `wisp` (the on/off switch): this only matters while
@@ -365,6 +366,19 @@ mod tests {
         assert_eq!(c.background.scrim, 0.45);
         assert_eq!(c.background.image, None);
         assert_eq!(c.background.image_fit, "cover");
+    }
+
+    #[test]
+    fn osc52_read_survives_a_save_and_load() {
+        let c = Config {
+            osc52_read: true,
+            ..Config::default()
+        };
+        let back: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert!(back.osc52_read);
+        // An older config.toml without the key still loads with reads off.
+        let old: Config = toml::from_str("").unwrap();
+        assert!(!old.osc52_read);
     }
 
     #[test]
