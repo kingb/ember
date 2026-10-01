@@ -477,6 +477,9 @@ pub(crate) struct WindowState {
     /// IME composition in progress (preedit text); non-empty = composing,
     /// during which raw key events are suppressed (they belong to the IME).
     pub(crate) ime_preedit: String,
+    /// This window's view registered as an accessibility text area (macOS),
+    /// so dictation tools can insert into it; `None` elsewhere.
+    pub(crate) ax: Option<ember_platform::accessibility::AxTextArea>,
     /// Command palette (Cmd+Shift+P): open flag, query, selected row index
     /// (into the CURRENT filtered list).
     pub(crate) palette_open: bool,
@@ -853,6 +856,7 @@ impl WindowState {
             search_query: String::new(),
             search_count: None,
             ime_preedit: String::new(),
+            ax: None,
             palette_open: false,
             palette_query: String::new(),
             palette_sel: 0,
@@ -1579,6 +1583,21 @@ impl WindowState {
             .and_then(|id| shared.bracketed.get(&id).copied())
             .unwrap_or(false);
         self.send_to_focused(shared, bracket_paste(text, bracketed));
+    }
+
+    /// Publish the focused pane's screen text + cursor to the accessibility
+    /// text area, once a client has started reading it (no cost otherwise).
+    pub(crate) fn refresh_ax(&self) {
+        let Some(ax) = self.ax.as_ref().filter(|ax| ax.active()) else {
+            return;
+        };
+        let Some(grid) = self
+            .focused_session_id()
+            .and_then(|id| self.renderer.grid(&id))
+        else {
+            return;
+        };
+        ax.set_text(grid.screen_text(), grid.cursor.row, grid.cursor.col);
     }
 
     /// A file dropped from the OS (Finder / file manager) onto this window:

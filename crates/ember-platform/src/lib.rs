@@ -13,6 +13,7 @@
 //! Wayland-specific clipboard quirk) without threading a new `#[cfg]` through
 //! every call site in `ember-app`.
 
+pub mod accessibility;
 pub mod menu;
 pub use menu::{AppMenu, MenuAction, build_menu, menu_action};
 

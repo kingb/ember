@@ -1012,6 +1012,8 @@ impl ApplicationHandler<EmberEvent> for App {
 
             let mut win = WindowState::new(renderer, tree);
             win.px = px;
+            win.ax =
+                ember_platform::accessibility::AxTextArea::install(&window, shared.wake.clone());
             if !win.spawn_session(
                 &mut shared,
                 session,
@@ -1767,6 +1769,7 @@ impl ApplicationHandler<EmberEvent> for App {
                         win.render_ema_ms
                     )));
                 }
+                win.refresh_ax();
                 let t = Instant::now();
                 match win.renderer.render() {
                     // A drawable came through — the surface is ground truth, so
@@ -1805,6 +1808,25 @@ impl ApplicationHandler<EmberEvent> for App {
         let Some(shared) = self.shared.as_mut() else {
             return;
         };
+
+        // Accessibility clients (dictation tools) reading or writing a
+        // window's terminal view: an insert pastes into that window's focused
+        // pane, exactly like Cmd+V; a first read starts its text updates.
+        for req in ember_platform::accessibility::drain() {
+            use ember_platform::accessibility::AxRequest;
+            let (AxRequest::Insert { view, .. } | AxRequest::Refresh { view }) = &req;
+            let Some(w) = self
+                .windows
+                .values()
+                .find(|w| w.ax.as_ref().is_some_and(|ax| ax.view() == *view))
+            else {
+                continue;
+            };
+            match req {
+                AxRequest::Insert { text, .. } => w.paste_into_focused(shared, &text),
+                AxRequest::Refresh { .. } => w.refresh_ax(),
+            }
+        }
 
         // Poll every session's pixel lane, routing each one's deltas to the
         // window that actually owns it (`session_window`) — "drain only the
@@ -2870,6 +2892,7 @@ fn open_window(
 
     let mut win = WindowState::new(renderer, tree);
     win.px = px;
+    win.ax = ember_platform::accessibility::AxTextArea::install(&window, shared.wake.clone());
     win.sync_layout(shared);
     win.apply_appearance(shared);
     win.renderer.window().request_redraw();

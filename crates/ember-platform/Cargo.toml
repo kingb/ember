@@ -14,7 +14,7 @@ arboard.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder", "NSWorkspace"] }
-objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSProcessInfo"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSProcessInfo", "NSRange"] }
 # default features pull muda's Linux GTK backend (gtk3 → glib), which Ember
 # never uses — the menu is macOS-only (NSMenu via objc2); other platforms get
 # an inert stub. Dropping them keeps the vulnerable glib (RUSTSEC-2024-0429)
