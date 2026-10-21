@@ -6,6 +6,30 @@ follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-10-20
+
+### Fixed
+
+- macOS built-in Dictation and the emoji picker now insert text
+  ([#25](https://github.com/kingb/ember/issues/25)). Dictation used to refuse
+  to start in an Ember window, characters picked from the emoji picker were
+  dropped, and the key pressed right after a dictation, often Enter, was
+  swallowed.
+- Third-party dictation tools that type through the macOS Accessibility API,
+  such as Speechify, can now insert into Ember. The terminal now presents
+  itself to them as a text area instead of a bare window, and the text they
+  insert arrives in the focused pane as a paste.
+- Dictated, picked, or composed text now goes where typing goes: into an open
+  find bar, command palette, or tab rename, rather than the shell behind it.
+  Multi-line dictation is sent as a paste, so a shell with bracketed paste
+  doesn't run it line by line.
+- The in-progress composition box now fits its text. Latin text from
+  Dictation or dead keys used to get a box about twice as wide, and long text
+  could wrap out from under it. The input method's candidate window now opens
+  at the cursor from the first keystroke.
+- A composition interrupted by switching input sources or leaving the window
+  no longer leaves Ember ignoring every key.
+
 ## [0.6.1] - 2026-09-25
 
 ### Fixed
@@ -363,7 +387,8 @@ this first release:
   created owner-only, use no fixed or predictable paths, and return
   JSON-encoded errors rather than leaking internal state.
 
-[Unreleased]: https://github.com/kingb/ember/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/kingb/ember/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/kingb/ember/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/kingb/ember/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/kingb/ember/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/kingb/ember/compare/v0.4.2...v0.5.0
