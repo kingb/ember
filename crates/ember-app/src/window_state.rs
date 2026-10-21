@@ -3991,6 +3991,11 @@ impl WindowState {
         // Draw the composition where its text will land: inside an open text
         // field (search, palette, tab rename) rather than at the shell cursor
         // behind it, and not at all behind a modal that will drop it.
+        // Behind a modal that will drop the commit, don't hold the composition
+        // at all: a non-empty `ime_preedit` suppresses raw keys.
+        if self.settings_open || self.restore_prompt.is_some() || self.pending_close.is_some() {
+            self.ime_preedit.clear();
+        }
         let at_cursor = !(self.search_open
             || self.palette_open
             || self.editing_tab.is_some()
@@ -5057,6 +5062,127 @@ impl WindowState {
             .min(self.tree.tabs.len() - 1);
         self.sync_layout(shared);
         false
+    }
+}
+
+/// Where IME-committed text goes. It mirrors where a keystroke would go, since
+/// the emoji picker and Dictation commit with no key press behind them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitTarget {
+    /// A modal that only takes navigation keys (settings, restore, close
+    /// confirm, a surface drag): drop the text.
+    Drop,
+    Palette,
+    Search,
+    Rename,
+    /// No overlay: the focused pane's PTY.
+    Terminal,
+}
+
+/// Commit routing, in the same precedence as keystroke routing.
+pub(crate) fn commit_target(
+    settings: bool,
+    palette: bool,
+    search: bool,
+    rename: bool,
+    blocking_modal: bool,
+) -> CommitTarget {
+    if settings {
+        CommitTarget::Drop
+    } else if palette {
+        CommitTarget::Palette
+    } else if search {
+        CommitTarget::Search
+    } else if rename {
+        CommitTarget::Rename
+    } else if blocking_modal {
+        CommitTarget::Drop
+    } else {
+        CommitTarget::Terminal
+    }
+}
+
+/// Committed text as keystrokes for a single-line text field: one
+/// `Key::Character` per char, control characters (a dictated "new line")
+/// dropped so they can't act as Enter or edit keys.
+pub(crate) fn commit_as_field_keys(text: &str) -> Vec<Key> {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .map(|c| Key::Character(c.to_string().into()))
+        .collect()
+}
+
+#[cfg(test)]
+mod commit_routing_tests {
+    use super::{CommitTarget, commit_as_field_keys, commit_target};
+    use winit::keyboard::Key;
+
+    #[test]
+    fn plain_commit_goes_to_the_terminal() {
+        assert_eq!(
+            commit_target(false, false, false, false, false),
+            CommitTarget::Terminal
+        );
+    }
+
+    #[test]
+    fn open_text_fields_take_the_commit() {
+        assert_eq!(
+            commit_target(false, true, false, false, false),
+            CommitTarget::Palette
+        );
+        assert_eq!(
+            commit_target(false, false, true, false, false),
+            CommitTarget::Search
+        );
+        assert_eq!(
+            commit_target(false, false, false, true, false),
+            CommitTarget::Rename
+        );
+    }
+
+    #[test]
+    fn navigation_only_modals_drop_the_commit() {
+        assert_eq!(
+            commit_target(true, false, false, false, false),
+            CommitTarget::Drop
+        );
+        assert_eq!(
+            commit_target(false, false, false, false, true),
+            CommitTarget::Drop
+        );
+    }
+
+    #[test]
+    fn precedence_matches_keystroke_routing() {
+        // Settings sits over everything; the palette beats search.
+        assert_eq!(
+            commit_target(true, true, true, true, true),
+            CommitTarget::Drop
+        );
+        assert_eq!(
+            commit_target(false, true, true, false, false),
+            CommitTarget::Palette
+        );
+        // A text field still takes the commit over a blocking modal flag.
+        assert_eq!(
+            commit_target(false, false, true, false, true),
+            CommitTarget::Search
+        );
+    }
+
+    #[test]
+    fn field_keys_drop_control_characters() {
+        let keys = commit_as_field_keys("ab\ncd\r");
+        let text: String = keys
+            .iter()
+            .map(|k| match k {
+                Key::Character(c) => c.to_string(),
+                other => panic!("unexpected key {other:?}"),
+            })
+            .collect();
+        assert_eq!(text, "abcd");
+        assert_eq!(commit_as_field_keys("日本").len(), 2);
     }
 }
 
