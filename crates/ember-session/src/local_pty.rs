@@ -57,6 +57,78 @@ impl LocalPtyConfig {
     }
 }
 
+/// The outer terminal's identity: set by whatever terminal or multiplexer
+/// Ember itself was launched from, and wrong for a child whose terminal is
+/// Ember. A program that believes it runs in tmux wraps escapes for tmux
+/// passthrough; one that believes it runs in iTerm uses features Ember lacks.
+/// Removed from every child's environment at spawn. Launched from Finder or
+/// the Dock none of these are set; launched from a terminal, all could be.
+///
+/// Kept byte-identical with the session daemon's list of the same name, so a
+/// remote pane's program sees the same terminal as a local pane's.
+pub(crate) const OUTER_TERMINAL_IDENTITY: &[&str] = &[
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "TERM_PROGRAM_VERSION",
+    "TERM_SESSION_ID",
+    "TERM_FEATURES",
+    "ITERM_SESSION_ID",
+    "ITERM_PROFILE",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "TERMINFO",
+    "TERMINFO_DIRS",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "KITTY_INSTALLATION_DIR",
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "ALACRITTY_WINDOW_ID",
+    "ALACRITTY_SOCKET",
+    "ALACRITTY_LOG",
+    "GHOSTTY_RESOURCES_DIR",
+    "GHOSTTY_BIN_DIR",
+    "VTE_VERSION",
+    "WINDOWID",
+    "WT_SESSION",
+    "KONSOLE_VERSION",
+    "KONSOLE_DBUS_SESSION",
+];
+
+/// A launching Claude Code session's markers. Ember started from inside a
+/// Claude session inherits them, and a child must not: it would carry that
+/// session's identity and credentials. An explicit list, not a CLAUDE_*
+/// prefix, because other CLAUDE_* variables are deliberate configuration
+/// (CLAUDE_CONFIG_DIR, provider switches) and must still reach the child.
+/// Byte-identical with the session daemon's list of the same name.
+pub(crate) const CLAUDE_SESSION_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_PID",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+];
+
+/// Give a child Ember's terminal identity: drop the outer terminal's and any
+/// Claude session's markers, then set Ember's own. Removal comes first because
+/// the outer list includes TERM_PROGRAM_VERSION, which Ember then sets itself.
+fn apply_terminal_identity(cmd: &mut CommandBuilder) {
+    for name in OUTER_TERMINAL_IDENTITY.iter().chain(CLAUDE_SESSION_MARKERS) {
+        cmd.env_remove(name);
+    }
+    cmd.env("TERM", "xterm-256color");
+    // Advertise truecolor + identify ourselves (standard TERM_PROGRAM
+    // protocol); without COLORTERM, capable apps downgrade to 256 colors.
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERM_PROGRAM", "ember");
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+}
+
 /// The v1 local-PTY backend.
 #[derive(Debug)]
 pub struct LocalPty;
@@ -115,12 +187,7 @@ impl SessionBackend for LocalPty {
         for a in args {
             cmd.arg(a);
         }
-        cmd.env("TERM", "xterm-256color");
-        // Advertise truecolor + identify ourselves (standard TERM_PROGRAM
-        // protocol); without COLORTERM, capable apps downgrade to 256 colors.
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "ember");
-        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        apply_terminal_identity(&mut cmd);
         match cwd {
             Some(dir) => cmd.cwd(dir),
             None => {
@@ -498,6 +565,58 @@ mod tests {
     use ember_core::CellContent;
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
+
+    /// A child sees Ember's terminal identity and none of the outer
+    /// terminal's, nor a launching Claude session's markers, while the user's
+    /// own configuration (including other CLAUDE_* settings) passes through.
+    #[test]
+    fn child_gets_embers_identity_and_not_the_outer_terminals() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        let inherited = [
+            ("TMUX", "/tmp/tmux-501/default,1,0"),
+            ("TMUX_PANE", "%3"),
+            ("TERM_SESSION_ID", "w0t0p0:abc"),
+            ("TERM_FEATURES", "T3LrMSc7UUw9Ts3BFGsSyHNoSxF"),
+            ("ITERM_SESSION_ID", "w0t0p0:abc"),
+            ("LC_TERMINAL", "iTerm2"),
+            ("TERMINFO", "/Applications/Ghostty.app/terminfo"),
+            ("KITTY_WINDOW_ID", "1"),
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_PROGRAM_VERSION", "3.6"),
+            ("TERM", "xterm-ghostty"),
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_SESSION_ID", "outer-session"),
+            ("CLAUDE_CODE_MESSAGING_TOKEN", "secret"),
+            // Deliberate user configuration: must reach the child.
+            ("CLAUDE_CONFIG_DIR", "/opt/claude-work"),
+            ("LANG", "en_US.UTF-8"),
+        ];
+        for (k, v) in inherited {
+            cmd.env(k, v);
+        }
+        apply_terminal_identity(&mut cmd);
+
+        let get = |k: &str| cmd.get_env(k).map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(get("TERM").as_deref(), Some("xterm-256color"));
+        assert_eq!(get("COLORTERM").as_deref(), Some("truecolor"));
+        assert_eq!(get("TERM_PROGRAM").as_deref(), Some("ember"));
+        assert_eq!(
+            get("TERM_PROGRAM_VERSION").as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        for gone in OUTER_TERMINAL_IDENTITY
+            .iter()
+            .chain(CLAUDE_SESSION_MARKERS)
+            .filter(|v| **v != "TERM_PROGRAM_VERSION")
+        {
+            assert_eq!(get(gone), None, "{gone} must not reach the child");
+        }
+        assert_eq!(
+            get("CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/opt/claude-work")
+        );
+        assert_eq!(get("LANG").as_deref(), Some("en_US.UTF-8"));
+    }
 
     #[test]
     fn osc52_read_gated_off_replies_empty() {
