@@ -1532,7 +1532,7 @@ impl WindowState {
                 let editing = editing_tab == Some(i);
                 TabLabel {
                     title: if editing {
-                        self.edit_buffer.clone()
+                        format!("{}{}", self.edit_buffer, self.ime_preedit)
                     } else {
                         tab_display_title(&t.title, i)
                     },
@@ -3988,8 +3988,23 @@ impl WindowState {
     /// cursor, and position the OS candidate window there.
     pub(crate) fn set_ime_preedit(&mut self, text: String) {
         self.ime_preedit = text.clone();
+        // Draw the composition where its text will land: inside an open text
+        // field (search, palette, tab rename) rather than at the shell cursor
+        // behind it, and not at all behind a modal that will drop it.
+        let at_cursor = !(self.search_open
+            || self.palette_open
+            || self.editing_tab.is_some()
+            || self.settings_open
+            || self.restore_prompt.is_some()
+            || self.pending_close.is_some());
         self.renderer
-            .set_ime_preedit((!text.is_empty()).then_some(text));
+            .set_ime_preedit((!text.is_empty() && at_cursor).then_some(text));
+        if self.search_open {
+            self.refresh_search_bar();
+        }
+        if self.palette_open {
+            self.refresh_palette();
+        }
         self.sync_ime_cursor_area();
     }
 
@@ -4010,7 +4025,10 @@ impl WindowState {
         let (cw, ch) = self.renderer.cell_metrics();
         let cur = grid.cursor;
         let x = rect.x as f32 + cur.col as f32 * cw;
-        let y = rect.y as f32 + (cur.row + 1) as f32 * ch;
+        // The cursor's own cell: the OS opens the candidate window and the
+        // Dictation popup just below this area, so the row below would put
+        // them a row too low.
+        let y = rect.y as f32 + cur.row as f32 * ch;
         let area = (x, y, cw, ch);
         if self.ime_cursor_area == Some(area) {
             return;
@@ -4027,7 +4045,12 @@ impl WindowState {
     pub(crate) fn ime_commit(&mut self, shared: &Shared, text: &str) {
         self.ime_preedit.clear();
         self.renderer.set_ime_preedit(None);
-        if !text.is_empty() {
+        if text.contains(['\n', '\r']) {
+            // Multi-line text (Dictation's "new line", a system text service)
+            // goes in as a paste, so a bracketed-paste shell doesn't run it
+            // line by line.
+            self.paste_into_focused(shared, text);
+        } else if !text.is_empty() {
             self.send_to_focused(shared, text.as_bytes().to_vec());
         }
     }
@@ -4081,8 +4104,11 @@ impl WindowState {
     fn refresh_palette(&mut self) {
         let rows = self.palette_rows();
         self.palette_sel = self.palette_sel.min(rows.len().saturating_sub(1));
-        self.renderer
-            .set_palette(Some((self.palette_query.clone(), rows, self.palette_sel)));
+        self.renderer.set_palette(Some((
+            format!("{}{}", self.palette_query, self.ime_preedit),
+            rows,
+            self.palette_sel,
+        )));
     }
 
     /// One keystroke routed to the open palette. Returns `Some(chord)` when
@@ -4180,8 +4206,11 @@ impl WindowState {
     }
 
     fn refresh_search_bar(&mut self) {
-        let line = if self.search_query.is_empty() {
+        let line = if self.search_query.is_empty() && self.ime_preedit.is_empty() {
             "find: type to search".to_string()
+        } else if !self.ime_preedit.is_empty() {
+            // Mid-composition: show the in-progress text after the query.
+            format!("find: {}{}\u{2038}", self.search_query, self.ime_preedit)
         } else {
             let count = match self.search_count {
                 Some((_, 0)) => "  no matches".to_string(),

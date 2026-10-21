@@ -1127,6 +1127,10 @@ impl ApplicationHandler<EmberEvent> for App {
                     win.occluded = false;
                     win.renderer.surface_revealed();
                     win.renderer.window().request_redraw();
+                } else if !win.ime_preedit.is_empty() {
+                    // Focus left mid-composition: drop it rather than leave a
+                    // stuck composition that swallows keys on return.
+                    win.set_ime_preedit(String::new());
                 }
             }
             WindowEvent::Occluded(occluded) => {
@@ -1382,9 +1386,55 @@ impl ApplicationHandler<EmberEvent> for App {
                 }
             }
             WindowEvent::Ime(ime) => match ime {
-                winit::event::Ime::Preedit(text, _) => win.set_ime_preedit(text),
-                winit::event::Ime::Commit(text) => win.ime_commit(shared, &text),
-                winit::event::Ime::Enabled | winit::event::Ime::Disabled => {}
+                winit::event::Ime::Preedit(text, _) => {
+                    win.set_ime_preedit(text);
+                    if win.editing_tab.is_some() {
+                        // The tab label shows the composition inline.
+                        win.sync_layout(shared);
+                    }
+                }
+                // Committed text goes where typing would go. The emoji picker
+                // and Dictation commit with no key press, so without this an
+                // open search bar or modal would let it reach the shell behind.
+                // Text fields take it as typed characters; modals that only take
+                // navigation keys drop it.
+                winit::event::Ime::Commit(text) => {
+                    let typed = |text: &str| -> Vec<Key> {
+                        text.chars()
+                            .map(|c| Key::Character(SmolStr::new(c.to_string())))
+                            .collect()
+                    };
+                    if win.settings_open {
+                        win.set_ime_preedit(String::new());
+                    } else if win.palette_open {
+                        win.set_ime_preedit(String::new());
+                        for key in typed(&text) {
+                            let _ = win.palette_key(&key);
+                        }
+                    } else if win.search_open {
+                        win.set_ime_preedit(String::new());
+                        for key in typed(&text) {
+                            win.search_key(shared, &key);
+                        }
+                    } else if win.editing_tab.is_some() {
+                        win.set_ime_preedit(String::new());
+                        for key in typed(&text) {
+                            win.rename_key(shared, &key);
+                        }
+                    } else if win.restore_prompt.is_some()
+                        || win.pending_close.is_some()
+                        || shared.drag.is_some()
+                    {
+                        win.set_ime_preedit(String::new());
+                    } else {
+                        win.ime_commit(shared, &text);
+                    }
+                }
+                // IME switched off (or the input source changed) mid-composition
+                // with no final commit: drop the composition, or it would keep
+                // swallowing every key.
+                winit::event::Ime::Disabled => win.set_ime_preedit(String::new()),
+                winit::event::Ime::Enabled => {}
             },
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state != ElementState::Pressed {

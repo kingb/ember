@@ -1606,18 +1606,11 @@ pub(crate) fn build_ime_preedit(
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
 ) -> (f32, f32) {
-    // Size to the text's terminal cell width: CJK is two cells, Latin one (an
-    // all-double guess doubles the box under dictated or dead-key text).
-    let cols = unicode_width::UnicodeWidthStr::width(text);
-    let w = (cols as f32 * cw).max(cw).min(logical_w);
-    let x = x.min((logical_w - w).max(0.0));
-    out.push((
-        scaled(x, y, w, ch, sf),
-        lin_rgba(Rgb::new(30, 20, 14), 0.95),
-    ));
-    // Accent composition underline.
-    out.push((scaled(x, y + ch - 2.0, w, 2.0, sf), lin_rgba(ACCENT, 0.95)));
-    buf.set_size(font_system, Some(w), Some(ch));
+    // One line, never wrapped: the backdrop and underline are one row tall, so
+    // a wrapped tail would draw over the pane with no backdrop. Text wider than
+    // the window is clipped at its edge instead.
+    buf.set_wrap(font_system, glyphon::Wrap::None);
+    buf.set_size(font_system, None, Some(ch));
     buf.set_text(
         font_system,
         text,
@@ -1628,7 +1621,26 @@ pub(crate) fn build_ime_preedit(
         None,
     );
     buf.shape_until_scroll(font_system, false);
+    // Cover the shaped run too: the overlay's font size is fixed, so at small
+    // cell sizes (or with a wide fallback glyph) the text can outrun the cells.
+    let shaped_w = buf.layout_runs().map(|run| run.line_w).fold(0.0, f32::max);
+    let w = preedit_box_w(text, cw, logical_w).max(shaped_w.min(logical_w));
+    let x = x.min((logical_w - w).max(0.0));
+    buf.set_size(font_system, Some(w), Some(ch));
+    out.push((
+        scaled(x, y, w, ch, sf),
+        lin_rgba(Rgb::new(30, 20, 14), 0.95),
+    ));
+    // Accent composition underline.
+    out.push((scaled(x, y + ch - 2.0, w, 2.0, sf), lin_rgba(ACCENT, 0.95)));
     (x, y)
+}
+
+/// Width of the composition overlay in cells: the text's terminal display
+/// width (CJK two cells, Latin one), at least one cell, at most the window.
+pub(crate) fn preedit_box_w(text: &str, cw: f32, logical_w: f32) -> f32 {
+    let cols = unicode_width::UnicodeWidthStr::width(text);
+    (cols as f32 * cw).max(cw).min(logical_w)
 }
 
 /// Build the command palette: a centered panel with the query line on top
@@ -2332,13 +2344,7 @@ mod tests {
     // --- IME preedit overlay: sized to the text's cell width ---
 
     fn preedit_box_width(text: &str, logical_w: f32) -> f32 {
-        let mut fs = super::new_font_system();
-        let mut buf = super::Buffer::new(&mut fs, super::Metrics::new(14.0, 17.0));
-        let mut out = Vec::new();
-        super::build_ime_preedit(
-            &mut fs, &mut buf, text, 0.0, 0.0, 8.0, 17.0, logical_w, 1.0, &mut out,
-        );
-        out[0].0[2] // the backdrop quad's width (sf = 1, so logical == physical)
+        super::preedit_box_w(text, 8.0, logical_w)
     }
 
     #[test]
