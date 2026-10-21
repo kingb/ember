@@ -1399,35 +1399,36 @@ impl ApplicationHandler<EmberEvent> for App {
                 // Text fields take it as typed characters; modals that only take
                 // navigation keys drop it.
                 winit::event::Ime::Commit(text) => {
-                    let typed = |text: &str| -> Vec<Key> {
-                        text.chars()
-                            .map(|c| Key::Character(SmolStr::new(c.to_string())))
-                            .collect()
-                    };
-                    if win.settings_open {
+                    let target = window_state::commit_target(
+                        win.settings_open,
+                        win.palette_open,
+                        win.search_open,
+                        win.editing_tab.is_some(),
+                        win.restore_prompt.is_some()
+                            || win.pending_close.is_some()
+                            || shared.drag.is_some(),
+                    );
+                    if target != window_state::CommitTarget::Terminal {
                         win.set_ime_preedit(String::new());
-                    } else if win.palette_open {
-                        win.set_ime_preedit(String::new());
-                        for key in typed(&text) {
-                            let _ = win.palette_key(&key);
+                    }
+                    match target {
+                        window_state::CommitTarget::Terminal => win.ime_commit(shared, &text),
+                        window_state::CommitTarget::Drop => {}
+                        window_state::CommitTarget::Palette => {
+                            for key in window_state::commit_as_field_keys(&text) {
+                                let _ = win.palette_key(&key);
+                            }
                         }
-                    } else if win.search_open {
-                        win.set_ime_preedit(String::new());
-                        for key in typed(&text) {
-                            win.search_key(shared, &key);
+                        window_state::CommitTarget::Search => {
+                            for key in window_state::commit_as_field_keys(&text) {
+                                win.search_key(shared, &key);
+                            }
                         }
-                    } else if win.editing_tab.is_some() {
-                        win.set_ime_preedit(String::new());
-                        for key in typed(&text) {
-                            win.rename_key(shared, &key);
+                        window_state::CommitTarget::Rename => {
+                            for key in window_state::commit_as_field_keys(&text) {
+                                win.rename_key(shared, &key);
+                            }
                         }
-                    } else if win.restore_prompt.is_some()
-                        || win.pending_close.is_some()
-                        || shared.drag.is_some()
-                    {
-                        win.set_ime_preedit(String::new());
-                    } else {
-                        win.ime_commit(shared, &text);
                     }
                 }
                 // IME switched off (or the input source changed) mid-composition
