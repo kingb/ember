@@ -12,7 +12,13 @@ members = [
 version = "0.6.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-authors = ["Brandon W. King", "Claude Opus 4.8"]
+authors = [
+    "Brandon W. King",
+    "Claude Opus 4.8",
+    "Claude Opus 5.5",
+    "Claude Fable 5.0",
+    "Claude Fable 5.1",
+]
 
 [workspace.dependencies]
 ember-core = { path = "crates/ember-core" }
