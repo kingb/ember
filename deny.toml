@@ -41,3 +41,7 @@ multiple-versions = "allow"
 # DB and can fail CI when a *new* advisory lands upstream. Kept out of the license
 # gate; wire `cargo deny check advisories` into a separate (non-blocking) job later.
 yanked = "warn"
+
+[sources]
+# The winit fork pinned in Cargo.toml's [patch.crates-io] (pending rust-windowing/winit#4784).
+allow-git = ["https://github.com/kingb/winit"]
