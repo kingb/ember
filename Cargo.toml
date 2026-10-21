@@ -42,3 +42,9 @@ unsafe_code = "warn"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# macOS: deliver Character Viewer (emoji picker) and Dictation text, and keep the
+# key after a commit. The v0.30.x backport of rust-windowing/winit#4784; drop this
+# once a winit release includes the fix.
+[patch.crates-io]
+winit = { git = "https://github.com/kingb/winit", rev = "f8d6ce3085399d0e5ab86fe173a64d914259e999" }
