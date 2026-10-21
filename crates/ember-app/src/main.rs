@@ -1770,6 +1770,7 @@ impl ApplicationHandler<EmberEvent> for App {
                     )));
                 }
                 win.refresh_ax();
+                win.sync_ime_cursor_area();
                 let t = Instant::now();
                 match win.renderer.render() {
                     // A drawable came through — the surface is ground truth, so
