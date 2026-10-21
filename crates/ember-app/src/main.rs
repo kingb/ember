@@ -4901,7 +4901,7 @@ fn about_info() -> ember_render::AboutInfo {
             "MIT OR Apache-2.0".to_string(),
             "Brandon W. King".to_string(),
             "Claude Opus 4.8 · 5.0 · 5.5".to_string(),
-            "Claude Fable 5.0 · 5.1".to_string(),
+            "Claude Fable 5.0".to_string(),
             String::new(),
             "emberterm.com".to_string(),
         ],
