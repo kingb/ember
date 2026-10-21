@@ -477,6 +477,8 @@ pub(crate) struct WindowState {
     /// IME composition in progress (preedit text); non-empty = composing,
     /// during which raw key events are suppressed (they belong to the IME).
     pub(crate) ime_preedit: String,
+    /// Last area handed to `set_ime_cursor_area` (x, y, w, h), to skip no-op calls.
+    pub(crate) ime_cursor_area: Option<(f32, f32, f32, f32)>,
     /// This window's view registered as an accessibility text area (macOS),
     /// so dictation tools can insert into it; `None` elsewhere.
     pub(crate) ax: Option<ember_platform::accessibility::AxTextArea>,
@@ -856,6 +858,7 @@ impl WindowState {
             search_query: String::new(),
             search_count: None,
             ime_preedit: String::new(),
+            ime_cursor_area: None,
             ax: None,
             palette_open: false,
             palette_query: String::new(),
@@ -3987,21 +3990,36 @@ impl WindowState {
         self.ime_preedit = text.clone();
         self.renderer
             .set_ime_preedit((!text.is_empty()).then_some(text));
-        // Put the IME candidate window at the focused pane's cursor.
-        if let Some(sid) = self.focused_session_id() {
-            if let Some((_, rect)) = self.pane_rects.iter().find(|(s, _)| *s == sid) {
-                if let Some(grid) = self.renderer.grid(&sid) {
-                    let (cw, ch) = self.renderer.cell_metrics();
-                    let cur = grid.cursor;
-                    let x = rect.x as f32 + cur.col as f32 * cw;
-                    let y = rect.y as f32 + (cur.row + 1) as f32 * ch;
-                    self.renderer.window().set_ime_cursor_area(
-                        winit::dpi::LogicalPosition::new(x, y),
-                        winit::dpi::LogicalSize::new(cw, ch),
-                    );
-                }
-            }
+        self.sync_ime_cursor_area();
+    }
+
+    /// Keep the OS text-input cursor area on the focused pane's cursor. macOS
+    /// places the IME candidate window and the Dictation popup there, and
+    /// Dictation asks before any composition exists, so this runs every frame
+    /// (it only reaches the OS when the area actually moves).
+    pub(crate) fn sync_ime_cursor_area(&mut self) {
+        let Some(sid) = self.focused_session_id() else {
+            return;
+        };
+        let Some((_, rect)) = self.pane_rects.iter().find(|(s, _)| *s == sid) else {
+            return;
+        };
+        let Some(grid) = self.renderer.grid(&sid) else {
+            return;
+        };
+        let (cw, ch) = self.renderer.cell_metrics();
+        let cur = grid.cursor;
+        let x = rect.x as f32 + cur.col as f32 * cw;
+        let y = rect.y as f32 + (cur.row + 1) as f32 * ch;
+        let area = (x, y, cw, ch);
+        if self.ime_cursor_area == Some(area) {
+            return;
         }
+        self.ime_cursor_area = Some(area);
+        self.renderer.window().set_ime_cursor_area(
+            winit::dpi::LogicalPosition::new(x, y),
+            winit::dpi::LogicalSize::new(cw, ch),
+        );
     }
 
     /// IME commit: the composition is final — clear the overlay and send the

@@ -1606,7 +1606,10 @@ pub(crate) fn build_ime_preedit(
     sf: f32,
     out: &mut Vec<([f32; 4], [f32; 4])>,
 ) -> (f32, f32) {
-    let w = (text.chars().count() as f32 * cw * 2.0).max(cw); // CJK cells are wide
+    // Size to the text's terminal cell width: CJK is two cells, Latin one (an
+    // all-double guess doubles the box under dictated or dead-key text).
+    let cols = unicode_width::UnicodeWidthStr::width(text);
+    let w = (cols as f32 * cw).max(cw).min(logical_w);
     let x = x.min((logical_w - w).max(0.0));
     out.push((
         scaled(x, y, w, ch, sf),
@@ -2324,6 +2327,35 @@ mod tests {
         let out = center("漢字漢字", 5);
         assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
         assert!(out.ends_with('…'));
+    }
+
+    // --- IME preedit overlay: sized to the text's cell width ---
+
+    fn preedit_box_width(text: &str, logical_w: f32) -> f32 {
+        let mut fs = super::new_font_system();
+        let mut buf = super::Buffer::new(&mut fs, super::Metrics::new(14.0, 17.0));
+        let mut out = Vec::new();
+        super::build_ime_preedit(
+            &mut fs, &mut buf, text, 0.0, 0.0, 8.0, 17.0, logical_w, 1.0, &mut out,
+        );
+        out[0].0[2] // the backdrop quad's width (sf = 1, so logical == physical)
+    }
+
+    #[test]
+    fn preedit_box_is_one_cell_per_latin_char() {
+        // Dictation streams plain text through the preedit; it must not get a
+        // double-width box and underline.
+        assert_eq!(preedit_box_width("hello there", 1000.0), 11.0 * 8.0);
+    }
+
+    #[test]
+    fn preedit_box_is_two_cells_per_cjk_char() {
+        assert_eq!(preedit_box_width("日本語", 1000.0), 6.0 * 8.0);
+    }
+
+    #[test]
+    fn preedit_box_never_exceeds_the_window() {
+        assert_eq!(preedit_box_width(&"x".repeat(500), 300.0), 300.0);
     }
 
     // --- TabsCache: skip tab-strip re-shaping when nothing changed ---
