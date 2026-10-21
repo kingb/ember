@@ -18,6 +18,7 @@ authors = [
     "Claude Opus 5.0",
     "Claude Opus 5.5",
     "Claude Fable 5.0",
+    "Claude Fable 5.1",
 ]
 
 [workspace.dependencies]
