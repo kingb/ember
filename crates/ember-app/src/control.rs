@@ -40,6 +40,37 @@ pub enum PromotePaneTarget {
     Window,
 }
 
+/// Which tab a `place-tab` request moves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TabSelector {
+    /// The target window's active tab.
+    Active,
+    /// A 1-based position, as `state` reports it.
+    Index(usize),
+    /// A title query: must identify one tab (see `resolve_tab_reorder`).
+    Title(String),
+}
+
+/// Where a `place-tab` request puts the tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TabDestination {
+    /// The tab's final 1-based position.
+    Index(usize),
+    /// Immediately before the tab this title query identifies.
+    Before(String),
+    /// Immediately after the tab this title query identifies.
+    After(String),
+}
+
+/// A validated `place-tab` request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabPlacement {
+    /// 1-based window number; `None` is the focused window.
+    pub window: Option<usize>,
+    pub tab: TabSelector,
+    pub dest: TabDestination,
+}
+
 /// A command forwarded from the control socket to the event loop.
 pub enum ControlMsg {
     /// Type raw text into the focused session (newlines included).
@@ -98,6 +129,10 @@ pub enum ControlMsg {
     Bell(Option<usize>),
     /// Move the tab at index `from` to index `to` (drag-reorder, for tests).
     ReorderTab(usize, usize),
+    /// Move a tab within its window, keeping its panes and processes. Reply is
+    /// the full JSON response line: `{"ok":true,"index":..,"title":..,"window":..}`
+    /// (both 1-based) or `{"ok":false,"error":..,"titles":[..]}`.
+    PlaceTab(TabPlacement, Sender<String>),
     /// Set tab `i`'s title to the given name (rename, for tests).
     RenameTab(usize, String),
     /// Begin inline rename of tab `i` (to screenshot the edit caret).
@@ -167,7 +202,9 @@ mod unix {
     use ember_core::ScrollAmount;
     use serde_json::Value;
 
-    use super::{ControlMsg, MoveTabTarget, PromotePaneTarget};
+    use super::{
+        ControlMsg, MoveTabTarget, PromotePaneTarget, TabDestination, TabPlacement, TabSelector,
+    };
 
     /// Directory holding per-instance sockets: `$TMPDIR/ember-ctl/`.
     pub fn socket_dir() -> PathBuf {
@@ -536,6 +573,21 @@ mod unix {
                 let _ = tx.send(ControlMsg::ReorderTab(g("from"), g("to")));
                 ok()
             }
+            "place-tab" => {
+                let placement = match parse_place_tab(&v) {
+                    Ok(p) => p,
+                    Err(e) => return err(&e),
+                };
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if tx.send(ControlMsg::PlaceTab(placement, reply_tx)).is_err() {
+                    return err("event loop gone");
+                }
+                waker(); // wake BEFORE waiting — see dispatch docs
+                match reply_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(resp) => resp,
+                    Err(_) => err("place-tab timeout"),
+                }
+            }
             "rename-tab" => {
                 let i = v.get("i").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
@@ -845,6 +897,47 @@ mod unix {
     /// `--cancel`/`--paced` flags) plus the optional flags. A pure function
     /// (no socket I/O) so the parsing itself is unit-testable independent of
     /// a running instance.
+    /// Validate a `place-tab` request: an optional `window`, at most one of
+    /// `tab`/`title`, and exactly one of `to`/`before`/`after`. Positions are
+    /// 1-based, matching `state`.
+    fn parse_place_tab(v: &Value) -> Result<TabPlacement, String> {
+        fn position(v: &Value, key: &str) -> Result<Option<usize>, String> {
+            match v.get(key) {
+                None => Ok(None),
+                Some(n) => match n.as_u64() {
+                    Some(n) if n >= 1 => Ok(Some(n as usize)),
+                    _ => Err(format!("place-tab: {key} must be a 1-based integer")),
+                },
+            }
+        }
+        fn query(v: &Value, key: &str) -> Result<Option<String>, String> {
+            match v.get(key) {
+                None => Ok(None),
+                Some(q) => match q.as_str() {
+                    Some(q) if !q.is_empty() => Ok(Some(q.to_string())),
+                    _ => Err(format!("place-tab: {key} must be a non-empty string")),
+                },
+            }
+        }
+        let tab = match (position(v, "tab")?, query(v, "title")?) {
+            (Some(_), Some(_)) => return Err("place-tab: give tab or title, not both".to_string()),
+            (Some(n), None) => TabSelector::Index(n),
+            (None, Some(q)) => TabSelector::Title(q),
+            (None, None) => TabSelector::Active,
+        };
+        let dest = match (position(v, "to")?, query(v, "before")?, query(v, "after")?) {
+            (Some(n), None, None) => TabDestination::Index(n),
+            (None, Some(q), None) => TabDestination::Before(q),
+            (None, None, Some(q)) => TabDestination::After(q),
+            _ => return Err("place-tab: give exactly one of to, before, after".to_string()),
+        };
+        Ok(TabPlacement {
+            window: position(v, "window")?,
+            tab,
+            dest,
+        })
+    }
+
     fn parse_drag_args(args: &[String]) -> Result<Value, String> {
         let mut positional: Vec<f64> = Vec::new();
         let mut steps: u64 = 8;
@@ -901,7 +994,48 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
-        use super::parse_drag_args;
+        use super::{TabDestination, TabSelector, parse_drag_args, parse_place_tab};
+        use serde_json::json;
+
+        #[test]
+        fn place_tab_defaults_to_the_active_tab_in_the_focused_window() {
+            let p = parse_place_tab(&json!({"to": 2})).unwrap();
+            assert_eq!(p.window, None);
+            assert_eq!(p.tab, TabSelector::Active);
+            assert_eq!(p.dest, TabDestination::Index(2));
+        }
+
+        #[test]
+        fn place_tab_parses_window_selector_and_relative_destination() {
+            let p =
+                parse_place_tab(&json!({"window": 2, "title": "logs", "after": "build"})).unwrap();
+            assert_eq!(p.window, Some(2));
+            assert_eq!(p.tab, TabSelector::Title("logs".to_string()));
+            assert_eq!(p.dest, TabDestination::After("build".to_string()));
+            let p = parse_place_tab(&json!({"tab": 3, "before": "build"})).unwrap();
+            assert_eq!(p.tab, TabSelector::Index(3));
+            assert_eq!(p.dest, TabDestination::Before("build".to_string()));
+        }
+
+        #[test]
+        fn place_tab_rejects_bad_requests() {
+            for bad in [
+                json!({}),
+                json!({"to": 1, "before": "a"}),
+                json!({"before": "a", "after": "b"}),
+                json!({"tab": 1, "title": "a", "to": 1}),
+                json!({"to": 0}),
+                json!({"to": "2"}),
+                json!({"to": -1}),
+                json!({"to": 1.5}),
+                json!({"tab": 0, "to": 1}),
+                json!({"window": 0, "to": 1}),
+                json!({"before": ""}),
+                json!({"title": "", "to": 1}),
+            ] {
+                assert!(parse_place_tab(&bad).is_err(), "should reject {bad}");
+            }
+        }
 
         fn args(s: &str) -> Vec<String> {
             s.split_whitespace().map(str::to_string).collect()

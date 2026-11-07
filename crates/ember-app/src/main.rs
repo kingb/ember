@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use control::{ControlMsg, MoveTabTarget, PromotePaneTarget};
+use control::{
+    ControlMsg, MoveTabTarget, PromotePaneTarget, TabDestination, TabPlacement, TabSelector,
+};
 
 use ember_core::{
     Axis, BackendControl, BackendEvent, BackendHandle, ClipboardOp, Config, GridDims,
@@ -2204,6 +2206,10 @@ impl ApplicationHandler<EmberEvent> for App {
                 deferred_windows.push(DeferredWindowAction::Focus(query, reply));
                 continue;
             }
+            if let ControlMsg::PlaceTab(placement, reply) = cmd {
+                deferred_windows.push(DeferredWindowAction::PlaceTab(placement, reply));
+                continue;
+            }
             // `ctl drag`: press/motion*/release must all run as one
             // sequence (there's no real per-event `WindowEvent` to hang each
             // step off), and — like the surface-mobility verbs above — a
@@ -2702,6 +2708,11 @@ impl ApplicationHandler<EmberEvent> for App {
                     );
                     let _ = reply.send(resp);
                 }
+                DeferredWindowAction::PlaceTab(placement, reply) => {
+                    let resp =
+                        place_tab(&mut self.windows, shared, self.focused_window, &placement);
+                    let _ = reply.send(resp);
+                }
                 DeferredWindowAction::Drag {
                     window,
                     x1,
@@ -2815,6 +2826,9 @@ enum DeferredWindowAction {
     /// on) any window, not just the one `win` currently borrows. Resolved at
     /// the tail by `focus_across_windows`.
     Focus(String, std::sync::mpsc::Sender<String>),
+    /// `place-tab`: same reasoning — it can target any window. Resolved at the
+    /// tail by `place_tab`.
+    PlaceTab(TabPlacement, std::sync::mpsc::Sender<String>),
     /// `ctl drag`: synthesize a full press→motion*→release (or →Escape, if
     /// `cancel`) gesture on `window`, through the exact same `WindowState`
     /// methods a real mouse hits. Resolved at the tail by `run_ctl_drag`.
@@ -4992,6 +5006,129 @@ fn match_tab_title_across(window_titles: &[Vec<String>], query: &str) -> Option<
         .find_map(|(wi, titles)| match_tab_title(titles, query).map(|ti| (wi, ti)))
 }
 
+/// The one tab a title query identifies, for callers that are about to change
+/// something and so can't settle for `match_tab_title`'s first match. A sole
+/// exact title (case-insensitive) beats substring matches, so "build" can still
+/// name its tab beside "build-2". `exclude` drops a tab from consideration.
+fn find_unique_tab(
+    titles: &[String],
+    query: &str,
+    exclude: Option<usize>,
+) -> Result<usize, String> {
+    let q = query.to_lowercase();
+    let matches: Vec<usize> = (0..titles.len())
+        .filter(|&i| Some(i) != exclude && titles[i].to_lowercase().contains(&q))
+        .collect();
+    let exact: Vec<usize> = matches
+        .iter()
+        .copied()
+        .filter(|&i| titles[i].to_lowercase() == q)
+        .collect();
+    match (exact.as_slice(), matches.as_slice()) {
+        ([i], _) | (_, [i]) => Ok(*i),
+        (_, []) => Err(format!("no tab title matches \"{query}\"")),
+        _ => {
+            let names: Vec<&str> = matches.iter().map(|&i| titles[i].as_str()).collect();
+            Err(format!(
+                "ambiguous title \"{query}\" matches: {}",
+                names.join(", ")
+            ))
+        }
+    }
+}
+
+/// Resolve a `place-tab` selector and destination against one window's titles
+/// to the 0-based `(from, to)` that `WindowTree::move_tab` takes. `to` is the
+/// index after the tab is removed, so `Before`/`After` account for the removal.
+/// The moved tab can't be its own destination: a query is only matched against
+/// the other tabs, so moving "build-2" after "build" works.
+fn resolve_tab_reorder(
+    titles: &[String],
+    active: usize,
+    tab: &TabSelector,
+    dest: &TabDestination,
+) -> Result<(usize, usize), String> {
+    let position = |n: usize| {
+        if (1..=titles.len()).contains(&n) {
+            Ok(n - 1)
+        } else {
+            Err(format!(
+                "tab position {n} is out of range 1..={}",
+                titles.len()
+            ))
+        }
+    };
+    let from = match tab {
+        TabSelector::Active => active,
+        TabSelector::Index(n) => position(*n)?,
+        TabSelector::Title(q) => find_unique_tab(titles, q, None)?,
+    };
+    let neighbor = |query: &str| {
+        let t = find_unique_tab(titles, query, Some(from))?;
+        Ok::<usize, String>(if t > from { t - 1 } else { t })
+    };
+    let to = match dest {
+        TabDestination::Index(n) => position(*n)?,
+        TabDestination::Before(q) => neighbor(q)?,
+        TabDestination::After(q) => neighbor(q)? + 1,
+    };
+    Ok((from, to))
+}
+
+/// `place-tab`: move a tab within one window. Selecting a window or tab here
+/// does not focus either, and the active tab stays active wherever it lands
+/// (`WindowTree::move_tab`). Every failure reports the target window's titles
+/// when there is one, so a caller can correct its query without a second call.
+fn place_tab(
+    windows: &mut HashMap<WindowId, WindowState>,
+    shared: &mut Shared,
+    focused_window: Option<WindowId>,
+    placement: &TabPlacement,
+) -> String {
+    let wid = match placement.window {
+        None => focused_window,
+        Some(n) => shared.window_order.get(n - 1).copied(),
+    };
+    let Some((wid, w)) = wid.and_then(|id| windows.get_mut(&id).map(|w| (id, w))) else {
+        return serde_json::json!({
+            "ok": false,
+            "error": match placement.window {
+                Some(n) => format!("no window {n}"),
+                None => "no focused window".to_string(),
+            },
+        })
+        .to_string();
+    };
+    let titles = w.tab_titles();
+    let blocker = w
+        .tab_move_blocker()
+        .or(shared.drag.is_some().then_some("a drag is in progress"));
+    let resolved = match blocker {
+        Some(why) => Err(format!("{why}; try again when it ends")),
+        None => resolve_tab_reorder(&titles, w.tree.active, &placement.tab, &placement.dest),
+    };
+    let (from, to) = match resolved {
+        Ok(pair) => pair,
+        Err(error) => {
+            return serde_json::json!({"ok": false, "error": error, "titles": titles}).to_string();
+        }
+    };
+    if from != to {
+        let vp = w.viewport();
+        ember_core::apply(&mut w.tree, LayoutCommand::MoveTab { from, to }, vp);
+        w.sync_layout(shared);
+        w.renderer.window().request_redraw();
+        shared.snapshot_dirty = true;
+    }
+    serde_json::json!({
+        "ok": true,
+        "index": to + 1,
+        "title": w.tab_titles()[to],
+        "window": resolve_window_index(shared, wid).map(|i| i + 1),
+    })
+    .to_string()
+}
+
 /// Build the `ctl state` JSON (Task 5): a top-level `windows` array — one
 /// summary per window in `Shared::window_order` (`{id,focused,active_tab,
 /// tabs}`, `id` 1-based) — plus `focused_window` (1-based), plus the
@@ -5509,9 +5646,10 @@ mod tests {
         TabId, bell_flash_intensity, bracket_paste, clamp_to_visible_monitor,
         clear_captured_commands, encode_key, match_tab_title, match_tab_title_across,
         needs_deferred_replay, next_prev_index, pane_snap_for, pretype_bytes, queue_close_this,
-        queue_close_window, resolve_index, resolve_restore_cwd, route_release, shell_escape_path,
-        tab_display_title, url_is_openable, window_owning_tab,
+        queue_close_window, resolve_index, resolve_restore_cwd, resolve_tab_reorder, route_release,
+        shell_escape_path, tab_display_title, url_is_openable, window_owning_tab,
     };
+    use crate::control::{TabDestination, TabSelector};
     use winit::keyboard::{Key, ModifiersState, NamedKey, SmolStr};
     use winit::window::WindowId;
 
@@ -6064,6 +6202,116 @@ mod tests {
         assert_eq!(match_tab_title(&titles, "BETA"), Some(2));
         assert_eq!(match_tab_title(&titles, "uild"), Some(1), "substring");
         assert_eq!(match_tab_title(&titles, "gamma"), None);
+    }
+
+    fn abcd() -> Vec<String> {
+        ["alpha", "build", "build-2", "docs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Apply a resolved move the way `WindowTree::move_tab` does and return
+    /// the resulting tab order.
+    fn reordered(tab: &TabSelector, dest: &TabDestination) -> Vec<String> {
+        let mut titles = abcd();
+        let (from, to) = resolve_tab_reorder(&titles, 0, tab, dest).unwrap();
+        let moved = titles.remove(from);
+        titles.insert(to, moved);
+        titles
+    }
+
+    #[test]
+    fn tab_reorder_to_an_absolute_position_is_the_final_position() {
+        let dest = TabDestination::Index(3);
+        assert_eq!(
+            reordered(&TabSelector::Index(1), &dest),
+            ["build", "build-2", "alpha", "docs"]
+        );
+        let dest = TabDestination::Index(1);
+        assert_eq!(
+            reordered(&TabSelector::Index(4), &dest),
+            ["docs", "alpha", "build", "build-2"]
+        );
+    }
+
+    #[test]
+    fn tab_reorder_before_and_after_land_beside_the_named_tab() {
+        let docs = TabSelector::Title("docs".to_string());
+        let alpha = TabSelector::Title("alpha".to_string());
+        // Moving leftward and rightward, since removal shifts the neighbor
+        // only when it sits to the right of the moved tab.
+        assert_eq!(
+            reordered(&docs, &TabDestination::Before("alpha".to_string())),
+            ["docs", "alpha", "build", "build-2"]
+        );
+        assert_eq!(
+            reordered(&docs, &TabDestination::After("alpha".to_string())),
+            ["alpha", "docs", "build", "build-2"]
+        );
+        assert_eq!(
+            reordered(&alpha, &TabDestination::Before("docs".to_string())),
+            ["build", "build-2", "alpha", "docs"]
+        );
+        assert_eq!(
+            reordered(&alpha, &TabDestination::After("docs".to_string())),
+            ["build", "build-2", "docs", "alpha"]
+        );
+    }
+
+    #[test]
+    fn tab_reorder_defaults_to_the_active_tab() {
+        let (from, to) =
+            resolve_tab_reorder(&abcd(), 2, &TabSelector::Active, &TabDestination::Index(1))
+                .unwrap();
+        assert_eq!((from, to), (2, 0));
+    }
+
+    #[test]
+    fn tab_reorder_an_exact_title_beats_a_longer_match() {
+        let dest = TabDestination::Index(1);
+        let (from, _) =
+            resolve_tab_reorder(&abcd(), 0, &TabSelector::Title("BUILD".to_string()), &dest)
+                .unwrap();
+        assert_eq!(from, 1);
+    }
+
+    #[test]
+    fn tab_reorder_does_not_match_the_moved_tab_as_its_own_destination() {
+        // "buil" matches two tabs, but one of them is the tab being moved.
+        assert_eq!(
+            reordered(
+                &TabSelector::Title("build-2".to_string()),
+                &TabDestination::Before("buil".to_string())
+            ),
+            ["alpha", "build-2", "build", "docs"]
+        );
+    }
+
+    #[test]
+    fn tab_reorder_errors_name_the_problem() {
+        let run = |tab: TabSelector, dest: TabDestination| {
+            resolve_tab_reorder(&abcd(), 0, &tab, &dest).unwrap_err()
+        };
+        let e = run(
+            TabSelector::Title("buil".to_string()),
+            TabDestination::Index(1),
+        );
+        assert!(e.contains("ambiguous") && e.contains("build-2"), "{e}");
+        let e = run(
+            TabSelector::Title("nope".to_string()),
+            TabDestination::Index(1),
+        );
+        assert!(e.contains("no tab title matches"), "{e}");
+        let e = run(TabSelector::Index(5), TabDestination::Index(1));
+        assert!(e.contains("out of range"), "{e}");
+        let e = run(TabSelector::Active, TabDestination::Index(5));
+        assert!(e.contains("out of range"), "{e}");
+        let e = run(
+            TabSelector::Active,
+            TabDestination::Before("alpha".to_string()),
+        );
+        assert!(e.contains("no tab title matches"), "{e}");
     }
 
     #[test]

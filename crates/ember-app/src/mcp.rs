@@ -72,6 +72,10 @@ fn target_props() -> Value {
     })
 }
 
+/// The `ember_reorder_tab` arguments forwarded to the `place-tab` command,
+/// which validates them.
+const REORDER_TAB_ARGS: [&str; 6] = ["window", "tab", "title", "to", "before", "after"];
+
 fn tools() -> Value {
     json!([
         {
@@ -131,6 +135,11 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": with(target_props(), "to", json!({"type": "string", "description": "new | next | prev | <1-based window number>"})), "required": ["to"]}
         },
         {
+            "name": "ember_reorder_tab",
+            "description": "Move a tab to a new position within its window, keeping its panes and running processes and without changing which tab is active. Choose the tab with tab or title (default: the window's active tab) and the destination with exactly one of to, before or after. Positions are 1-based, as in ember_state. A title is a case-insensitive substring that must identify one tab, and a sole exact match wins. Returns {ok:true,index,title,window} or {ok:false,error,titles}.",
+            "inputSchema": {"type": "object", "properties": reorder_tab_props()}
+        },
+        {
             "name": "ember_promote_pane",
             "description": "Promote the focused pane out of its current split: into its own new tab (same window) or its own brand-new window. Returns {ok:true} or {ok:false,error}.",
             "inputSchema": {"type": "object", "properties": with(target_props(), "to", json!({"type": "string", "enum": ["tab", "window"]})), "required": ["to"]}
@@ -141,6 +150,40 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": target_props()}
         }
     ])
+}
+
+/// Schema for `ember_reorder_tab`: the target props plus [`REORDER_TAB_ARGS`].
+fn reorder_tab_props() -> Value {
+    let props = with(
+        target_props(),
+        "window",
+        json!({"type": "integer", "description": "1-based window number, as in ember_state (default: the focused window)."}),
+    );
+    let props = with(
+        props,
+        "tab",
+        json!({"type": "integer", "description": "1-based position of the tab to move."}),
+    );
+    let props = with(
+        props,
+        "title",
+        json!({"type": "string", "description": "Title of the tab to move."}),
+    );
+    let props = with(
+        props,
+        "to",
+        json!({"type": "integer", "description": "The tab's final 1-based position."}),
+    );
+    let props = with(
+        props,
+        "before",
+        json!({"type": "string", "description": "Place the tab immediately before the tab with this title."}),
+    );
+    with(
+        props,
+        "after",
+        json!({"type": "string", "description": "Place the tab immediately after the tab with this title."}),
+    )
 }
 
 /// Insert one property into a target-props object (small schema-builder helper).
@@ -244,6 +287,7 @@ fn tools_call(params: Option<&Value>) -> Result<Value, String> {
                 .ok_or("to required")?;
             Ok(text(send(&args, json!({"cmd": "move-tab", "to": to}))?))
         }
+        "ember_reorder_tab" => Ok(text(send(&args, reorder_tab_request(&args))?)),
         "ember_promote_pane" => {
             let to = args
                 .get("to")
@@ -254,6 +298,17 @@ fn tools_call(params: Option<&Value>) -> Result<Value, String> {
         "ember_merge_tab" => Ok(text(send(&args, json!({"cmd": "merge-tab"}))?)),
         other => Err(format!("unknown tool: {other}")),
     }
+}
+
+/// Build the `place-tab` request for an `ember_reorder_tab` call.
+fn reorder_tab_request(args: &Value) -> Value {
+    let mut req = json!({"cmd": "place-tab"});
+    for key in REORDER_TAB_ARGS {
+        if let Some(v) = args.get(key) {
+            req[key] = v.clone();
+        }
+    }
+    req
 }
 
 /// Resolve the target instance from the tool args and send one request.
@@ -267,4 +322,28 @@ fn send(args: &Value, request: Value) -> Result<String, String> {
 /// Wrap a string as MCP text tool-result content.
 fn text(s: impl Into<String>) -> Value {
     json!({ "content": [{"type": "text", "text": s.into()}] })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reorder_tab_forwards_placement_args_but_not_instance_targeting() {
+        let req = reorder_tab_request(&json!({
+            "pid": 42, "sock": "/x", "window": 2, "title": "logs", "after": "build",
+        }));
+        assert_eq!(
+            req,
+            json!({"cmd": "place-tab", "window": 2, "title": "logs", "after": "build"})
+        );
+    }
+
+    #[test]
+    fn reorder_tab_schema_declares_every_forwarded_arg() {
+        let props = reorder_tab_props();
+        for key in REORDER_TAB_ARGS {
+            assert!(props.get(key).is_some(), "schema is missing {key}");
+        }
+    }
 }
