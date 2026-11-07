@@ -1343,7 +1343,10 @@ impl WindowState {
             ControlMsg::NewWindow => {}
             // Same reasoning as `NewWindow`: `apply_move` needs the live
             // window set + event loop, neither of which this method has.
-            ControlMsg::MoveTab(..) | ControlMsg::PromotePane(..) | ControlMsg::MergeTab(..) => {}
+            ControlMsg::MoveTab(..)
+            | ControlMsg::PromotePane(..)
+            | ControlMsg::MergeTab(..)
+            | ControlMsg::PlaceTab(..) => {}
         }
         None
     }
@@ -1358,6 +1361,19 @@ impl WindowState {
             .enumerate()
             .map(|(i, t)| tab_display_title(&t.title, i))
             .collect()
+    }
+
+    /// Why this window's tabs can't be repositioned right now: a rename or a
+    /// drag holds a raw tab index that a move would leave pointing at the
+    /// wrong tab.
+    pub(crate) fn tab_move_blocker(&self) -> Option<&'static str> {
+        if self.editing_tab.is_some() {
+            Some("a tab rename is in progress")
+        } else if self.tab_drag.is_some() {
+            Some("a tab drag is in progress")
+        } else {
+            None
+        }
     }
 
     /// The `tabs` array shape shared by `ctl state`'s per-window `windows[]`
