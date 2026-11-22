@@ -25,5 +25,9 @@ log = "0.4"
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[dev-dependencies]
+# tests/osc8_links.rs drives a projection with alacritty's no-op listener.
+alacritty_terminal.workspace = true
+
 [lints]
 workspace = true

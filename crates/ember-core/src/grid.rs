@@ -86,6 +86,10 @@ pub enum CellContent {
     WideSpacer,
 }
 
+/// Interned OSC 8 hyperlink key (see [`GridDelta::new_links`]). Non-zero so
+/// `Option<LinkId>` costs two bytes.
+pub type LinkId = std::num::NonZeroU16;
+
 /// One neutral cell: resolved content + an interned style key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NeutralCell {
@@ -95,6 +99,14 @@ pub struct NeutralCell {
     /// (alacritty's `WRAPLINE`). Lets copy join a wrapped logical line without a
     /// spurious newline. Meaningless on non-last cells.
     pub wrapped: bool,
+    /// Interned OSC 8 hyperlink id (see [`GridDelta::new_links`]), when the
+    /// program explicitly marked this cell as part of a hyperlink. `None`
+    /// for ordinary cells (and for every frame from a pre-OSC-8 producer).
+    /// A non-zero `u16` so the field fits in the cell's existing padding:
+    /// `NeutralCell` stays 32 bytes, which keeps the throughput hot path
+    /// (one patch per damaged cell) free of extra memory traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkId>,
     /// This cell's glyph spans 2 columns (CJK, most emoji) — set for wide
     /// `Char` AND wide `Cluster` leaders; the following cell is a
     /// [`CellContent::WideSpacer`]. Defaulted so pre-wide serialized frames
@@ -110,6 +122,7 @@ impl NeutralCell {
             style,
             wrapped: false,
             wide: false,
+            link: None,
         }
     }
 }
@@ -207,6 +220,12 @@ pub struct GridDelta {
     pub cells: Vec<CellPatch>,
     /// Styles first referenced by this delta.
     pub new_styles: Vec<(StyleId, Style)>,
+    /// OSC 8 hyperlink URIs first seen this delta, `(interned id, uri)` —
+    /// same interning discipline as `new_styles`; a reset ships the full
+    /// table. Serde-defaulted so pre-OSC-8 frames still parse, and omitted
+    /// when empty so link-free frames are byte-identical on the wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_links: Vec<(LinkId, String)>,
     pub cursor: CursorState,
     /// Snapshot of the engine's bracketed-paste mode (DEC 2004) as of this drain —
     /// terminal state, like `cursor`, not damage. Lets the app wrap pastes in
@@ -279,6 +298,15 @@ impl GridDelta {
                 styles.insert(id, style);
             }
             newer.new_styles = styles.into_iter().collect();
+            // Links follow the same rule: a producer reset ships its full
+            // table, but a reset built elsewhere may lean on ids first seen
+            // in the superseded delta. Carry them forward, newer wins.
+            if !self.new_links.is_empty() {
+                let mut links: BTreeMap<LinkId, String> =
+                    std::mem::take(&mut self.new_links).into_iter().collect();
+                links.extend(std::mem::take(&mut newer.new_links));
+                newer.new_links = links.into_iter().collect();
+            }
             *self = newer;
             return;
         }
@@ -304,6 +332,15 @@ impl GridDelta {
         }
         self.new_styles = styles.into_iter().collect();
 
+        // Union first-seen links — newer wins per id. Skipped entirely in the
+        // common link-free case.
+        if !newer.new_links.is_empty() {
+            let mut links: BTreeMap<LinkId, String> =
+                std::mem::take(&mut self.new_links).into_iter().collect();
+            links.extend(newer.new_links);
+            self.new_links = links.into_iter().collect();
+        }
+
         self.epoch = newer.epoch;
         self.dims = newer.dims;
         self.cursor = newer.cursor;
@@ -328,6 +365,42 @@ mod tests {
             col,
             cell: NeutralCell::new(CellContent::Char(ch), StyleId(style)),
         }
+    }
+
+    #[test]
+    fn neutral_cell_stays_32_bytes_with_a_link() {
+        // The OSC 8 link id rides in padding. If this grows, the per-cell
+        // drain path pays for it on every flood (the v0.5.0 regression).
+        assert_eq!(std::mem::size_of::<NeutralCell>(), 32);
+        assert_eq!(std::mem::size_of::<Option<LinkId>>(), 2);
+    }
+
+    #[test]
+    fn link_free_delta_omits_new_links_on_the_wire() {
+        let d = GridDelta::new(1, GridDims::new(2, 1));
+        let v = serde_json::to_value(&d).unwrap();
+        assert!(v.get("new_links").is_none(), "{v}");
+    }
+
+    #[test]
+    fn merge_unions_new_links() {
+        let dims = GridDims::new(80, 24);
+        let id = |n| LinkId::new(n).unwrap();
+        let mut a = GridDelta::new(1, dims);
+        a.new_links = vec![(id(1), "https://a/".into())];
+        let mut b = GridDelta::new(2, dims);
+        b.new_links = vec![(id(2), "https://b/".into())];
+        a.merge(b);
+        assert_eq!(
+            a.new_links,
+            vec![(id(1), "https://a/".into()), (id(2), "https://b/".into())]
+        );
+        // A coalesced reset keeps ids learned from the superseded delta.
+        let mut r = GridDelta::new(3, dims);
+        r.reset = true;
+        r.new_links = vec![(id(3), "https://c/".into())];
+        a.merge(r);
+        assert_eq!(a.new_links.len(), 3);
     }
 
     #[test]

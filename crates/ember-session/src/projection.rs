@@ -15,8 +15,8 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape as AlacCursorShape, Processor};
 use ember_core::{
-    Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, MarkStatus,
-    NeutralCell, OscEvent, ScrollAmount, Style, StyleId, VtProjection,
+    Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, LinkId,
+    MarkStatus, NeutralCell, OscEvent, ScrollAmount, Style, StyleId, VtProjection,
 };
 
 use crate::osc133::Osc133;
@@ -89,6 +89,16 @@ pub struct AlacrittyProjection<L: EventListener> {
     scan_tail_1337: Vec<u8>,
     /// Same, for OSC 633.
     scan_tail_633: Vec<u8>,
+    /// Sticky: this session has emitted an OSC 8 hyperlink intro. Until it
+    /// has, the drain never probes cells for hyperlinks, so link-free floods
+    /// (the throughput gate) pay nothing for OSC 8 support.
+    osc8_seen: bool,
+    /// Last bytes of the previous read, so an `ESC ] 8 ;` split across reads
+    /// still flips [`Self::osc8_seen`]. Only meaningful while it is false.
+    osc8_tail: [u8; OSC8_INTRO.len() - 1],
+    osc8_tail_len: usize,
+    /// OSC 8 hyperlink interner: uri -> stable id for this session's frames.
+    link_ids: HashMap<Box<str>, LinkId>,
     /// Live scrollback-search state: the pattern as typed, its compiled DFA,
     /// and the engine-space range of the last match (the origin the next
     /// `search` call continues from). Reset when the pattern changes.
@@ -109,6 +119,10 @@ struct SearchState {
 /// scan on a huge scrollback with a pathologically common pattern (e.g. "e").
 /// Beyond this the count reads as "CAP+"; the normal case is well under it.
 const SEARCH_MATCH_CAP: usize = 2000;
+
+/// The 7-bit OSC 8 introducer (`ESC ] 8 ;`). Its first sighting turns on the
+/// per-cell hyperlink probe for the rest of the session.
+const OSC8_INTRO: &[u8] = b"\x1b]8;";
 
 /// One tracked command (OSC 133) or manual (OSC 1337 `SetMark`) mark: the
 /// prompt/mark's absolute history line, and — for a command — its exit code.
@@ -144,7 +158,67 @@ impl<L: EventListener> AlacrittyProjection<L> {
             scan_tail_133: Vec::new(),
             scan_tail_1337: Vec::new(),
             scan_tail_633: Vec::new(),
+            osc8_seen: false,
+            osc8_tail: [0; OSC8_INTRO.len() - 1],
+            osc8_tail_len: 0,
+            link_ids: HashMap::new(),
         }
+    }
+
+    /// Flip [`Self::osc8_seen`] once the byte stream carries an OSC 8 intro.
+    /// One SIMD substring search per read until then; free afterwards.
+    fn note_osc8(&mut self, bytes: &[u8]) {
+        if self.osc8_seen {
+            return;
+        }
+        if memchr::memmem::find(bytes, OSC8_INTRO).is_some() {
+            self.osc8_seen = true;
+            return;
+        }
+        // Split across the read boundary: previous tail ++ this head.
+        let head = &bytes[..bytes.len().min(OSC8_INTRO.len() - 1)];
+        let mut seam = [0u8; 2 * (OSC8_INTRO.len() - 1)];
+        let n = self.osc8_tail_len;
+        seam[..n].copy_from_slice(&self.osc8_tail[..n]);
+        seam[n..n + head.len()].copy_from_slice(head);
+        if memchr::memmem::find(&seam[..n + head.len()], OSC8_INTRO).is_some() {
+            self.osc8_seen = true;
+            return;
+        }
+        // Keep the last (intro - 1) bytes of (tail ++ bytes) for next time.
+        let keep = OSC8_INTRO.len() - 1;
+        if bytes.len() >= keep {
+            self.osc8_tail.copy_from_slice(&bytes[bytes.len() - keep..]);
+            self.osc8_tail_len = keep;
+        } else {
+            let joined = &seam[..n + head.len()];
+            let take = joined.len().min(keep);
+            self.osc8_tail[..take].copy_from_slice(&joined[joined.len() - take..]);
+            self.osc8_tail_len = take;
+        }
+    }
+
+    /// Intern an OSC 8 URI, recording first sightings in `first_links`.
+    /// `None` when the id space is exhausted; the next drain then resyncs
+    /// with a fresh table built from just the visible links.
+    fn intern_link(
+        &mut self,
+        uri: &str,
+        first_links: &mut Vec<(LinkId, String)>,
+    ) -> Option<LinkId> {
+        if let Some(&id) = self.link_ids.get(uri) {
+            return Some(id);
+        }
+        let Some(id) = u16::try_from(self.link_ids.len() + 1)
+            .ok()
+            .and_then(LinkId::new)
+        else {
+            self.resync = true;
+            return None;
+        };
+        self.link_ids.insert(uri.into(), id);
+        first_links.push((id, uri.to_string()));
+        Some(id)
     }
 
     /// Feed raw PTY bytes through the VT parser into the engine, and pre-scan them
@@ -154,6 +228,7 @@ impl<L: EventListener> AlacrittyProjection<L> {
     /// state for the gutter.
     pub fn advance(&mut self, bytes: &[u8]) -> Vec<OscEvent> {
         let mut events = Vec::new();
+        self.note_osc8(bytes);
         // Scan over (carried tail ++ new bytes): a mark split across the 8 KB
         // read boundary is statistically inevitable in long sessions and used
         // to be lost forever. The tail's bytes were already fed to the engine
@@ -532,7 +607,6 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
         self.display_offset = self.term.grid().display_offset();
 
         let cols = self.dims.columns as usize;
-        let lines = self.dims.screen_lines as usize;
 
         // Collect damaged ranges first — the damage iterator borrows the term,
         // and we need to read the grid afterwards. The arm consumes the iterator
@@ -545,28 +619,29 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
         let full = full || std::mem::take(&mut self.resync);
 
         let mut first_seen = Vec::new();
-        if full {
-            out.reset = true;
-            out.cells.clear();
-            for line in 0..lines {
-                for col in 0..cols {
-                    out.cells.push(self.patch(line, col, &mut first_seen));
-                }
-            }
+        let mut first_links = Vec::new();
+        // Pick the per-cell path ONCE per drain, with direct calls (no fn
+        // pointer): link-free sessions run a copy of the loops with no
+        // hyperlink code in them at all.
+        if self.osc8_seen {
+            self.fill_patches::<true>(out, full, &ranges, &mut first_seen, &mut first_links);
         } else {
-            for (line, left, right) in ranges {
-                for col in left..=right {
-                    out.cells.push(self.patch(line, col, &mut first_seen));
-                }
-            }
+            self.fill_patches::<false>(out, full, &ranges, &mut first_seen, &mut first_links);
         }
         // MERGE into whatever the caller left pending (the trait contract) —
         // assigning here would clobber styles from a superseded drain and
         // re-open the black-on-black coalescing bug fixed in GridDelta::merge.
         out.new_styles.extend(first_seen);
+        out.new_links.extend(first_links);
         if out.reset {
             // A resync consumer has no style cache at all: ship the full table.
             out.new_styles = self.interner.all();
+            out.new_links = self
+                .link_ids
+                .iter()
+                .map(|(uri, id)| (*id, uri.to_string()))
+                .collect();
+            out.new_links.sort_unstable_by_key(|(id, _)| *id);
         }
         out.cursor = self.cursor_state();
         let mode = self.term.mode();
@@ -625,22 +700,73 @@ impl<L: EventListener> VtProjection for AlacrittyProjection<L> {
 }
 
 impl<L: EventListener> AlacrittyProjection<L> {
-    fn patch(
+    /// The per-cell drain loops, monomorphized on whether this session can
+    /// carry OSC 8 links. Full damage re-projects the whole screen.
+    #[inline(always)]
+    fn fill_patches<const LINKS: bool>(
+        &mut self,
+        out: &mut GridDelta,
+        full: bool,
+        ranges: &[(usize, usize, usize)],
+        first_seen: &mut Vec<(StyleId, Style)>,
+        first_links: &mut Vec<(LinkId, String)>,
+    ) {
+        let cols = self.dims.columns as usize;
+        let lines = self.dims.screen_lines as usize;
+        if full {
+            out.reset = true;
+            out.cells.clear();
+            // A reset ships the whole link table, so rebuild it from just the
+            // links on screen: keeps it small and recycles exhausted ids.
+            if LINKS {
+                self.link_ids.clear();
+            }
+            for line in 0..lines {
+                for col in 0..cols {
+                    out.cells
+                        .push(self.patch::<LINKS>(line, col, first_seen, first_links));
+                }
+            }
+            // Only an absurd screen (> 65535 distinct visible links) can
+            // exhaust ids mid-pass; don't let that loop into resync forever.
+            self.resync = false;
+        } else {
+            for &(line, left, right) in ranges {
+                for col in left..=right {
+                    out.cells
+                        .push(self.patch::<LINKS>(line, col, first_seen, first_links));
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn patch<const LINKS: bool>(
         &mut self,
         line: usize,
         col: usize,
         first_seen: &mut Vec<(StyleId, Style)>,
+        first_links: &mut Vec<(LinkId, String)>,
     ) -> CellPatch {
         // Map a visible row to the engine's line index accounting for scroll: when
         // scrolled up by `display_offset`, visible row `v` shows engine line
         // `v - display_offset` (history lines are negative). At the bottom
         // (`display_offset == 0`) this is just `Line(v)`.
         let engine_line = line as i32 - self.display_offset as i32;
-        let (content, style, wrapped, wide) = {
+        let (content, style, wrapped, wide, hyperlink) = {
             let cell = &self.term.grid()[Point::new(Line(engine_line), Column(col))];
-            neutral_of(cell, &self.palette, self.term.colors())
+            let (c, st, wr, wi) = neutral_of(cell, &self.palette, self.term.colors());
+            // Until the session has sent an OSC 8 no cell can carry a
+            // hyperlink, and `LINKS = false` compiles the probe out entirely.
+            let h = if LINKS && cell.extra.is_some() {
+                cell.hyperlink()
+            } else {
+                None
+            };
+            (c, st, wr, wi, h)
         };
         let id = self.interner.intern(style, first_seen);
+        let link = hyperlink.and_then(|h| self.intern_link(h.uri(), first_links));
         CellPatch {
             row: line as u16,
             col: col as u16,
@@ -649,6 +775,7 @@ impl<L: EventListener> AlacrittyProjection<L> {
                 style: id,
                 wrapped,
                 wide,
+                link,
             },
         }
     }
@@ -759,6 +886,76 @@ mod tests {
             .iter()
             .find(|p| p.row == row && p.col == col)
             .expect("cell present")
+    }
+
+    fn drain(p: &mut AlacrittyProjection<VoidListener>) -> GridDelta {
+        let mut d = GridDelta::default();
+        p.drain_damage_into(&mut d);
+        d
+    }
+
+    /// Claude Code's shape: the label is visible, the URL lives in the escape.
+    const LABELLED: &[u8] =
+        b"see \x1b]8;;https://claude.ai/artifact/abc\x1b\\MVP checklist\x1b]8;;\x1b\\ ok";
+
+    #[test]
+    fn osc8_label_cells_carry_the_interned_uri() {
+        let mut p = proj();
+        p.advance(LABELLED);
+        let d = drain(&mut p);
+        assert_eq!(d.new_links.len(), 1);
+        let (id, uri) = &d.new_links[0];
+        assert_eq!(uri, "https://claude.ai/artifact/abc");
+        // "see " is cols 0..4, the label "MVP checklist" is cols 4..17.
+        assert_eq!(find(&d, 0, 3).cell.link, None);
+        for col in 4..17 {
+            assert_eq!(find(&d, 0, col).cell.link, Some(*id), "col {col}");
+        }
+        assert_eq!(find(&d, 0, 17).cell.link, None);
+    }
+
+    #[test]
+    fn osc8_intro_split_across_reads_still_enables_links() {
+        for split in 1..6 {
+            let mut p = proj();
+            p.advance(&LABELLED[..4 + split]);
+            p.advance(&LABELLED[4 + split..]);
+            let d = drain(&mut p);
+            assert_eq!(d.new_links.len(), 1, "split at {split}");
+            assert!(find(&d, 0, 4).cell.link.is_some(), "split at {split}");
+        }
+        // One byte per read is the worst case for the seam carry.
+        let mut p = proj();
+        for b in LABELLED {
+            p.advance(std::slice::from_ref(b));
+        }
+        assert!(find(&drain(&mut p), 0, 4).cell.link.is_some());
+    }
+
+    #[test]
+    fn link_free_output_never_probes_or_ships_links() {
+        let mut p = proj();
+        p.advance(b"plain https://example.com text \x1b]133;A\x07\x1b]9;x\x07");
+        let d = drain(&mut p);
+        assert!(!p.osc8_seen);
+        assert!(d.new_links.is_empty());
+        assert!(d.cells.iter().all(|c| c.cell.link.is_none()));
+    }
+
+    #[test]
+    fn reset_ships_only_the_visible_link_table() {
+        let mut p = proj();
+        p.advance(LABELLED);
+        drain(&mut p);
+        // Clear the screen and draw a different link, then force a resync.
+        p.advance(b"\x1b[2J\x1b[H\x1b]8;;https://two/\x1b\\two\x1b]8;;\x1b\\");
+        p.resync = true;
+        let d = drain(&mut p);
+        assert!(d.reset);
+        let uris: Vec<&str> = d.new_links.iter().map(|(_, u)| u.as_str()).collect();
+        assert_eq!(uris, ["https://two/"]);
+        let (id, _) = d.new_links[0];
+        assert_eq!(find(&d, 0, 0).cell.link, Some(id));
     }
 
     #[test]
