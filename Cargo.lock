@@ -658,6 +658,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 name = "ember-app"
 version = "0.6.2"
 dependencies = [
+ "alacritty_terminal",
  "ember-core",
  "ember-platform",
  "ember-render",
@@ -718,6 +719,7 @@ dependencies = [
  "criterion",
  "ember-core",
  "libc",
+ "memchr",
  "portable-pty",
  "serde",
  "serde_json",

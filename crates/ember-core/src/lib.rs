@@ -30,8 +30,8 @@ pub use config::{
 pub use focus::{Direction, focus_dir};
 pub use geom::Rect;
 pub use grid::{
-    Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, MarkStatus,
-    MouseProto, NeutralCell, Rgb, Style, StyleId,
+    Attrs, CellContent, CellPatch, CursorShape, CursorState, GridDelta, GridDims, LinkId,
+    MarkStatus, MouseProto, NeutralCell, Rgb, Style, StyleId,
 };
 pub use ids::{PaneId, SessionId, TabId};
 pub use layout::{Axis, LayoutNode, Tab, WindowTree, layout, remove_pane};
